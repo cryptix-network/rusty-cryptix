@@ -27,7 +27,7 @@ impl<T: HeaderStoreReader> FullPastMedianTimeManager<T> {
     }
 }
 
-/// A past median time manager implementing [KIP-0004](https://github.com/cryptixnet/kips/blob/master/kip-0004.md),
+/// A past median time manager implementing [KIP-0004](https://github.com/cryptix-network/kips/blob/master/kip-0004.md),
 /// so based on sampled windows
 #[derive(Clone)]
 pub struct SampledPastMedianTimeManager<T: HeaderStoreReader> {

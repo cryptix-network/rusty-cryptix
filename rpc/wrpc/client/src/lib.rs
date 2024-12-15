@@ -7,7 +7,7 @@
 //! meant to function as an IPC (Inter-Process Communication) mechanism for Rust applications.
 //!
 //! Rust examples on using wRPC client can be found in the
-//! [examples](https://github.com/cryptixnet/rusty-cryptix/tree/master/rpc/wrpc/examples) folder.
+//! [examples](https://github.com/cryptix-network/rusty-cryptix/tree/master/rpc/wrpc/examples) folder.
 //!
 //! WASM bindings for wRPC client can be found in the [`cryptix-wrpc-wasm`](https://docs.rs/cryptix-wrpc-wasm) crate.
 //!

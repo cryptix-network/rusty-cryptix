@@ -48,7 +48,7 @@ The default branch of this repository is `master` and new contributions are cons
       ```
   5. Clone the repo
       ```bash
-      git clone https://github.com/cryptixnet/rusty-cryptix
+      git clone https://github.com/cryptix-network/rusty-cryptix
       cd rusty-cryptix
       ```
   </details>
@@ -85,7 +85,7 @@ The default branch of this repository is `master` and new contributions are cons
       ```
   7. Clone the repo
       ```bash
-      git clone https://github.com/cryptixnet/rusty-cryptix
+      git clone https://github.com/cryptix-network/rusty-cryptix
       cd rusty-cryptix
       ```
  </details>
@@ -145,7 +145,7 @@ To build WASM on MacOS you need to install `llvm` from homebrew (at the time of 
       ```
   5. Clone the repo
       ```bash
-      git clone https://github.com/cryptixnet/rusty-cryptix
+      git clone https://github.com/cryptix-network/rusty-cryptix
       cd rusty-cryptix
       ```
 
@@ -174,7 +174,7 @@ To build WASM on MacOS you need to install `llvm` from homebrew (at the time of 
 
 ### Builds & documentation
 
-  - Release builds: https://github.com/cryptixnet/rusty-cryptix/releases
+  - Release builds: https://github.com/cryptix-network/rusty-cryptix/releases
   - Developer builds: https://cryptix.aspectron.org/nightly/downloads/
   - Developer TypeScript documentation: https://cryptix.aspectron.org/docs/
 

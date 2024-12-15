@@ -8,7 +8,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cryptixnet/rusty-cryptix.git"
+    "url": "git+https://github.com/cryptix-network/rusty-cryptix.git"
   },
   "keywords": [
     "cryptix",
@@ -18,9 +18,9 @@
   "author": "Cryptix developers",
   "license": "ISC",
   "bugs": {
-    "url": "https://github.com/cryptixnet/rusty-cryptix/issues"
+    "url": "https://github.com/cryptix-network/rusty-cryptix/issues"
   },
-  "homepage": "https://github.com/cryptixnet/rusty-cryptix#readme",
+  "homepage": "https://github.com/cryptix-network/rusty-cryptix#readme",
   "dependencies": {
     "websocket": "1.0.34",
     "cryptix-wasm": "0.13.5"

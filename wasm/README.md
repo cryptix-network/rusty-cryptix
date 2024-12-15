@@ -1,7 +1,7 @@
 
 ## WASM32 bindings for Rusty Cryptix SDK
 
-[<img alt="github" src="https://img.shields.io/badge/github-cryptixnet/rusty--cryptix-8da0cb?style=for-the-badge&labelColor=555555&color=8da0cb&logo=github" height="20">](https://github.com/cryptixnet/rusty-cryptix/tree/master/wasm)
+[<img alt="github" src="https://img.shields.io/badge/github-cryptix-network/rusty--cryptix-8da0cb?style=for-the-badge&labelColor=555555&color=8da0cb&logo=github" height="20">](https://github.com/cryptix-network/rusty-cryptix/tree/master/wasm)
 [<img alt="crates.io" src="https://img.shields.io/crates/v/cryptix-wasm.svg?maxAge=2592000&style=for-the-badge&color=fc8d62&logo=rust" height="20">](https://crates.io/crates/cryptix-wasm)
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-cryptix--wasm-56c2a5?maxAge=2592000&style=for-the-badge&logo=docs.rs" height="20">](https://docs.rs/cryptix-wasm)
 <img alt="license" src="https://img.shields.io/crates/l/cryptix-wasm.svg?maxAge=2592000&color=6ac&style=for-the-badge&logoColor=fff" height="20">
@@ -65,7 +65,7 @@ file in a web browser.
 ## Building from Source
 
 To build the WASM32 SDK from source, you need to have the Rust environment installed. To do that,
-follow instructions in the [Rusty Cryptix README](https://github.com/cryptixnet/rusty-cryptix).
+follow instructions in the [Rusty Cryptix README](https://github.com/cryptix-network/rusty-cryptix).
 
 Once you have Rust installed, you can build the WASM32 SDK as follows:
 

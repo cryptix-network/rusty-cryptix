@@ -66,7 +66,7 @@ rust-version = "1.82.0"
 version = "0.15.4"
 authors = ["Cryptix developers"]
 license = "ISC"
-repository = "https://github.com/cryptixnet/rusty-cryptix"
+repository = "https://github.com/cryptix-network/rusty-cryptix"
 edition = "2021"
 include = [
     "src/**/*.rs",

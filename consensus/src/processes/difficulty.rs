@@ -164,7 +164,7 @@ impl<T: HeaderStoreReader> DifficultyManagerExtension for FullDifficultyManager<
     }
 }
 
-/// A difficulty manager implementing [KIP-0004](https://github.com/cryptixnet/kips/blob/master/kip-0004.md),
+/// A difficulty manager implementing [KIP-0004](https://github.com/cryptix-network/kips/blob/master/kip-0004.md),
 /// so based on sampled windows
 #[derive(Clone)]
 pub struct SampledDifficultyManager<T: HeaderStoreReader> {

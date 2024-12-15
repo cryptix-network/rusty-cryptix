@@ -290,7 +290,7 @@ enum SampledBlock {
     NonDaa(Hash),
 }
 
-/// A sampled window manager implementing [KIP-0004](https://github.com/cryptixnet/kips/blob/master/kip-0004.md)
+/// A sampled window manager implementing [KIP-0004](https://github.com/cryptix-network/kips/blob/master/kip-0004.md)
 #[derive(Clone)]
 pub struct SampledWindowManager<
     T: GhostdagStoreReader,
