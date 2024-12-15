@@ -1,7 +1,7 @@
 
 <h1>Cryptix On Rust</h1>
 
-Welcome to the Rust-based implementation of the Cryptix full-node and its ancillary libraries. The contained node release serves as a drop-in replacement to the established <a href="https://github.com/cryptixnet/cryptixd">Golang node</a> and to date is the recommended node software for the Cryptix network, introducing developers to the possibilities of Rust in the Cryptix network's context.
+Welcome to the Rust-based implementation of the Cryptix full-node and its ancillary libraries. The contained node release serves as a drop-in replacement to the established <a href="https://github.com/cryptix-network/cryptixd">Golang node</a> and to date is the recommended node software for the Cryptix network, introducing developers to the possibilities of Rust in the Cryptix network's context.
 
 We invite developers and blockchain enthusiasts to collaborate, test, and optimize our Rust implementation. Each line of code here is an opportunity to contribute to the open-source blockchain movement, shaping a platform designed for scalability and speed without compromising on security and decentralization.
 
