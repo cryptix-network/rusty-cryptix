@@ -1,0 +1,42 @@
+[package]
+name = "simpa"
+description = "Cryptix Network Simulator"
+publish = false
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cryptix-alloc.workspace = true            # This changes the global allocator for all of the next dependencies so should be kept first
+cryptix-consensus-core.workspace = true
+cryptix-consensus-notify.workspace = true
+cryptix-consensus.workspace = true
+cryptix-core.workspace = true
+cryptix-database.workspace = true
+cryptix-hashes.workspace = true
+cryptix-perf-monitor.workspace = true
+cryptix-utils.workspace = true
+
+async-channel.workspace = true
+cfg-if.workspace = true
+clap.workspace = true
+dhat = { workspace = true, optional = true }
+futures-util.workspace = true
+futures.workspace = true
+indexmap.workspace = true
+itertools.workspace = true
+log.workspace = true
+num_cpus.workspace = true
+rand_distr.workspace = true
+rand.workspace = true
+rayon.workspace = true
+secp256k1.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
+
+[features]
+heap = ["dhat", "cryptix-alloc/heap"]
+semaphore-trace = ["cryptix-utils/semaphore-trace"]

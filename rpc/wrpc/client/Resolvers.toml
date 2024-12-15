@@ -1,0 +1,41 @@
+[[resolver]]
+enable = false
+address = "http://127.0.0.1:8888"
+
+[[group]]
+template = "https://*.cryptix.stream"
+nodes = ["eric","maxim","sean","troy"]
+
+[[group]]
+template = "https://*.cryptix.red"
+nodes = ["john", "mike", "paul", "alex"]
+
+[[group]]
+template = "https://*.cryptix.green"
+nodes = ["jake", "mark", "adam", "liam"]
+
+[[group]]
+template = "https://*.cryptix.blue"
+nodes = ["noah", "ryan", "jack", "luke"]
+
+# [[group]]
+# enable = true
+# template = "https://*.cryptix-ng.org"
+# nodes = ["cole", "ivan", "oscar", "zane"]
+
+# [[group]]
+# enable = true
+# template = "https://*.cryptix-ng.io"
+# nodes = ["gary", "hugo", "finn", "evan"]
+
+# [[group]]
+# enable = true
+# template = "https://*.cryptix-ng.net"
+# nodes = ["neil", "dave", "kyle", "toby"]
+
+# ---
+
+# [[group]]
+# enable = false
+# template = "https://*."
+# nodes = ["rudy", "todd", "clay", "walt"]

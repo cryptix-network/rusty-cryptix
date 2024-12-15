@@ -1,0 +1,1 @@
+wasm-pack build --target nodejs --out-name cryptix-wallet --out-dir nodejs/cryptix-wallet $@

@@ -1,0 +1,37 @@
+[package]
+name = "rothschild"
+description = "Cryptix Transaction Generator"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cryptix-addresses.workspace = true
+cryptix-consensus-core.workspace = true
+cryptix-core.workspace = true
+cryptix-grpc-client.workspace = true
+cryptix-notify.workspace = true
+cryptix-rpc-core.workspace = true
+cryptix-txscript.workspace = true
+cryptix-utils.workspace = true
+
+async-channel.workspace = true
+clap.workspace = true
+faster-hex.workspace = true
+itertools.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+rayon.workspace = true
+secp256k1 = { workspace = true, features = ["global-context", "rand-std"] }
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "bench"
+harness = false

@@ -1,0 +1,39 @@
+[package]
+name = "cryptix-consensus-wasm"
+description = "Cryptix consensus core WASM bindings"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+wasm32-sdk = []
+wasm32-types = []
+
+[dependencies]
+cryptix-consensus-core.workspace = true
+cryptix-consensus-client.workspace = true
+cryptix-addresses.workspace = true
+cryptix-txscript.workspace = true
+cryptix-hashes.workspace = true
+cryptix-utils.workspace = true
+
+cfg-if.workspace = true
+faster-hex.workspace = true
+js-sys.workspace = true
+rand.workspace = true
+secp256k1.workspace = true
+serde_json.workspace = true
+serde-wasm-bindgen.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+wasm-bindgen.workspace = true
+
+workflow-wasm.workspace = true
+workflow-log.workspace = true
+
+[lints]
+workspace = true

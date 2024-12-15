@@ -1,0 +1,34 @@
+[package]
+name = "cryptix-pow"
+description = "Cryptix proof-of-work"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+wasm32-sdk = []
+
+[dependencies]
+js-sys.workspace = true
+cryptix-consensus-core.workspace = true
+cryptix-consensus-client.workspace = true
+cryptix-hashes.workspace = true
+cryptix-math.workspace = true
+cryptix-utils.workspace = true
+wasm-bindgen.workspace = true
+workflow-wasm.workspace = true
+num.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "bench"
+harness = false
+
+[lints]
+workspace = true

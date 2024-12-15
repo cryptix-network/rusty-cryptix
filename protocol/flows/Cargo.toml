@@ -1,0 +1,38 @@
+[package]
+name = "cryptix-p2p-flows"
+description = "Cryptix p2p flows"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cryptix-core.workspace = true
+cryptix-consensus-core.workspace = true
+cryptix-consensus-notify.workspace = true
+cryptix-p2p-lib.workspace = true
+cryptix-utils.workspace = true
+cryptix-utils-tower.workspace = true
+cryptix-hashes.workspace = true
+cryptix-muhash.workspace = true
+cryptix-connectionmanager.workspace = true
+cryptix-addressmanager.workspace = true
+cryptix-consensusmanager.workspace = true
+cryptix-mining.workspace = true
+cryptix-notify.workspace = true
+
+async-trait.workspace = true
+futures = { workspace = true, features = ["alloc"] }
+indexmap.workspace = true
+itertools.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tokio-stream = { workspace = true, features = ["net"] }
+uuid = { workspace = true, features = ["v4", "fast-rng"] }
+chrono.workspace = true

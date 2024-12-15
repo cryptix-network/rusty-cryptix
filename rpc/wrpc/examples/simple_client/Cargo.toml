@@ -1,0 +1,18 @@
+[package]
+name = "cryptix-wrpc-simple-client-example"
+description = "Cryptix wRPC simple client example"
+publish = false
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+futures.workspace = true
+cryptix-rpc-core.workspace = true
+cryptix-wrpc-client.workspace = true
+tokio.workspace = true
+

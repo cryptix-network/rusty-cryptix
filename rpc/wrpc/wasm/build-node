@@ -1,0 +1,3 @@
+#!/bin/bash
+
+wasm-pack build --target nodejs --out-name cryptix-rpc --out-dir nodejs/cryptix-rpc --features wasm32-sdk

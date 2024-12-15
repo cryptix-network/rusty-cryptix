@@ -1,0 +1,130 @@
+[package]
+name = "cryptix-wallet-core"
+description = "Cryptix wallet library"
+keywords = ["cryptix", "wallet"]
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+multi-user = []
+wasm32-keygen = [
+    # "cryptix-consensus-wasm/wasm32-types",
+]
+wasm32-core = [
+    "cryptix-consensus-wasm/wasm32-sdk",
+    "cryptix-consensus-core/wasm32-sdk",
+    "cryptix-wrpc-client/wasm32-sdk",
+    "cryptix-wrpc-wasm/wasm32-sdk",
+    "cryptix-wasm-core/wasm32-sdk",
+]
+wasm32-sdk = [
+    "wasm32-core"
+]
+default = ["wasm32-sdk"]
+# default = []
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+aes.workspace = true
+ahash.workspace = true
+argon2.workspace = true
+async-channel.workspace = true
+async-std.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+borsh.workspace = true
+cfb-mode.workspace = true
+cfg-if.workspace = true
+chacha20poly1305.workspace = true
+convert_case.workspace = true
+crypto_box.workspace = true
+dashmap.workspace = true
+derivative.workspace = true
+downcast.workspace = true
+evpkdf.workspace = true
+faster-hex.workspace = true
+fixedstr.workspace = true
+futures.workspace = true
+heapless.workspace = true
+hmac.workspace = true
+itertools.workspace = true
+js-sys.workspace = true
+cryptix-addresses.workspace = true
+cryptix-bip32.workspace = true
+cryptix-consensus-client.workspace = true
+cryptix-consensus-core.workspace = true
+cryptix-consensus-wasm.workspace = true
+cryptix-core.workspace = true
+cryptix-hashes.workspace = true
+cryptix-metrics-core.workspace = true
+cryptix-notify.workspace = true
+cryptix-rpc-core.workspace = true
+cryptix-txscript-errors.workspace = true
+cryptix-txscript.workspace = true
+cryptix-utils.workspace = true
+cryptix-wallet-keys.workspace = true
+cryptix-wallet-macros.workspace = true
+cryptix-wallet-pskt.workspace = true
+cryptix-wasm-core.workspace = true
+cryptix-wrpc-client.workspace = true
+cryptix-wrpc-wasm.workspace = true
+md-5.workspace = true
+pad.workspace = true
+pbkdf2.workspace = true
+rand.workspace = true
+regex.workspace = true
+ripemd.workspace = true
+secp256k1.workspace = true
+separator.workspace = true
+serde_json.workspace = true
+serde-wasm-bindgen.workspace = true
+serde.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+slugify-rs.workspace = true
+sorted-insert.workspace = true
+thiserror.workspace = true
+wasm-bindgen-futures.workspace = true
+wasm-bindgen.workspace = true
+workflow-core.workspace = true
+workflow-log.workspace = true
+workflow-node.workspace = true
+workflow-rpc.workspace = true
+workflow-store.workspace = true
+workflow-wasm.workspace = true
+xxhash-rust.workspace = true
+zeroize.workspace = true
+indexed_db_futures.workspace = true
+
+[dependencies.web-sys]
+workspace = true
+features = [
+    'Storage',
+    'Window',
+    'IdbFactory',
+    'IdbDatabase',
+    'IdbOpenDbOptions',
+    'IdbOpenDbRequest',
+    'IdbTransaction',
+    'IdbCursorDirection',
+]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+home.workspace = true
+
+[dev-dependencies]
+hex-literal.workspace = true
+serde_repr.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

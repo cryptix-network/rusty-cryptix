@@ -1,0 +1,36 @@
+[package]
+name = "cryptix-rpc-service"
+description = "Cryptix RPC service"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cryptix-addresses.workspace = true
+cryptix-consensus-core.workspace = true
+cryptix-consensus-notify.workspace = true
+cryptix-consensusmanager.workspace = true
+cryptix-core.workspace = true
+cryptix-hashes.workspace = true
+cryptix-index-core.workspace = true
+cryptix-math.workspace = true
+cryptix-mining.workspace = true
+cryptix-notify.workspace = true
+cryptix-p2p-flows.workspace = true
+cryptix-p2p-lib.workspace = true
+cryptix-perf-monitor.workspace = true
+cryptix-rpc-core.workspace = true
+cryptix-txscript.workspace = true
+cryptix-utils.workspace = true
+cryptix-utils-tower.workspace = true
+cryptix-utxoindex.workspace = true
+
+async-trait.workspace = true
+log.workspace = true
+tokio.workspace = true
+triggered.workspace = true
+workflow-rpc.workspace = true
