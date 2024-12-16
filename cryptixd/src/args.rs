@@ -103,7 +103,7 @@ impl Default for Args {
             async_threads: num_cpus::get(),
             utxoindex: false,
             reset_db: false,
-            outbound_target: 2,
+            outbound_target: 8,
             inbound_limit: 128,
             rpc_max_clients: 128,
             max_tracked_addresses: 0,
