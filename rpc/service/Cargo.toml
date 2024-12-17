@@ -34,4 +34,3 @@ log.workspace = true
 tokio.workspace = true
 triggered.workspace = true
 workflow-rpc.workspace = true
-cryptix-rpc-service = "=0.15.0"
