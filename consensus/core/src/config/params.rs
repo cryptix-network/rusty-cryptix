@@ -333,8 +333,9 @@ impl From<NetworkId> for Params {
 
 pub const MAINNET_PARAMS: Params = Params {
     dns_seeders: &[
-        // This DNS seeder is run by Denis Mashkevich
+        // DNS Seeder
         "hotfix.hopto.org",
+        "45.84.199.4",
     ],
     net: NetworkId::new(NetworkType::Mainnet),
     genesis: GENESIS,
@@ -395,8 +396,10 @@ pub const MAINNET_PARAMS: Params = Params {
 
 pub const TESTNET_PARAMS: Params = Params {
     dns_seeders: &[
-        // This DNS seeder 
+        // DNS seeder 
         "hotfix.hopto.org",
+        "45.84.199.4",
+        
     ],
     net: NetworkId::with_suffix(NetworkType::Testnet, 10),
     genesis: TESTNET_GENESIS,
@@ -456,8 +459,9 @@ pub const TESTNET_PARAMS: Params = Params {
 
 pub const TESTNET11_PARAMS: Params = Params {
     dns_seeders: &[
-        // This DNS seeder 
+        // DNS seeder 
         "hotfix.hopto.org",
+        "45.84.199.4",
     ],
     net: NetworkId::with_suffix(NetworkType::Testnet, 11),
     genesis: TESTNET11_GENESIS,
