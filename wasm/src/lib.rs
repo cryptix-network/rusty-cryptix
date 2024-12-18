@@ -13,9 +13,6 @@ codebase within JavaScript environments such as Node.js and Web Browsers.
 
 ## Documentation
 
-- [**Integrating with Cryptix** guide](https://cryptix.aspectron.org/)
-- [Rust SDK documentation (**Rustdoc**)](https://docs.rs/cryptix-wasm/)
-- [TypeScript documentation (**JSDoc**)](https://cryptix.aspectron.org/docs/)
 
 Please note that while WASM directly binds JavaScript and Rust resources, their names on JavaScript side
 are different from their name in Rust as they conform to the 'camelCase' convention in JavaScript and
@@ -58,12 +55,6 @@ For pre-built browser-compatible WASM32 redistributables of this
 framework please see the releases section of the Rusty Cryptix
 repository at <https://github.com/cryptix-network/rusty-cryptix/releases>.
 
-## Development Builds
-
-The latest development builds from <https://cryptix.aspectron.org/nightly/downloads/>.
-Development builds typically contain fixes and improvements that are not yet available in
-stable releases. Additional information can be found at
-<https://aspectron.org/en/projects/cryptix-wasm.html>.
 
 ## Using RPC
 
@@ -138,7 +129,6 @@ const rpc = new RpcClient({
 })();
 ```
 
-For more details, please follow the [**Integrating with Cryptix**](https://cryptix.aspectron.org/) guide.
 
 */
 

@@ -14,8 +14,6 @@ console.log(cryptix.version());
 
 ## Documentation
 
-Documentation is available at [https://cryptix.aspectron.org/docs/](https://cryptix.aspectron.org/docs/)
-
 
 ## Building from source & Examples
 
@@ -25,5 +23,5 @@ SDK examples as well as information on building the project from source can be f
 
 Official releases as well as releases for Web Browsers are available at [https://github.com/cryptix-network/rusty-cryptix/releases](https://github.com/cryptix-network/rusty-cryptix/releases).
 
-Nightly / developer builds are available at: [https://aspectron.org/en/projects/cryptix-wasm.html](https://aspectron.org/en/projects/cryptix-wasm.html)
+
 

@@ -84,7 +84,7 @@ impl Inner {
 ///
 /// # Resolver - a client for obtaining public Cryptix wRPC endpoints.
 ///
-/// This client operates against [Cryptix Resolver](https://github.com/aspectron/cryptix-resolver) service
+
 /// that provides load-balancing and failover capabilities for Cryptix wRPC endpoints. The default
 /// configuration allows access to public Cryptix nodes, while custom configurations can be supplied
 /// if you are running your own custom Cryptix node cluster.

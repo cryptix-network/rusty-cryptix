@@ -175,8 +175,6 @@ To build WASM on MacOS you need to install `llvm` from homebrew (at the time of 
 ### Builds & documentation
 
   - Release builds: https://github.com/cryptix-network/rusty-cryptix/releases
-  - Developer builds: https://cryptix.aspectron.org/nightly/downloads/
-  - Developer TypeScript documentation: https://cryptix.aspectron.org/docs/
 
   </details>
 <details>

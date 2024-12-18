@@ -40,8 +40,6 @@
 //! within native Rust applications as well as within NodeJS, Bun
 //! and browser environments via the WASM32 SDK.
 //!
-//! WASM32 SDK documentation is available at:
-//! <https://cryptix.aspectron.org/docs/>
 //!
 //! For NodeJS JavaScript and TypeScript environments, there are two
 //! available NPM modules:
@@ -52,8 +50,6 @@
 //! attacks) it is always recommended to build WASM SDK from source or
 //! download pre-built redistributables.
 //!
-//! Latest development builds of the WASM32 SDK can be found at:
-//! <https://aspectron.org/en/projects/cryptix-wasm.html>
 //!
 //! The `cryptix-wasm` module is a pure WASM32 module that includes
 //! the entire wallet framework, but does not support RPC due to an absence
