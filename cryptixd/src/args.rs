@@ -502,7 +502,7 @@ fn arg_match_many_unwrap_or<T: Clone + Send + Sync + 'static>(m: &clap::ArgMatch
                                             peers. (default: 100)
       --whitelist=                          Add an IP network or IP that will not be banned. (eg. 192.168.1.0/24 or
                                             ::1)
-      --rpclisten=                          Add an interface/port to listen for RPC connections (default port: 16110,
+      --rpclisten=                          Add an interface/port to listen for RPC connections (default port: 19201,
                                             testnet: 16210)
       --rpccert=                            File containing the certificate file (default:
                                             /Users/aspect/Library/Application Support/Cryptixd/rpc.cert)
