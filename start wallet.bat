@@ -1,0 +1,2 @@
+cryptix-wallet
+pause
