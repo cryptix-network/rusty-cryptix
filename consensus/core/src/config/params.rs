@@ -335,6 +335,7 @@ pub const MAINNET_PARAMS: Params = Params {
     dns_seeders: &[
         // DNS Seeder
         "hotfix.hopto.org",
+        "n.seed-cryptix.duckdns.org",
         "45.84.199.4",
     ],
     net: NetworkId::new(NetworkType::Mainnet),
