@@ -87,6 +87,7 @@ The default branch of this repository is `master` and new contributions are cons
       ```bash
       git clone https://github.com/cryptix-network/rusty-cryptix
       cd rusty-cryptix
+      cargo build --release --bin cryptixd 
       ```
  </details>
 
