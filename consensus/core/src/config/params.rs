@@ -336,6 +336,7 @@ pub const MAINNET_PARAMS: Params = Params {
         // DNS Seeder
         "hotfix.hopto.org",
         "n.seed-cryptix.duckdns.org",
+        "hotfix-dev.duckdns.org",
         "45.84.199.4",
     ],
     net: NetworkId::new(NetworkType::Mainnet),
@@ -400,6 +401,7 @@ pub const TESTNET_PARAMS: Params = Params {
         // DNS Seeder
         "hotfix.hopto.org",
         "n.seed-cryptix.duckdns.org",
+        "hotfix-dev.duckdns.org",
         "45.84.199.4",
     ],
     net: NetworkId::with_suffix(NetworkType::Testnet, 10),
@@ -461,8 +463,9 @@ pub const TESTNET_PARAMS: Params = Params {
 pub const TESTNET11_PARAMS: Params = Params {
     dns_seeders: &[
         // DNS Seeder
-		"n.seed-cryptix.duckdns.org",
-		"n.hotfix-dev.duckdns.org",
+        "hotfix.hopto.org",
+        "n.seed-cryptix.duckdns.org",
+        "hotfix-dev.duckdns.org",
         "45.84.199.4",
     ],
     net: NetworkId::with_suffix(NetworkType::Testnet, 11),
