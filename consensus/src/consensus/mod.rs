@@ -639,22 +639,7 @@ impl ConsensusApi for Consensus {
             // Source: https://github.com/cryptixgang/cryptixd-py-explorer/blob/main/src/tx_timestamp_estimation.ipynb
             // For context see also: https://github.com/cryptixgang/cryptixd-py-explorer/blob/main/src/genesis_proof.ipynb
             const POINTS: &[DaaScoreTimestamp] = &[
-                DaaScoreTimestamp { daa_score: 0, timestamp: 1636298787842 },
-                DaaScoreTimestamp { daa_score: 87133, timestamp: 1636386662010 },
-                DaaScoreTimestamp { daa_score: 176797, timestamp: 1636473700804 },
-                DaaScoreTimestamp { daa_score: 264837, timestamp: 1636560706885 },
-                DaaScoreTimestamp { daa_score: 355974, timestamp: 1636650005662 },
-                DaaScoreTimestamp { daa_score: 445152, timestamp: 1636737841327 },
-                DaaScoreTimestamp { daa_score: 536709, timestamp: 1636828600930 },
-                DaaScoreTimestamp { daa_score: 624635, timestamp: 1636912614350 },
-                DaaScoreTimestamp { daa_score: 712234, timestamp: 1636999362832 },
-                DaaScoreTimestamp { daa_score: 801831, timestamp: 1637088292662 },
-                DaaScoreTimestamp { daa_score: 890716, timestamp: 1637174890675 },
-                DaaScoreTimestamp { daa_score: 978396, timestamp: 1637260956454 },
-                DaaScoreTimestamp { daa_score: 1068387, timestamp: 1637349078269 },
-                DaaScoreTimestamp { daa_score: 1139626, timestamp: 1637418723538 },
-                DaaScoreTimestamp { daa_score: 1218320, timestamp: 1637495941516 },
-                DaaScoreTimestamp { daa_score: 1312860, timestamp: 1637609671037 },
+                DaaScoreTimestamp { daa_score: 0, timestamp: 1735689600000 },
             ];
             sample_headers = Vec::<DaaScoreTimestamp>::with_capacity(prealloc_len + POINTS.len());
             sample_headers.extend_from_slice(POINTS);

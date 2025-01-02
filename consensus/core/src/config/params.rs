@@ -513,8 +513,8 @@ pub const TESTNET11_PARAMS: Params = Params {
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     storage_mass_activation: ForkActivation::always(),
     // Roughly at Dec 3, 2024 1800 UTC
-    kip10_activation: ForkActivation::new(287238000),
-    payload_activation: ForkActivation::new(287238000),
+    kip10_activation: ForkActivation::new(0),
+    payload_activation: ForkActivation::new(0),
 
     skip_proof_of_work: false,
     max_block_level: 250,
