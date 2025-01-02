@@ -638,6 +638,7 @@ impl ConsensusApi for Consensus {
             // For mainnet, we add extra data (16 pp headers) from before checkpoint genesis.
             // Source: https://github.com/cryptixgang/cryptixd-py-explorer/blob/main/src/tx_timestamp_estimation.ipynb
             // For context see also: https://github.com/cryptixgang/cryptixd-py-explorer/blob/main/src/genesis_proof.ipynb
+            // Nothing
             const POINTS: &[DaaScoreTimestamp] = &[
                 DaaScoreTimestamp { daa_score: 0, timestamp: 1735689600000 },
             ];
