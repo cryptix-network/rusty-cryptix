@@ -418,3 +418,9 @@ Logging in `cryptixd` and `simpa` can be [filtered](https://docs.rs/env_logger/0
     In this command we set the `loglevel` to `INFO`.
 
 </details>
+
+
+
+
+## Discord
+Join Discord: [Cryptix Discord](https://discord.gg/SxXCXHFFeA)
