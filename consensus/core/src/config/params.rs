@@ -341,8 +341,8 @@ pub const MAINNET_PARAMS: Params = Params {
     // switches to the deflationary period. This number is calculated as follows:
     // We define a year as 365.25 days
 
-    deflationary_phase_daa_score: 259200,
-    pre_deflationary_phase_base_subsidy: 3900000000,
+    deflationary_phase_daa_score: 86400,
+    pre_deflationary_phase_base_subsidy: 60000000000,
     coinbase_maturity: 100,
     skip_proof_of_work: false,
     max_block_level: 225,
@@ -401,8 +401,8 @@ pub const TESTNET_PARAMS: Params = Params {
     // switches to the deflationary period. This number is calculated as follows:
     // We define a year as 365.25 days
 
-    deflationary_phase_daa_score: 259200,
-    pre_deflationary_phase_base_subsidy: 3900000000,
+    deflationary_phase_daa_score: 86400,
+    pre_deflationary_phase_base_subsidy: 60000000000,
     coinbase_maturity: 100,
     skip_proof_of_work: false,
     max_block_level: 250,
@@ -564,8 +564,8 @@ pub const DEVNET_PARAMS: Params = Params {
     // deflationary_phase_daa_score is the DAA score after which the pre-deflationary period
     // switches to the deflationary period. This number is calculated as follows:
     // We define a year as 365.25 days
-    deflationary_phase_daa_score: 259200,
-    pre_deflationary_phase_base_subsidy: 3900000000,
+    deflationary_phase_daa_score: 86400,
+    pre_deflationary_phase_base_subsidy: 60000000000,
     coinbase_maturity: 100,
     skip_proof_of_work: false,
     max_block_level: 250,

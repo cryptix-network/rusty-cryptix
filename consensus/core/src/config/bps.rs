@@ -137,11 +137,11 @@ impl<const BPS: u64> Bps<BPS> {
     /// This number is calculated as follows:
     ///
     pub const fn deflationary_phase_daa_score() -> u64 {
-        BPS * 259200
+        BPS * 86400
     }
 
     pub const fn pre_deflationary_phase_base_subsidy() -> u64 {
-        3900000000 / BPS
+        60000000000 / BPS
     }
 }
 
