@@ -1,5 +1,3 @@
-//! Re-exports of the most commonly used types and traits.
-
 pub use crate::client::{ConnectOptions, ConnectStrategy};
 pub use crate::{CryptixRpcClient, Resolver, WrpcEncoding};
 pub use cryptix_consensus_core::network::{NetworkId, NetworkType};

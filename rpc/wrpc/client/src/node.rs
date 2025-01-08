@@ -1,5 +1,3 @@
-//! Node connection endpoint as provided by the [`Resolver`].
-
 use crate::imports::*;
 
 ///

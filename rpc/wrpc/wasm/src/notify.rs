@@ -1,7 +1,3 @@
-//! Notification types and interfaces for wRPC events.
-
-#![allow(non_snake_case)]
-
 use crate::imports::*;
 use cryptix_rpc_macros::declare_typescript_wasm_interface as declare;
 

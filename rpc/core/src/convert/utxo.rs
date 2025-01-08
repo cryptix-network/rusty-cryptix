@@ -1,5 +1,3 @@
-//! Conversion functions for UTXO related types.
-
 use crate::RpcUtxoEntry;
 use crate::RpcUtxosByAddressesEntry;
 use cryptix_addresses::Prefix;

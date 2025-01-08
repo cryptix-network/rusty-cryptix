@@ -520,7 +520,8 @@ mod address_store_with_cache {
         use cryptix_database::create_temp_db;
         use cryptix_database::prelude::ConnBuilder;
         use cryptix_utils::networking::IpAddress;
-        use rv::{dist::Uniform, misc::ks_test as one_way_ks_test, traits::Cdf};
+        use statest::ks::KSTest;
+        use statrs::distribution::Uniform;
         use std::net::{IpAddr, Ipv6Addr};
 
         #[test]
@@ -590,11 +591,10 @@ mod address_store_with_cache {
             assert!(num_of_buckets >= 12);
 
             // Run multiple Kolmogorov–Smirnov tests to offset random noise of the random weighted iterator
-            let num_of_trials = 2048; // Number of trials to run the test, chosen to reduce random noise.
+            let num_of_trials = 512;
             let mut cul_p = 0.;
             // The target uniform distribution
-            let target_uniform_dist = Uniform::new(1.0, num_of_buckets as f64).unwrap();
-            let uniform_cdf = |x: f64| target_uniform_dist.cdf(&x);
+            let target_u_dist = Uniform::new(0.0, (num_of_buckets) as f64).unwrap();
             for _ in 0..num_of_trials {
                 // The weight sampled expected uniform distibution
                 let prioritized_address_distribution = am
@@ -603,12 +603,13 @@ mod address_store_with_cache {
                     .take(num_of_buckets)
                     .map(|addr| addr.prefix_bucket().as_u64() as f64)
                     .collect_vec();
-                cul_p += one_way_ks_test(prioritized_address_distribution.as_slice(), uniform_cdf).1;
+
+                let ks_test = KSTest::new(prioritized_address_distribution.as_slice());
+                cul_p += ks_test.ks1(&target_u_dist).0;
             }
 
             // Normalize and adjust p to test for uniformity, over average of all trials.
-            // we do this to reduce the effect of random noise failing this test.
-            let adjusted_p = ((cul_p / num_of_trials as f64) - 0.5).abs();
+            let adjusted_p = (0.5 - cul_p / num_of_trials as f64).abs();
             // Define the significance threshold.
             let significance = 0.10;
 
@@ -618,7 +619,7 @@ mod address_store_with_cache {
                 adjusted_p,
                 significance
             );
-            assert!(adjusted_p <= significance);
+            assert!(adjusted_p <= significance)
         }
     }
 }

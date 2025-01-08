@@ -38,7 +38,7 @@ use cryptix_rpc_core::{
 use cryptix_utils::{channel::Channel, triggers::DuplexTrigger};
 use cryptix_utils_tower::{
     counters::TowerConnectionCounters,
-    middleware::{BodyExt, CountBytesBody, MapRequestBodyLayer, MapResponseBodyLayer, ServiceBuilder},
+    middleware::{measure_request_body_size_layer, CountBytesBody, MapResponseBodyLayer, ServiceBuilder},
 };
 use regex::Regex;
 use std::{
@@ -50,6 +50,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tonic::codec::CompressionEncoding;
+use tonic::codegen::Body;
 use tonic::Streaming;
 
 mod connection_event;
@@ -101,7 +102,7 @@ impl GrpcClient {
     /// `url`: the server to connect to
     ///
     /// `subscription_context`: it is advised to provide a clone of the same instance if multiple clients dealing with
-    /// `UtxosChangedNotifications` are connected concurrently in order to optimize the memory footprint.
+    /// [`UtxosChangedNotifications`] are connected concurrently in order to optimize the memory footprint.
     ///
     /// `reconnect`: features an automatic reconnection to the server, reactivating all subscriptions on success.
     ///
@@ -543,7 +544,9 @@ impl Inner {
         let bytes_tx = &counters.bytes_tx;
         let channel = ServiceBuilder::new()
             .layer(MapResponseBodyLayer::new(move |body| CountBytesBody::new(body, bytes_rx.clone())))
-            .layer(MapRequestBodyLayer::new(move |body| CountBytesBody::new(body, bytes_tx.clone()).boxed_unsync()))
+            .layer(measure_request_body_size_layer(bytes_tx.clone(), |body| {
+                body.map_err(|e| tonic::Status::from_error(Box::new(e))).boxed_unsync()
+            }))
             .service(channel);
 
         // Build the gRPC client with an interceptor setting the request timeout

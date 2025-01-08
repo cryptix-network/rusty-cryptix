@@ -1,10 +1,3 @@
-//!
-//! # WASM bindings for the [Cryptix p2p Node RPC client](CryptixRpcClient).
-//!
-//! This module provides a WASM interface for the Cryptix p2p Node RPC client
-//! - [`RpcClient`].
-//!
-
 #![allow(non_snake_case)]
 
 use crate::imports::*;
@@ -137,7 +130,7 @@ impl TryFrom<JsValue> for NotificationEvent {
     }
 }
 
-pub(crate) struct Inner {
+pub struct Inner {
     client: Arc<CryptixRpcClient>,
     resolver: Option<Resolver>,
     notification_task: AtomicBool,
@@ -976,11 +969,6 @@ build_wrpc_wasm_bindgen_interface!(
         /// Obtains basic information about the synchronization status of the Cryptix node.
         /// Returned information: Syncing status.
         GetSyncStatus,
-        /// Feerate estimates
-        GetFeeEstimate,
-        /// Retrieves the current network configuration.
-        /// Returned information: Current network configuration.
-        GetCurrentNetwork,
     ],
     [
         // functions with `request` argument
@@ -1015,8 +1003,13 @@ build_wrpc_wasm_bindgen_interface!(
         /// score timestamp estimate.
         /// Returned information: DAA score timestamp estimate.
         GetDaaScoreTimestampEstimate,
+        /// Feerate estimates
+        GetFeeEstimate,
         /// Feerate estimates (experimental)
         GetFeeEstimateExperimental,
+        /// Retrieves the current network configuration.
+        /// Returned information: Current network configuration.
+        GetCurrentNetwork,
         /// Retrieves block headers from the Cryptix BlockDAG.
         /// Returned information: List of block headers.
         GetHeaders,

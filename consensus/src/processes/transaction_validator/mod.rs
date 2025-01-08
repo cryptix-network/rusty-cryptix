@@ -1,7 +1,7 @@
 pub mod errors;
-pub mod tx_validation_in_header_context;
-pub mod tx_validation_in_isolation;
-pub mod tx_validation_in_utxo_context;
+pub mod transaction_validator_populated;
+mod tx_validation_in_isolation;
+pub mod tx_validation_not_utxo_related;
 use std::sync::Arc;
 
 use crate::model::stores::ghostdag;
@@ -11,7 +11,7 @@ use cryptix_txscript::{
     SigCacheKey,
 };
 
-use cryptix_consensus_core::{config::params::ForkActivation, mass::MassCalculator};
+use cryptix_consensus_core::mass::MassCalculator;
 
 #[derive(Clone)]
 pub struct TransactionValidator {
@@ -27,14 +27,10 @@ pub struct TransactionValidator {
     pub(crate) mass_calculator: MassCalculator,
 
     /// Storage mass hardfork DAA score
-    storage_mass_activation: ForkActivation,
-    /// KIP-10 hardfork DAA score
-    kip10_activation: ForkActivation,
-    payload_activation: ForkActivation,
+    storage_mass_activation_daa_score: u64,
 }
 
 impl TransactionValidator {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         max_tx_inputs: usize,
         max_tx_outputs: usize,
@@ -45,9 +41,7 @@ impl TransactionValidator {
         coinbase_maturity: u64,
         counters: Arc<TxScriptCacheCounters>,
         mass_calculator: MassCalculator,
-        storage_mass_activation: ForkActivation,
-        kip10_activation: ForkActivation,
-        payload_activation: ForkActivation,
+        storage_mass_activation_daa_score: u64,
     ) -> Self {
         Self {
             max_tx_inputs,
@@ -59,9 +53,7 @@ impl TransactionValidator {
             coinbase_maturity,
             sig_cache: Cache::with_counters(10_000, counters),
             mass_calculator,
-            storage_mass_activation,
-            kip10_activation,
-            payload_activation,
+            storage_mass_activation_daa_score,
         }
     }
 
@@ -85,9 +77,7 @@ impl TransactionValidator {
             coinbase_maturity,
             sig_cache: Cache::with_counters(10_000, counters),
             mass_calculator: MassCalculator::new(0, 0, 0, 0),
-            storage_mass_activation: ForkActivation::never(),
-            kip10_activation: ForkActivation::never(),
-            payload_activation: ForkActivation::never(),
+            storage_mass_activation_daa_score: u64::MAX,
         }
     }
 }

@@ -1,7 +1,3 @@
-//!
-//! [`PrivateKeyGenerator`] helper for generating private key derivations from an extended private key (XPrv).
-//!
-
 use crate::derivation::gen1::WalletDerivationManager;
 use crate::imports::*;
 

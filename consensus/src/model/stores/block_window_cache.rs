@@ -1,6 +1,6 @@
 use crate::processes::ghostdag::ordering::SortableBlock;
 use cryptix_consensus_core::BlockHasher;
-use cryptix_database::prelude::{Cache, CachePolicy};
+use cryptix_database::prelude::Cache;
 use cryptix_hashes::Hash;
 use cryptix_utils::mem_size::MemSizeEstimator;
 use std::{
@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub enum WindowOrigin {
     Full,
     Sampled,
@@ -54,46 +54,16 @@ impl DerefMut for BlockWindowHeap {
     }
 }
 
-/// A newtype wrapper over `[Cache]` meant to prevent erroneous reads of windows from different origins
-#[derive(Clone)]
-pub struct BlockWindowCacheStore {
-    inner: Cache<Hash, Arc<BlockWindowHeap>, BlockHasher>,
-}
-
-impl BlockWindowCacheStore {
-    pub fn new(policy: CachePolicy) -> Self {
-        Self { inner: Cache::new(policy) }
-    }
-
-    pub fn contains_key(&self, key: &Hash) -> bool {
-        self.inner.contains_key(key)
-    }
-
-    pub fn remove(&self, key: &Hash) -> Option<Arc<BlockWindowHeap>> {
-        self.inner.remove(key)
-    }
-}
-
 /// Reader API for `BlockWindowCacheStore`.
 pub trait BlockWindowCacheReader {
-    /// Get the cache entry to this hash conditioned that *it matches the provided origin*.
-    /// We demand the origin to be provided in order to prevent reader errors.
-    fn get(&self, hash: &Hash, origin: WindowOrigin) -> Option<Arc<BlockWindowHeap>>;
+    fn get(&self, hash: &Hash) -> Option<Arc<BlockWindowHeap>>;
 }
+
+pub type BlockWindowCacheStore = Cache<Hash, Arc<BlockWindowHeap>, BlockHasher>;
 
 impl BlockWindowCacheReader for BlockWindowCacheStore {
     #[inline(always)]
-    fn get(&self, hash: &Hash, origin: WindowOrigin) -> Option<Arc<BlockWindowHeap>> {
-        self.inner.get(hash).and_then(|win| if win.origin() == origin { Some(win) } else { None })
-    }
-}
-
-pub trait BlockWindowCacheWriter {
-    fn insert(&self, hash: Hash, window: Arc<BlockWindowHeap>);
-}
-
-impl BlockWindowCacheWriter for BlockWindowCacheStore {
-    fn insert(&self, hash: Hash, window: Arc<BlockWindowHeap>) {
-        self.inner.insert(hash, window);
+    fn get(&self, hash: &Hash) -> Option<Arc<BlockWindowHeap>> {
+        self.get(hash)
     }
 }

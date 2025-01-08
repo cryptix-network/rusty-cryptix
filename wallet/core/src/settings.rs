@@ -13,7 +13,6 @@ use std::path::PathBuf;
 use workflow_core::enums::Describe;
 use workflow_store::fs;
 
-/// Wallet settings enumeration.
 #[derive(Describe, Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd)]
 #[serde(rename_all = "lowercase")]
 pub enum WalletSettings {
@@ -37,8 +36,6 @@ pub trait DefaultSettings: Sized {
     async fn defaults() -> Vec<(Self, Value)>;
 }
 
-/// Platform neutral settings store (stores the settings K:V map
-/// in a file or the browser `localStorage`).
 #[derive(Debug, Clone)]
 pub struct SettingsStore<K>
 where
@@ -173,12 +170,10 @@ where
     }
 }
 
-/// Returns the wallet data storage folder `~/.cryptix`.
 pub fn application_folder() -> Result<PathBuf> {
     Ok(fs::resolve_path(storage::local::default_storage_folder())?)
 }
 
-/// If missing, creates the wallet data storage folder `~/.cryptix`.
 pub async fn ensure_application_folder() -> Result<()> {
     let path = application_folder()?;
     log_info!("Creating application folder: `{}`", path.display());

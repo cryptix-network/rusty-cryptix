@@ -1,5 +1,3 @@
-//! PSKT output structure.
-
 use crate::pskt::KeySource;
 use crate::utils::combine_if_no_conflicts;
 use derive_builder::Builder;

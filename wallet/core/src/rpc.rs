@@ -6,16 +6,12 @@ use std::sync::Arc;
 
 pub use cryptix_rpc_core::api::ctl::RpcCtl;
 pub use cryptix_rpc_core::api::rpc::RpcApi;
+pub type DynRpcApi = dyn RpcApi;
+pub type NotificationChannel = cryptix_utils::channel::Channel<cryptix_rpc_core::Notification>;
 pub use cryptix_rpc_core::notify::mode::NotificationMode;
 pub use cryptix_wrpc_client::client::{ConnectOptions, ConnectStrategy};
 pub use cryptix_wrpc_client::Resolver;
 pub use cryptix_wrpc_client::WrpcEncoding;
-
-/// Type alias for [`dyn RpcApi`](RpcApi).
-pub type DynRpcApi = dyn RpcApi;
-/// Type alias for a concrete [`Channel`](cryptix_utils::channel::Channel)
-/// used for handling RPC [`Notification`](cryptix_rpc_core::Notification) events.
-pub type NotificationChannel = cryptix_utils::channel::Channel<cryptix_rpc_core::Notification>;
 
 /// RPC adaptor class that holds the [`RpcApi`]
 /// and [`RpcCtl`] instances.

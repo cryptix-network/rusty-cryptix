@@ -1,5 +1,3 @@
-//! WASM related conversions
-
 pub mod convert;
 
 cfg_if::cfg_if! {

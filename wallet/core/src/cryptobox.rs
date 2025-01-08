@@ -1,7 +1,3 @@
-//!
-//! Re-export of the `crypto_box` crate that can be used to encrypt and decrypt messages.
-//!
-
 use crate::imports::*;
 use crypto_box::{
     aead::{Aead, AeadCore, OsRng},
@@ -9,13 +5,8 @@ use crypto_box::{
 };
 pub use crypto_box::{PublicKey, SecretKey};
 
-///
-/// Primitives for encrypting and decrypting messages using the `crypto_box` crate.
-/// This exists primarily for the purposes of [WASM bindings](crate::wasm::cryptobox::CryptoBox)
-/// to allow access to the `crypto_box` encryption functionality from within web wallets.
-///
-/// <https://docs.rs/crypto_box/0.9.1/crypto_box/>
-///
+// https://docs.rs/crypto_box/0.9.1/crypto_box/
+
 pub struct CryptoBox {
     public_key: PublicKey,
     codec: ChaChaBox,

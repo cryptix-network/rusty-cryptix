@@ -1,7 +1,3 @@
-//!
-//! Extended public key ([`XPub`]).
-//!
-
 use cryptix_bip32::{ChainCode, KeyFingerprint, Prefix};
 use std::{fmt, str::FromStr};
 
@@ -116,7 +112,7 @@ extern "C" {
 
 impl TryCastFromJs for XPub {
     type Error = Error;
-    fn try_cast_from<'a, R>(value: &'a R) -> Result<Cast<'a, Self>, Self::Error>
+    fn try_cast_from<'a, R>(value: &'a R) -> Result<Cast<Self>, Self::Error>
     where
         R: AsRef<JsValue> + 'a,
     {

@@ -1,9 +1,3 @@
-//!
-//! Implementation of the Block [`Header`] struct.
-//!
-
-#![allow(non_snake_case)]
-
 use crate::error::Error;
 use js_sys::{Array, Object};
 use cryptix_consensus_core::hashing;
@@ -65,15 +59,10 @@ export interface IRawHeader {
 
 #[wasm_bindgen]
 extern "C" {
-    /// WASM (TypeScript) type definition for the Header-like struct: `Header | IHeader | IRawHeader`.
-    ///
-    /// @category Consensus
     #[wasm_bindgen(typescript_type = "Header | IHeader | IRawHeader")]
     pub type HeaderT;
 }
 
-/// Cryptix Block Header
-///
 /// @category Consensus
 #[derive(Clone, Debug, Serialize, Deserialize, CastFromJs)]
 #[serde(rename_all = "camelCase")]
@@ -266,7 +255,7 @@ impl Header {
 
 impl TryCastFromJs for Header {
     type Error = Error;
-    fn try_cast_from<'a, R>(value: &'a R) -> Result<Cast<'a, Self>, Self::Error>
+    fn try_cast_from<'a, R>(value: &'a R) -> Result<Cast<Self>, Self::Error>
     where
         R: AsRef<JsValue> + 'a,
     {

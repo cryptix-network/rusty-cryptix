@@ -1,5 +1,5 @@
 //!
-//! [`WalletApi`] trait implementation for the [`Wallet`] struct.
+//! [`WalletApi`] trait implementation for [`Wallet`].
 //!
 
 use crate::api::{message::*, traits::WalletApi};
@@ -62,17 +62,15 @@ impl WalletApi for super::Wallet {
 
         if let Some(data) = data {
             self.inner.retained_contexts.lock().unwrap().insert(name, Arc::new(data));
+
             Ok(RetainContextResponse {})
         } else {
             self.inner.retained_contexts.lock().unwrap().remove(&name);
+            // let data = self.inner.retained_contexts.lock().unwrap().get(&name).cloned();
             Ok(RetainContextResponse {})
         }
-    }
 
-    async fn get_context_call(self: Arc<Self>, request: GetContextRequest) -> Result<GetContextResponse> {
-        let GetContextRequest { name } = request;
-        let data = self.inner.retained_contexts.lock().unwrap().get(&name).map(|data| (**data).clone());
-        Ok(GetContextResponse { data })
+        // self.retain_context(retain);
     }
 
     // -------------------------------------------------------------------------------------

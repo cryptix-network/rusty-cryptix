@@ -13,8 +13,11 @@ use cryptix_hashes::Hash;
 use cryptix_notify::subscription::context::SubscriptionContext;
 use parking_lot::RwLock;
 
-use super::services::{DbDagTraversalManager, DbGhostdagManager, DbWindowManager};
-use super::Consensus;
+use cryptix_database::create_temp_db;
+use cryptix_database::prelude::ConnBuilder;
+use std::future::Future;
+use std::{sync::Arc, thread::JoinHandle};
+
 use crate::pipeline::virtual_processor::test_block_builder::TestBlockBuilder;
 use crate::processes::window::WindowManager;
 use crate::{
@@ -32,10 +35,9 @@ use crate::{
     pipeline::{body_processor::BlockBodyProcessor, virtual_processor::VirtualStateProcessor, ProcessingCounters},
     test_helpers::header_from_precomputed_hash,
 };
-use cryptix_database::create_temp_db;
-use cryptix_database::prelude::ConnBuilder;
-use std::future::Future;
-use std::{sync::Arc, thread::JoinHandle};
+
+use super::services::{DbDagTraversalManager, DbGhostdagManager, DbWindowManager};
+use super::Consensus;
 
 pub struct TestConsensus {
     params: Params,
@@ -116,7 +118,7 @@ impl TestConsensus {
 
     pub fn build_header_with_parents(&self, hash: Hash, parents: Vec<Hash>) -> Header {
         let mut header = header_from_precomputed_hash(hash, parents);
-        let ghostdag_data = self.consensus.services.ghostdag_manager.ghostdag(header.direct_parents());
+        let ghostdag_data = self.consensus.services.ghostdag_primary_manager.ghostdag(header.direct_parents());
         header.pruning_point = self
             .consensus
             .services
@@ -136,12 +138,6 @@ impl TestConsensus {
         self.validate_and_insert_block(self.build_block_with_parents(hash, parents).to_immutable()).virtual_state_task
     }
 
-    /// Adds a valid block with the given transactions and parents to the consensus.
-    ///
-    /// # Panics
-    ///
-    /// Panics if block builder validation rules are violated.
-    /// See `cryptix_consensus_core::errors::block::RuleError` for the complete list of possible validation rules.
     pub fn add_utxo_valid_block_with_parents(
         &self,
         hash: Hash,
@@ -153,12 +149,6 @@ impl TestConsensus {
             .virtual_state_task
     }
 
-    /// Builds a valid block with the given transactions, parents, and miner data.
-    ///
-    /// # Panics
-    ///
-    /// Panics if block builder validation rules are violated.
-    /// See `cryptix_consensus_core::errors::block::RuleError` for the complete list of possible validation rules.
     pub fn build_utxo_valid_block_with_parents(
         &self,
         hash: Hash,
@@ -211,7 +201,7 @@ impl TestConsensus {
     }
 
     pub fn ghostdag_store(&self) -> &Arc<DbGhostdagStore> {
-        &self.consensus.ghostdag_store
+        &self.consensus.ghostdag_primary_store
     }
 
     pub fn reachability_store(&self) -> &Arc<RwLock<DbReachabilityStore>> {
@@ -243,7 +233,7 @@ impl TestConsensus {
     }
 
     pub fn ghostdag_manager(&self) -> &DbGhostdagManager {
-        &self.consensus.services.ghostdag_manager
+        &self.consensus.services.ghostdag_primary_manager
     }
 }
 

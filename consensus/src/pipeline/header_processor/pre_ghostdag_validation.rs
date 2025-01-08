@@ -9,7 +9,7 @@ use cryptix_consensus_core::header::Header;
 use cryptix_consensus_core::BlockLevel;
 use cryptix_core::time::unix_now;
 use cryptix_database::prelude::StoreResultExtensions;
-use cryptix_pow::calc_level_from_pow;
+use std::cmp::max;
 
 impl HeaderProcessor {
     /// Validates the header in isolation including pow check against header declared bits.
@@ -102,7 +102,8 @@ impl HeaderProcessor {
         let state = cryptix_pow::State::new(header);
         let (passed, pow) = state.check_pow(header.nonce);
         if passed || self.skip_proof_of_work {
-            Ok(calc_level_from_pow(pow, self.max_block_level))
+            let signed_block_level = self.max_block_level as i64 - pow.bits() as i64;
+            Ok(max(signed_block_level, 0) as BlockLevel)
         } else {
             Err(RuleError::InvalidPoW)
         }

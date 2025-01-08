@@ -146,7 +146,7 @@ pub struct MuHashElementBuilder<'a> {
     element_hasher: MuHashElementHash,
 }
 
-impl HasherBase for MuHashElementBuilder<'_> {
+impl<'a> HasherBase for MuHashElementBuilder<'a> {
     fn update<A: AsRef<[u8]>>(&mut self, data: A) -> &mut Self {
         self.element_hasher.write(data);
         self

@@ -1,4 +1,4 @@
-//! Derivation management for legacy account derivation scheme based on `'972` derivation path (deprecated).
+//! Derivation management for legacy account derivation scheme `972`
 
 mod hd;
 pub use hd::{PubkeyDerivationManagerV0, WalletDerivationManagerV0};

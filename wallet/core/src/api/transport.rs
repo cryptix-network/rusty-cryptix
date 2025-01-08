@@ -71,7 +71,6 @@ impl WalletApi for WalletClient {
         Disconnect,
         ChangeNetworkId,
         RetainContext,
-        GetContext,
         Batch,
         Flush,
         WalletEnumerate,
@@ -119,7 +118,7 @@ pub trait EventHandler: Send + Sync {
 
 /// [`WalletServer`] is a server-side transport interface that declares
 /// API methods that can be invoked via Borsh or Serde messages containing
-/// serializations created using the [`Codec`] interface. The [`WalletServer`]
+/// serializations created using the [`Transport`] interface. The [`WalletServer`]
 /// is a counter-part to [`WalletClient`].
 pub struct WalletServer {
     // pub wallet_api: Arc<dyn WalletApi>,
@@ -148,7 +147,6 @@ impl WalletServer {
         Disconnect,
         ChangeNetworkId,
         RetainContext,
-        GetContext,
         Batch,
         Flush,
         WalletEnumerate,

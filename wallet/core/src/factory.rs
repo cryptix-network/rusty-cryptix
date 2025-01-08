@@ -6,7 +6,6 @@ use crate::imports::*;
 use crate::result::Result;
 use std::sync::OnceLock;
 
-/// Wallet account loading factory.
 #[async_trait]
 pub trait Factory {
     fn name(&self) -> String;
@@ -23,7 +22,6 @@ type FactoryMap = AHashMap<AccountKind, Arc<dyn Factory + Sync + Send + 'static>
 static EXTERNAL: OnceLock<Mutex<FactoryMap>> = OnceLock::new();
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// Global factory registry accessor.
 pub fn factories() -> &'static FactoryMap {
     static FACTORIES: OnceLock<FactoryMap> = OnceLock::new();
     FACTORIES.get_or_init(|| {
@@ -43,7 +41,6 @@ pub fn factories() -> &'static FactoryMap {
     })
 }
 
-/// Registers a new global account factory.
 pub fn register(kind: AccountKind, factory: Arc<dyn Factory + Sync + Send + 'static>) {
     if INITIALIZED.load(Ordering::Relaxed) {
         panic!("Factory registrations must occur before the framework initialization");

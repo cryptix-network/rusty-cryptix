@@ -5,7 +5,6 @@
 
 use crate::imports::*;
 
-/// A thread-safe map of [`AccountId`] to [`Account`] instances.
 #[derive(Default, Clone)]
 pub struct ActiveAccountMap(Arc<Mutex<HashMap<AccountId, Arc<dyn Account>>>>);
 

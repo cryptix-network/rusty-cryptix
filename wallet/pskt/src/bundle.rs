@@ -13,11 +13,6 @@ use cryptix_txscript::{extract_script_pub_key_address, pay_to_address_script, pa
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 
-///
-/// Bundle is a [`PSKT`] bundle - a sequence of PSKT transactions
-/// meant for batch processing and transport as a
-/// single serialized payload.
-///
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Bundle(pub Vec<PSKTInner>);
@@ -247,18 +242,23 @@ mod tests {
     use secp256k1::Secp256k1;
     use secp256k1::{rand::thread_rng, Keypair};
     use std::str::FromStr;
-    use std::sync::LazyLock;
+    use std::sync::Once;
 
-    static CONTEXT: LazyLock<Box<([Keypair; 2], Vec<u8>)>> = LazyLock::new(|| {
-        let kps = [Keypair::new(&Secp256k1::new(), &mut thread_rng()), Keypair::new(&Secp256k1::new(), &mut thread_rng())];
-        let redeem_script: Vec<u8> =
-            multisig_redeem_script(kps.iter().map(|pk| pk.x_only_public_key().0.serialize()), 2).expect("Test multisig redeem script");
-
-        Box::new((kps, redeem_script))
-    });
+    static INIT: Once = Once::new();
+    static mut CONTEXT: Option<Box<([Keypair; 2], Vec<u8>)>> = None;
 
     fn mock_context() -> &'static ([Keypair; 2], Vec<u8>) {
-        CONTEXT.as_ref()
+        unsafe {
+            INIT.call_once(|| {
+                let kps = [Keypair::new(&Secp256k1::new(), &mut thread_rng()), Keypair::new(&Secp256k1::new(), &mut thread_rng())];
+                let redeem_script: Vec<u8> = multisig_redeem_script(kps.iter().map(|pk| pk.x_only_public_key().0.serialize()), 2)
+                    .expect("Test multisig redeem script");
+
+                CONTEXT = Some(Box::new((kps, redeem_script)));
+            });
+
+            CONTEXT.as_ref().unwrap()
+        }
     }
 
     // Mock multisig PSKT from example

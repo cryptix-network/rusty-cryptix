@@ -1,19 +1,13 @@
 use super::BlockBodyProcessor;
 use crate::{
     errors::{BlockProcessResult, RuleError},
-    model::stores::statuses::StatusesStoreReader,
-    processes::{
-        transaction_validator::{
-            tx_validation_in_header_context::{LockTimeArg, LockTimeType},
-            TransactionValidator,
-        },
-        window::WindowManager,
-    },
+    model::stores::{ghostdag::GhostdagStoreReader, statuses::StatusesStoreReader},
+    processes::window::WindowManager,
 };
 use cryptix_consensus_core::block::Block;
 use cryptix_database::prelude::StoreResultExtensions;
 use cryptix_hashes::Hash;
-use once_cell::unsync::Lazy;
+use cryptix_utils::option::OptionExtensions;
 use std::sync::Arc;
 
 impl BlockBodyProcessor {
@@ -24,20 +18,13 @@ impl BlockBodyProcessor {
     }
 
     fn check_block_transactions_in_context(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
-        // Use lazy evaluation to avoid unnecessary work, as most of the time we expect the txs not to have lock time.
-        let lazy_pmt_res = Lazy::new(|| self.window_manager.calc_past_median_time_for_known_hash(block.hash()));
-
+        let (pmt, _) = self.window_manager.calc_past_median_time(&self.ghostdag_store.get_data(block.hash()).unwrap())?;
         for tx in block.transactions.iter() {
-            let lock_time_arg = match TransactionValidator::get_lock_time_type(tx) {
-                LockTimeType::Finalized => LockTimeArg::Finalized,
-                LockTimeType::DaaScore => LockTimeArg::DaaScore(block.header.daa_score),
-                // We only evaluate the pmt calculation when actually needed
-                LockTimeType::Time => LockTimeArg::MedianTime((*lazy_pmt_res).clone()?),
-            };
-            if let Err(e) = self.transaction_validator.validate_tx_in_header_context(tx, block.header.daa_score, lock_time_arg) {
+            if let Err(e) = self.transaction_validator.utxo_free_tx_validation(tx, block.header.daa_score, pmt) {
                 return Err(RuleError::TxInContextFailed(tx.id(), e));
-            };
+            }
         }
+
         Ok(())
     }
 
@@ -50,7 +37,7 @@ impl BlockBodyProcessor {
             .copied()
             .filter(|parent| {
                 let status_option = statuses_read_guard.get(*parent).unwrap_option();
-                status_option.is_none_or(|s| !s.has_block_body())
+                status_option.is_none_or_ex(|s| !s.has_block_body())
             })
             .collect();
         if !missing.is_empty() {
@@ -131,7 +118,7 @@ mod tests {
             block.header.hash_merkle_root = calc_hash_merkle_root(block.transactions.iter());
 
             assert_match!(
-                consensus.validate_and_insert_block(block.clone().to_immutable()).virtual_state_task.await, Err(RuleError::WrongSubsidy(expected,_)) if expected == 50000000000);
+                consensus.validate_and_insert_block(block.clone().to_immutable()).virtual_state_task.await, Err(RuleError::WrongSubsidy(expected,_)) if expected == 20000000);
 
             // The second time we send an invalid block we expect it to be a known invalid.
             assert_match!(
@@ -169,7 +156,7 @@ mod tests {
             let mut block = consensus.build_block_with_parents_and_transactions(7.into(), vec![6.into()], vec![]);
             block.transactions[0].payload[8..16].copy_from_slice(&(5_u64).to_le_bytes());
             block.header.hash_merkle_root = calc_hash_merkle_root(block.transactions.iter());
-            assert_match!(consensus.validate_and_insert_block(block.to_immutable()).virtual_state_task.await, Err(RuleError::WrongSubsidy(expected,_)) if expected == 44000000000);
+            assert_match!(consensus.validate_and_insert_block(block.to_immutable()).virtual_state_task.await, Err(RuleError::WrongSubsidy(expected,_)) if expected == 3900000000);
         }
 
         {

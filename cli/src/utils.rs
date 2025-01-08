@@ -8,7 +8,7 @@ pub fn try_parse_required_nonzero_cryptix_as_sompi_u64<S: ToString + Display>(cr
         let sompi_amount = cryptix_amount
             .to_string()
             .parse::<f64>()
-            .map_err(|_| Error::custom(format!("Supplied Cryptix amount is not valid: '{cryptix_amount}'")))?
+            .map_err(|_| Error::custom(format!("Supplied Cytxapa amount is not valid: '{cryptix_amount}'")))?
             * SOMPI_PER_CRYPTIX as f64;
         if sompi_amount < 0.0 {
             Err(Error::custom("Supplied Cryptix amount is not valid: '{cryptix_amount}'"))

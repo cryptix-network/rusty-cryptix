@@ -54,14 +54,9 @@ serde_json.workspace = true
 flate2.workspace = true
 rand_distr.workspace = true
 cryptix-txscript-errors.workspace = true
-cryptix-addresses.workspace = true
 
 [[bench]]
-name = "parallel_muhash"
-harness = false
-
-[[bench]]
-name = "check_scripts"
+name = "hash_benchmarks"
 harness = false
 
 [features]

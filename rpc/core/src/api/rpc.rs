@@ -1,10 +1,8 @@
-//!
-//! The main [`RpcApi`] trait that defines all RPC methods available in the Rusty Cryptix p2p node.
+//! The client API
 //!
 //! Rpc = External RPC Service
-//! All data provided by the RPC server can be trusted by the client
-//! No data submitted by the client to the node can be trusted
-//!
+//! All data provided by the RCP server can be trusted by the client
+//! No data submitted by the client to the server can be trusted
 
 use crate::api::connection::DynRpcConnection;
 use crate::{model::*, notify::connection::ChannelConnection, RpcResult};

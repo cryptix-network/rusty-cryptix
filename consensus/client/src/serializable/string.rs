@@ -1,7 +1,4 @@
-//!
-//! This module implements transaction-related primitives for JSON serialization
-//! where all large integer values (`u64`) are serialized to and from JSON as strings.
-//!
+//! This module implements the primitives for external transaction signing.
 
 use crate::imports::*;
 use crate::result::Result;

@@ -22,8 +22,6 @@ where
     prefix: Vec<u8>,
 }
 
-pub type KeyDataResult<TData> = Result<(Box<[u8]>, TData), Box<dyn Error>>;
-
 impl<TKey, TData, S> CachedDbAccess<TKey, TData, S>
 where
     TKey: Clone + std::hash::Hash + Eq + Send + Sync,
@@ -67,7 +65,7 @@ where
         }
     }
 
-    pub fn iterator(&self) -> impl Iterator<Item = KeyDataResult<TData>> + '_
+    pub fn iterator(&self) -> impl Iterator<Item = Result<(Box<[u8]>, TData), Box<dyn Error>>> + '_
     where
         TKey: Clone + AsRef<[u8]>,
         TData: DeserializeOwned, // We need `DeserializeOwned` since the slice coming from `db.get_pinned` has short lifetime
@@ -175,7 +173,7 @@ where
         seek_from: Option<TKey>, // iter whole range if None
         limit: usize,            // amount to take.
         skip_first: bool,        // skips the first value, (useful in conjunction with the seek-key, as to not re-retrieve).
-    ) -> impl Iterator<Item = KeyDataResult<TData>> + '_
+    ) -> impl Iterator<Item = Result<(Box<[u8]>, TData), Box<dyn Error>>> + '_
     where
         TKey: Clone + AsRef<[u8]>,
         TData: DeserializeOwned,

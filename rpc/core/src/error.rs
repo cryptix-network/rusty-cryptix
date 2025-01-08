@@ -1,7 +1,3 @@
-//!
-//! [`RpcError`] enum used by RPC primitives.
-//!
-
 use cryptix_consensus_core::{subnets::SubnetworkConversionError, tx::TransactionId};
 use cryptix_utils::networking::IpAddress;
 use std::{net::AddrParseError, num::TryFromIntError};

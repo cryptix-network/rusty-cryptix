@@ -4,6 +4,7 @@ use zeroize::Zeroize;
 
 /// BIP39 seeds.
 // TODO(tarcieri): support for 32-byte seeds
+#[cfg_attr(docsrs, doc(cfg(feature = "bip39")))]
 pub struct Seed(pub(crate) [u8; Seed::SIZE]);
 
 impl Seed {

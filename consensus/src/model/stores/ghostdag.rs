@@ -48,7 +48,6 @@ impl MemSizeEstimator for GhostdagData {
 impl MemSizeEstimator for CompactGhostdagData {}
 
 impl From<&GhostdagData> for CompactGhostdagData {
-    #[inline(always)]
     fn from(value: &GhostdagData) -> Self {
         Self { blue_score: value.blue_score, blue_work: value.blue_work, selected_parent: value.selected_parent }
     }
@@ -116,7 +115,7 @@ impl GhostdagData {
     pub fn ascending_mergeset_without_selected_parent<'a>(
         &'a self,
         store: &'a (impl GhostdagStoreReader + ?Sized),
-    ) -> impl Iterator<Item = SortableBlock> + 'a {
+    ) -> impl Iterator<Item = SortableBlock> + '_ {
         self.mergeset_blues
             .iter()
             .skip(1) // Skip the selected parent
@@ -139,7 +138,7 @@ impl GhostdagData {
     pub fn descending_mergeset_without_selected_parent<'a>(
         &'a self,
         store: &'a (impl GhostdagStoreReader + ?Sized),
-    ) -> impl Iterator<Item = SortableBlock> + 'a {
+    ) -> impl Iterator<Item = SortableBlock> + '_ {
         self.mergeset_blues
                 .iter()
                 .skip(1) // Skip the selected parent
@@ -175,7 +174,7 @@ impl GhostdagData {
     pub fn consensus_ordered_mergeset<'a>(
         &'a self,
         store: &'a (impl GhostdagStoreReader + ?Sized),
-    ) -> impl Iterator<Item = Hash> + 'a {
+    ) -> impl Iterator<Item = Hash> + '_ {
         once(self.selected_parent).chain(self.ascending_mergeset_without_selected_parent(store).map(|s| s.hash))
     }
 
@@ -183,7 +182,7 @@ impl GhostdagData {
     pub fn consensus_ordered_mergeset_without_selected_parent<'a>(
         &'a self,
         store: &'a (impl GhostdagStoreReader + ?Sized),
-    ) -> impl Iterator<Item = Hash> + 'a {
+    ) -> impl Iterator<Item = Hash> + '_ {
         self.ascending_mergeset_without_selected_parent(store).map(|s| s.hash)
     }
 
@@ -263,27 +262,6 @@ impl DbGhostdagStore {
         let lvl_bytes = level.to_le_bytes();
         let prefix = DatabaseStorePrefixes::Ghostdag.into_iter().chain(lvl_bytes).collect_vec();
         let compact_prefix = DatabaseStorePrefixes::GhostdagCompact.into_iter().chain(lvl_bytes).collect_vec();
-        Self {
-            db: Arc::clone(&db),
-            level,
-            access: CachedDbAccess::new(db.clone(), cache_policy, prefix),
-            compact_access: CachedDbAccess::new(db, compact_cache_policy, compact_prefix),
-        }
-    }
-
-    pub fn new_temp(
-        db: Arc<DB>,
-        level: BlockLevel,
-        cache_policy: CachePolicy,
-        compact_cache_policy: CachePolicy,
-        temp_index: u8,
-    ) -> Self {
-        assert_ne!(SEPARATOR, level, "level {} is reserved for the separator", level);
-        let lvl_bytes = level.to_le_bytes();
-        let temp_index_bytes = temp_index.to_le_bytes();
-        let prefix = DatabaseStorePrefixes::TempGhostdag.into_iter().chain(lvl_bytes).chain(temp_index_bytes).collect_vec();
-        let compact_prefix =
-            DatabaseStorePrefixes::TempGhostdagCompact.into_iter().chain(lvl_bytes).chain(temp_index_bytes).collect_vec();
         Self {
             db: Arc::clone(&db),
             level,

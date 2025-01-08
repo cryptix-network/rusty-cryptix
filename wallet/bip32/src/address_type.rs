@@ -1,10 +1,5 @@
-//!
-//!  Address type (`Receive` or `Change`) used in HD wallet address derivation.
-//!
-
 use std::fmt;
 
-/// Address type used in HD wallet address derivation.
 pub enum AddressType {
     Receive = 0,
     Change,

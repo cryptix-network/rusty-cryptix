@@ -1,7 +1,3 @@
-//!
-//! RPC notifications that can be sent to clients.
-//!
-
 use crate::model::message::*;
 use derive_more::Display;
 use cryptix_notify::{

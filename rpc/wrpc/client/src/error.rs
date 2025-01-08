@@ -1,5 +1,3 @@
-//! [`Error`](enum@Error) variants for the wRPC client library.
-
 use thiserror::Error;
 use wasm_bindgen::JsError;
 use wasm_bindgen::JsValue;

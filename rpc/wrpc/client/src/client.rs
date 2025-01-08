@@ -1,5 +1,3 @@
-//! Cryptix wRPC client implementation.
-
 use crate::imports::*;
 use crate::parse::parse_host;
 use crate::{error::Error, node::NodeDescriptor};
@@ -248,17 +246,14 @@ impl RpcResolver for Inner {
 
 const WRPC_CLIENT: &str = "wrpc-client";
 
-/// # [`CryptixRpcClient`] connects to Cryptix wRPC endpoint via binary Borsh or JSON protocols.
+/// [`CryptixRpcClient`] allows connection to the Cryptix wRPC Server via
+/// binary Borsh or JSON protocols.
 ///
 /// RpcClient has two ways to interface with the underlying RPC subsystem:
 /// [`Interface`] that has a [`notification()`](Interface::notification)
 /// method to register closures that will be invoked on server-side
-/// notifications and the [`RpcClient::call`] method that allows server-side
-/// async method invocation.
-///
-/// The node address can be supplied via a URL or a [`Resolver`] that
-/// can be used to resolve a public node address dynamically. [`Resolver`] can also
-/// be configured to operate against custom node clusters.
+/// notifications and the [`RpcClient::call`] method that allows async
+/// method invocation server-side.
 ///
 #[derive(Clone)]
 pub struct CryptixRpcClient {

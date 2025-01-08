@@ -27,4 +27,5 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-rv.workspace = true
+statrs.workspace = true
+statest.workspace = true

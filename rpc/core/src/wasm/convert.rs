@@ -1,7 +1,3 @@
-//!
-//! WASM specific conversion functions
-//!
-
 use crate::model::*;
 use cryptix_consensus_client::*;
 use std::sync::Arc;
