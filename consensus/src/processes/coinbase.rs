@@ -490,6 +490,6 @@ mod tests {
 
     /// Return a CoinbaseManager with legacy golang 1 BPS properties
     fn create_legacy_manager() -> CoinbaseManager {
-        CoinbaseManager::new(150, 204, 259200, 3900000000, 1000)
+        CoinbaseManager::new(150, 204, 86400, 20000000000, 1000)
     }
 }
