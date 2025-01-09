@@ -16,7 +16,7 @@ pub const SOMPI_PER_CRYPTIX: u64 = 100_000_000;
 pub const STORAGE_MASS_PARAMETER: u64 = SOMPI_PER_CRYPTIX * 10_000;
 
 /// MaxSompi is the maximum transaction amount allowed in sompi.
-pub const MAX_SOMPI: u64 = 29_000_000_000 * SOMPI_PER_CRYPTIX;
+pub const MAX_SOMPI: u64 = 520_395_506  * SOMPI_PER_CRYPTIX;
 
 // MAX_TX_IN_SEQUENCE_NUM is the maximum sequence number the sequence field
 // of a transaction input can be.
