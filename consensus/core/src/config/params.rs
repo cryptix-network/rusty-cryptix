@@ -291,14 +291,12 @@ impl From<NetworkId> for Params {
 
 pub const MAINNET_PARAMS: Params = Params {
     dns_seeders: &[
-        // DNS Seeder
         "seed1.cryptix-network.org",
         "seed2.cryptix-network.org",
         "seed3.cryptix-network.org",
         "dyn1.cryptix-network.org",
         "dyn2.cryptix-network.org",
         "dyn3.cryptix-network.org",
-        //Backup Domain
         "cryptix-network-dns.duckdns.org",
         "cryptix-network-dns2.duckdns.org",
     ],
@@ -355,15 +353,15 @@ pub const MAINNET_PARAMS: Params = Params {
 };
 
 pub const TESTNET_PARAMS: Params = Params {
-    dns_seeders: &    dns_seeders: &[
-        // DNS Seeder
+          dns_seeders: &[
+
         "t.seed1.cryptix-network.org",
         "t.seed2.cryptix-network.org",
         "t.seed3.cryptix-network.org",
         "t.dyn1.cryptix-network.org",
         "t.dyn2.cryptix-network.org",
         "t.dyn3.cryptix-network.org",
-        //Backup Domain
+
         "t.cryptix-network-dns.duckdns.org",
         "t.cryptix-network-dns2.duckdns.org",
     ],
@@ -421,14 +419,14 @@ pub const TESTNET_PARAMS: Params = Params {
 
 pub const TESTNET11_PARAMS: Params = Params {
     dns_seeders: &[
-        // DNS Seeder
+
         "t11.seed1.cryptix-network.org",
         "t11.seed2.cryptix-network.org",
         "t11.seed3.cryptix-network.org",
         "t11.dyn1.cryptix-network.org",
         "t11.dyn2.cryptix-network.org",
         "t11.dyn3.cryptix-network.org",
-        //Backup Domain
+
         "t11.cryptix-network-dns.duckdns.org",
         "t11.cryptix-network-dns2.duckdns.org",
     ],
