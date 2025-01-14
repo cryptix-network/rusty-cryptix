@@ -292,10 +292,15 @@ impl From<NetworkId> for Params {
 pub const MAINNET_PARAMS: Params = Params {
     dns_seeders: &[
         // DNS Seeder
-        "hotfix.hopto.org",
-        "n.seed-cryptix.duckdns.org",
-        "hotfix-dev.duckdns.org",
-        "45.84.199.4",
+        "seed1.cryptix-network.org",
+        "seed2.cryptix-network.org",
+        "seed3.cryptix-network.org",
+        "dyn1.cryptix-network.org",
+        "dyn2.cryptix-network.org",
+        "dyn3.cryptix-network.org",
+        //Backup Domain
+        "cryptix-network-dns.duckdns.org",
+        "cryptix-network-dns2.duckdns.org",
     ],
     net: NetworkId::new(NetworkType::Mainnet),
     genesis: GENESIS,
@@ -350,12 +355,17 @@ pub const MAINNET_PARAMS: Params = Params {
 };
 
 pub const TESTNET_PARAMS: Params = Params {
-    dns_seeders: &[
+    dns_seeders: &    dns_seeders: &[
         // DNS Seeder
-        "hotfix.hopto.org",
-        "n.seed-cryptix.duckdns.org",
-        "hotfix-dev.duckdns.org",
-        "45.84.199.4",
+        "t.seed1.cryptix-network.org",
+        "t.seed2.cryptix-network.org",
+        "t.seed3.cryptix-network.org",
+        "t.dyn1.cryptix-network.org",
+        "t.dyn2.cryptix-network.org",
+        "t.dyn3.cryptix-network.org",
+        //Backup Domain
+        "t.cryptix-network-dns.duckdns.org",
+        "t.cryptix-network-dns2.duckdns.org",
     ],
     net: NetworkId::with_suffix(NetworkType::Testnet, 10),
     genesis: TESTNET_GENESIS,
@@ -412,10 +422,15 @@ pub const TESTNET_PARAMS: Params = Params {
 pub const TESTNET11_PARAMS: Params = Params {
     dns_seeders: &[
         // DNS Seeder
-        "hotfix.hopto.org",
-        "n.seed-cryptix.duckdns.org",
-        "hotfix-dev.duckdns.org",
-        "45.84.199.4",
+        "t11.seed1.cryptix-network.org",
+        "t11.seed2.cryptix-network.org",
+        "t11.seed3.cryptix-network.org",
+        "t11.dyn1.cryptix-network.org",
+        "t11.dyn2.cryptix-network.org",
+        "t11.dyn3.cryptix-network.org",
+        //Backup Domain
+        "t11.cryptix-network-dns.duckdns.org",
+        "t11.cryptix-network-dns2.duckdns.org",
     ],
     net: NetworkId::with_suffix(NetworkType::Testnet, 11),
     genesis: TESTNET11_GENESIS,
