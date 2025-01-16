@@ -1,5 +1,5 @@
 use crate::xoshiro::XoShiRo256PlusPlus;
-use cryptix_hashes::{Hash, KHeavyHash};
+use cryptix_hashes::{Hash, CryptixHash};
 use std::mem::MaybeUninit;
 
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq)]
@@ -128,7 +128,7 @@ impl Matrix {
 
         product.iter_mut().zip(hash.as_bytes()).for_each(|(p, h)| *p ^= h);
 
-        KHeavyHash::hash(Hash::from_bytes(product))
+        CryptixHash::hash(Hash::from_bytes(product))
     }
 }
 
