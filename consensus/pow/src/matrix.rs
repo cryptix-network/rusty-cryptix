@@ -99,28 +99,37 @@ impl Matrix {
     }
 
     pub fn heavy_hash(&self, hash: Hash) -> Hash {
-        // SAFETY: An uninitialized MaybrUninit is always safe.
-        let mut vec: [MaybeUninit<u8>; 64] = unsafe { MaybeUninit::uninit().assume_init() };
-        for (i, element) in hash.as_bytes().into_iter().enumerate() {
-            vec[2 * i].write(element >> 4);
-            vec[2 * i + 1].write(element & 0x0F);
-        }
-        // SAFETY: The loop above wrote into all indexes.
-        let vec: [u8; 64] = unsafe { std::mem::transmute(vec) };
-
-        // Matrix-vector multiplication, convert to 4 bits, and then combine back to 8 bits.
-        let mut product: [u8; 32] = array_from_fn(|i| {
-            let mut sum1 = 0;
-            let mut sum2 = 0;
-            for (j, &elem) in vec.iter().enumerate() {
-                sum1 += self.0[2 * i][j] * (elem as u16);
-                sum2 += self.0[2 * i + 1][j] * (elem as u16);
+        let nibbles: [u8; 64] = {
+            let o_bytes = hash.as_bytes();
+            let mut arr = [0u8; 64];
+            for (i, &byte) in o_bytes.iter().enumerate() {
+                arr[2 * i]     = byte >> 4;
+                arr[2 * i + 1] = byte & 0x0F;
             }
-            ((sum1 >> 10) << 4) as u8 | (sum2 >> 10) as u8
-        });
+            arr
+        };
 
-        // Concatenate 4 LSBs back to 8 bit xor with sum1
-        product.iter_mut().zip(hash.as_bytes()).for_each(|(p, h)| *p ^= h);
+        let mut product = [0u8; 32];
+        
+        for i in 0..32 {
+            let mut sum1 = 0u16;
+            let mut sum2 = 0u16;
+            for j in 0..64 {
+                let elem = nibbles[j] as u16;
+                sum1 += self.0[2 * i][j] * elem;
+                sum2 += self.0[2 * i + 1][j] * elem;
+            }
+
+            let a_nibble = (sum1 & 0xF) ^ ((sum2 >> 4) & 0xF) ^ ((sum1 >> 8) & 0xF);
+            let b_nibble = (sum2 & 0xF) ^ ((sum1 >> 4) & 0xF) ^ ((sum2 >> 8) & 0xF);
+
+            product[i] = ((a_nibble << 4) | b_nibble) as u8;
+        }
+
+        for (p, &h) in product.iter_mut().zip(hash.as_bytes()) {
+            *p ^= h;
+        }
+
         KHeavyHash::hash(Hash::from_bytes(product))
     }
 }
