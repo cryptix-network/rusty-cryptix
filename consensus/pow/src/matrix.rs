@@ -110,8 +110,7 @@ impl Matrix {
         };
 
         let mut product = [0u8; 32];
-        
-        
+
         for i in 0..32 {
             let mut sum1 = 0u16;
             let mut sum2 = 0u16;
@@ -124,13 +123,10 @@ impl Matrix {
             let a_nibble = (sum1 & 0xF) ^ ((sum2 >> 4) & 0xF) ^ ((sum1 >> 8) & 0xF);
             let b_nibble = (sum2 & 0xF) ^ ((sum1 >> 4) & 0xF) ^ ((sum2 >> 8) & 0xF);
 
-
-            product.iter_mut().zip(hash.as_bytes()).for_each(|(p, h)| *p ^= h);
+            product[i] = ((a_nibble << 4) | b_nibble) as u8;
         }
 
-        for (p, &h) in product.iter_mut().zip(hash.as_bytes()) {
-            *p ^= h;
-        }
+        product.iter_mut().zip(hash.as_bytes()).for_each(|(p, h)| *p ^= h);
 
         KHeavyHash::hash(Hash::from_bytes(product))
     }
