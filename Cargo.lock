@@ -1827,6 +1827,7 @@ dependencies = [
  "cryptix-utils",
  "js-sys",
  "num",
+ "sha3",
  "wasm-bindgen",
  "workflow-wasm",
 ]
