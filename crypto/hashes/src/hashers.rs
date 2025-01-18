@@ -1,4 +1,3 @@
-// use sha3::CShake256;
 use once_cell::sync::Lazy;
 
 pub trait HasherBase {

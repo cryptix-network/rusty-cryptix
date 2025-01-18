@@ -30,22 +30,29 @@ impl PowHash {
         Self(start)
     }
 
+    // #[inline(always)]
+    // pub fn finalize_with_nonce(mut self, nonce: u64) -> Hash {
+    //     self.0[9] ^= nonce;
+    
+
+    //     keccak256::f1600(&mut self.0);
+    
+    //     // Hello ASICs - try to eat this.
+    //     // Info: Cryptix will never accept or support ASICs. This is just the first step. In the future, multiple iterations may be added, or even other algorithms,
+    //     // up to the potential integration of RandomX. So don't waste your time and money building an ASIC miner, it won't even work for a week, and the algorithm will 
+    //     //be changed as soon as there is even a suspicion of ASIC involvement.
+
+    //     let mut second_hash = self.0.clone();  
+    //     keccak256::f1600(&mut second_hash);  
+    
+    //     Hash::from_le_u64(second_hash[..4].try_into().unwrap())
+    // }
+
     #[inline(always)]
     pub fn finalize_with_nonce(mut self, nonce: u64) -> Hash {
         self.0[9] ^= nonce;
-    
-
         keccak256::f1600(&mut self.0);
-    
-        // Hello ASICs - try to eat this.
-        // Info: Cryptix will never accept or support ASICs. This is just the first step. In the future, multiple iterations may be added, or even other algorithms,
-        // up to the potential integration of RandomX. So don't waste your time and money building an ASIC miner, it won't even work for a week, and the algorithm will 
-        //be changed as soon as there is even a suspicion of ASIC involvement.
-
-        let mut second_hash = self.0.clone();  
-        keccak256::f1600(&mut second_hash);  
-    
-        Hash::from_le_u64(second_hash[..4].try_into().unwrap())
+        Hash::from_le_u64(self.0[..4].try_into().unwrap())
     }
     
 }
