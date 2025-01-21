@@ -98,6 +98,17 @@ impl Matrix {
         rank
     }
 
+    const final_x: [u8; 32] = [
+        0x3F, 0xC2, 0xF2, 0xE2,
+        0xD1, 0x55, 0x81, 0x92,
+        0xA0, 0x6B, 0xF5, 0x3F,
+        0x5A, 0x70, 0x32, 0xB4,
+        0xE4, 0x84, 0xE4, 0xCB,
+        0x81, 0x73, 0xE7, 0xE0,
+        0xD2, 0x7F, 0x8C, 0x55,
+        0xAD, 0x8C, 0x60, 0x8F,
+        ];
+
     pub fn heavy_hash(&self, hash: Hash) -> Hash {
         let nibbles: [u8; 64] = {
             let o_bytes = hash.as_bytes();
@@ -128,8 +139,13 @@ impl Matrix {
 
         product.iter_mut().zip(hash.as_bytes()).for_each(|(p, h)| *p ^= h);
 
+        for i in 0..32 {
+            product[i] ^= Self::final_x[i];
+        }
+
         CryptixHash::hash(Hash::from_bytes(product))
     }
+    
 }
 
 pub fn array_from_fn<F, T, const N: usize>(mut cb: F) -> [T; N]
