@@ -139,9 +139,6 @@ impl Matrix {
 
         product.iter_mut().zip(hash.as_bytes()).for_each(|(p, h)| *p ^= h);
 
-        for i in 0..32 {
-            product[i] ^= Self::final_x[i];
-        }
 
         CryptixHash::hash(Hash::from_bytes(product))
     }
