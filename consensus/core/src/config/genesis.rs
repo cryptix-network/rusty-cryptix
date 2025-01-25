@@ -41,6 +41,7 @@ impl From<&GenesisBlock> for Header {
     }
 }
 
+
 impl From<&GenesisBlock> for Block {
     fn from(genesis: &GenesisBlock) -> Self {
         Block::new(genesis.into(), genesis.build_genesis_transactions())
@@ -65,10 +66,10 @@ impl From<(&Header, &'static [u8])> for GenesisBlock {
 
 pub const GENESIS: GenesisBlock = GenesisBlock {
     hash: Hash::from_bytes([
-        0x00, 0x00, 0x5a, 0x91, 0x91, 0x0d, 0xad, 0x11, 0xf6, 0x7f,
-        0x7d, 0x70, 0xc3, 0xbe, 0x84, 0x5f, 0xcd, 0x70, 0xdb, 0x42,
-        0xf0, 0x90, 0x78, 0x38, 0x59, 0x9d, 0x63, 0x75, 0x98, 0x08,
-        0x2c, 0xde,
+        0x00, 0x00, 0x2c, 0x14, 0x11, 0xb2, 0x03, 0x41, 
+        0x9f, 0xf9, 0x23, 0xc5, 0x87, 0x36, 0xb2, 0x54, 
+        0x3c, 0x1f, 0x5e, 0x35, 0x6d, 0x68, 0xf9, 0xaf, 
+        0xde, 0x47, 0x5c, 0x44, 0xc6, 0x4e, 0x45, 0x4c,
     ]),
     version: 7, 
     hash_merkle_root: Hash::from_bytes([
@@ -79,8 +80,8 @@ pub const GENESIS: GenesisBlock = GenesisBlock {
     ]),
     utxo_commitment: EMPTY_MUHASH,
     timestamp: 1735689600000, // Time
-    bits: 0x3392c, // Difficulty Target (Bits)
-    nonce: 43823, // Nonce
+    bits: 100,
+    nonce:   0xB5D2,
     daa_score: 0, // Difficulty Adjustment
     coinbase_payload: &[
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Blue score
@@ -104,7 +105,7 @@ pub const TESTNET_GENESIS: GenesisBlock = GenesisBlock {
     ]),
     utxo_commitment: EMPTY_MUHASH,
     timestamp: 0x17c5f62fbb6,
-    bits: 0x1e7fffff,
+    bits: 0x1e7fffff, 
     nonce: 0x14582,
     daa_score: 0,
     #[rustfmt::skip]
