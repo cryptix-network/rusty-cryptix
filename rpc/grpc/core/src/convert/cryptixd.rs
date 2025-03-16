@@ -63,6 +63,7 @@ pub mod cryptixd_request_convert {
     impl_into_cryptixd_request!(GetFeeEstimate);
     impl_into_cryptixd_request!(GetFeeEstimateExperimental);
     impl_into_cryptixd_request!(GetCurrentBlockColor);
+    impl_into_cryptixd_request!(GetUtxoReturnAddress);
 
     impl_into_cryptixd_request!(NotifyBlockAdded);
     impl_into_cryptixd_request!(NotifyNewBlockTemplate);
@@ -200,6 +201,7 @@ pub mod cryptixd_response_convert {
     impl_into_cryptixd_response!(GetFeeEstimate);
     impl_into_cryptixd_response!(GetFeeEstimateExperimental);
     impl_into_cryptixd_response!(GetCurrentBlockColor);
+    impl_into_cryptixd_response!(GetUtxoReturnAddress);
 
     impl_into_cryptixd_notify_response!(NotifyBlockAdded);
     impl_into_cryptixd_notify_response!(NotifyNewBlockTemplate);

@@ -1,3 +1,7 @@
+//!
+//! WASM bindings for the [Rusty Cryptix p2p Node wRPC Client](cryptix-wrpc-client)
+//!
+
 #![allow(unused_imports)]
 
 use cfg_if::cfg_if;

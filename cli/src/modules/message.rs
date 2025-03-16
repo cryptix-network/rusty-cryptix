@@ -1,5 +1,6 @@
 use cryptix_addresses::Version;
 use cryptix_bip32::secp256k1::XOnlyPublicKey;
+use cryptix_wallet_core::message::SignMessageOptions;
 use cryptix_wallet_core::{
     account::{BIP32_ACCOUNT_KIND, KEYPAIR_ACCOUNT_KIND},
     message::{sign_message, verify_message, PersonalMessage},
@@ -87,8 +88,9 @@ impl Message {
 
         let pm = PersonalMessage(message);
         let privkey = self.get_address_private_key(&ctx, cryptix_address).await?;
+        let sign_options = SignMessageOptions { no_aux_rand: false };
 
-        let sig_result = sign_message(&pm, &privkey);
+        let sig_result = sign_message(&pm, &privkey, &sign_options);
 
         match sig_result {
             Ok(signature) => {

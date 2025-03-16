@@ -227,7 +227,7 @@ pub fn cli() -> Command {
                 .num_args(0..=1)
                 .require_equals(true)
                 .value_parser(clap::value_parser!(ContextualNetAddress))
-                .help("Interface:port to listen for gRPC connections (default port: 19201, testnet: 19202)."),
+                .help("Interface:port to listen for gRPC connections (default port: 16110, testnet: 16210)."),
         )
         .arg(
             Arg::new("rpclisten-borsh")
@@ -237,7 +237,7 @@ pub fn cli() -> Command {
                 .require_equals(true)
                 .default_missing_value("default") // TODO: Find a way to use defaults.rpclisten_borsh
                 .value_parser(clap::value_parser!(WrpcNetAddress))
-                .help("Interface:port to listen for wRPC Borsh connections (default port: 19301, testnet: 19302)."),
+                .help("Interface:port to listen for wRPC Borsh connections (default port: 17110, testnet: 17210)."),
 
         )
         .arg(
@@ -248,7 +248,7 @@ pub fn cli() -> Command {
                 .require_equals(true)
                 .default_missing_value("default") // TODO: Find a way to use defaults.rpclisten_json
                 .value_parser(clap::value_parser!(WrpcNetAddress))
-                .help("Interface:port to listen for wRPC JSON connections (default port: 19401, testnet: 19402)."),
+                .help("Interface:port to listen for wRPC JSON connections (default port: 18110, testnet: 18210)."),
         )
         .arg(arg!(--unsaferpc "Enable RPC commands which affect the state of the node"))
         .arg(
@@ -275,7 +275,7 @@ pub fn cli() -> Command {
                 .value_name("IP[:PORT]")
                 .require_equals(true)
                 .value_parser(clap::value_parser!(ContextualNetAddress))
-                .help("Add an interface:port to listen for connections (default all interfaces port: 19101, testnet: 19102)."),
+                .help("Add an interface:port to listen for connections (default all interfaces port: 16111, testnet: 16211)."),
         )
         .arg(
             Arg::new("outpeers")
@@ -481,9 +481,9 @@ fn arg_match_many_unwrap_or<T: Clone + Send + Sync + 'static>(m: &clap::ArgMatch
 /*
 
   -V, --version                             Display version information and exit
-  -C, --configfile=                         Path to configuration file (default: /Users/aspect/Library/Application
+  -C, --configfile=                         Path to configuration file (default: /Users/user/Library/Application
                                             Support/Cryptixd/cryptixd.conf)
-  -b, --appdir=                             Directory to store data (default: /Users/aspect/Library/Application
+  -b, --appdir=                             Directory to store data (default: /Users/user/Library/Application
                                             Support/Cryptixd)
       --logdir=                             Directory to log output.
   -a, --addpeer=                            Add a peer to connect with at startup
@@ -492,7 +492,7 @@ fn arg_match_many_unwrap_or<T: Clone + Send + Sync + 'static>(m: &clap::ArgMatch
                                             automatically disabled if the --connect or --proxy options are used
                                             without also specifying listen interfaces via --listen
       --listen=                             Add an interface/port to listen for connections (default all interfaces
-                                            port: 19101, testnet: 19102)
+                                            port: 16111, testnet: 16211)
       --outpeers=                           Target number of outbound peers (default: 8)
       --maxinpeers=                         Max number of inbound peers (default: 117)
       --enablebanning                       Enable banning of misbehaving peers
@@ -502,12 +502,12 @@ fn arg_match_many_unwrap_or<T: Clone + Send + Sync + 'static>(m: &clap::ArgMatch
                                             peers. (default: 100)
       --whitelist=                          Add an IP network or IP that will not be banned. (eg. 192.168.1.0/24 or
                                             ::1)
-      --rpclisten=                          Add an interface/port to listen for RPC connections (default port: 19201,
-                                            testnet: 19202)
+      --rpclisten=                          Add an interface/port to listen for RPC connections (default port: 16110,
+                                            testnet: 16210)
       --rpccert=                            File containing the certificate file (default:
-                                            /Users/aspect/Library/Application Support/Cryptixd/rpc.cert)
+                                            /Users/user/Library/Application Support/Cryptixd/rpc.cert)
       --rpckey=                             File containing the certificate key (default:
-                                            /Users/aspect/Library/Application Support/Cryptixd/rpc.key)
+                                            /Users/user/Library/Application Support/Cryptixd/rpc.key)
       --rpcmaxclients=                      Max number of RPC clients for standard connections (default: 128)
       --rpcmaxwebsockets=                   Max number of RPC websocket connections (default: 25)
       --rpcmaxconcurrentreqs=               Max number of concurrent RPC requests that may be processed concurrently

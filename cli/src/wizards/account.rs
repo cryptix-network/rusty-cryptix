@@ -16,7 +16,7 @@ pub(crate) async fn create(
     let term = ctx.term();
     let wallet = ctx.wallet();
 
-    // TODO @aspect
+    // TODO
     let word_count = WordCount::Words12;
 
     let name = if let Some(name) = name {

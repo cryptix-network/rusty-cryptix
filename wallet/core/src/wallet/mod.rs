@@ -1,6 +1,14 @@
 //!
-//! Cryptix wallet runtime implementation.
+//! # Cryptix wallet runtime implementation.
 //!
+//! This module contains a Rust implementation of the Cryptix wallet that
+//! can be used in native Rust as well as WASM32 (Browser, NodeJs, Bun)
+//! environments.
+//!
+//! This wallet is not meant to be used directly, but rather through the
+//! use of the [`WalletApi`] trait.
+//!
+
 pub mod api;
 pub mod args;
 pub mod maps;
@@ -49,7 +57,7 @@ pub struct SingleWalletFileV1<'a, T: AsRef<[u8]>> {
     pub ecdsa: bool,
 }
 
-impl<'a, T: AsRef<[u8]>> SingleWalletFileV1<'a, T> {
+impl<T: AsRef<[u8]>> SingleWalletFileV1<'_, T> {
     const NUM_THREADS: u32 = 8;
 }
 
@@ -72,7 +80,7 @@ pub struct MultisigWalletFileV1<'a, T: AsRef<[u8]>> {
     pub ecdsa: bool,
 }
 
-impl<'a, T: AsRef<[u8]>> MultisigWalletFileV1<'a, T> {
+impl<T: AsRef<[u8]>> MultisigWalletFileV1<'_, T> {
     const NUM_THREADS: u32 = 8;
 }
 
@@ -81,7 +89,8 @@ pub enum WalletBusMessage {
     Discovery { record: TransactionRecord },
 }
 
-pub struct Inner {
+/// Internal wallet state.
+struct Inner {
     active_accounts: ActiveAccountMap,
     legacy_accounts: ActiveAccountMap,
     listener_id: Mutex<Option<ListenerId>>,
@@ -133,7 +142,7 @@ impl Wallet {
 
     pub fn try_with_wrpc(store: Arc<dyn Interface>, resolver: Option<Resolver>, network_id: Option<NetworkId>) -> Result<Wallet> {
         let rpc_client =
-            Arc::new(CryptixRpcClient::new_with_args(WrpcEncoding::Borsh, Some("wrpc://127.0.0.1:19301"), resolver, network_id, None)?);
+            Arc::new(CryptixRpcClient::new_with_args(WrpcEncoding::Borsh, Some("wrpc://127.0.0.1:17110"), resolver, network_id, None)?);
 
         let rpc_ctl = rpc_client.ctl().clone();
         let rpc_api: Arc<DynRpcApi> = rpc_client;
@@ -187,10 +196,6 @@ impl Wallet {
     pub fn with_url(self, url: Option<&str>) -> Self {
         self.wrpc_client().set_url(url).expect("Unable to set url");
         self
-    }
-
-    pub fn inner(&self) -> &Arc<Inner> {
-        &self.inner
     }
 
     //
@@ -1572,7 +1577,7 @@ impl Wallet {
         let bip39_mnemonic = std::str::from_utf8(bip39_mnemonic.as_ref()).map_err(|_| Error::InvalidMnemonicPhrase)?;
         let mnemonic = Mnemonic::new(bip39_mnemonic, Language::English)?;
 
-        // TODO @aspect - this is not efficient, we need to scan without encrypting prv_key_data
+        // TODO - this is not efficient, we need to scan without encrypting prv_key_data
         let prv_key_data =
             storage::PrvKeyData::try_new_from_mnemonic(mnemonic, bip39_passphrase.as_ref(), EncryptionKind::XChaCha20Poly1305)?;
 

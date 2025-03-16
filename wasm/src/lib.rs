@@ -1,5 +1,5 @@
 /*!
-# `rusty-cryptix WASM32 bindings`
+# Rusty Cryptix WASM32 bindings
 
 [<img alt="github" src="https://img.shields.io/badge/github-cryptix-network/rusty--cryptix-8da0cb?style=for-the-badge&labelColor=555555&color=8da0cb&logo=github" height="20">](https://github.com/cryptix-network/rusty-cryptix/tree/master/wasm)
 [<img alt="crates.io" src="https://img.shields.io/crates/v/cryptix-wasm.svg?maxAge=2592000&style=for-the-badge&color=fc8d62&logo=rust" height="20">](https://crates.io/crates/cryptix-wasm)
@@ -13,10 +13,6 @@ codebase within JavaScript environments such as Node.js and Web Browsers.
 
 ## Documentation
 
-- [**integrating with Cryptix** guide](https://cryptix.aspectron.org/)
-- [**Rustdoc** documentation](https://docs.rs/cryptix-wasm/latest/cryptix-wasm)
-- [**JSDoc** documentation](https://cryptix.aspectron.org/jsdoc/)
-
 Please note that while WASM directly binds JavaScript and Rust resources, their names on JavaScript side
 are different from their name in Rust as they conform to the 'camelCase' convention in JavaScript and
 to the 'snake_case' convention in Rust.
@@ -25,9 +21,10 @@ to the 'snake_case' convention in Rust.
 
 The APIs are currently separated into the following groups (this will be expanded in the future):
 
-- **Transaction API** — Bindings for primitives related to transactions.
-- **RPC API** — [RPC interface bindings](rpc) for the Cryptix node using WebSocket (wRPC) connections.
-- **Wallet API** — API for async core wallet processing tasks.
+- **Consensus Client API** — Bindings for primitives related to transactions.
+- **RPC API** — [RPC interface bindings](cryptix_wrpc_wasm::client) for the Cryptix node using WebSocket (wRPC) connections.
+- **Wallet SDK** — API for async core wallet processing tasks.
+- **Wallet API** — A rust implementation of the fully-featured wallet usable in the native Rust, Browser or NodeJs and Bun environments.
 
 ## NPM Modules
 
@@ -43,6 +40,9 @@ of a native WebSocket in NodeJs environment, while
 the `cryptix` module includes `websocket` package dependency simulating
 the W3C WebSocket and due to this supports RPC.
 
+NOTE: for security reasons it is always recommended to build WASM SDK from source or
+download pre-built redistributables from releases or development builds.
+
 ## Examples
 
 JavaScript examples for using this framework can be found at:
@@ -54,7 +54,14 @@ For pre-built browser-compatible WASM32 redistributables of this
 framework please see the releases section of the Rusty Cryptix
 repository at <https://github.com/cryptix-network/rusty-cryptix/releases>.
 
+## Development Builds
+
+
 ## Using RPC
+
+No special handling is required to use the RPC client
+in **Browser** or **Bun** environments due to the fact that
+these environments provide native WebSocket support.
 
 **NODEJS:** If you are building from source, to use WASM RPC client
 in the NodeJS environment, you need to introduce a global W3C WebSocket
@@ -122,8 +129,6 @@ const rpc = new RpcClient({
     }
 })();
 ```
-
-For more details, please follow the [**integrating with Cryptix**](https://cryptix.aspectron.org/) guide.
 
 */
 

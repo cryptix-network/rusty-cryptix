@@ -45,7 +45,7 @@ cryptix.init_console_panic_hook();
     //     // await wallet.connect();
     //     await wallet.connect({
     //         // url : "ws://foobar",
-    //         url : "wrpc://127.0.0.1:19301",
+    //         url : "wrpc://127.0.0.1:17110",
     //         retry : false,
     //         block : true,
     //     });

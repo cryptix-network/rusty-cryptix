@@ -14,6 +14,7 @@ duration-string.workspace = true
 futures-util.workspace = true
 futures.workspace = true
 itertools.workspace = true
+cryptix-addresses.workspace=true
 cryptix-consensus-core.workspace = true
 cryptix-consensus-notify.workspace = true
 cryptix-core.workspace = true

@@ -1,5 +1,3 @@
-Latest online documentation available at: https://cryptix.aspectron.org/docs/
-
 ### Latest Release
 
 - Replace `MassCalculator` with `calculateTransactionMass` and `calculateTransactionFee` functions.
@@ -119,7 +117,7 @@ as Rust or WASM objects, allowing user to call `hasAddress(<address>)` on the re
 - Simplify conversion between different key types (`XPrv->Keypair`, `XPrv->XPub->Pubkey`, etc)
 - Introduced `Beacon` class that provides connectivity to the community-operated public node infrastructure (backed by `cryptix-beacon` load balancer & node status monitor)
 - Created TypeScript type definitions across the entire SDK and refactored `RpcClient` class (as well as many other components) to use TypeScript interfaces
-- Changed documentation structure to use `typedoc` available as a part of redistributables or online at https://cryptix.aspectron.org/docs/
+- Changed documentation structure to use `typedoc` available as a part of redistributables
 - Project-wide documentation updates
 - Additional self-contained Web Browser examples
 - Modified the structure of WASM32 SDK release to include all variants of libraries (both release and dev builds), examples and documentation in a single package.

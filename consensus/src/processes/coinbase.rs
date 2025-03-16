@@ -72,7 +72,7 @@ impl CoinbaseManager {
         // Precomputed subsidy by month table for the actual block per second rate
         // Here values are rounded up so that we keep the same number of rewarding months as in the original 1 BPS table.
         // In a 10 BPS network, the induced increase in total rewards is 51 CYTX (see tests::calc_high_bps_total_rewards_delta())
-        let subsidy_by_month_table: SubsidyByMonthTable = core::array::from_fn(|i| (SUBSIDY_BY_MONTH_TABLE[i] + bps - 1) / bps);
+        let subsidy_by_month_table: SubsidyByMonthTable = core::array::from_fn(|i| SUBSIDY_BY_MONTH_TABLE[i].div_ceil(bps));
         Self {
             coinbase_payload_script_public_key_max_len,
             max_coinbase_payload_len,
@@ -248,7 +248,7 @@ impl CoinbaseManager {
 */
 #[rustfmt::skip]
 const SUBSIDY_BY_MONTH_TABLE: [u64; 426] = [
-    1000000000, 943874312, 890898718, 840896415, 793700525, 749153538, 707106781, 667419927, 629960524, 594603557, 561231024, 529731547, 500000000, 471937156, 445449359, 420448207, 396850262, 374576769, 353553390, 333709963, 314980262, 297301778, 280615512, 264865773, 250000000,
+    890898718, 840896415, 793700525, 749153538, 707106781, 667419927, 629960524, 594603557, 561231024, 529731547, 500000000, 471937156, 445449359, 420448207, 396850262, 374576769, 353553390, 333709963, 314980262, 297301778, 280615512, 264865773, 250000000,
 	235968578, 222724679, 210224103, 198425131, 187288384, 176776695, 166854981, 157490131, 148650889, 140307756, 132432886, 125000000, 117984289, 111362339, 105112051, 99212565, 93644192, 88388347, 83427490, 78745065, 74325444, 70153878, 66216443, 62500000, 58992144,        
 	55681169, 52556025, 49606282, 46822096, 44194173, 41713745, 39372532, 37162722, 35076939, 33108221, 31250000, 29496072, 27840584, 26278012, 24803141, 23411048, 22097086, 20856872, 19686266, 18581361, 17538469, 16554110, 15625000, 14748036, 13920292,
 	13139006, 12401570, 11705524, 11048543, 10428436, 9843133, 9290680, 8769234, 8277055, 7812500, 7374018, 6960146, 6569503, 6200785, 5852762, 5524271, 5214218, 4921566, 4645340, 4384617, 4138527, 3906250, 3687009, 3480073, 3284751,
@@ -264,11 +264,9 @@ const SUBSIDY_BY_MONTH_TABLE: [u64; 426] = [
 	7, 6, 6, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1,
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
     0,
 ];
-
-
 
 #[cfg(test)]
 mod tests {
@@ -290,10 +288,7 @@ mod tests {
         let total_rewards: u64 = pre_deflationary_rewards + SUBSIDY_BY_MONTH_TABLE.iter().map(|x| x * SECONDS_PER_MONTH).sum::<u64>();
         let testnet_11_bps = TESTNET11_PARAMS.bps();
         let total_high_bps_rewards_rounded_up: u64 = pre_deflationary_rewards
-            + SUBSIDY_BY_MONTH_TABLE
-                .iter()
-                .map(|x| ((x + testnet_11_bps - 1) / testnet_11_bps * testnet_11_bps) * SECONDS_PER_MONTH)
-                .sum::<u64>();
+            + SUBSIDY_BY_MONTH_TABLE.iter().map(|x| (x.div_ceil(testnet_11_bps) * testnet_11_bps) * SECONDS_PER_MONTH).sum::<u64>();
 
         let cbm = create_manager(&TESTNET11_PARAMS);
         let total_high_bps_rewards: u64 =
@@ -329,7 +324,7 @@ mod tests {
 
     #[test]
     fn subsidy_test() {
-        const PRE_DEFLATIONARY_PHASE_BASE_SUBSIDY: u64 = 60000000000;
+        const PRE_DEFLATIONARY_PHASE_BASE_SUBSIDY: u64 = 110000000000;
         const DEFLATIONARY_PHASE_INITIAL_SUBSIDY: u64 = 1000000000;
         const SECONDS_PER_MONTH: u64 = 2629800;
         const SECONDS_PER_HALVING: u64 = SECONDS_PER_MONTH * 12;
@@ -410,7 +405,7 @@ mod tests {
         let extra_data = [2u8, 3];
         let data = CoinbaseData {
             blue_score: 56,
-            subsidy: 1050000000,
+            subsidy: 44000000000,
             miner_data: MinerData {
                 script_public_key: ScriptPublicKey::new(0, ScriptVec::from_slice(&script_data)),
                 extra_data: &extra_data as &[u8],

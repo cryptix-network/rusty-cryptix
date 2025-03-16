@@ -1,5 +1,5 @@
 use crate::xoshiro::XoShiRo256PlusPlus;
-use cryptix_hashes::{Hash, CryptixHash};
+use cryptix_hashes::{Hash, CryptixHashV2};
 use std::mem::MaybeUninit;
 
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq)]
@@ -98,18 +98,85 @@ impl Matrix {
         rank
     }
 
-    const final_x: [u8; 32] = [
-        0x3F, 0xC2, 0xF2, 0xE2,
-        0xD1, 0x55, 0x81, 0x92,
-        0xA0, 0x6B, 0xF5, 0x3F,
-        0x5A, 0x70, 0x32, 0xB4,
-        0xE4, 0x84, 0xE4, 0xCB,
-        0x81, 0x73, 0xE7, 0xE0,
-        0xD2, 0x7F, 0x8C, 0x55,
-        0xAD, 0x8C, 0x60, 0x8F,
-        ];
 
-    pub fn heavy_hash(&self, hash: Hash) -> Hash {
+    // TODO:
+    // Better filling of the cache - Scattering is not sufficient
+    // Better filling of the Memory hard function - Scattering is not sufficient
+    // Performance optimization of illiterations.
+    // Correct values ​​for the cache & memory
+
+    // IDEA:
+    // Consider bottlenecking the LUTS with 64-bit values, which would overload at least 1,000,000 LUTs. But this needs to be considered first. The current LUT usage must also be calculated with Vivado Studio.
+
+
+    // Const Final Cryptix
+    const FINAL_CRYPTIX: [u8; 32] = [
+        0xE4, 0x7F, 0x3F, 0x73, 
+        0xB4, 0xF2, 0xD2, 0x8C, 
+        0x55, 0xD1, 0xE7, 0x6B, 
+        0xE0, 0xAD, 0x70, 0x55, 
+        0xCB, 0x3F, 0x8C, 0x8F, 
+        0xF5, 0xA0, 0xE2, 0x60, 
+        0x81, 0xC2, 0x5A, 0x84, 
+        0x32, 0x81, 0xE4, 0x92,
+    ];    
+
+
+    // Anti-ASIC cache
+    pub fn anti_asic_cache(product: &mut [u8; 32]) {
+        const CACHE_SIZE: usize = 4096;  // 4 KB
+        let mut cache = [0u8; CACHE_SIZE];
+
+        let mut index: usize = 0;
+
+        // Cache initialization
+        let mut hash_value = 0u8;
+        for i in 0..CACHE_SIZE { 
+            // Combine product values with cache indices
+            hash_value = (product[i % 32] ^ i as u8).wrapping_add(hash_value);
+            cache[i] = hash_value;  // starting pattern
+        }
+        
+        for _ in 0..8 { 
+            for i in 0..32 {
+                // XOR for destructive cache effect
+                index = (index.rotate_left(5) ^ (product[i] as usize).wrapping_mul(17)) % CACHE_SIZE;
+                cache[index] ^= product[i]; 
+                
+                // Unpredictable index mapping
+                let safe_index = ((index * 7) % CACHE_SIZE).min(CACHE_SIZE - 1);
+                index = (index.wrapping_add(product[i] as usize * 23) ^ cache[safe_index] as usize) % CACHE_SIZE;
+                cache[index] ^= product[(i + 11) % 32];
+
+                // Data-Dependent Memory Access
+                let dynamic_offset = ((cache[index] as usize * 37) ^ (product[i] as usize * 19)) % CACHE_SIZE;
+                cache[dynamic_offset] ^= product[(i + 3) % 32];
+            }
+        }
+
+        // Link cache values ​​back to product
+        for i in 0..32{
+            let shift_val = (product[i] as usize * 47 + i) % CACHE_SIZE;
+            product[i] ^= cache[shift_val];
+        }
+
+    }
+
+    // Non linear sbox
+    pub fn generate_non_linear_sbox(input: u8, key: u8) -> u8 {
+        let mut result = input;
+    
+        // A combination of multiplication and bitwise permutation
+        result = result.wrapping_mul(key);          // Multiply by the key
+        result = (result >> 3) | (result << 5);    // Bitwise permutation (rotation)
+        result ^= 0x5A;                             // XOR
+    
+        result
+    }
+
+    pub fn cryptix_hash(&self, hash: Hash) -> Hash {
+        let hash_bytes = hash.as_bytes(); 
+
         let nibbles: [u8; 64] = {
             let o_bytes = hash.as_bytes();
             let mut arr = [0u8; 64];
@@ -119,9 +186,9 @@ impl Matrix {
             }
             arr
         };
-
+    
         let mut product = [0u8; 32];
-
+    
         for i in 0..32 {
             let mut sum1 = 0u16;
             let mut sum2 = 0u16;
@@ -130,22 +197,71 @@ impl Matrix {
                 sum1 += self.0[2 * i][j] * elem;
                 sum2 += self.0[2 * i + 1][j] * elem;
             }
-
+    
             let a_nibble = (sum1 & 0xF) ^ ((sum2 >> 4) & 0xF) ^ ((sum1 >> 8) & 0xF);
             let b_nibble = (sum2 & 0xF) ^ ((sum1 >> 4) & 0xF) ^ ((sum2 >> 8) & 0xF);
-
+    
             product[i] = ((a_nibble << 4) | b_nibble) as u8;
         }
-
+    
         product.iter_mut().zip(hash.as_bytes()).for_each(|(p, h)| *p ^= h);
+    
+        // **Memory-Hard**
+        let mut memory_table: [u8; 16 * 1024] = [0; 16 * 1024]; // 16 KB
+        let mut index: usize = 0;
 
+        // Repeat calculations and manipulations on memory
         for i in 0..32 {
-            product[i] ^= Self::final_x[i];
+            let mut sum = 0u16;
+            for j in 0..64 {
+                sum += nibbles[j] as u16 * self.0[2 * i][j] as u16;
+            }
+
+            // ** non-linear memory accesses:**
+            for _ in 0..12 { 
+                index ^= (memory_table[(index * 7 + i) % memory_table.len()] as usize * 19) ^ ((i * 53) % 13);
+                index = (index * 73 + i * 41) % memory_table.len(); 
+            
+                // Index paths
+                let shifted = (index.wrapping_add(i * 13)) % memory_table.len();
+                memory_table[shifted] ^= (sum & 0xFF) as u8;
+            }
         }
 
-        CryptixHash::hash(Hash::from_bytes(product))
+        // Final memory-hash result
+        for i in 0..32 {
+            let shift_val = (product[i] as usize * 47 + i) % memory_table.len();
+            product[i] ^= memory_table[shift_val];
+        }
+
+        // final xor
+        for i in 0..32 {
+            product[i] ^= Self::FINAL_CRYPTIX[i];
+        }
+
+        // **Anti-ASIC Cache **
+        Self::anti_asic_cache(&mut product);               
+
+        // **Apply nonlinear S-Box**
+        let mut sbox: [u8; 256] = [0; 256];
+
+        // Calculate S-Box with the product value and hash values
+        for _ in 0..6 {  
+            for i in 0..256 { 
+                let mut value = i as u8;
+                value = Self::generate_non_linear_sbox(value, hash_bytes[i % hash_bytes.len()]);
+                value ^= value.rotate_left(4) | value.rotate_right(2);
+                sbox[i] = value;
+            }
+        }
+        
+        // Apply S-Box to the product
+        for i in 0..32 {
+            product[i] = sbox[product[i] as usize];
+        }     
+        
+        CryptixHashV2::hash(Hash::from_bytes(product))
     }
-    
 }
 
 pub fn array_from_fn<F, T, const N: usize>(mut cb: F) -> [T; N]
@@ -184,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn test_heavy_hash() {
+    fn test_cryptix_hash() {
         let expected_hash = Hash::from_bytes([
             135, 104, 159, 55, 153, 67, 234, 249, 183, 71, 92, 169, 83, 37, 104, 119, 114, 191, 204, 104, 252, 120, 153, 202, 235, 68,
             9, 236, 69, 144, 195, 37,
@@ -260,7 +376,7 @@ mod tests {
             82, 46, 212, 218, 28, 192, 143, 92, 213, 66, 86, 63, 245, 241, 155, 189, 73, 159, 229, 180, 202, 105, 159, 166, 109, 172,
             128, 136, 169, 195, 97, 41,
         ]);
-        assert_eq!(test_matrix.heavy_hash(hash), expected_hash);
+        assert_eq!(test_matrix.cryptix_hash(hash), expected_hash);
     }
     #[test]
     fn test_generate_matrix() {

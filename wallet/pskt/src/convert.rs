@@ -1,3 +1,9 @@
+//!
+//! Conversion functions for converting between
+//! the [`cryptix_consensus_client`], [`cryptix_consensus_core`]
+//! and [`cryptix_wallet_pskt`](crate) types.
+//!
+
 use crate::error::Error;
 use crate::input::{Input, InputBuilder};
 use crate::output::{Output, OutputBuilder};

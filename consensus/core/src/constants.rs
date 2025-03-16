@@ -34,3 +34,4 @@ pub const SEQUENCE_LOCK_TIME_DISABLED: u64 = 1 << 63;
 /// UNACCEPTED_DAA_SCORE is used to for UtxoEntries that were created by
 /// transactions in the mempool, or otherwise not-yet-accepted transactions.
 pub const UNACCEPTED_DAA_SCORE: u64 = u64::MAX;
+

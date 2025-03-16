@@ -33,7 +33,7 @@ impl<const BPS: u64> Bps<BPS> {
     }
 
     /// Returns the GHOSTDAG K value which was pre-computed for this BPS
-    /// (see [`calculate_ghostdag_k`] and [`gen_ghostdag_table`] for the full calculation)
+    /// (see [`calculate_ghostdag_k`] and `gen_ghostdag_table` for the full calculation)
     #[rustfmt::skip]
     pub const fn ghostdag_k() -> KType {
         match BPS {
@@ -136,12 +136,15 @@ impl<const BPS: u64> Bps<BPS> {
     ///
     /// This number is calculated as follows:
     ///
+    /// - We define a year as 365.25 days
+    /// - Half a year in seconds = 365.25 / 2 * 24 * 60 * 60 = 15778800
+    /// - One days in seconds = 1 * 24 * 60 * 60 = 86400
     pub const fn deflationary_phase_daa_score() -> u64 {
         BPS * 86400
     }
 
     pub const fn pre_deflationary_phase_base_subsidy() -> u64 {
-        60000000000 / BPS
+        117900000000 / BPS
     }
 }
 

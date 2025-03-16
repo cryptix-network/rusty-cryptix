@@ -21,7 +21,7 @@ pub(crate) async fn create(
         Some(locked_guard) => locked_guard,
         None => local_guard.lock().await,
     };
-    // TODO @aspect
+    // TODO
     let word_count = WordCount::Words12;
 
     if let Err(err) = wallet.network_id() {

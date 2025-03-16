@@ -1,3 +1,4 @@
+// use sha3::CShake256;
 use once_cell::sync::Lazy;
 
 pub trait HasherBase {
@@ -17,8 +18,8 @@ pub trait Hasher: HasherBase + Clone + Default {
 
 // Implemented manually in pow_hashers:
 //  struct PowHash => `cSHAKE256("ProofOfWorkHash")
-//  struct CryptixHash => `cSHAKE256("HeavyHash")
-pub use crate::pow_hashers::{CryptixHash, PowHash};
+//  struct CryptixHashV2 => `cSHAKE256("HeavyHash")
+pub use crate::pow_hashers::{CryptixHashV2, PowHash};
 blake2b_hasher! {
     struct TransactionHash => b"TransactionHash",
     struct TransactionID => b"TransactionID",

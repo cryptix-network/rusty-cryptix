@@ -82,18 +82,18 @@ fn bench_pow_hash(c: &mut Criterion) {
     });
 }
 
-fn bench_heavy_hash(c: &mut Criterion) {
+fn bench_cryptix_hash(c: &mut Criterion) {
     let mut rng = thread_rng();
     let in_hash = Hash::from_bytes(rng.gen());
 
-    c.bench_function("CryptixHash", |b| {
+    c.bench_function("CryptixHashV2", |b| {
         b.iter(|| {
-            black_box(CryptixHash::hash(in_hash));
+            black_box(CryptixHashV2::hash(in_hash));
         })
     });
 
-    let hasher = CShake256::from_core(CShake256Core::new(b"CryptixHash"));
-    c.bench_function("generic CryptixHash without init", |b| {
+    let hasher = CShake256::from_core(CShake256Core::new(b"CryptixHashV2"));
+    c.bench_function("generic CryptixHashV2 without init", |b| {
         b.iter(|| {
             let hasher = hasher.clone().chain(in_hash.as_bytes());
             let mut hash = [0u8; 32];
@@ -102,9 +102,9 @@ fn bench_heavy_hash(c: &mut Criterion) {
         })
     });
 
-    c.bench_function("generic CryptixHash with init", |b| {
+    c.bench_function("generic CryptixHashV2 with init", |b| {
         b.iter(|| {
-            let hasher = CShake256::from_core(CShake256Core::new(b"CryptixHash")).chain(black_box(in_hash.as_bytes()));
+            let hasher = CShake256::from_core(CShake256Core::new(b"CryptixHashV2")).chain(black_box(in_hash.as_bytes()));
             let mut hash = [0u8; 32];
             hasher.finalize_xof().read(&mut hash);
             black_box(hash);
@@ -112,5 +112,5 @@ fn bench_heavy_hash(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_pow_hash, bench_heavy_hash, bench_hashers);
+criterion_group!(benches, bench_pow_hash, bench_cryptix_hash, bench_hashers);
 criterion_main!(benches);

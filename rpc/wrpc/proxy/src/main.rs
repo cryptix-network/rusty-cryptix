@@ -30,12 +30,12 @@ struct Args {
     #[clap(long)]
     devnet: bool,
 
-    /// proxy:port for gRPC server (grpc://127.0.0.1:19201)
+    /// proxy:port for gRPC server (grpc://127.0.0.1:16110)
     #[clap(name = "grpc")]
     grpc_proxy_address: Option<String>,
 
     // /// wRPC port
-    /// interface:port for wRPC server (wrpc://127.0.0.1:19301)
+    /// interface:port for wRPC server (wrpc://127.0.0.1:17110)
     #[clap(long)]
     interface: Option<String>,
     /// Number of notification serializer threads

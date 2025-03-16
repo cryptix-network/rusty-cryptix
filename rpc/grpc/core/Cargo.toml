@@ -10,6 +10,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+cryptix-addresses.workspace = true
 cryptix-consensus-core.workspace = true
 cryptix-core.workspace = true
 cryptix-notify.workspace = true

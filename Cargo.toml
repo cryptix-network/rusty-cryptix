@@ -62,8 +62,8 @@ members = [
 ]
 
 [workspace.package]
-rust-version = "1.81.0"
-version = "0.15.5"
+rust-version = "1.82.0"
+version = "0.16.1"
 authors = ["Cryptix developers"]
 license = "ISC"
 repository = "https://github.com/cryptix-network/rusty-cryptix"
@@ -80,61 +80,61 @@ include = [
 ]
 
 [workspace.dependencies]
-# cryptix-testing-integration = { version = "0.15.5", path = "testing/integration" }
-cryptix-addresses = { version = "0.15.5", path = "crypto/addresses" }
-cryptix-addressmanager = { version = "0.15.5", path = "components/addressmanager" }
-cryptix-bip32 = { version = "0.15.5", path = "wallet/bip32" }
-cryptix-cli = { version = "0.15.5", path = "cli" }
-cryptix-connectionmanager = { version = "0.15.5", path = "components/connectionmanager" }
-cryptix-consensus = { version = "0.15.5", path = "consensus" }
-cryptix-consensus-core = { version = "0.15.5", path = "consensus/core" }
-cryptix-consensus-client = { version = "0.15.5", path = "consensus/client" }
-cryptix-consensus-notify = { version = "0.15.5", path = "consensus/notify" }
-cryptix-consensus-wasm = { version = "0.15.5", path = "consensus/wasm" }
-cryptix-consensusmanager = { version = "0.15.5", path = "components/consensusmanager" }
-cryptix-core = { version = "0.15.5", path = "core" }
-cryptix-daemon = { version = "0.15.5", path = "daemon" }
-cryptix-database = { version = "0.15.5", path = "database" }
-cryptix-grpc-client = { version = "0.15.5", path = "rpc/grpc/client" }
-cryptix-grpc-core = { version = "0.15.5", path = "rpc/grpc/core" }
-cryptix-grpc-server = { version = "0.15.5", path = "rpc/grpc/server" }
-cryptix-hashes = { version = "0.15.5", path = "crypto/hashes" }
-cryptix-index-core = { version = "0.15.5", path = "indexes/core" }
-cryptix-index-processor = { version = "0.15.5", path = "indexes/processor" }
-cryptix-math = { version = "0.15.5", path = "math" }
-cryptix-merkle = { version = "0.15.5", path = "crypto/merkle" }
-cryptix-metrics-core = { version = "0.15.5", path = "metrics/core" }
-cryptix-mining = { version = "0.15.5", path = "mining" }
-cryptix-mining-errors = { version = "0.15.5", path = "mining/errors" }
-cryptix-muhash = { version = "0.15.5", path = "crypto/muhash" }
-cryptix-notify = { version = "0.15.5", path = "notify" }
-cryptix-p2p-flows = { version = "0.15.5", path = "protocol/flows" }
-cryptix-p2p-lib = { version = "0.15.5", path = "protocol/p2p" }
-cryptix-perf-monitor = { version = "0.15.5", path = "metrics/perf_monitor" }
-cryptix-pow = { version = "0.15.5", path = "consensus/pow" }
-cryptix-rpc-core = { version = "0.15.5", path = "rpc/core" }
-cryptix-rpc-macros = { version = "0.15.5", path = "rpc/macros" }
-cryptix-rpc-service = { version = "0.15.5", path = "rpc/service" }
-cryptix-txscript = { version = "0.15.5", path = "crypto/txscript" }
-cryptix-txscript-errors = { version = "0.15.5", path = "crypto/txscript/errors" }
-cryptix-utils = { version = "0.15.5", path = "utils" }
-cryptix-utils-tower = { version = "0.15.5", path = "utils/tower" }
-cryptix-utxoindex = { version = "0.15.5", path = "indexes/utxoindex" }
-cryptix-wallet = { version = "0.15.5", path = "wallet/native" }
-cryptix-wallet-cli-wasm = { version = "0.15.5", path = "wallet/wasm" }
-cryptix-wallet-keys = { version = "0.15.5", path = "wallet/keys" }
-cryptix-wallet-pskt = { version = "0.15.5", path = "wallet/pskt" }
-cryptix-wallet-core = { version = "0.15.5", path = "wallet/core" }
-cryptix-wallet-macros = { version = "0.15.5", path = "wallet/macros" }
-cryptix-wasm = { version = "0.15.5", path = "wasm" }
-cryptix-wasm-core = { version = "0.15.5", path = "wasm/core" }
-cryptix-wrpc-client = { version = "0.15.5", path = "rpc/wrpc/client" }
-cryptix-wrpc-proxy = { version = "0.15.5", path = "rpc/wrpc/proxy" }
-cryptix-wrpc-server = { version = "0.15.5", path = "rpc/wrpc/server" }
-cryptix-wrpc-wasm = { version = "0.15.5", path = "rpc/wrpc/wasm" }
-cryptix-wrpc-example-subscriber = { version = "0.15.5", path = "rpc/wrpc/examples/subscriber" }
-cryptixd = { version = "0.15.5", path = "cryptixd" }
-cryptix-alloc = { version = "0.15.5", path = "utils/alloc" }
+# cryptix-testing-integration = { version = "0.16.1", path = "testing/integration" }
+cryptix-addresses = { version = "0.16.1", path = "crypto/addresses" }
+cryptix-addressmanager = { version = "0.16.1", path = "components/addressmanager" }
+cryptix-bip32 = { version = "0.16.1", path = "wallet/bip32" }
+cryptix-cli = { version = "0.16.1", path = "cli" }
+cryptix-connectionmanager = { version = "0.16.1", path = "components/connectionmanager" }
+cryptix-consensus = { version = "0.16.1", path = "consensus" }
+cryptix-consensus-core = { version = "0.16.1", path = "consensus/core" }
+cryptix-consensus-client = { version = "0.16.1", path = "consensus/client" }
+cryptix-consensus-notify = { version = "0.16.1", path = "consensus/notify" }
+cryptix-consensus-wasm = { version = "0.16.1", path = "consensus/wasm" }
+cryptix-consensusmanager = { version = "0.16.1", path = "components/consensusmanager" }
+cryptix-core = { version = "0.16.1", path = "core" }
+cryptix-daemon = { version = "0.16.1", path = "daemon" }
+cryptix-database = { version = "0.16.1", path = "database" }
+cryptix-grpc-client = { version = "0.16.1", path = "rpc/grpc/client" }
+cryptix-grpc-core = { version = "0.16.1", path = "rpc/grpc/core" }
+cryptix-grpc-server = { version = "0.16.1", path = "rpc/grpc/server" }
+cryptix-hashes = { version = "0.16.1", path = "crypto/hashes" }
+cryptix-index-core = { version = "0.16.1", path = "indexes/core" }
+cryptix-index-processor = { version = "0.16.1", path = "indexes/processor" }
+cryptix-math = { version = "0.16.1", path = "math" }
+cryptix-merkle = { version = "0.16.1", path = "crypto/merkle" }
+cryptix-metrics-core = { version = "0.16.1", path = "metrics/core" }
+cryptix-mining = { version = "0.16.1", path = "mining" }
+cryptix-mining-errors = { version = "0.16.1", path = "mining/errors" }
+cryptix-muhash = { version = "0.16.1", path = "crypto/muhash" }
+cryptix-notify = { version = "0.16.1", path = "notify" }
+cryptix-p2p-flows = { version = "0.16.1", path = "protocol/flows" }
+cryptix-p2p-lib = { version = "0.16.1", path = "protocol/p2p" }
+cryptix-perf-monitor = { version = "0.16.1", path = "metrics/perf_monitor" }
+cryptix-pow = { version = "0.16.1", path = "consensus/pow" }
+cryptix-rpc-core = { version = "0.16.1", path = "rpc/core" }
+cryptix-rpc-macros = { version = "0.16.1", path = "rpc/macros" }
+cryptix-rpc-service = { version = "0.16.1", path = "rpc/service" }
+cryptix-txscript = { version = "0.16.1", path = "crypto/txscript" }
+cryptix-txscript-errors = { version = "0.16.1", path = "crypto/txscript/errors" }
+cryptix-utils = { version = "0.16.1", path = "utils" }
+cryptix-utils-tower = { version = "0.16.1", path = "utils/tower" }
+cryptix-utxoindex = { version = "0.16.1", path = "indexes/utxoindex" }
+cryptix-wallet = { version = "0.16.1", path = "wallet/native" }
+cryptix-wallet-cli-wasm = { version = "0.16.1", path = "wallet/wasm" }
+cryptix-wallet-keys = { version = "0.16.1", path = "wallet/keys" }
+cryptix-wallet-pskt = { version = "0.16.1", path = "wallet/pskt" }
+cryptix-wallet-core = { version = "0.16.1", path = "wallet/core" }
+cryptix-wallet-macros = { version = "0.16.1", path = "wallet/macros" }
+cryptix-wasm = { version = "0.16.1", path = "wasm" }
+cryptix-wasm-core = { version = "0.16.1", path = "wasm/core" }
+cryptix-wrpc-client = { version = "0.16.1", path = "rpc/wrpc/client" }
+cryptix-wrpc-proxy = { version = "0.16.1", path = "rpc/wrpc/proxy" }
+cryptix-wrpc-server = { version = "0.16.1", path = "rpc/wrpc/server" }
+cryptix-wrpc-wasm = { version = "0.16.1", path = "rpc/wrpc/wasm" }
+cryptix-wrpc-example-subscriber = { version = "0.16.1", path = "rpc/wrpc/examples/subscriber" }
+cryptixd = { version = "0.16.1", path = "cryptixd" }
+cryptix-alloc = { version = "0.16.1", path = "utils/alloc" }
 
 # external
 aes = "0.8.3"
@@ -150,6 +150,7 @@ bincode = { version = "1.3.3", default-features = false }
 blake2b_simd = "1.0.2"
 borsh = { version = "1.5.1", features = ["derive", "rc"] }
 bs58 = { version = "0.5.0", features = ["check"], default-features = false }
+bytes = "1.7.1"
 cc = "1.0.83"
 cfb-mode = "0.8.2"
 cfg-if = "1.0.0"
@@ -188,6 +189,8 @@ hex-literal = "0.4.1"
 hexplay = "0.3.0"
 hmac = { version = "0.12.1", default-features = false }
 home = "0.5.5"
+http-body = "1.0.1"
+http-body-util = "0.1.2"
 igd-next = { version = "0.14.2", features = ["aio_tokio"] }
 indexmap = "2.1.0"
 intertrait = "0.2.2"
@@ -211,8 +214,7 @@ parking_lot = "0.12.1"
 paste = "1.0.14"
 pbkdf2 = "0.12.2"
 portable-atomic = { version = "1.5.1", features = ["float"] }
-prost = "0.12.1"
-# prost = "0.13.1"
+prost = "0.13.2"
 rand = "0.8.5"
 rand_chacha = "0.3.1"
 rand_core = { version = "0.6.4", features = ["std"] }
@@ -222,6 +224,7 @@ regex = "1.10.2"
 ripemd = { version = "0.1.3", default-features = false }
 rlimit = "0.10.1"
 rocksdb = "0.22.0"
+rv = "0.16.4"
 secp256k1 = { version = "0.29.0", features = [
     "global-context",
     "rand-std",
@@ -238,11 +241,10 @@ serde-wasm-bindgen = "0.6.1"
 sha1 = "0.10.6"
 sha2 = "0.10.8"
 sha3 = "0.10.8"
+blake3 = "1.3"
 slugify-rs = "0.0.3"
 smallvec = { version = "1.11.1", features = ["serde"] }
 sorted-insert = "0.2.3"
-statest = "0.2.2"
-statrs = "0.13.0" # TODO "0.16.0"
 subtle = { version = "2.5.0", default-features = false }
 sysinfo = "0.31.2"
 tempfile = "3.8.1"
@@ -251,23 +253,22 @@ thiserror = "1.0.50"
 tokio = { version = "1.33.0", features = ["sync", "rt-multi-thread"] }
 tokio-stream = "0.1.14"
 toml = "0.8.8"
-tonic = { version = "0.10.2", features = ["tls-webpki-roots", "gzip", "transport"] }
-tonic-build = { version = "0.10.2", features = ["prost"] }
+tonic = { version = "0.12.3", features = ["tls-webpki-roots", "gzip", "transport"] }
+tonic-build = { version = "0.12.3", features = ["prost"] }
 triggered = "0.1.2"
 uuid = { version = "1.5.0", features = ["v4", "fast-rng", "serde"] }
-wasm-bindgen = { version = "0.2.93", features = ["serde-serialize"] }
+wasm-bindgen = { version = "0.2.100", features = ["serde-serialize"] }
 wasm-bindgen-futures = "0.4.43"
-wasm-bindgen-test = "0.3.43"
+wasm-bindgen-test = "0.3.50"
 web-sys = "0.3.70"
 xxhash-rust = { version = "0.8.7", features = ["xxh3"] }
 zeroize = { version = "1.6.0", default-features = false, features = ["alloc"] }
 pin-project-lite = "0.2.13"
-tower-http = { version = "0.4.4", features = [
+tower-http = { version = "0.5.2", features = [
     "map-response-body",
     "map-request-body",
 ] }
-tower = "0.4.7"
-hyper = "0.14.27"
+tower = "0.5.1"
 chrono = "0.4.31"
 indexed_db_futures = "0.5.0"
 # workflow dependencies that are not a part of core libraries

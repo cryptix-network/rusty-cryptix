@@ -1,4 +1,8 @@
-use cryptix_consensus_core::{subnets::SubnetworkConversionError, tx::TransactionId};
+//!
+//! [`RpcError`] enum used by RPC primitives.
+//!
+
+use cryptix_consensus_core::{subnets::SubnetworkConversionError, tx::TransactionId, utxo::utxo_inquirer::UtxoInquirerError};
 use cryptix_utils::networking::IpAddress;
 use std::{net::AddrParseError, num::TryFromIntError};
 use thiserror::Error;
@@ -130,6 +134,9 @@ pub enum RpcError {
 
     #[error(transparent)]
     ConsensusClient(#[from] cryptix_consensus_client::error::Error),
+
+    #[error("utxo return address could not be found -> {0}")]
+    UtxoReturnAddressNotFound(UtxoInquirerError),
 }
 
 impl From<String> for RpcError {

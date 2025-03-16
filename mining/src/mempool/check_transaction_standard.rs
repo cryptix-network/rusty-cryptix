@@ -2,12 +2,13 @@ use crate::mempool::{
     errors::{NonStandardError, NonStandardResult},
     Mempool,
 };
+use cryptix_consensus_core::hashing::sighash::SigHashReusedValuesUnsync;
 use cryptix_consensus_core::{
     constants::{MAX_SCRIPT_PUBLIC_KEY_VERSION, MAX_SOMPI},
     mass,
     tx::{MutableTransaction, PopulatedTransaction, TransactionOutput},
 };
-use cryptix_txscript::{get_sig_op_count, is_unspendable, script_class::ScriptClass};
+use cryptix_txscript::{get_sig_op_count_upper_bound, is_unspendable, script_class::ScriptClass};
 
 /// MAX_STANDARD_P2SH_SIG_OPS is the maximum number of signature operations
 /// that are considered standard in a pay-to-script-hash script.
@@ -114,7 +115,7 @@ impl Mempool {
     /// It is exposed by [MiningManager] for use by transaction generators and wallets.
     pub(crate) fn is_transaction_output_dust(&self, transaction_output: &TransactionOutput) -> bool {
         // Unspendable outputs are considered dust.
-        if is_unspendable::<PopulatedTransaction>(transaction_output.script_public_key.script()) {
+        if is_unspendable::<PopulatedTransaction, SigHashReusedValuesUnsync>(transaction_output.script_public_key.script()) {
             return true;
         }
 
@@ -175,7 +176,6 @@ impl Mempool {
         if contextual_mass > MAXIMUM_STANDARD_TRANSACTION_MASS {
             return Err(NonStandardError::RejectContextualMass(transaction_id, contextual_mass, MAXIMUM_STANDARD_TRANSACTION_MASS));
         }
-
         for (i, input) in transaction.tx.inputs.iter().enumerate() {
             // It is safe to elide existence and index checks here since
             // they have already been checked prior to calling this
@@ -188,9 +188,12 @@ impl Mempool {
                 ScriptClass::PubKey => {}
                 ScriptClass::PubKeyECDSA => {}
                 ScriptClass::ScriptHash => {
-                    get_sig_op_count::<PopulatedTransaction>(&input.signature_script, &entry.script_public_key);
-                    let num_sig_ops = 1;
-                    if num_sig_ops > MAX_STANDARD_P2SH_SIG_OPS {
+                    // todo relax due to on fly calculation
+                    let num_sig_ops = get_sig_op_count_upper_bound::<PopulatedTransaction, SigHashReusedValuesUnsync>(
+                        &input.signature_script,
+                        &entry.script_public_key,
+                    );
+                    if num_sig_ops > MAX_STANDARD_P2SH_SIG_OPS as u64 {
                         return Err(NonStandardError::RejectSignatureCount(transaction_id, i, num_sig_ops, MAX_STANDARD_P2SH_SIG_OPS));
                     }
                 }
