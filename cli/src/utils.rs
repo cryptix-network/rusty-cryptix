@@ -30,7 +30,7 @@ pub fn try_parse_required_cryptix_as_sompi_u64<S: ToString + Display>(cryptix_am
         let sompi_amount = cryptix_amount
             .to_string()
             .parse::<f64>()
-            .map_err(|_| Error::custom(format!("Supplied Kasapa amount is not valid: '{cryptix_amount}'")))?
+            .map_err(|_| Error::custom(format!("Supplied cryptix amount is not valid: '{cryptix_amount}'")))?
             * SOMPI_PER_CRYPTIX as f64;
         if sompi_amount < 0.0 {
             Err(Error::custom("Supplied Cryptix amount is not valid: '{cryptix_amount}'"))
@@ -47,7 +47,7 @@ pub fn try_parse_optional_cryptix_as_sompi_i64<S: ToString + Display>(cryptix_am
         let sompi_amount = cryptix_amount
             .to_string()
             .parse::<f64>()
-            .map_err(|_e| Error::custom(format!("Supplied Kasapa amount is not valid: '{cryptix_amount}'")))?
+            .map_err(|_e| Error::custom(format!("Supplied cryptix amount is not valid: '{cryptix_amount}'")))?
             * SOMPI_PER_CRYPTIX as f64;
         if sompi_amount < 0.0 {
             Err(Error::custom("Supplied Cryptix amount is not valid: '{cryptix_amount}'"))
