@@ -167,7 +167,7 @@ fn affine_transform(value: u8) -> u8 {
         // Convert the hash to its byte representation
         let hash_bytes = hash.as_bytes();
 
-        //Nibbles
+        // Create an array containing the nibbles (4-bit halves of the bytes)
         let nibbles: [u8; 64] = {
             let o_bytes = hash.as_bytes();
             let mut arr = [0u8; 64];
@@ -188,13 +188,15 @@ fn affine_transform(value: u8) -> u8 {
                 sum1 += self.0[2 * i][j] * elem;
                 sum2 += self.0[2 * i + 1][j] * elem;
             }
-    
+            
+             // Combine the nibbles back into bytes
             let a_nibble = (sum1 & 0xF) ^ ((sum2 >> 4) & 0xF) ^ ((sum1 >> 8) & 0xF);
             let b_nibble = (sum2 & 0xF) ^ ((sum1 >> 4) & 0xF) ^ ((sum2 >> 8) & 0xF);
     
             product[i] = ((a_nibble << 4) | b_nibble) as u8;
         }
-    
+
+         // XOR the product with the original hash   
         product.iter_mut().zip(hash.as_bytes()).for_each(|(p, h)| *p ^= h);
 
         // **Apply nonlinear S-Box**
@@ -203,29 +205,30 @@ fn affine_transform(value: u8) -> u8 {
         // Calculate S-Box with the product value and hash values
         for _ in 0..6 {  
             for i in 0..256 { 
-                let mut value = i as u8;
-                value = Self::generate_non_linear_sbox(value, hash_bytes[i % hash_bytes.len()]);
+                let mut value = sbox[i];  
+                value = Self::generate_non_linear_sbox(value, hash_bytes[i % hash_bytes.len()] ^ product[i % product.len()]);
                 value ^= value.rotate_left(4) | value.rotate_right(2);
-                sbox[i] = value;
+                sbox[i] ^= value;  
+                sbox.swap(i, (value as usize) % 256);  
             }
         }
 
-        // Apply S-Box to the product
+        // Apply S-Box to the product with XOR
         for i in 0..32 {
-            product[i] = sbox[product[i] as usize];
+            product[i] ^= sbox[product[i] as usize]; 
         }
 
-        // **Branches for Byte Manipulation on `product` (not `hash_bytes`)**
+        // **Branches for Byte Manipulation
         for i in 0..32 {
             // Nonce from s-box product
             let cryptix_nonce = product[0] as u64; 
 
-            // Use the result of the S-Box (product[i]) in the condition
-            let condition = (product[i] ^ (hash_bytes[i % hash_bytes.len()] ^ cryptix_nonce as u8)) % 6; // Use nonce properly
+            // Use the result of the S-Box (product[i])
+            let condition = (product[i] ^ (hash_bytes[i % hash_bytes.len()] ^ cryptix_nonce as u8)) % 6; // Use nonce
 
             match condition {
                 0 => {
-                    // Manipulate the `product` result in this branch (not `hash_bytes`)
+                    // Manipulate the `product` result in this branch
                     product[i] = product[i].wrapping_add(13);  // Add 13
                     product[i] = product[i].rotate_left(3);    // Rotate left by 3 bits
                 },
