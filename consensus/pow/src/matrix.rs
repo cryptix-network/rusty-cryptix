@@ -98,18 +98,6 @@ impl Matrix {
         rank
     }
 
-    // Const Final Cryptix
-    const FINAL_CRYPTIX: [u8; 32] = [
-        0xE4, 0x7F, 0x3F, 0x73, 
-        0xB4, 0xF2, 0xD2, 0x8C, 
-        0x55, 0xD1, 0xE7, 0x6B, 
-        0xE0, 0xAD, 0x70, 0x55, 
-        0xCB, 0x3F, 0x8C, 0x8F, 
-        0xF5, 0xA0, 0xE2, 0x60, 
-        0x81, 0xC2, 0x5A, 0x84, 
-        0x32, 0x81, 0xE4, 0x92,
-    ];    
-
     // Non linear sbox
     pub fn generate_non_linear_sbox(input: u8, key: u8) -> u8 {
         let mut result = input;
@@ -153,39 +141,44 @@ impl Matrix {
         }
     
         product.iter_mut().zip(hash.as_bytes()).for_each(|(p, h)| *p ^= h);
-    
-        // **Memory-Hard**
-        let mut memory_table: [u8; 16 * 1024] = [0; 16 * 1024]; // 16 KB
-        let mut index: usize = 0;
 
-        // Repeat calculations and manipulations on memory
+        /*
+        // Memory Hard Function
+        let mut memory_table: [u8; 16 * 1024] = [0; 16 * 1024]; // 16 KB
+        let nonce = hash.as_bytes(); 
+        
+        // **Fill the memory with the nonce**
+        for i in 0..memory_table.len() {
+            memory_table[i] = nonce[i % nonce.len()];  
+        }
+        
+        let mut index: usize = 0;
+        
+        // Repeat the calculations and manipulations in memory
         for i in 0..32 {
             let mut sum = 0u16;
-            for j in 0..64 {
-                sum += nibbles[j] as u16 * self.0[2 * i][j] as u16;
+        
+             // Memory on product
+            for j in 0..32 {
+                sum += product[j] as u16 * self.0[2 * i][j % self.0[2 * i].len()] as u16;
             }
-
-            // ** non-linear memory accesses:**
+        
+            // **non-linear memory accesses**
             for _ in 0..12 { 
                 index ^= (memory_table[(index * 7 + i) % memory_table.len()] as usize * 19) ^ ((i * 53) % 13);
                 index = (index * 73 + i * 41) % memory_table.len(); 
-            
-                // Index paths
+                
+                // Index-Pfade
                 let shifted = (index.wrapping_add(i * 13)) % memory_table.len();
                 memory_table[shifted] ^= (sum & 0xFF) as u8;
             }
         }
-
-        // Final memory-hash result
+        
+        // Final hash result in memory
         for i in 0..32 {
             let shift_val = (product[i] as usize * 47 + i) % memory_table.len();
             product[i] ^= memory_table[shift_val];
-        }
-
-        // final xor
-        for i in 0..32 {
-            product[i] ^= Self::FINAL_CRYPTIX[i];
-        }              
+        } */
 
         // **Apply nonlinear S-Box**
         let mut sbox: [u8; 256] = [0; 256];
@@ -199,12 +192,12 @@ impl Matrix {
                 sbox[i] = value;
             }
         }
-        
+            
         // Apply S-Box to the product
         for i in 0..32 {
             product[i] = sbox[product[i] as usize];
         }     
-        
+
         CryptixHashV2::hash(Hash::from_bytes(product))
     }
 }
