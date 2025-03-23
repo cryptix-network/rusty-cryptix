@@ -153,14 +153,14 @@ impl Matrix {
         result
     }*/
 
-    // Non linear sbox
+    // Non-linear S-box generation
     pub fn generate_non_linear_sbox(input: u8, key: u8) -> u8 {
         let mut result = input;
 
         // Combination of multiplication and bitwise permutation
         result = result.wrapping_mul(key);          // Multiply by the key
         result = (result >> 3) | (result << 5);    // Bitwise permutation (Rotation)
-        result ^= 0x5A;                             //XOR with 0x5A
+        result ^= 0x5A;                             // XOR with 0x5A
 
         result
     }
@@ -174,8 +174,8 @@ impl Matrix {
             let o_bytes = hash.as_bytes();
             let mut arr = [0u8; 64];
             for (i, &byte) in o_bytes.iter().enumerate() {
-                arr[2 * i]     = byte >> 4;
-                arr[2 * i + 1] = byte & 0x0F;
+                arr[2 * i]     = byte >> 4;               // Store the high nibble
+                arr[2 * i + 1] = byte & 0x0F;             // Store the low nibble
             }
             arr
         };
@@ -187,85 +187,85 @@ impl Matrix {
             let mut sum2 = 0u16;
             for j in 0..64 {
                 let elem = nibbles[j] as u16;
-                sum1 += self.0[2 * i][j] * elem;
+                sum1 += self.0[2 * i][j] * elem;   // Matrix multiplication
                 sum2 += self.0[2 * i + 1][j] * elem;
             }
             
-             // Combine the nibbles back into bytes
-            let a_nibble = (sum1 & 0xF) ^ ((sum2 >> 4) & 0xF) ^ ((sum1 >> 8) & 0xF);
+            // Combine the nibbles back into bytes
+            let a_nibble = (sum1 & 0xF) ^ ((sum2 >> 4) & 0xF) ^ ((sum1 >> 8) & 0xF); // Combine the bits
             let b_nibble = (sum2 & 0xF) ^ ((sum1 >> 4) & 0xF) ^ ((sum2 >> 8) & 0xF);
     
-            product[i] = ((a_nibble << 4) | b_nibble) as u8;
+            product[i] = ((a_nibble << 4) | b_nibble) as u8; // Combine to form final byte
         }
 
         // XOR the product with the original hash   
-        product.iter_mut().zip(hash.as_bytes()).for_each(|(p, h)| *p ^= h);
+        product.iter_mut().zip(hash.as_bytes()).for_each(|(p, h)| *p ^= h); // Apply XOR with the hash
 
         // **Apply nonlinear S-Box**
         let mut sbox: [u8; 256] = [0; 256];
 
-        // Use the bytes of the hash to fill the S-box
+        // Fill the S-box using the bytes of the hash
         for i in 0..256 {
-            sbox[i] = hash_bytes[i % hash_bytes.len()];
+            sbox[i] = hash_bytes[i % hash_bytes.len()]; // Wrap around the hash bytes
         }
 
-        // Calculate S-Box with the product value and hash values
+        // Apply non-linear S-box transformation with the product and hash values
         for _ in 0..6 {  
-            let mut temp_sbox = sbox;
+            let mut temp_sbox = sbox;  // Temporary S-box to store updated values
             
             for i in 0..256 { 
                 let mut value = temp_sbox[i];  // Get the current value from the S-Box
                 
-                value = Self::generate_non_linear_sbox(value, hash_bytes[i % hash_bytes.len()] ^ product[i % product.len()]); // Generate a non-linear S-Box value using hash and product
-                value ^= value.rotate_left(4) | value.rotate_right(2); // Bitwise rotations (left by 4 bits, right by 2 bits) and XOR
-                temp_sbox[i] = value; // Store the modified value in the temporary S-Box
+                value = Self::generate_non_linear_sbox(value, hash_bytes[i % hash_bytes.len()] ^ product[i % product.len()]); // Generate non-linear value
+                value ^= value.rotate_left(4) | value.rotate_right(2); // Apply bitwise rotations (left by 4, right by 2) and XOR
+                temp_sbox[i] = value; // Update the value in the temporary S-Box
             }
 
-            // At the end of the round, update the S-Box with the new values
+            // After the round, update the S-Box with the new values
             sbox = temp_sbox;
         }
 
-        // Apply S-Box to the product with XOR
+        // Apply the final S-Box transformation to the product with XOR
         for i in 0..32 {
-            product[i] ^= sbox[product[i] as usize]; 
+            product[i] ^= sbox[product[i] as usize]; // XOR product with S-Box values
         }
 
-        // **Branches for Byte Manipulation
+        // **Branches for Byte Manipulation**
         for i in 0..32 {
-            // Nonce from s-box product
+            // Nonce from the s-box product
             let cryptix_nonce = product[0] as u64; 
 
-            // Use the result of the S-Box (product[i])
-            let condition = (product[i] ^ (hash_bytes[i % hash_bytes.len()] ^ cryptix_nonce as u8)) % 6; // Use nonce
+            // Use the result of the S-Box (product[i]) and some conditional manipulation
+            let condition = (product[i] ^ (hash_bytes[i % hash_bytes.len()] ^ cryptix_nonce as u8)) % 6; // Use nonce for conditional branching
 
             match condition {
                 0 => {
-                    // Manipulate the `product` result in this branch
+                    // Branch 0
                     product[i] = product[i].wrapping_add(13);  // Add 13
                     product[i] = product[i].rotate_left(3);    // Rotate left by 3 bits
                 },
                 1 => {
-                    // Manipulate the `product` result in this branch
+                    // Branch 1
                     product[i] = product[i].wrapping_sub(7);   // Subtract 7
                     product[i] = product[i].rotate_left(5);    // Rotate left by 5 bits
                 },
                 2 => {
-                    // Manipulate the `product` result in this branch
+                    // Branch 2
                     product[i] ^= 0x5A;                       // XOR with 0x5A
                     product[i] = product[i].wrapping_add(0xAC); // Add 0xAC
                 },
                 3 => {
-                    // Manipulate the `product` result in this branch
+                    // Branch 3
                     product[i] = product[i].wrapping_mul(17);   // Multiply by 17
                     product[i] ^= 0xAA;                        // XOR with 0xAA
                 },
                 4 => {
-                    // Manipulate the `product` result in this branch
+                    // Branch 4
                     product[i] = product[i].wrapping_sub(29);   // Subtract 29
                     product[i] = product[i].rotate_left(1);     // Rotate left by 1 bit
                 },
                 5 => {
-                    // Manipulate the `product` result in this branch
+                    // Branch 5
                     product[i] = product[i].wrapping_add(0xAA ^ cryptix_nonce as u8); // Add XOR of 0xAA and nonce
                     product[i] ^= 0x45;                        // XOR with 0x45
                 },
@@ -273,8 +273,8 @@ impl Matrix {
             }
         }
 
-        //Final Cryptixhash v2
-        CryptixHashV2::hash(Hash::from_bytes(product))
+        // Final Cryptixhash v2
+        CryptixHashV2::hash(Hash::from_bytes(product)) // Return
     }
 }
 
@@ -495,7 +495,7 @@ mod tests {
                 index ^= (memory_table[(index * 7 + i) % memory_table.len()] as usize * 19) ^ ((i * 53) % 13);
                 index = (index * 73 + i * 41) % memory_table.len(); 
                 
-                // Index-Pfade
+                // Index-Path
                 let shifted = (index.wrapping_add(i * 13)) % memory_table.len();
                 memory_table[shifted] ^= (sum & 0xFF) as u8;
             }
