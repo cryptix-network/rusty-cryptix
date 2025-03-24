@@ -5,6 +5,7 @@ use std::mem::MaybeUninit;
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq)]
 pub struct Matrix([[u16; 64]; 64]);
 
+
 impl Matrix {
     // pub fn generate(hash: Hash) -> Self {
     //     let mut generator = XoShiRo256PlusPlus::new(hash);
@@ -153,6 +154,9 @@ impl Matrix {
         result
     }*/
 
+
+
+
     // Non-linear S-box generation
     pub fn generate_non_linear_sbox(input: u8, key: u8) -> u8 {
         let mut result = input;
@@ -201,6 +205,9 @@ impl Matrix {
         // XOR the product with the original hash   
         product.iter_mut().zip(hash.as_bytes()).for_each(|(p, h)| *p ^= h); // Apply XOR with the hash
 
+
+        
+
         // **Apply nonlinear S-Box**
         let mut sbox: [u8; 256] = [0; 256];
 
@@ -209,27 +216,30 @@ impl Matrix {
             sbox[i] = hash_bytes[i % hash_bytes.len()]; // Wrap around the hash bytes
         }
 
-        // Apply non-linear S-box transformation with the product and hash values
-        for _ in 0..6 {  
-            let mut temp_sbox = sbox;  // Temporary S-box to store updated values
+        // Number of iterations depends on the first byte of the product
+        let iterations = 3 + (product[0] % 7);  // Modulo 7 gives values ​​from 0 to 6 → +3 gives 3 to 9
+
+        for _ in 0..iterations {  
+            let mut temp_sbox = sbox;
             
             for i in 0..256 { 
-                let mut value = temp_sbox[i];  // Get the current value from the S-Box
+                let mut value = temp_sbox[i];  
                 
-                value = Self::generate_non_linear_sbox(value, hash_bytes[i % hash_bytes.len()] ^ product[i % product.len()]); // Generate non-linear value
-                value ^= value.rotate_left(4) | value.rotate_right(2); // Apply bitwise rotations (left by 4, right by 2) and XOR
-                temp_sbox[i] = value; // Update the value in the temporary S-Box
+                // Generate nonlinear value based on Hash + Product
+                value = Self::generate_non_linear_sbox(value, hash_bytes[i % hash_bytes.len()] ^ product[i % product.len()]); 
+                
+                // Bitwise rotation + XOR
+                value ^= value.rotate_left(4) | value.rotate_right(2); 
+                temp_sbox[i] = value; 
             }
 
-            // After the round, update the S-Box with the new values
-            sbox = temp_sbox;
+            sbox = temp_sbox; // Update the S-Box after the round
         }
 
         // Apply the final S-Box transformation to the product with XOR
         for i in 0..32 {
             product[i] ^= sbox[product[i] as usize]; // XOR product with S-Box values
         }
-
 
         // **Branches for Byte Manipulation**
         for i in 0..32 {
