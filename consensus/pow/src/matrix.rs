@@ -232,12 +232,10 @@ impl Matrix {
 
         // **Branches for Byte Manipulation**
         for i in 0..32 {
-            // Nonce from the s-box product
-            let cryptix_nonce = product[0] as u64; 
-
-            // Use the result of the S-Box (product[i]) and some conditional manipulation
-            let condition = (product[i] ^ (hash_bytes[i % hash_bytes.len()] ^ cryptix_nonce as u8)) % 6; // Use nonce for conditional branching
-
+            // Nonce from s-box product
+            let cryptix_nonce = product[i]; 
+            let condition = (product[i] ^ (hash_bytes[i % hash_bytes.len()] ^ cryptix_nonce)) % 6;
+            
             match condition {
                 0 => {
                     // Branch 0
