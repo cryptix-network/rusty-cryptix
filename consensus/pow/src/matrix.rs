@@ -230,44 +230,123 @@ impl Matrix {
             product[i] ^= sbox[product[i] as usize]; // XOR product with S-Box values
         }
 
+
         // **Branches for Byte Manipulation**
         for i in 0..32 {
             // Nonce from s-box product
-            let cryptix_nonce = product[i]; 
-            let condition = (product[i] ^ (hash_bytes[i % hash_bytes.len()] ^ cryptix_nonce)) % 6;
+            let cryptix_nonce = product[i];
+            let condition = (product[i] ^ (hash_bytes[i % hash_bytes.len()] ^ cryptix_nonce)) % 9;
             
             match condition {
                 0 => {
-                    // Branch 0
+                    // Main case 0
                     product[i] = product[i].wrapping_add(13);  // Add 13
                     product[i] = product[i].rotate_left(3);    // Rotate left by 3 bits
+                    
+                    // Nested cases in case 0
+                    if product[i] > 100 {
+                        product[i] = product[i].wrapping_add(0x20);  // Add 0x20 if greater than 100
+                    } else {
+                        product[i] = product[i].wrapping_sub(0x10);  // Subtract 0x10 if not
+                    }
                 },
                 1 => {
-                    // Branch 1
+                    // Main case 1
                     product[i] = product[i].wrapping_sub(7);   // Subtract 7
                     product[i] = product[i].rotate_left(5);    // Rotate left by 5 bits
+                    
+                    // Nested case inside case 1
+                    if product[i] % 2 == 0 {
+                        product[i] = product[i].wrapping_add(0x11); // Add 0x11 if even
+                    } else {
+                        product[i] = product[i].wrapping_sub(0x05); // Subtract 0x05 if odd
+                    }
                 },
                 2 => {
-                    // Branch 2
+                    // Main case 2
                     product[i] ^= 0x5A;                       // XOR with 0x5A
                     product[i] = product[i].wrapping_add(0xAC); // Add 0xAC
+                    
+                    // Nested case inside case 2
+                    if product[i] > 0x50 {
+                        product[i] = product[i].wrapping_mul(2);   // Multiply by 2 if greater than 0x50
+                    } else {
+                        product[i] = product[i].wrapping_div(3);   // Divide by 3 if not
+                    }
                 },
                 3 => {
-                    // Branch 3
+                    // Main case 3
                     product[i] = product[i].wrapping_mul(17);   // Multiply by 17
                     product[i] ^= 0xAA;                        // XOR with 0xAA
+                    
+                    // Nested case inside case 3
+                    if product[i] % 4 == 0 {
+                        product[i] = product[i].rotate_left(4); // Rotate left by 4 bits if divisible by 4
+                    } else {
+                        product[i] = product[i].rotate_right(2); // Rotate right by 2 bits if not
+                    }
                 },
                 4 => {
-                    // Branch 4
+                    // Main case 4
                     product[i] = product[i].wrapping_sub(29);   // Subtract 29
                     product[i] = product[i].rotate_left(1);     // Rotate left by 1 bit
+                    
+                    // Nested case inside case 4
+                    if product[i] < 50 {
+                        product[i] = product[i].wrapping_add(0x55); // Add 0x55 if less than 50
+                    } else {
+                        product[i] = product[i].wrapping_sub(0x22); // Subtract 0x22 if not
+                    }
                 },
                 5 => {
-                    // Branch 5
+                    // Main case 5
                     product[i] = product[i].wrapping_add(0xAA ^ cryptix_nonce as u8); // Add XOR of 0xAA and nonce
                     product[i] ^= 0x45;                        // XOR with 0x45
+                    
+                    // Nested case inside case 5
+                    if product[i] & 0x0F == 0 {
+                        product[i] = product[i].rotate_left(6); // Rotate left by 6 bits if lower nibble is 0
+                    } else {
+                        product[i] = product[i].rotate_right(3); // Rotate right by 3 bits if not
+                    }
                 },
-                _ => unreachable!(), // Should never happen
+                6 => {
+                    // Main case 6
+                    product[i] = product[i].wrapping_add(0x33);  // Add 0x33
+                    product[i] = product[i].rotate_right(4);     // Rotate right by 4 bits
+                    
+                    // Nested case inside case 6
+                    if product[i] < 0x80 {
+                        product[i] = product[i].wrapping_sub(0x22); // Subtract 0x22 if less than 0x80
+                    } else {
+                        product[i] = product[i].wrapping_add(0x44); // Add 0x44 if not
+                    }
+                },
+                7 => {
+                    // Main case 7
+                    product[i] = product[i].wrapping_mul(3);     // Multiply by 3
+                    product[i] = product[i].rotate_left(2);      // Rotate left by 2 bits
+                    
+                    // Nested case inside case 7
+                    if product[i] > 0x50 {
+                        product[i] = product[i].wrapping_add(0x11); // Add 0x11 if greater than 0x50
+                    } else {
+                        product[i] = product[i].wrapping_sub(0x11); // Subtract 0x11 if not
+                    }
+                },
+                8 => {
+                    // Main case 8
+                    product[i] = product[i].wrapping_sub(0x10);   // Subtract 0x10
+                    product[i] = product[i].rotate_right(3);      // Rotate right by 3 bits
+                    
+                    // Nested case inside case 8
+                    if product[i] % 3 == 0 {
+                        product[i] = product[i].wrapping_add(0x55); // Add 0x55 if divisible by 3
+                    } else {
+                        product[i] = product[i].wrapping_sub(0x33); // Subtract 0x33 if not
+                    }
+                },
+                _ => unreachable!(), // This should never happen
             }
         }
 
