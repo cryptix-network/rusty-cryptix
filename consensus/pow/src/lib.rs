@@ -71,6 +71,16 @@ impl State {
                 current_hash[20] ^= 0x55; // XOR with 0x55 if byte 3 is divisible by 3
             } else if current_hash[7] % 5 == 0 { 
                 current_hash[25] = current_hash[25].rotate_left(7); // Rotate left by 7 if byte 7 is divisible by 5
+            } else if current_hash[5] % 2 == 0 { 
+                current_hash[10] ^= 0xAA; // XOR with 0xAA if byte 5 is divisible by 2
+            } else if current_hash[6] % 4 == 0 {
+                current_hash[15] = current_hash[15].rotate_left(3); // Rotate left by 3 if byte 6 is divisible by 4
+            } else if current_hash[8] % 7 == 0 {
+                current_hash[30] ^= 0xFF; // XOR with 0xFF if byte 8 is divisible by 7
+            } else if current_hash[9] % 11 == 0 {
+                current_hash[5] = current_hash[5].rotate_right(4); // Rotate right by 4 if byte 9 is divisible by 11
+            } else if current_hash[12] % 13 == 0 {
+                current_hash[18] = current_hash[18].rotate_left(2); // Rotate left by 2 if byte 12 is divisible by 13
             }
         }
     
