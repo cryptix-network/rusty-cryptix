@@ -23,7 +23,6 @@ wasm-bindgen.workspace = true
 workflow-wasm.workspace = true
 num.workspace = true
 sha3.workspace = true
-blake3.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
