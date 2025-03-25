@@ -54,7 +54,7 @@ impl State {
         let hash_bytes: [u8; 32] = hash.as_bytes().try_into().expect("Hash output length mismatch");
     
         // Use the first byte of the hash to determine the number of iterations
-        let iterations = (hash_bytes[0] % 3) + 1;  // The first byte modulo 3, plus 1 for the range [1, 3]
+        let iterations = (hash_bytes[0] % 2) + 1;  // The first byte modulo 2, plus 1 for the range [1, 2]
     
         // Iterative SHA-3 process
         let mut sha3_hasher = Sha3_256::new();
@@ -65,6 +65,13 @@ impl State {
             sha3_hasher.update(&current_hash);
             let sha3_hash = sha3_hasher.finalize_reset();
             current_hash = sha3_hash.as_slice().try_into().expect("SHA-3 output length mismatch");
+
+            // Conditions
+            if current_hash[3] % 3 == 0 { 
+                current_hash[20] ^= 0x55; // XOR with 0x55 if byte 3 is divisible by 3
+            } else if current_hash[7] % 5 == 0 { 
+                current_hash[25] = current_hash[25].rotate_left(7); // Rotate left by 7 if byte 7 is divisible by 5
+            }
         }
     
         // Final computation with matrix.cryptix_hash
