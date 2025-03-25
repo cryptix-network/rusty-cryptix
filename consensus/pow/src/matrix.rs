@@ -213,7 +213,7 @@ impl Matrix {
         }
 
         // Number of iterations depends on the first byte of the product
-        let iterations = 3 + (product[0] % 7);  // Modulo 7 gives values ​​from 0 to 6 → +3 gives 3 to 9
+        let iterations = 3 + (product[0] % 5);  // Modulo 5 gives values ​​from 0 to 4 → +3 gives 3 to 7
 
         for _ in 0..iterations {  
             let mut temp_sbox = sbox;
