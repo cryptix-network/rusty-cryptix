@@ -54,7 +54,7 @@ impl State {
         let hash_bytes: [u8; 32] = hash.as_bytes().try_into().expect("Hash output length mismatch");
     
         // Use the first byte of the hash to determine the number of iterations
-        let iterations = (hash_bytes[0] % 2) + 1;  // The first byte modulo 3, plus 1 for the range [1, 2]
+        let iterations = (hash_bytes[0] % 3) + 1;  // The first byte modulo 3, plus 1 for the range [1, 3]
     
         // Iterative SHA-3 process
         let mut sha3_hasher = Sha3_256::new();
