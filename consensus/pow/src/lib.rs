@@ -110,7 +110,7 @@ impl State {
                 
                 for _ in 0..repeat {
                     // Dynamically select the byte to modify based on a combination of hash bytes and iteration
-                    let target_byte = ((current_hash[1] as usize) + (i as u8) as usize) % 32;  // Dynamic byte position for XOR
+                    let target_byte = ((current_hash[1] as usize) + (i as u8) as usize) % 32; // Dynamic byte position for XOR
                     let xor_value = current_hash[(i % 16) as usize] ^ 0xA5; // Dynamic XOR value based on iteration index and hash
                     current_hash[target_byte] ^= xor_value;  // XOR on dynamically selected byte
 
