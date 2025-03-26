@@ -66,51 +66,349 @@ impl State {
             let sha3_hash = sha3_hasher.finalize_reset();
             current_hash = sha3_hash.as_slice().try_into().expect("SHA-3 output length mismatch");
 
-            // Conditions
-            if current_hash[3] % 3 == 0 { 
+            // Conditions for dynamic rotation based on the first byte of the current hash
+            if current_hash[3] % 3 == 0 {
                 let repeat = (current_hash[4] % 3) + 1; // 1-3 iterations
                 for _ in 0..repeat {
                     current_hash[20] ^= 0x55; // XOR with 0x55
+
+                    let first_byte = current_hash[0];
+                    let rotation_amount = (first_byte % 4) + 1;
+
+                    if first_byte % 2 == 0 {
+                        current_hash[20] = current_hash[20].rotate_left(rotation_amount as u32);
+                    } else {
+                        current_hash[20] = current_hash[20].rotate_right(rotation_amount as u32);
+                    }
                 }
-            } else if current_hash[7] % 5 == 0 { 
+            } else if current_hash[7] % 5 == 0 {
                 let repeat = (current_hash[8] % 3) + 1;
                 for _ in 0..repeat {
-                    current_hash[25] = current_hash[25].rotate_left(7); // Rotate left by 7
+                    current_hash[25] = current_hash[25].rotate_left(7);
+
+                    let first_byte = current_hash[0];
+                    let rotation_amount = (first_byte % 4) + 1;
+
+                    if first_byte % 2 == 0 {
+                        current_hash[25] = current_hash[25].rotate_left(rotation_amount as u32);
+                    } else {
+                        current_hash[25] = current_hash[25].rotate_right(rotation_amount as u32);
+                    }
                 }
-            } else if current_hash[5] % 2 == 0 { 
+            } else if current_hash[5] % 2 == 0 {
                 let repeat = (current_hash[6] % 3) + 1;
                 for _ in 0..repeat {
-                    current_hash[10] ^= 0xAA; // XOR with 0xAA
+                    current_hash[10] ^= 0xAA;
+
+                    let first_byte = current_hash[0];
+                    let rotation_amount = (first_byte % 4) + 1;
+
+                    if first_byte % 2 == 0 {
+                        current_hash[10] = current_hash[10].rotate_left(rotation_amount as u32);
+                    } else {
+                        current_hash[10] = current_hash[10].rotate_right(rotation_amount as u32);
+                    }
                 }
             } else if current_hash[6] % 4 == 0 {
                 let repeat = (current_hash[7] % 3) + 1;
                 for _ in 0..repeat {
-                    current_hash[15] = current_hash[15].rotate_left(3); // Rotate left by 3
+                    current_hash[15] = current_hash[15].rotate_left(3);
+
+                    let first_byte = current_hash[0];
+                    let rotation_amount = (first_byte % 4) + 1;
+
+                    if first_byte % 2 == 0 {
+                        current_hash[15] = current_hash[15].rotate_left(rotation_amount as u32);
+                    } else {
+                        current_hash[15] = current_hash[15].rotate_right(rotation_amount as u32);
+                    }
                 }
             } else if current_hash[8] % 7 == 0 {
                 let repeat = (current_hash[9] % 3) + 1;
                 for _ in 0..repeat {
-                    current_hash[30] ^= 0xFF; // XOR with 0xFF
+                    current_hash[30] ^= 0xFF;
+
+                    let first_byte = current_hash[0];
+                    let rotation_amount = (first_byte % 4) + 1;
+
+                    if first_byte % 2 == 0 {
+                        current_hash[30] = current_hash[30].rotate_left(rotation_amount as u32);
+                    } else {
+                        current_hash[30] = current_hash[30].rotate_right(rotation_amount as u32);
+                    }
                 }
             } else if current_hash[9] % 11 == 0 {
                 let repeat = (current_hash[10] % 3) + 1;
                 for _ in 0..repeat {
-                    current_hash[5] = current_hash[5].rotate_right(4); // Rotate right by 4
+                    current_hash[5] = current_hash[5].rotate_right(4);
+
+                    let first_byte = current_hash[0];
+                    let rotation_amount = (first_byte % 4) + 1;
+
+                    if first_byte % 2 == 0 {
+                        current_hash[5] = current_hash[5].rotate_left(rotation_amount as u32);
+                    } else {
+                        current_hash[5] = current_hash[5].rotate_right(rotation_amount as u32);
+                    }
                 }
             } else if current_hash[12] % 13 == 0 {
                 let repeat = (current_hash[13] % 3) + 1;
                 for _ in 0..repeat {
-                    current_hash[18] = current_hash[18].rotate_left(2); // Rotate left by 2
+                    current_hash[18] = current_hash[18].rotate_left(2);
+
+                    let first_byte = current_hash[0];
+                    let rotation_amount = (first_byte % 4) + 1;
+
+                    if first_byte % 2 == 0 {
+                        current_hash[18] = current_hash[18].rotate_left(rotation_amount as u32);
+                    } else {
+                        current_hash[18] = current_hash[18].rotate_right(rotation_amount as u32);
+                    }
                 }
             }
         }
-    
+        
         // Final computation with matrix.cryptix_hash
         let final_hash = self.matrix.cryptix_hash(cryptix_hashes::Hash::from(current_hash));
     
         // Return the final result as Uint256
         Uint256::from_le_bytes(final_hash.as_bytes())
     }
+
+
+/*
+
+// Iterate according to the number of iterations
+for _ in 0..iterations {
+    sha3_hasher.update(&current_hash);
+    let sha3_hash = sha3_hasher.finalize_reset();
+    current_hash = sha3_hash.as_slice().try_into().expect("SHA-3 output length mismatch");
+
+    // Conditions for dynamic rotation based on the first byte of the current hash
+    if current_hash[3] % 3 == 0 { 
+        let repeat = (current_hash[4] % 3) + 1; // 1-3 iterations
+        for _ in 0..repeat {
+            current_hash[20] ^= 0x55; // XOR with 0x55
+            
+            // Here we add the dynamic rotation
+            let first_byte = current_hash[0]; // Get the first byte of the current hash
+            
+            // Generate a deterministic pseudo-random rotation between 1-4 based on the first byte
+            let rotation_amount = (first_byte % 4) + 1; // Rotates between 1-4 bits
+            
+            // Apply the rotation to a specific byte
+            if first_byte % 2 == 0 {
+                // Rotate left if the first byte is even
+                current_hash[20] = current_hash[20].rotate_left(rotation_amount); // Rotate left by determined amount
+            } else {
+                // Rotate right if the first byte is odd
+                current_hash[20] = current_hash[20].rotate_right(rotation_amount); // Rotate right by determined amount
+            }
+        }
+    } else if current_hash[7] % 5 == 0 { 
+        let repeat = (current_hash[8] % 3) + 1;
+        for _ in 0..repeat {
+            current_hash[25] = current_hash[25].rotate_left(7); // Rotate left by 7
+
+            // Here we add the dynamic rotation
+            let first_byte = current_hash[0]; // Get the first byte of the current hash
+            
+            // Generate a deterministic pseudo-random rotation between 1-4 based on the first byte
+            let rotation_amount = (first_byte % 4) + 1; // Rotates between 1-4 bits
+            
+            // Apply the rotation to a specific byte
+            if first_byte % 2 == 0 {
+                // Rotate left if the first byte is even
+                current_hash[25] = current_hash[25].rotate_left(rotation_amount); // Rotate left by determined amount
+            } else {
+                // Rotate right if the first byte is odd
+                current_hash[25] = current_hash[25].rotate_right(rotation_amount); // Rotate right by determined amount
+            }
+        }
+    } else if current_hash[5] % 2 == 0 { 
+        let repeat = (current_hash[6] % 3) + 1;
+        for _ in 0..repeat {
+            current_hash[10] ^= 0xAA; // XOR with 0xAA
+
+            // Here we add the dynamic rotation
+            let first_byte = current_hash[0]; // Get the first byte of the current hash
+            
+            // Generate a deterministic pseudo-random rotation between 1-4 based on the first byte
+            let rotation_amount = (first_byte % 4) + 1; // Rotates between 1-4 bits
+            
+            // Apply the rotation to a specific byte
+            if first_byte % 2 == 0 {
+                // Rotate left if the first byte is even
+                current_hash[10] = current_hash[10].rotate_left(rotation_amount); // Rotate left by determined amount
+            } else {
+                // Rotate right if the first byte is odd
+                current_hash[10] = current_hash[10].rotate_right(rotation_amount); // Rotate right by determined amount
+            }
+        }
+    } else if current_hash[6] % 4 == 0 {
+        let repeat = (current_hash[7] % 3) + 1;
+        for _ in 0..repeat {
+            current_hash[15] = current_hash[15].rotate_left(3); // Rotate left by 3
+
+            // Here we add the dynamic rotation
+            let first_byte = current_hash[0]; // Get the first byte of the current hash
+            
+            // Generate a deterministic pseudo-random rotation between 1-4 based on the first byte
+            let rotation_amount = (first_byte % 4) + 1; // Rotates between 1-4 bits
+            
+            // Apply the rotation to a specific byte
+            if first_byte % 2 == 0 {
+                // Rotate left if the first byte is even
+                current_hash[15] = current_hash[15].rotate_left(rotation_amount); // Rotate left by determined amount
+            } else {
+                // Rotate right if the first byte is odd
+                current_hash[15] = current_hash[15].rotate_right(rotation_amount); // Rotate right by determined amount
+            }
+        }
+    } else if current_hash[8] % 7 == 0 {
+        let repeat = (current_hash[9] % 3) + 1;
+        for _ in 0..repeat {
+            current_hash[30] ^= 0xFF; // XOR with 0xFF
+
+            // Here we add the dynamic rotation
+            let first_byte = current_hash[0]; // Get the first byte of the current hash
+            
+            // Generate a deterministic pseudo-random rotation between 1-4 based on the first byte
+            let rotation_amount = (first_byte % 4) + 1; // Rotates between 1-4 bits
+            
+            // Apply the rotation to a specific byte
+            if first_byte % 2 == 0 {
+                // Rotate left if the first byte is even
+                current_hash[30] = current_hash[30].rotate_left(rotation_amount); // Rotate left by determined amount
+            } else {
+                // Rotate right if the first byte is odd
+                current_hash[30] = current_hash[30].rotate_right(rotation_amount); // Rotate right by determined amount
+            }
+        }
+    } else if current_hash[9] % 11 == 0 {
+        let repeat = (current_hash[10] % 3) + 1;
+        for _ in 0..repeat {
+            current_hash[5] = current_hash[5].rotate_right(4); // Rotate right by 4
+
+            // Here we add the dynamic rotation
+            let first_byte = current_hash[0]; // Get the first byte of the current hash
+            
+            // Generate a deterministic pseudo-random rotation between 1-4 based on the first byte
+            let rotation_amount = (first_byte % 4) + 1; // Rotates between 1-4 bits
+            
+            // Apply the rotation to a specific byte
+            if first_byte % 2 == 0 {
+                // Rotate left if the first byte is even
+                current_hash[5] = current_hash[5].rotate_left(rotation_amount); // Rotate left by determined amount
+            } else {
+                // Rotate right if the first byte is odd
+                current_hash[5] = current_hash[5].rotate_right(rotation_amount); // Rotate right by determined amount
+            }
+        }
+    } else if current_hash[12] % 13 == 0 {
+        let repeat = (current_hash[13] % 3) + 1;
+        for _ in 0..repeat {
+            current_hash[18] = current_hash[18].rotate_left(2); // Rotate left by 2
+
+            // Here we add the dynamic rotation
+            let first_byte = current_hash[0]; // Get the first byte of the current hash
+            
+            // Generate a deterministic pseudo-random rotation between 1-4 based on the first byte
+            let rotation_amount = (first_byte % 4) + 1; // Rotates between 1-4 bits
+            
+            // Apply the rotation to a specific byte
+            if first_byte % 2 == 0 {
+                // Rotate left if the first byte is even
+                current_hash[18] = current_hash[18].rotate_left(rotation_amount); // Rotate left by determined amount
+            } else {
+                // Rotate right if the first byte is odd
+                current_hash[18] = current_hash[18].rotate_right(rotation_amount); // Rotate right by determined amount
+            }
+        }
+    }
+}
+
+
+
+#[inline(always)]
+// PRE_POW_HASH || TIME || 32 zero byte padding || NONCE
+pub fn calculate_pow(&self, nonce: u64) -> Uint256 {
+    // Calculate the first hash
+    let hash = self.hasher.clone().finalize_with_nonce(nonce);
+    let mut current_hash: [u8; 32] = hash.to_le_bytes();
+
+    // FPGA-Zerstörungs-Feedback-Loop
+    let mut state = 0xA5A5A5A5A5A5A5A5u64;
+    for i in 0..32 {
+        state ^= current_hash[i] as u64;
+        state = state.rotate_left(7);
+        state = state.wrapping_mul(0x41C64E6D7);
+        current_hash[i] ^= (state as u8);
+    }
+
+    // Use the first byte of the hash to determine the number of iterations
+    let iterations = (current_hash[0] % 2) + 1;  // The first byte modulo 2, plus 1 for the range [1, 2]
+
+    // Iterative SHA-3 process
+    let mut sha3_hasher = Sha3_256::new();
+
+    for _ in 0..iterations {
+        sha3_hasher.update(&current_hash);
+        let sha3_hash = sha3_hasher.finalize_reset();
+        current_hash = sha3_hash.as_slice().try_into().expect("SHA-3 output length mismatch");
+
+        // FPGA-Killer mit sequentieller Feedback-Manipulation
+        let mut feedback = 0xC3C3C3C3C3C3C3C3u64;
+        for i in 0..current_hash.len() {
+            feedback ^= current_hash[i] as u64;
+            feedback = feedback.rotate_left((feedback % 13) as u32);
+            feedback = feedback.wrapping_mul(0x9E3779B97F4A7C15);
+            current_hash[i] ^= (feedback as u8);
+        }
+
+        // Conditions
+        if current_hash[3] % 3 == 0 { 
+            let repeat = (current_hash[4] % 3) + 1;
+            for _ in 0..repeat {
+                current_hash[20] ^= 0x55;
+            }
+        } else if current_hash[7] % 5 == 0 { 
+            let repeat = (current_hash[8] % 3) + 1;
+            for _ in 0..repeat {
+                current_hash[25] = current_hash[25].rotate_left(7);
+            }
+        } else if current_hash[5] % 2 == 0 { 
+            let repeat = (current_hash[6] % 3) + 1;
+            for _ in 0..repeat {
+                current_hash[10] ^= 0xAA;
+            }
+        } else if current_hash[6] % 4 == 0 {
+            let repeat = (current_hash[7] % 3) + 1;
+            for _ in 0..repeat {
+                current_hash[15] = current_hash[15].rotate_left(3);
+            }
+        } else if current_hash[8] % 7 == 0 {
+            let repeat = (current_hash[9] % 3) + 1;
+            for _ in 0..repeat {
+                current_hash[30] ^= 0xFF;
+            }
+        } else if current_hash[9] % 11 == 0 {
+            let repeat = (current_hash[10] % 3) + 1;
+            for _ in 0..repeat {
+                current_hash[5] = current_hash[5].rotate_right(4);
+            }
+        } else if current_hash[12] % 13 == 0 {
+            let repeat = (current_hash[13] % 3) + 1;
+            for _ in 0..repeat {
+                current_hash[18] = current_hash[18].rotate_left(2);
+            }
+        }
+    }
+
+    // Send to heavy hash
+    self.matrix.heavy_hash(Hash::from_le_bytes(current_hash))
+}
+ */
     
     #[inline]
     #[must_use]
