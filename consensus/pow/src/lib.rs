@@ -116,7 +116,7 @@ impl State {
 
                     // Dynamically choose the byte to calculate rotation based on the current iteration
                     let rotation_byte = current_hash[(i % 32) as usize];  // Use different byte based on iteration index
-                    let rotation_amount = ((current_hash[2] as u32) + (current_hash[5] as u32) % 5) + 1; // Combined rotation calculation
+                    let rotation_amount = ((current_hash[1] as u32) + (current_hash[3] as u32)) % 4 + 2; // Combined rotation calculation
                     
                     // Perform rotation based on whether the rotation byte is even or odd
                     if rotation_byte % 2 == 0 {
@@ -128,7 +128,7 @@ impl State {
                     }
 
                     // Perform additional bitwise manipulation on the target byte using a shift
-                    let shift_amount = ((current_hash[7] as u32) + (current_hash[9] as u32) % 6) + 2; // Combined shift calculation
+                    let shift_amount = ((current_hash[5] as u32) + (current_hash[1] as u32)) % 3 + 1; // Combined shift calculation
                     current_hash[target_byte] ^= current_hash[target_byte].rotate_left(shift_amount); // XOR with rotated value
                 }
             } else if current_hash[3] % 3 == 0 {
@@ -139,14 +139,14 @@ impl State {
                     current_hash[target_byte] ^= xor_value;
 
                     let rotation_byte = current_hash[(i % 32) as usize];
-                    let rotation_amount = (rotation_byte % 4) + 1;
+                    let rotation_amount = ((current_hash[7] as u32) + (current_hash[2] as u32)) % 6 + 1;
                     if rotation_byte % 2 == 0 {
                         current_hash[target_byte] = current_hash[target_byte].rotate_left(rotation_amount as u32);
                     } else {
                         current_hash[target_byte] = current_hash[target_byte].rotate_right(rotation_amount as u32);
                     }
 
-                    let shift_amount = ((current_hash[5] as u32) + (current_hash[8] as u32) % 7) + 3;
+                    let shift_amount = ((current_hash[1] as u32) + (current_hash[3] as u32)) % 4 + 1; 
                     current_hash[target_byte] ^= current_hash[target_byte].rotate_left(shift_amount);
                 }
             } else if current_hash[2] % 6 == 0 {
@@ -157,14 +157,14 @@ impl State {
                     current_hash[target_byte] ^= xor_value;
 
                     let rotation_byte = current_hash[(i % 32) as usize];  
-                    let rotation_amount = (rotation_byte % 3) + 1;
+                    let rotation_amount = ((current_hash[7] as u32) + (current_hash[7] as u32)) % 7 + 1;
                     if rotation_byte % 2 == 0 {
                         current_hash[target_byte] = current_hash[target_byte].rotate_left(rotation_amount as u32);
                     } else {
                         current_hash[target_byte] = current_hash[target_byte].rotate_right(rotation_amount as u32);
                     }
 
-                    let shift_amount = (current_hash[7] % 5) + 3;
+                    let shift_amount = ((current_hash[3] as u32) + (current_hash[5] as u32)) % 5 + 2; 
                     current_hash[target_byte] ^= current_hash[target_byte].rotate_left(shift_amount as u32);
                 }
             } else if current_hash[7] % 5 == 0 {
@@ -175,14 +175,14 @@ impl State {
                     current_hash[target_byte] ^= xor_value;
 
                     let rotation_byte = current_hash[(i % 32) as usize]; 
-                    let rotation_amount = (rotation_byte % 3) + 2;
+                    let rotation_amount = ((current_hash[1] as u32) + (current_hash[3] as u32)) % 4 + 2;
                     if rotation_byte % 2 == 0 {
                         current_hash[target_byte] = current_hash[target_byte].rotate_left(rotation_amount as u32);
                     } else {
                         current_hash[target_byte] = current_hash[target_byte].rotate_right(rotation_amount as u32);
                     }
 
-                    let shift_amount = (current_hash[10] % 6) + 4;
+                    let shift_amount = ((current_hash[1] as u32) + (current_hash[3] as u32)) % 4 + 1; 
                     current_hash[target_byte] ^= current_hash[target_byte].rotate_left(shift_amount as u32);
                 }
             } else if current_hash[8] % 7 == 0 {
@@ -193,14 +193,14 @@ impl State {
                     current_hash[target_byte] ^= xor_value;
 
                     let rotation_byte = current_hash[(i % 32) as usize];  
-                    let rotation_amount = (rotation_byte % 4) + 1;
+                    let rotation_amount = ((current_hash[2] as u32) + (current_hash[5] as u32)) % 5 + 1;
                     if rotation_byte % 2 == 0 {
                         current_hash[target_byte] = current_hash[target_byte].rotate_left(rotation_amount as u32);
                     } else {
                         current_hash[target_byte] = current_hash[target_byte].rotate_right(rotation_amount as u32);
                     }
 
-                    let shift_amount = (current_hash[11] % 7) + 2;
+                    let shift_amount = ((current_hash[7] as u32) + (current_hash[9] as u32)) % 6 + 2; 
                     current_hash[target_byte] ^= current_hash[target_byte].rotate_left(shift_amount as u32);
                 }
             }

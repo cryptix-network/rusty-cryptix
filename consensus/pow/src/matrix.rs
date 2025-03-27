@@ -154,6 +154,62 @@ impl Matrix {
         result
     }*/
 
+    /*
+    // Function for the multiplication of octonions
+    fn octonion_multiply(a: &[f64; 8], b: &[f64; 8]) -> [f64; 8] {
+        let mut result = [0.0; 8];
+    
+        // The rules for multiplying octonions
+        result[0] = a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3] - a[4] * b[4] - a[5] * b[5] - a[6] * b[6] - a[7] * b[7];
+        result[1] = a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2] + a[4] * b[5] - a[5] * b[4] - a[6] * b[7] + a[7] * b[6];
+        result[2] = a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1] + a[4] * b[6] - a[5] * b[7] + a[6] * b[4] - a[7] * b[5];
+        result[3] = a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0] + a[4] * b[7] + a[5] * b[6] - a[6] * b[5] + a[7] * b[4];
+        result[4] = a[0] * b[4] - a[1] * b[5] - a[2] * b[6] - a[3] * b[7] + a[4] * b[0] + a[5] * b[1] + a[6] * b[2] + a[7] * b[3];
+        result[5] = a[0] * b[5] + a[1] * b[4] - a[2] * b[7] + a[3] * b[6] - a[4] * b[1] + a[5] * b[0] + a[6] * b[3] + a[7] * b[2];
+        result[6] = a[0] * b[6] + a[1] * b[7] + a[2] * b[4] - a[3] * b[5] - a[4] * b[2] + a[5] * b[3] + a[6] * b[0] + a[7] * b[1];
+        result[7] = a[0] * b[7] - a[1] * b[6] + a[2] * b[5] + a[3] * b[4] - a[4] * b[3] + a[5] * b[2] + a[6] * b[1] + a[7] * b[0];
+    
+        result
+    
+       }
+       
+       fn octonion_hash(input_hash: &[u8; 32]) -> [f64; 8] {
+     
+           // Convert the input hash to octonions
+           let mut oct = [
+               input_hash[0] as f64,
+               input_hash[1] as f64,
+               input_hash[2] as f64,
+               input_hash[3] as f64,
+               input_hash[4] as f64,
+               input_hash[5] as f64,
+               input_hash[6] as f64,
+               input_hash[7] as f64,
+           ];
+       
+           // Loop through all bytes of the input value and form the vector
+           for i in 8..input_hash.len() {
+               // Calculate the index for rotation by cyclically using the bytes
+               let rotation = [
+                   input_hash[(i + 0) % 32] as f64,
+                   input_hash[(i + 1) % 32] as f64,
+                   input_hash[(i + 2) % 32] as f64,
+                   input_hash[(i + 3) % 32] as f64,
+                   input_hash[(i + 4) % 32] as f64,
+                   input_hash[(i + 5) % 32] as f64,
+                   input_hash[(i + 6) % 32] as f64,
+                   input_hash[(i + 7) % 32] as f64,
+               ];
+       
+               // Octonion multiplication
+               oct = Self::octonion_multiply(&oct, &rotation);
+       
+           }
+       
+           oct
+       }
+     */
+   
     // Non-linear S-box generation
     pub fn generate_non_linear_sbox(input: u8, key: u8) -> u8 {
         let mut result = input;
@@ -204,6 +260,21 @@ impl Matrix {
         
         // ### Memory Hard
 
+        /* 
+        // ** Octonion Function
+        let octonion_result = Self::octonion_hash(&product);
+        // XOR with f64 values ​​- conversion to u8
+        for i in 0..32 {
+            let oct_value = octonion_result[i / 4]; // Access the Octonion values ​​(f64)
+            
+            // Get the bit representation of the f64 value as u64 and extract the lowest byte
+            let oct_value_u8 = (oct_value.to_bits() & 0xFF) as u8; // Use the lower 8 bits of u64 as u8
+
+            // XOR the values ​​and put them in product
+            product[i] ^= oct_value_u8;
+        }
+        */
+                
         // **Apply nonlinear S-Box**
         let mut sbox: [u8; 256] = [0; 256];
 
