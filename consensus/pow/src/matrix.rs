@@ -338,7 +338,6 @@ impl Matrix {
         // XOR the product with the original hash   
         product.iter_mut().zip(hash.as_bytes()).for_each(|(p, h)| *p ^= h); // Apply XOR with the hash
         
-        // ### Memory Hard
 
         // ** Octonion Function **
         let octonion_result = Self::octonion_hash(&product); // Compute the octonion hash of the product
