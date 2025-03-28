@@ -154,7 +154,8 @@ impl Matrix {
         result
     }*/
 
-    fn octonion_multiply(a: &[u64; 8], b: &[u64; 8]) -> [u64; 8] {
+    // Octionion Multiply
+    fn octonion_multiply(a: &[i64; 8], b: &[i64; 8]) -> [i64; 8] {
         let mut result = [0; 8];
 
         /*
@@ -184,7 +185,8 @@ impl Matrix {
 
         result
         */
-    
+        
+         // e0
         result[0] = a[0].wrapping_mul(b[0])
             .wrapping_sub(a[1].wrapping_mul(b[1]))
             .wrapping_sub(a[2].wrapping_mul(b[2]))
@@ -193,7 +195,8 @@ impl Matrix {
             .wrapping_sub(a[5].wrapping_mul(b[5]))
             .wrapping_sub(a[6].wrapping_mul(b[6]))
             .wrapping_sub(a[7].wrapping_mul(b[7]));
-    
+        
+         // e1
         result[1] = a[0].wrapping_mul(b[1])
             .wrapping_add(a[1].wrapping_mul(b[0]))
             .wrapping_add(a[2].wrapping_mul(b[3]))
@@ -202,7 +205,8 @@ impl Matrix {
             .wrapping_sub(a[5].wrapping_mul(b[4]))
             .wrapping_sub(a[6].wrapping_mul(b[7]))
             .wrapping_add(a[7].wrapping_mul(b[6]));
-    
+
+         // e2
         result[2] = a[0].wrapping_mul(b[2])
             .wrapping_sub(a[1].wrapping_mul(b[3]))
             .wrapping_add(a[2].wrapping_mul(b[0]))
@@ -211,7 +215,8 @@ impl Matrix {
             .wrapping_sub(a[5].wrapping_mul(b[7]))
             .wrapping_add(a[6].wrapping_mul(b[4]))
             .wrapping_sub(a[7].wrapping_mul(b[5]));
-    
+
+       // e3
         result[3] = a[0].wrapping_mul(b[3])
             .wrapping_add(a[1].wrapping_mul(b[2]))
             .wrapping_sub(a[2].wrapping_mul(b[1]))
@@ -221,6 +226,7 @@ impl Matrix {
             .wrapping_sub(a[6].wrapping_mul(b[5]))
             .wrapping_add(a[7].wrapping_mul(b[4]));
     
+         // e4
         result[4] = a[0].wrapping_mul(b[4])
             .wrapping_sub(a[1].wrapping_mul(b[5]))
             .wrapping_sub(a[2].wrapping_mul(b[6]))
@@ -230,6 +236,7 @@ impl Matrix {
             .wrapping_add(a[6].wrapping_mul(b[2]))
             .wrapping_add(a[7].wrapping_mul(b[3]));
     
+         // e5
         result[5] = a[0].wrapping_mul(b[5])
             .wrapping_add(a[1].wrapping_mul(b[4]))
             .wrapping_sub(a[2].wrapping_mul(b[7]))
@@ -239,6 +246,7 @@ impl Matrix {
             .wrapping_add(a[6].wrapping_mul(b[3]))
             .wrapping_add(a[7].wrapping_mul(b[2]));
     
+         // e6
         result[6] = a[0].wrapping_mul(b[6])
             .wrapping_add(a[1].wrapping_mul(b[7]))
             .wrapping_add(a[2].wrapping_mul(b[4]))
@@ -247,7 +255,8 @@ impl Matrix {
             .wrapping_add(a[5].wrapping_mul(b[3]))
             .wrapping_add(a[6].wrapping_mul(b[0]))
             .wrapping_add(a[7].wrapping_mul(b[1]));
-    
+
+         // e7
         result[7] = a[0].wrapping_mul(b[7])
             .wrapping_sub(a[1].wrapping_mul(b[6]))
             .wrapping_add(a[2].wrapping_mul(b[5]))
@@ -256,37 +265,44 @@ impl Matrix {
             .wrapping_add(a[5].wrapping_mul(b[2]))
             .wrapping_add(a[6].wrapping_mul(b[1]))
             .wrapping_add(a[7].wrapping_mul(b[0]));
-    
-        result
+        
+        // Result
+        return result;
     }
-    
-    fn octonion_hash(input_hash: &[u8; 32]) -> [u64; 8] {
+
+    // Octonion Hash
+    fn octonion_hash(input_hash: &[u8; 32]) -> [i64; 8] {
+
+        // Initialize the octonion with the first 8 bytes of the input_hash
         let mut oct = [
-            input_hash[0] as u64,
-            input_hash[1] as u64,
-            input_hash[2] as u64,
-            input_hash[3] as u64,
-            input_hash[4] as u64,
-            input_hash[5] as u64,
-            input_hash[6] as u64,
-            input_hash[7] as u64,
+            input_hash[0] as i64,  // e0
+            input_hash[1] as i64,  // e1
+            input_hash[2] as i64,  // e2
+            input_hash[3] as i64,  // e3
+            input_hash[4] as i64,  // e4
+            input_hash[5] as i64,  // e5
+            input_hash[6] as i64,  // e6
+            input_hash[7] as i64,  // e7
         ];
-    
+
+        // Loop through the remaining bytes of the input_hash        
         for i in 8..input_hash.len() {
             let rotation = [
-                input_hash[i % 32] as u64,
-                input_hash[(i + 1) % 32] as u64,
-                input_hash[(i + 2) % 32] as u64,
-                input_hash[(i + 3) % 32] as u64,
-                input_hash[(i + 4) % 32] as u64,
-                input_hash[(i + 5) % 32] as u64,
-                input_hash[(i + 6) % 32] as u64,
-                input_hash[(i + 7) % 32] as u64,
+                input_hash[i % 32] as i64,        // e0
+                input_hash[(i + 1) % 32] as i64,  // e1
+                input_hash[(i + 2) % 32] as i64,  // e2
+                input_hash[(i + 3) % 32] as i64,  // e3
+                input_hash[(i + 4) % 32] as i64,  // e4
+                input_hash[(i + 5) % 32] as i64,  // e5
+                input_hash[(i + 6) % 32] as i64,  // e6
+                input_hash[(i + 7) % 32] as i64,  // e7
             ];
-    
+
+             // Perform octonion multiplication with the current rotation
             oct = Self::octonion_multiply(&oct, &rotation);
         }
     
+        // Return the resulting octonion after applying all rotations
         oct
     }    
 
