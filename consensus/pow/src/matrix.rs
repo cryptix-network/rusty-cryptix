@@ -401,6 +401,23 @@ impl Matrix {
         for i in 0..32 {
             product[i] ^= sbox[product[i] as usize]; // XOR product with S-Box values
         }
+        
+
+        // Cache Test
+        const CACHE_SIZE: usize = 2 * 1024; // 2KB
+        let mut cache: [u8; CACHE_SIZE] = [0; CACHE_SIZE];
+
+        for i in 0..CACHE_SIZE {
+            cache[i] = hash_bytes[i % 32] ^ (i as u8);  // XOR
+        }
+
+        // Cache Apply to Product
+        for i in 0..32 {
+            let cache_index = (i * 256) % CACHE_SIZE; 
+            product[i] = cache[cache_index] ^ product[(i + 1) % 32];
+        }
+
+
 
         // Final Cryptixhash v2
         CryptixHashV2::hash(Hash::from_bytes(product)) // Return
@@ -599,41 +616,5 @@ mod tests {
         /*
         // ### Cryptixhash v3
 
-        // Memory Hard Function - Inline Code
-        let mut memory_table: [u8; 16 * 1024] = [0; 16 * 1024]; // 16 KB
-        let nonce = hash.as_bytes(); 
-        
-        // **Fill the memory with the nonce**
-        for i in 0..memory_table.len() {
-            memory_table[i] = nonce[i % nonce.len()];  
-        }
-        
-        let mut index: usize = 0;
-        
-        // Repeat the calculations and manipulations in memory
-        for i in 0..32 {
-            let mut sum = 0u16;
-        
-             // Memory on product
-            for j in 0..32 {
-                sum += product[j] as u16 * self.0[2 * i][j % self.0[2 * i].len()] as u16;
-            }
-        
-            // **non-linear memory accesses**
-            for _ in 0..12 { 
-                index ^= (memory_table[(index * 7 + i) % memory_table.len()] as usize * 19) ^ ((i * 53) % 13);
-                index = (index * 73 + i * 41) % memory_table.len(); 
-                
-                // Index-Path
-                let shifted = (index.wrapping_add(i * 13)) % memory_table.len();
-                memory_table[shifted] ^= (sum & 0xFF) as u8;
-            }
-        }
-        
-        // Final hash result in memory
-        for i in 0..32 {
-            let shift_val = (product[i] as usize * 47 + i) % memory_table.len();
-            product[i] ^= memory_table[shift_val];
-        } 
 
         */
