@@ -397,19 +397,19 @@ impl Matrix {
             let value = if i < 16 { product[i as usize % 32] ^ 0xAA }
                 else if i < 32 { hash_bytes[(i - 16) as usize % 32] ^ 0xBB }
                 else if i < 48 { product_before_oct[(i - 32) as usize % 32] ^ 0xCC }
-                else if i < 64 { hash_bytes[(i - 48) as usize % 32] ^ 0xDD }
+                else if i < 64 { nibble_product[(i - 48) as usize % 32] ^ 0xDD }
                 else if i < 80 { product[(i - 64) as usize % 32] ^ 0xEE }
                 else if i < 96 { hash_bytes[(i - 80) as usize % 32] ^ 0xFF }
                 else if i < 112 { product_before_oct[(i - 96) as usize % 32] ^ 0x11 }
-                else if i < 128 { hash_bytes[(i - 112) as usize % 32] ^ 0x22 }
+                else if i < 128 { nibble_product[(i - 112) as usize % 32] ^ 0x22 }
                 else if i < 144 { product[(i - 128) as usize % 32] ^ 0x33 }
                 else if i < 160 { hash_bytes[(i - 144) as usize % 32] ^ 0x44 }
                 else if i < 176 { product_before_oct[(i - 160) as usize % 32] ^ 0x55 }
-                else if i < 192 { hash_bytes[(i - 176) as usize % 32] ^ 0x66 }
+                else if i < 192 { nibble_product[(i - 176) as usize % 32] ^ 0x66 }
                 else if i < 208 { product[(i - 192) as usize % 32] ^ 0x77 }
                 else if i < 224 { hash_bytes[(i - 208) as usize % 32] ^ 0x88 }
                 else if i < 240 { product_before_oct[(i - 224) as usize % 32] ^ 0x99 }
-                else { hash_bytes[(i - 240) as usize % 32] ^ 0xAA };
+                else { nibble_product[(i - 240) as usize % 32] ^ 0xAA };
         
             let rotate_left_shift = (product[(i as usize + 1) % product.len()] as u32 + i as u32) % 8;
             let rotate_right_shift = (hash_bytes[(i as usize + 2) % hash_bytes.len()] as u32 + i as u32) % 8;
@@ -456,7 +456,7 @@ impl Matrix {
 
 
         
-
+        
         // Cache Test
         const CACHE_SIZE: usize = 2 * 1024; // 2KB
         let mut cache: [u8; CACHE_SIZE] = [0; CACHE_SIZE];
