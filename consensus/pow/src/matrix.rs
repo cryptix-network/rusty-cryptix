@@ -304,18 +304,6 @@ impl Matrix {
     
         // Return the resulting octonion after applying all rotations
         oct
-    }    
-
-    // Non-linear S-box generation
-    pub fn generate_non_linear_sbox(input: u8, key: u8) -> u8 {
-        let mut result = input;
-
-        // Combination of multiplication and bitwise permutation
-        result = result.wrapping_mul(key);          // Multiply by the key
-        result = (result >> 3) | (result << 5);    // Bitwise permutation (Rotation)
-        result ^= 0x5A;                             // XOR with 0x5A
-
-        result
     }
 
     pub fn cryptix_hash(&self, hash: Hash) -> Hash {
@@ -368,18 +356,61 @@ impl Matrix {
             // XOR the values and store the result in the product
             product[i] ^= oct_value_u8;
         }
-                
+
         // **Apply nonlinear S-Box**
         let mut sbox: [u8; 256] = [0; 256];
 
-
-        
         for i in 0..256 {
-            let offset = i / 32;  
-            let index = (i + (product[(i + offset) % product.len()] as usize)) % hash_bytes.len();        
-            sbox[i] = hash_bytes[index];
+            let i = i as u8;
+        
+            // Select source array and rotation values based on 'i'
+            let (source_array, rotate_left_val, rotate_right_val) = if i < 32 {
+                (&product, (product[5] as u8 ^ 0x5A), (hash_bytes[5] as u8 ^ 0x3C))
+            } else if i < 64 {
+                (&hash_bytes, (product[4] as u8 ^ 0xA1), (hash_bytes[6] as u8 ^ 0xB2))
+            } else if i < 96 {
+                (&product, (product[2] as u8 ^ 0x7F), (hash_bytes[0] as u8 ^ 0x8E))
+            } else if i < 128 {
+                (&hash_bytes, (product[6] as u8 ^ 0x3B), (hash_bytes[2] as u8 ^ 0x4D))
+            } else if i < 160 {
+                (&product, (product[7] as u8 ^ 0x92), (hash_bytes[1] as u8 ^ 0x61))
+            } else if i < 192 {
+                (&hash_bytes, (product[0] as u8 ^ 0x4C), (hash_bytes[3] as u8 ^ 0x73))
+            } else {
+                (&product, (product[1] as u8 ^ 0x56), (hash_bytes[5] as u8 ^ 0x2D))
+            };
+        
+            // Calculate the value based on 'i'
+            let value = if i < 32 {
+                product[i as usize % 32] ^ 0xAA
+            } else if i < 64 {
+                hash_bytes[(i - 32) as usize % 32] ^ 0xBB
+            } else if i < 96 {
+                product[(i - 64) as usize % 32] ^ 0xCC
+            } else if i < 128 {
+                hash_bytes[(i - 96) as usize % 32] ^ 0xDD
+            } else if i < 160 {
+                product[(i - 128) as usize % 32] ^ 0xEE
+            } else if i < 192 {
+                hash_bytes[(i - 160) as usize % 32] ^ 0xFF
+            } else {
+                product[(i - 192) as usize % 32] ^ 0x11
+            };
+        
+            // Calculate rotation shift values
+            let rotate_left_shift = (product[(i as usize + 1) % product.len()] as u32 + i as u32) % 8;
+            let rotate_right_shift = (hash_bytes[(i as usize + 2) % hash_bytes.len()] as u32 + i as u32) % 8;
+        
+            // Perform rotations
+            let rotation_left = rotate_left_val.rotate_left(rotate_left_shift as u32);
+            let rotation_right = rotate_right_val.rotate_right(rotate_right_shift as u32);
+        
+            // Calculate index for S-box assignment
+            let index = (i as usize + rotation_left as usize + rotation_right as usize) % source_array.len();
+            
+            // Assign value to S-box with XOR
+            sbox[i as usize] = source_array[index] ^ value;
         }
-
 
         // Number of iterations depends on the first byte of the product
         let iterations = 3 + (product[0] % 4);  // Modulo 4 gives values ​​from 0 to 3 → +3 gives 3 to 6
@@ -390,9 +421,6 @@ impl Matrix {
             for i in 0..256 { 
                 let mut value = temp_sbox[i];  
                 
-                // Generate nonlinear value based on Hash + Product
-                value = Self::generate_non_linear_sbox(value, hash_bytes[i % hash_bytes.len()] ^ product[i % product.len()]); 
-                
                 // Bitwise rotation + XOR
                 value ^= value.rotate_left(4) | value.rotate_right(2); 
                 temp_sbox[i] = value; 
@@ -401,10 +429,18 @@ impl Matrix {
             sbox = temp_sbox; // Update the S-Box after the round
         }
 
-        // Apply the final S-Box transformation to the product with XOR
+        // Apply S-Box to the product with XOR
         for i in 0..32 {
-            product[i] ^= sbox[product[i] as usize]; // XOR product with S-Box values
+            product[i] ^= sbox[product[i] as usize]; 
         }
+
+
+
+
+
+
+
+
         
 
         // Cache Test
