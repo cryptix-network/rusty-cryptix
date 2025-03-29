@@ -342,6 +342,7 @@ impl Matrix {
         // XOR the product with the original hash   
         product.iter_mut().zip(hash.as_bytes()).for_each(|(p, h)| *p ^= h); // Apply XOR with the hash
         
+        let product_before_oct = product.clone();
 
         // ** Octonion Function **
         let octonion_result = Self::octonion_hash(&product); // Compute the octonion hash of the product
@@ -363,55 +364,53 @@ impl Matrix {
         for i in 0..256 {
             let i = i as u8;
         
-            // Select source array and rotation values based on 'i'
-            let (source_array, rotate_left_val, rotate_right_val) = if i < 32 {
-                (&product, (product[5] as u8 ^ 0x5A), (hash_bytes[5] as u8 ^ 0x3C))
-            } else if i < 64 {
-                (&hash_bytes, (product[4] as u8 ^ 0xA1), (hash_bytes[6] as u8 ^ 0xB2))
-            } else if i < 96 {
-                (&product, (product[2] as u8 ^ 0x7F), (hash_bytes[0] as u8 ^ 0x8E))
-            } else if i < 128 {
-                (&hash_bytes, (product[6] as u8 ^ 0x3B), (hash_bytes[2] as u8 ^ 0x4D))
-            } else if i < 160 {
-                (&product, (product[7] as u8 ^ 0x92), (hash_bytes[1] as u8 ^ 0x61))
-            } else if i < 192 {
-                (&hash_bytes, (product[0] as u8 ^ 0x4C), (hash_bytes[3] as u8 ^ 0x73))
-            } else {
-                (&product, (product[1] as u8 ^ 0x56), (hash_bytes[5] as u8 ^ 0x2D))
-            };
+            let (source_array, rotate_left_val, rotate_right_val) = if i < 16 { (&product, product[3] ^ 0x4F, hash_bytes[2] ^ 0xD3) }
+                else if i < 32 { (&hash_bytes, product[7] ^ 0xA6, hash_bytes[5] ^ 0x5B) }
+                else if i < 48 { (&product, product_before_oct[1] ^ 0x9C, hash_bytes[0] ^ 0x8E) }
+                else if i < 64 { (&hash_bytes, product[6] ^ 0x71, hash_bytes[3] ^ 0x2F) }
+                else if i < 80 { (&product_before_oct, product[4] ^ 0xB2, hash_bytes[7] ^ 0x6D) }
+                else if i < 96 { (&hash_bytes, product[0] ^ 0x58, hash_bytes[1] ^ 0xEE) }
+                else if i < 112 { (&product, product_before_oct[2] ^ 0x37, hash_bytes[6] ^ 0x44) }
+                else if i < 128 { (&hash_bytes, product[5] ^ 0x1A, hash_bytes[4] ^ 0x7C) }
+                else if i < 144 { (&product_before_oct, product[3] ^ 0x93, hash_bytes[2] ^ 0xAF) }
+                else if i < 160 { (&hash_bytes, product[7] ^ 0x29, hash_bytes[5] ^ 0xDC) }
+                else if i < 176 { (&product, product_before_oct[1] ^ 0x4E, hash_bytes[0] ^ 0x8B) }
+                else if i < 192 { (&hash_bytes, product[6] ^ 0xF3, hash_bytes[3] ^ 0x62) }
+                else if i < 208 { (&product_before_oct, product[4] ^ 0xB7, hash_bytes[7] ^ 0x15) }
+                else if i < 224 { (&hash_bytes, product[0] ^ 0x2D, hash_bytes[1] ^ 0xC8) }
+                else if i < 240 { (&product, product_before_oct[2] ^ 0x6F, hash_bytes[6] ^ 0x99) }
+                else { (&hash_bytes, product[5] ^ 0xE1, hash_bytes[4] ^ 0x3B) };
         
-            // Calculate the value based on 'i'
-            let value = if i < 32 {
-                product[i as usize % 32] ^ 0xAA
-            } else if i < 64 {
-                hash_bytes[(i - 32) as usize % 32] ^ 0xBB
-            } else if i < 96 {
-                product[(i - 64) as usize % 32] ^ 0xCC
-            } else if i < 128 {
-                hash_bytes[(i - 96) as usize % 32] ^ 0xDD
-            } else if i < 160 {
-                product[(i - 128) as usize % 32] ^ 0xEE
-            } else if i < 192 {
-                hash_bytes[(i - 160) as usize % 32] ^ 0xFF
-            } else {
-                product[(i - 192) as usize % 32] ^ 0x11
-            };
+            let value = if i < 16 { product[i as usize % 32] ^ 0xAA }
+                else if i < 32 { hash_bytes[(i - 16) as usize % 32] ^ 0xBB }
+                else if i < 48 { product_before_oct[(i - 32) as usize % 32] ^ 0xCC }
+                else if i < 64 { hash_bytes[(i - 48) as usize % 32] ^ 0xDD }
+                else if i < 80 { product[(i - 64) as usize % 32] ^ 0xEE }
+                else if i < 96 { hash_bytes[(i - 80) as usize % 32] ^ 0xFF }
+                else if i < 112 { product_before_oct[(i - 96) as usize % 32] ^ 0x11 }
+                else if i < 128 { hash_bytes[(i - 112) as usize % 32] ^ 0x22 }
+                else if i < 144 { product[(i - 128) as usize % 32] ^ 0x33 }
+                else if i < 160 { hash_bytes[(i - 144) as usize % 32] ^ 0x44 }
+                else if i < 176 { product_before_oct[(i - 160) as usize % 32] ^ 0x55 }
+                else if i < 192 { hash_bytes[(i - 176) as usize % 32] ^ 0x66 }
+                else if i < 208 { product[(i - 192) as usize % 32] ^ 0x77 }
+                else if i < 224 { hash_bytes[(i - 208) as usize % 32] ^ 0x88 }
+                else if i < 240 { product_before_oct[(i - 224) as usize % 32] ^ 0x99 }
+                else { hash_bytes[(i - 240) as usize % 32] ^ 0xAA };
         
-            // Calculate rotation shift values
             let rotate_left_shift = (product[(i as usize + 1) % product.len()] as u32 + i as u32) % 8;
             let rotate_right_shift = (hash_bytes[(i as usize + 2) % hash_bytes.len()] as u32 + i as u32) % 8;
         
-            // Perform rotations
-            let rotation_left = rotate_left_val.rotate_left(rotate_left_shift as u32);
-            let rotation_right = rotate_right_val.rotate_right(rotate_right_shift as u32);
+            let rotation_left = rotate_left_val.rotate_left(rotate_left_shift);
+            let rotation_right = rotate_right_val.rotate_right(rotate_right_shift);
         
-            // Calculate index for S-box assignment
             let index = (i as usize + rotation_left as usize + rotation_right as usize) % source_array.len();
-            
-            // Assign value to S-box with XOR
             sbox[i as usize] = source_array[index] ^ value;
         }
+        
 
+
+        /* 
         // Number of iterations depends on the first byte of the product
         let iterations = 3 + (product[0] % 4);  // Modulo 4 gives values ​​from 0 to 3 → +3 gives 3 to 6
 
@@ -428,6 +427,8 @@ impl Matrix {
 
             sbox = temp_sbox; // Update the S-Box after the round
         }
+        */
+
 
         // Apply S-Box to the product with XOR
         for i in 0..32 {
