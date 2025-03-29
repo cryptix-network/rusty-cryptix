@@ -372,10 +372,14 @@ impl Matrix {
         // **Apply nonlinear S-Box**
         let mut sbox: [u8; 256] = [0; 256];
 
-        // Fill the S-box using the bytes of the hash
+
+        
         for i in 0..256 {
-            sbox[i] = hash_bytes[i % hash_bytes.len()]; // Wrap around the hash bytes
+            let offset = i / 32;  
+            let index = (i + (product[(i + offset) % product.len()] as usize)) % hash_bytes.len();        
+            sbox[i] = hash_bytes[index];
         }
+
 
         // Number of iterations depends on the first byte of the product
         let iterations = 3 + (product[0] % 4);  // Modulo 4 gives values ​​from 0 to 3 → +3 gives 3 to 6
@@ -612,9 +616,3 @@ mod tests {
         assert_eq!(matrix, expected_matrix);
     }
 }
-
-        /*
-        // ### Cryptixhash v3
-
-
-        */
