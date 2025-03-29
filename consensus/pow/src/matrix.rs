@@ -321,22 +321,35 @@ impl Matrix {
             arr
         };
     
+        // Matrix and vector multiplication
         let mut product = [0u8; 32];
-    
+        let mut nibble_product = [0u8; 32];
+
         for i in 0..32 {
-            let mut sum1 = 0u16;
-            let mut sum2 = 0u16;
+            let mut sum1: u16 = 0;
+            let mut sum2: u16 = 0;
+            let mut sum3: u16 = 0;
+            let mut sum4: u16 = 0;
+    
             for j in 0..64 {
                 let elem = nibbles[j] as u16;
-                sum1 += self.0[2 * i][j] * elem;   // Matrix multiplication
+                sum1 += self.0[2 * i][j] * elem;
                 sum2 += self.0[2 * i + 1][j] * elem;
+                sum3 += self.0[1 * i + 2][j] * elem;
+                sum4 += self.0[1 * i + 3][j] * elem; 
             }
-            
-            // Combine the nibbles back into bytes
-            let a_nibble = (sum1 & 0xF) ^ ((sum2 >> 4) & 0xF) ^ ((sum1 >> 8) & 0xF); // Combine the bits
-            let b_nibble = (sum2 & 0xF) ^ ((sum1 >> 4) & 0xF) ^ ((sum2 >> 8) & 0xF);
     
-            product[i] = ((a_nibble << 4) | b_nibble) as u8; // Combine to form final byte
+            // Combine the nibbles back into bytes
+            let a_nibble = (sum1 & 0xF) ^ ((sum2 >> 4) & 0xF) ^ ((sum3 >> 8) & 0xF);
+            let b_nibble = (sum2 & 0xF) ^ ((sum1 >> 4) & 0xF) ^ ((sum4 >> 8) & 0xF);
+
+            // Calculate c_nibble and d_nibble
+            let c_nibble = (sum3 & 0xF) ^ ((sum2 >> 4) & 0xF) ^ ((sum2 >> 8) & 0xF);
+            let d_nibble = (sum1 & 0xF) ^ ((sum4 >> 4) & 0xF) ^ ((sum1 >> 8) & 0xF);
+
+            // Combine c_nibble and d_nibble to form nibble_product
+            nibble_product[i] = ((c_nibble << 4) | d_nibble) as u8; 
+            product[i] = ((a_nibble << 4) | b_nibble) as u8;
         }
 
         // XOR the product with the original hash   
