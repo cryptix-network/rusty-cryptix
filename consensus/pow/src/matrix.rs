@@ -398,6 +398,17 @@ impl Matrix {
             sbox = temp_sbox;
         }
 
+        // BLAKE3 Step
+        let mut b3_hasher = blake3::Hasher::new();
+        b3_hasher.update(&product);
+        let product_blake3 = b3_hasher.finalize();
+        let b3_hash_bytes = product_blake3.as_bytes();
+
+        // Convert Blake3 [u8; 32]
+        let mut b3_hash_array = [0u8; 32];
+        b3_hash_array.copy_from_slice(b3_hash_bytes);
+
+
         // Apply S-Box to the product with XOR
         for i in 0..32 {
             let ref_array = match (i * 31) % 4 { 
@@ -413,12 +424,12 @@ impl Matrix {
                         + product[(i * 31) % product.len()] as usize 
                         + hash_bytes[(i * 19) % hash_bytes.len()] as usize 
                         + i * 41) % 256;  
-
-            product[i] ^= sbox[index]; 
+            
+           b3_hash_array[i] ^= sbox[index]; 
         }
 
         // Final Cryptixhash v2
-        CryptixHashV2::hash(Hash::from_bytes(product)) // Return
+        CryptixHashV2::hash(Hash::from_bytes(b3_hash_array)) // Return
     }
 }
 
