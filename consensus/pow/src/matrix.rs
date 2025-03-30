@@ -371,7 +371,8 @@ impl Matrix {
         }
         
         // Update Sbox Values
-        let iterations = 1 + (product[0] % 3);  
+        let index = ((product_before_oct[2] % 8) + 1) as usize;  
+        let iterations = 1 + (product[index] % 2);
 
         for _ in 0..iterations {
             let mut temp_sbox = sbox;
