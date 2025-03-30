@@ -284,16 +284,18 @@ impl Matrix {
                 sum4 += self.0[1 * i + 3][j] * elem; 
             }
     
-            // Combine the nibbles back into bytes
+            // Calculate a_nibble and b_nibble for product
             let a_nibble = (sum1 & 0xF) ^ ((sum2 >> 4) & 0xF) ^ ((sum3 >> 8) & 0xF);
             let b_nibble = (sum2 & 0xF) ^ ((sum1 >> 4) & 0xF) ^ ((sum4 >> 8) & 0xF);
 
-            // Calculate c_nibble and d_nibble
+            // Calculate c_nibble and d_nibble for nibble product
             let c_nibble = (sum3 & 0xF) ^ ((sum2 >> 4) & 0xF) ^ ((sum2 >> 8) & 0xF);
             let d_nibble = (sum1 & 0xF) ^ ((sum4 >> 4) & 0xF) ^ ((sum1 >> 8) & 0xF);
 
             // Combine c_nibble and d_nibble to form nibble_product
             nibble_product[i] = ((c_nibble << 4) | d_nibble) as u8; 
+
+            // Combine a_nibble and b_nibble to form product
             product[i] = ((a_nibble << 4) | b_nibble) as u8;
         }
 
@@ -322,7 +324,8 @@ impl Matrix {
         for i in 0..256 {
             let i = i as u8;
         
-            let (source_array, rotate_left_val, rotate_right_val) = if i < 16 { (&product, nibble_product[3] ^ 0x4F, hash_bytes[2] ^ 0xD3) }
+            let (source_array, rotate_left_val, rotate_right_val) = 
+                if i < 16 { (&product, nibble_product[3] ^ 0x4F, hash_bytes[2] ^ 0xD3) }
                 else if i < 32 { (&hash_bytes, product[7] ^ 0xA6, nibble_product[5] ^ 0x5B) }
                 else if i < 48 { (&nibble_product, product_before_oct[1] ^ 0x9C, product[0] ^ 0x8E) }
                 else if i < 64 { (&hash_bytes, product[6] ^ 0x71, product_before_oct[3] ^ 0x2F) }
@@ -339,7 +342,8 @@ impl Matrix {
                 else if i < 240 { (&product, product_before_oct[2] ^ 0x6F, nibble_product[6] ^ 0x99) }
                 else { (&hash_bytes, nibble_product[5] ^ 0xE1, hash_bytes[4] ^ 0x3B) };
         
-            let value = if i < 16 { product[i as usize % 32] ^ 0xAA }
+            let value = 
+                if i < 16 { product[i as usize % 32] ^ 0xAA }
                 else if i < 32 { hash_bytes[(i - 16) as usize % 32] ^ 0xBB }
                 else if i < 48 { product_before_oct[(i - 32) as usize % 32] ^ 0xCC }
                 else if i < 64 { nibble_product[(i - 48) as usize % 32] ^ 0xDD }
@@ -387,10 +391,23 @@ impl Matrix {
         }
         */
 
-
         // Apply S-Box to the product with XOR
         for i in 0..32 {
-            product[i] ^= sbox[product[i] as usize]; 
+            let ref_array = match (i * 31) % 4 { 
+                0 => &nibble_product,
+                1 => &hash_bytes,
+                2 => &product,
+                _ => &product_before_oct,
+            };
+
+            let byte_val = ref_array[(i * 13) % ref_array.len()] as usize;
+
+            let index = (byte_val 
+                        + product[(i * 31) % product.len()] as usize 
+                        + hash_bytes[(i * 19) % hash_bytes.len()] as usize 
+                        + i * 41) % 256;  
+
+            product[i] ^= sbox[index]; 
         }
 
         // Final Cryptixhash v2
