@@ -99,61 +99,6 @@ impl Matrix {
         rank
     }
 
-    /* 
-    // ### Cryptixhash v3
-
-    // generate_non_linear_sbox method
-    pub fn generate_non_linear_sbox(input: u8, key: u8) -> u8 {
-        let mut result = input;
-
-        // Calculate the inverse in GF(2^8)
-        result = Self::gf_invert(result);
-
-        // Affine transformation (left rotation, XOR with constant 0x63)
-        result = Self::affine_transform(result);
-
-        // XOR with the key for additional diffusion
-        result ^= key;
-
-        result
-    }
-
-    // Inverse calculation and affine transformation
-    fn gf_invert(value: u8) -> u8 {
-        if value == 0 {
-            return 0; // The inverse of 0 is 0
-        }
-
-        let mut t = 0u8;
-        let r: u16 = 0x11b; // The irreducible polynomial as u16
-        let mut v = value;
-        let mut u: u16 = 1; // 1 in GF(2^8)
-
-        // Extended Euclidean algorithm
-        for _ in 0..8 {
-            if v & 1 == 1 {
-                t ^= u as u8; // Cast the result as u8
-            }
-
-            v >>= 1;
-            u = (u << 1) ^ (if v & 0x80 != 0 { r } else { 0 });
-
-            if u & 0x100 != 0 {
-                u ^= 0x11b; // XOR with irreducible polynomial
-            }
-        }
-
-        t
-    }
-
-    // Affine Transformation (left rotation + XOR with constant 0x63)
-    fn affine_transform(value: u8) -> u8 {
-        let mut result = value;
-        result = result.rotate_left(4) ^ result; // Left rotation + XOR with itself (for diffusion)
-        result ^= 0x63; // XOR with a constant (similar to AES)
-        result
-    }*/
-
     // Octionion Multiply
     fn octonion_multiply(a: &[i64; 8], b: &[i64; 8]) -> [i64; 8] {
         let mut result = [0; 8];
@@ -447,31 +392,6 @@ impl Matrix {
         for i in 0..32 {
             product[i] ^= sbox[product[i] as usize]; 
         }
-
-
-
-
-
-
-
-
-        
-        
-        // Cache Test
-        const CACHE_SIZE: usize = 2 * 1024; // 2KB
-        let mut cache: [u8; CACHE_SIZE] = [0; CACHE_SIZE];
-
-        for i in 0..CACHE_SIZE {
-            cache[i] = hash_bytes[i % 32] ^ (i as u8);  // XOR
-        }
-
-        // Cache Apply to Product
-        for i in 0..32 {
-            let cache_index = (i * 256) % CACHE_SIZE; 
-            product[i] = cache[cache_index] ^ product[(i + 1) % 32];
-        }
-
-
 
         // Final Cryptixhash v2
         CryptixHashV2::hash(Hash::from_bytes(product)) // Return
