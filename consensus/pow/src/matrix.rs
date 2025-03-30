@@ -377,22 +377,22 @@ impl Matrix {
         for i in 0..256 {
             let i = i as u8;
         
-            let (source_array, rotate_left_val, rotate_right_val) = if i < 16 { (&product, product[3] ^ 0x4F, hash_bytes[2] ^ 0xD3) }
-                else if i < 32 { (&hash_bytes, product[7] ^ 0xA6, hash_bytes[5] ^ 0x5B) }
-                else if i < 48 { (&product, product_before_oct[1] ^ 0x9C, hash_bytes[0] ^ 0x8E) }
-                else if i < 64 { (&hash_bytes, product[6] ^ 0x71, hash_bytes[3] ^ 0x2F) }
-                else if i < 80 { (&product_before_oct, product[4] ^ 0xB2, hash_bytes[7] ^ 0x6D) }
-                else if i < 96 { (&hash_bytes, product[0] ^ 0x58, hash_bytes[1] ^ 0xEE) }
+            let (source_array, rotate_left_val, rotate_right_val) = if i < 16 { (&product, nibble_product[3] ^ 0x4F, hash_bytes[2] ^ 0xD3) }
+                else if i < 32 { (&hash_bytes, product[7] ^ 0xA6, nibble_product[5] ^ 0x5B) }
+                else if i < 48 { (&nibble_product, product_before_oct[1] ^ 0x9C, product[0] ^ 0x8E) }
+                else if i < 64 { (&hash_bytes, product[6] ^ 0x71, product_before_oct[3] ^ 0x2F) }
+                else if i < 80 { (&product_before_oct, nibble_product[4] ^ 0xB2, hash_bytes[7] ^ 0x6D) }
+                else if i < 96 { (&hash_bytes, product[0] ^ 0x58, nibble_product[1] ^ 0xEE) }
                 else if i < 112 { (&product, product_before_oct[2] ^ 0x37, hash_bytes[6] ^ 0x44) }
                 else if i < 128 { (&hash_bytes, product[5] ^ 0x1A, hash_bytes[4] ^ 0x7C) }
-                else if i < 144 { (&product_before_oct, product[3] ^ 0x93, hash_bytes[2] ^ 0xAF) }
-                else if i < 160 { (&hash_bytes, product[7] ^ 0x29, hash_bytes[5] ^ 0xDC) }
-                else if i < 176 { (&product, product_before_oct[1] ^ 0x4E, hash_bytes[0] ^ 0x8B) }
-                else if i < 192 { (&hash_bytes, product[6] ^ 0xF3, hash_bytes[3] ^ 0x62) }
-                else if i < 208 { (&product_before_oct, product[4] ^ 0xB7, hash_bytes[7] ^ 0x15) }
-                else if i < 224 { (&hash_bytes, product[0] ^ 0x2D, hash_bytes[1] ^ 0xC8) }
-                else if i < 240 { (&product, product_before_oct[2] ^ 0x6F, hash_bytes[6] ^ 0x99) }
-                else { (&hash_bytes, product[5] ^ 0xE1, hash_bytes[4] ^ 0x3B) };
+                else if i < 144 { (&product_before_oct, nibble_product[3] ^ 0x93, product[2] ^ 0xAF) }
+                else if i < 160 { (&hash_bytes, product[7] ^ 0x29, nibble_product[5] ^ 0xDC) }
+                else if i < 176 { (&nibble_product, product_before_oct[1] ^ 0x4E, hash_bytes[0] ^ 0x8B) }
+                else if i < 192 { (&hash_bytes, nibble_product[6] ^ 0xF3, product_before_oct[3] ^ 0x62) }
+                else if i < 208 { (&product_before_oct, product[4] ^ 0xB7, product[7] ^ 0x15) }
+                else if i < 224 { (&hash_bytes, product[0] ^ 0x2D, product_before_oct[1] ^ 0xC8) }
+                else if i < 240 { (&product, product_before_oct[2] ^ 0x6F, nibble_product[6] ^ 0x99) }
+                else { (&hash_bytes, nibble_product[5] ^ 0xE1, hash_bytes[4] ^ 0x3B) };
         
             let value = if i < 16 { product[i as usize % 32] ^ 0xAA }
                 else if i < 32 { hash_bytes[(i - 16) as usize % 32] ^ 0xBB }
