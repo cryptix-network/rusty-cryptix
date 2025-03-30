@@ -318,7 +318,7 @@ impl Matrix {
             product[i] ^= oct_value_u8;
         }
 
-        // **Apply nonlinear S-Box**
+        // **Nonlinear S-Box**
         let mut sbox: [u8; 256] = [0; 256];
 
         for i in 0..256 {
