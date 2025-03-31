@@ -99,6 +99,11 @@ impl Matrix {
         rank
     }
 
+    // **Octonion Multiply Function**  
+    // This function multiplies two 8-dimensional octonions, `a` and `b`, and returns the resulting octonion.
+    // Octonion multiplication is non-commutative and follows a set of specific rules as shown in the multiplication table below.  
+    // The elements of the octonion are represented as a tuple of 8 elements: e₀, e₁, e₂, ..., e₇.  
+
     // Octionion Multiply
     fn octonion_multiply(a: &[i64; 8], b: &[i64; 8]) -> [i64; 8] {
         let mut result = [0; 8];
@@ -215,6 +220,11 @@ impl Matrix {
         return result;
     }
 
+    // **Octonion Hash Function**  
+    // This function generates an octonion hash from an input hash (32-byte array).  
+    // It uses the first 8 bytes of the `input_hash` as the initial octonion and then performs octonion multiplication with rotated versions of the `input_hash`'s bytes.  
+    // The rotation ensures that every byte of the input contributes to the octonion transformation over several iterations, introducing complexity and diffusion.  
+
     // Octonion Hash
     fn octonion_hash(input_hash: &[u8; 32]) -> [i64; 8] {
 
@@ -255,6 +265,15 @@ impl Matrix {
         // Convert the hash to its byte representation
         let hash_bytes = hash.as_bytes();
 
+        // ## Matrix & Nibbles 
+        // 
+        // This function performs a transformation on a hash by first extracting its nibbles (4-bit halves) and then 
+        // applying a structured matrix-vector multiplication. The resulting sums are processed using a non-linear 
+        // transformation with bitwise operations and modular multiplications to increase complexity. The transformed 
+        // values are then recombined into a new 32-byte product, which is finally XORed with the original hash to 
+        // introduce diffusion and additional complexity. 
+        // 
+        
         // Create an array containing the nibbles (4-bit halves of the bytes)
         let nibbles: [u8; 64] = {
             let o_bytes = hash.as_bytes();
@@ -283,6 +302,10 @@ impl Matrix {
                 sum3 += (self.0[1 * i + 2][j] as u32) * elem;
                 sum4 += (self.0[1 * i + 3][j] as u32) * elem;                
             }
+
+            // **Nibble Calculations**  
+            // Here it calculates four nibbles (4-bit values) using bitwise operations like AND, XOR, and bit shifting, 
+            // combined with wrapping multiplication to generate a pseudo-randomized effect based on `sum1`, `sum2`, `sum3`, and `sum4`.
 
            // Nibbles
            //A
@@ -320,6 +343,14 @@ impl Matrix {
 
         // XOR the product with the original hash   
         product.iter_mut().zip(hash.as_bytes()).for_each(|(p, h)| *p ^= h); // Apply XOR with the hash
+
+        // Octonion
+        //
+        // This section introduces an additional transformation using octonion algebra.
+        // Octonions are an extension of quaternions and follow non-commutative, 
+        // non-associative multiplication rules. This adds further complexity and diffusion 
+        // to the hash transformation process.
+        //
         
         let product_before_oct = product.clone();
 
@@ -337,12 +368,25 @@ impl Matrix {
             product[i] ^= oct_value_u8;
         }
 
+        // S-Box Transformation
+        //
+        // This section constructs a nonlinear S-Box using multiple data sources, rotations, and XOR operations. 
+        // The S-Box is dynamically generated based on the input data, ensuring high diffusion and resistance 
+        // against cryptographic attacks. It undergoes an iterative refinement process, enhancing its complexity.
+        //
+
         // **Nonlinear S-Box**
         let mut sbox: [u8; 256] = [0; 256];
 
         for i in 0..256 {
             let i = i as u8;
-        
+
+            // **Source Array and Rotation Values Assignment**  
+            // In this code block, based on the value of `i`, the function selects which array to operate on and also computes the left and right rotation values.  
+            // The `source_array` is chosen from different byte arrays (`product`, `hash_bytes`, `nibble_product`, `product_before_oct`) depending on the index `i`.  
+            // Each case modifies the rotation values through XOR operations to add more complexity to the transformation.  
+            // The rotations (both left and right) are used in later steps for shifting the bits in the respective arrays, further obfuscating the data.  
+
             let (source_array, rotate_left_val, rotate_right_val) = 
                 if i < 16 { (&product, nibble_product[3] ^ 0x4F, hash_bytes[2] ^ 0xD3) }
                 else if i < 32 { (&hash_bytes, product[7] ^ 0xA6, nibble_product[5] ^ 0x5B) }
@@ -361,6 +405,12 @@ impl Matrix {
                 else if i < 240 { (&product, product_before_oct[2] ^ 0x6F, nibble_product[6] ^ 0x99) }
                 else { (&hash_bytes, nibble_product[5] ^ 0xE1, hash_bytes[4] ^ 0x3B) };
         
+            // **Value Assignment Based on Index `i`**  
+            // This code assigns a value to the variable `value` based on the index `i`.  
+            // The value is selected from one of the byte arrays (`product`, `hash_bytes`, `product_before_oct`, `nibble_product`) with a corresponding XOR operation for each index range.  
+            // The XOR operation uses different constants (0xAA, 0xBB, etc.) to further introduce complexity in the transformation.  
+            // The use of modular arithmetic (`i % 32`) ensures that the index wraps around and accesses values in a cyclic manner within the respective byte array.  
+
             let value = 
                 if i < 16 { product[i as usize % 32] ^ 0xAA }
                 else if i < 32 { hash_bytes[(i - 16) as usize % 32] ^ 0xBB }
@@ -379,6 +429,11 @@ impl Matrix {
                 else if i < 240 { product_before_oct[(i - 224) as usize % 32] ^ 0x99 }
                 else { nibble_product[(i - 240) as usize % 32] ^ 0xAA };
         
+            // **Rotations and Index Calculation for S-box Assignment**  
+            // This section performs bitwise rotation operations and computes the index used for accessing values from a source array.  
+            // The values used for rotation are derived from the `product` and `hash_bytes` arrays, along with the index `i` and certain rotation constants.  
+            // The result of the rotations determines the index, which is then used to modify the `sbox` array with a XOR operation.
+
             let rotate_left_shift = (product[(i as usize + 1) % product.len()] as u32 + i as u32) % 8;
             let rotate_right_shift = (hash_bytes[(i as usize + 2) % hash_bytes.len()] as u32 + i as u32) % 8;
         
@@ -389,6 +444,10 @@ impl Matrix {
             sbox[i as usize] = source_array[index] ^ value;
         }
         
+        // **Update S-box Values**  
+        // This section updates the S-box values through a series of rotations, XOR operations, and iterations.  
+        // The number of iterations is determined based on the value of `product_before_oct[2]`. In each iteration, the values of the S-box are updated.
+
         // Update Sbox Values
         let index = ((product_before_oct[2] % 8) + 1) as usize;  
         let iterations = 1 + (product[index] % 2);
@@ -417,7 +476,10 @@ impl Matrix {
             sbox = temp_sbox;
         }
 
-        // BLAKE3 Step
+        // ** BLAKE3 Hashing Step **  
+        // This step applies the BLAKE3 cryptographic hash function to the `product` array.
+
+        // BLAKE3
         let mut b3_hasher = blake3::Hasher::new();
         b3_hasher.update(&product);
         let product_blake3 = b3_hasher.finalize();
@@ -427,6 +489,12 @@ impl Matrix {
         let mut b3_hash_array = [0u8; 32];
         b3_hash_array.copy_from_slice(b3_hash_bytes);
 
+        // ** Apply S-Box to the Product with XOR **  
+        // In this step, the S-box transformation is applied to the `product` by using XOR operations.  
+        // The S-box helps in introducing non-linearity into the data, making it harder to reverse-engineer.  
+        // For each byte in the `product` array, a reference array (`nibble_product`, `hash_bytes`, `product`, or `product_before_oct`) is selected based on the current index.  
+        // A byte value is then extracted from the selected reference array, and the resulting index is calculated based on several XOR operations.  
+        // The final step XORs the result of the S-box lookup with the corresponding value in the `b3_hash_array`.  
 
         // Apply S-Box to the product with XOR
         for i in 0..32 {
@@ -446,6 +514,9 @@ impl Matrix {
             
            b3_hash_array[i] ^= sbox[index]; 
         }
+
+        // ** Tada Cryptix Hash v2 **  
+        // He is a little shy, but still sexy
 
         // Final Cryptixhash v2
         CryptixHashV2::hash(Hash::from_bytes(b3_hash_array)) // Return
