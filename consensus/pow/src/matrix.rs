@@ -477,7 +477,10 @@ impl Matrix {
         }
 
         // ** BLAKE3 Hashing Step **  
-        // This step applies the BLAKE3 cryptographic hash function to the `product` array.
+        // This step applies the BLAKE3 cryptographic hash function to the `product` array multiple times in a chained manner.
+        // The number of iterations (1 to 3) is determined dynamically based on `product[index_blake]`.  
+        // Each iteration uses the previous hash result as input for the next hashing step, ensuring sequential chaining.
+
 
         // Blake3 Chaining
         let index_blake = ((product_before_oct[5] % 8) + 1) as usize;  
