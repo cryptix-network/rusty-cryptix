@@ -102,12 +102,12 @@ impl Matrix {
     // Sinusoidal (It needs to be tested in the testnet first due to arch rounding errors)
     // Sin Lookup
     fn generate_sin_lookup() -> [u8; 360] {
-        let pi = 3.14159265359f32;
+        let pi = 3.141592653589793f64;
         let scale = 255.0;
         let mut table = [0u8; 360];
     
         for i in 0..360 {
-            let angle_rad = (i as f32) * (pi / 180.0);
+            let angle_rad = (i as f64) * (pi / 180.0);
             table[i] = ((angle_rad.sin().abs()) * scale) as u8;
         }
     
