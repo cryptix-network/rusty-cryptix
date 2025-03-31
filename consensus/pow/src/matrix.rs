@@ -271,30 +271,49 @@ impl Matrix {
         let mut nibble_product = [0u8; 32];
 
         for i in 0..32 {
-            let mut sum1: u16 = 0;
-            let mut sum2: u16 = 0;
-            let mut sum3: u16 = 0;
-            let mut sum4: u16 = 0;
+            let mut sum1: u32 = 0;
+            let mut sum2: u32 = 0;
+            let mut sum3: u32 = 0;
+            let mut sum4: u32 = 0;
     
             for j in 0..64 {
-                let elem = nibbles[j] as u16;
-                sum1 += self.0[2 * i][j] * elem;
-                sum2 += self.0[2 * i + 1][j] * elem;
-                sum3 += self.0[1 * i + 2][j] * elem;
-                sum4 += self.0[1 * i + 3][j] * elem; 
+                let elem = nibbles[j] as u32;
+                sum1 += (self.0[2 * i][j] as u32) * elem;
+                sum2 += (self.0[2 * i + 1][j] as u32) * elem;
+                sum3 += (self.0[1 * i + 2][j] as u32) * elem;
+                sum4 += (self.0[1 * i + 3][j] as u32) * elem;                
             }
-    
-            // Calculate a_nibble and b_nibble for product
-            let a_nibble = (sum1 & 0xF) ^ ((sum2 >> 4) & 0xF) ^ ((sum3 >> 8) & 0xF);
-            let b_nibble = (sum2 & 0xF) ^ ((sum1 >> 4) & 0xF) ^ ((sum4 >> 8) & 0xF);
 
-            // Calculate c_nibble and d_nibble for nibble product
-            let c_nibble = (sum3 & 0xF) ^ ((sum2 >> 4) & 0xF) ^ ((sum2 >> 8) & 0xF);
-            let d_nibble = (sum1 & 0xF) ^ ((sum4 >> 4) & 0xF) ^ ((sum1 >> 8) & 0xF);
+           // Nibbles
+           //A
+            let a_nibble = (sum1 & 0xF) ^ ((sum2 >> 4) & 0xF) ^ ((sum3 >> 8) & 0xF) 
+                ^ ((sum1.wrapping_mul(0xABCD) >> 12) & 0xF) 
+                ^ ((sum1.wrapping_mul(0x1234) >> 8) & 0xF)
+                ^ ((sum2.wrapping_mul(0x5678) >> 16) & 0xF)
+                ^ ((sum3.wrapping_mul(0x9ABC) >> 4) & 0xF);
+
+            // B
+            let b_nibble = (sum2 & 0xF) ^ ((sum1 >> 4) & 0xF) ^ ((sum4 >> 8) & 0xF) 
+                ^ ((sum2.wrapping_mul(0xDCBA) >> 14) & 0xF)
+                ^ ((sum2.wrapping_mul(0x8765) >> 10) & 0xF) 
+                ^ ((sum1.wrapping_mul(0x4321) >> 6) & 0xF);
+
+            // C
+            let c_nibble = (sum3 & 0xF) ^ ((sum2 >> 4) & 0xF) ^ ((sum2 >> 8) & 0xF) 
+                ^ ((sum3.wrapping_mul(0xF135) >> 10) & 0xF)
+                ^ ((sum3.wrapping_mul(0x2468) >> 12) & 0xF) 
+                ^ ((sum4.wrapping_mul(0xACEF) >> 8) & 0xF)
+                ^ ((sum2.wrapping_mul(0x1357) >> 4) & 0xF);
+
+            // D
+            let d_nibble = (sum1 & 0xF) ^ ((sum4 >> 4) & 0xF) ^ ((sum1 >> 8) & 0xF)
+                ^ ((sum4.wrapping_mul(0x57A3) >> 6) & 0xF)
+                ^ ((sum3.wrapping_mul(0xD4E3) >> 12) & 0xF)
+                ^ ((sum1.wrapping_mul(0x9F8B) >> 10) & 0xF);
 
             // Combine c_nibble and d_nibble to form nibble_product
             nibble_product[i] = ((c_nibble << 4) | d_nibble) as u8; 
-
+            
             // Combine a_nibble and b_nibble to form product
             product[i] = ((a_nibble << 4) | b_nibble) as u8;
         }
