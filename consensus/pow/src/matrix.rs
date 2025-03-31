@@ -99,6 +99,7 @@ impl Matrix {
         rank
     }
 
+    /* 
     // Sin Lookup
     const SIN_LOOKUP: [u8; 360] = [
         0, 4, 8, 13, 17, 22, 26, 31, 35, 39, 44, 48, 53, 57, 61, 65, 70, 74, 78, 83, 87, 91, 95, 99, 103, 107, 111, 115, 119, 123, 127, 131, 135, 138, 142, 146, 149, 153, 156, 160,
@@ -137,6 +138,7 @@ impl Matrix {
 
         sinus_out
     }
+    */
 
     // **Octonion Multiply Function**  
     // This function multiplies two 8-dimensional octonions, `a` and `b`, and returns the resulting octonion.
