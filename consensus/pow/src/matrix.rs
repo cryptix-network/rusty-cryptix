@@ -525,6 +525,10 @@ impl Matrix {
             b3_hash_array.copy_from_slice(b3_hash_bytes);
         }
 
+        // Sinus (Testnet)
+        // let sinus_in = product.clone();    
+        // let sinus_out = Self::sinusoidal_multiply(&sinus_in);
+
         // ** Apply S-Box to the Product with XOR **  
         // In this step, the S-box transformation is applied to the `product` by using XOR operations.  
         // The S-box helps in introducing non-linearity into the data, making it harder to reverse-engineer.  
@@ -549,6 +553,7 @@ impl Matrix {
                         + i * 41) % 256;  
             
            b3_hash_array[i] ^= sbox[index]; 
+           // b3_hash_array[i] ^= sbox[index] ^ sinus_out;
         }
 
         // ** Tada Cryptix Hash v2 **  
