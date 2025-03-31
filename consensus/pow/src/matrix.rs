@@ -99,6 +99,33 @@ impl Matrix {
         rank
     }
 
+    // Sinusoidal (It needs to be tested in the testnet first due to arch rounding errors)
+    fn sinusoidal_multiply(sinus_in: u8) -> u8 {
+        let mut left = (sinus_in >> 4) & 0x0F; 
+        let mut right = sinus_in & 0x0F;  
+    
+        for _i in 0..16 {
+            let temp = right;
+            right = (left ^ ((right * 31 + 13) & 0xFF) ^ (right >> 3) ^ (right * 5)) & 0x0F; 
+            left = temp;
+        }
+    
+        let complex_op = (left * right + 97) & 0xFF; 
+        let nonlinear_op = (complex_op ^ (right >> 4) ^ (left * 11)) & 0xFF;
+    
+        let angle: f32 = (sinus_in as u16 % 360) as f32 * (3.14159265359f32 / 180.0f32);
+        let sin_value: f32 = angle.sin();
+        let sin_lookup = (f32::abs(sin_value) * 255.0) as u8;  
+    
+        let modulated_value = (sin_lookup ^ (sin_lookup >> 3) ^ (sin_lookup << 1) ^ 0xA5) & 0xFF;
+        let sbox_val = ((modulated_value ^ (modulated_value >> 4)) * 43 + 17) & 0xFF;
+        let obfuscated = ((sbox_val >> 2) | (sbox_val << 6)) ^ 0xF3 ^ 0xA5;
+    
+        let sinus_out = ((obfuscated ^ (sbox_val * 7) ^ nonlinear_op) + 0xF1) & 0xFF;
+    
+        sinus_out
+    }
+    
     // **Octonion Multiply Function**  
     // This function multiplies two 8-dimensional octonions, `a` and `b`, and returns the resulting octonion.
     // Octonion multiplication is non-commutative and follows a set of specific rules as shown in the multiplication table below.  
