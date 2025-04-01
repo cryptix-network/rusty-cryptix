@@ -100,7 +100,8 @@ impl Matrix {
     }
 
     /*
-    // Sinusoidal (It needs to be tested in the testnet first due to arch rounding errors)
+    // ***Sinusoidal*** 
+    // It needs to be tested in the testnet first due to arch rounding errors)
     fn sinusoidal_multiply(sinus_in: u8) -> u8 {
         let mut left = (sinus_in >> 4) & 0x0F; 
         let mut right = sinus_in & 0x0F;  
@@ -127,6 +128,13 @@ impl Matrix {
         sinus_out
     }
     */
+
+    // ***Complex Lookup Table***
+    // - Pseudo-random generator: The use of XOR, shifts, and multiplications makes the algorithm unpredictable and hard to parallelize.
+    // - Prime factorization: Factoring numbers is computationally intensive and not easily parallelizable on FPGAs.
+    // - Deep recursion with random factors: Recursive functions with randomness make the calculations dynamic and hard to predict, complicating FPGA optimization.
+    // - Dynamic depth: The dynamic calculation of recursion depth introduces non-deterministic behavior, preventing a fixed pipeline for FPGA execution.
+
 
     fn pseudo_random(seed: u8) -> u32 {
         let mut x = seed as u32;
@@ -161,7 +169,7 @@ impl Matrix {
     
         for _ in 0..max_depth {
             let random_factor = Self::pseudo_random(seed as u8);
-            result = (result.wrapping_mul(987654321) ^ random_factor) & 0xFFFFFFF;
+            result = (result.wrapping_mul(7828321) ^ random_factor) & 0xFFFFFFF;
             seed = Self::pseudo_random(seed as u8); 
         }
     
@@ -177,7 +185,7 @@ impl Matrix {
             for factor in factors {
                 result = result.wrapping_mul(factor);
             }
-            result = (result * 1234567) & 0xFFFFFFF;
+            result = (result * 3893621) & 0xFFFFFFF;
         }
     
         (result & 0xFF) as u8
