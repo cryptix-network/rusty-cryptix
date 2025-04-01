@@ -130,20 +130,18 @@ impl Matrix {
     */
 
     // ***Complex Lookup Table***
-    // - Pseudo-random generator: The use of XOR, shifts, and multiplications makes the algorithm unpredictable and hard to parallelize.
-    // - Prime factorization: Factoring numbers is computationally intensive and not easily parallelizable on FPGAs.
-    // - Deep recursion with random factors: Recursive functions with randomness make the calculations dynamic and hard to predict, complicating FPGA optimization.
-    // - Dynamic depth: The dynamic calculation of recursion depth introduces non-deterministic behavior, preventing a fixed pipeline for FPGA execution.
+    // - Pseudo-random generator: Utilizes XOR, shifts, and multiplications to create unpredictable behavior, making parallelization difficult.
+    // - Prime factorization: Computationally expensive and resistant to FPGA acceleration due to its sequential nature.
+    // - Serial dependency: Ensures that each computation depends on the previous result, preventing pipeline optimizations.
+    // - Dynamic recursion depth: Introduces non-deterministic execution paths, complicating FPGA execution strategies.
 
-
-    fn pseudo_random(seed: u8) -> u32 {
-        let mut x = seed as u32;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
+    fn chaotic_random(mut x: u32) -> u32 {
+        for _ in 0..5 {
+            x = x.wrapping_mul(3646246005).rotate_left(13) ^ 0xA5A5A5A5;
+        }
         x
     }
-    
+
     fn prime_factors(mut n: u32) -> Vec<u32> {
         let mut factors = Vec::new();
         let mut i = 2;
@@ -159,27 +157,29 @@ impl Matrix {
         }
         factors
     }
-    
-    fn recursive_multiplication_with_randomness(dynlut_input: u8, depth: u8, seed: u8) -> u8 {
-        let dynlut_input = dynlut_input as u32;
-        let mut seed = seed as u32;
-        
-        let mut result = dynlut_input;
-        let max_depth = depth as u32;
-    
-        for _ in 0..max_depth {
-            let random_factor = Self::pseudo_random(seed as u8);
-            result = (result.wrapping_mul(7828321) ^ random_factor) & 0xFFFFFFF;
-            seed = Self::pseudo_random(seed as u8); 
+
+    fn serial_dependency(mut x: u32, rounds: u8) -> u32 {
+        for _ in 0..rounds {
+            x = x.wrapping_mul(3).wrapping_add(5).rotate_left(7);
+            x ^= Self::chaotic_random(x);
         }
-    
-        (result & 0xFF) as u8
+        x
     }
-    
+
+    fn unpredictable_depth(x: u32) -> u8 {
+        let noise = Self::chaotic_random(x) & 0xF;
+        10 + (noise as u8)  
+    }
+
+    fn recursive_multiplication_with_randomness(dynlut_input: u8) -> u8 {
+        let depth = Self::unpredictable_depth(dynlut_input as u32);
+        Self::serial_dependency(dynlut_input as u32, depth) as u8
+    }
+
     fn recursive_multiplication_with_factors(dynlut_input: u8, depth: u8) -> u8 {
         let dynlut_input = dynlut_input as u32;
         let mut result = dynlut_input;
-    
+
         for _ in 0..depth {
             let factors = Self::prime_factors(result);
             for factor in factors {
@@ -187,15 +187,14 @@ impl Matrix {
             }
             result = (result * 3893621) & 0xFFFFFFF;
         }
-    
+
         (result & 0xFF) as u8
     }
-    
+
     fn dynamic_depth_multiplication(dynlut_input: u8) -> u8 {
-        let depth = (dynlut_input as u32 % 8) + 7;  
-        Self::recursive_multiplication_with_randomness(dynlut_input, depth as u8, dynlut_input)
+        Self::recursive_multiplication_with_randomness(dynlut_input)
     }
-    
+
     fn complex_lookup_table(dynlut_input: u8) -> u8 {
         let dynlut_out = Self::dynamic_depth_multiplication(dynlut_input);
         dynlut_out
