@@ -519,27 +519,27 @@ impl Matrix {
         
             // **Value Assignment Based on Index `i`**  
             // This code assigns a value to the variable `value` based on the index `i`.  
-            // The value is selected from one of the byte arrays (`product`, `hash_bytes`, `product_before_oct`, `nibble_product`) with a corresponding XOR operation for each index range.  
-            // The XOR operation uses different constants (0xAA, 0xBB, etc.) to further introduce complexity in the transformation.  
-            // The use of modular arithmetic (`i % 32`) ensures that the index wraps around and accesses values in a cyclic manner within the respective byte array.  
+            // The value is selected from one of the byte arrays (`product`, `hash_bytes`, `product_before_oct`, `nibble_product`) and is modified using a corresponding XOR operation for each index range.  
+            // The XOR operation uses different constants (0xAA, 0xBB, etc.) to introduce complexity in the transformation.  
+            // Additionally, each value is multiplied by a constant that increases progressively with the index (`0x03`, `0x05`, etc.), adding further complexity to the transformation.  
+            // The use of modular arithmetic (`i % 32`) ensures that the index wraps around and accesses values in a cyclic manner within the respective byte array, allowing for repeated cycles over the arrays.
 
-            let value = 
-                if i < 16 { product[i as usize % 32] ^ 0xAA }
-                else if i < 32 { hash_bytes[(i - 16) as usize % 32] ^ 0xBB }
-                else if i < 48 { product_before_oct[(i - 32) as usize % 32] ^ 0xCC }
-                else if i < 64 { nibble_product[(i - 48) as usize % 32] ^ 0xDD }
-                else if i < 80 { product[(i - 64) as usize % 32] ^ 0xEE }
-                else if i < 96 { hash_bytes[(i - 80) as usize % 32] ^ 0xFF }
-                else if i < 112 { product_before_oct[(i - 96) as usize % 32] ^ 0x11 }
-                else if i < 128 { nibble_product[(i - 112) as usize % 32] ^ 0x22 }
-                else if i < 144 { product[(i - 128) as usize % 32] ^ 0x33 }
-                else if i < 160 { hash_bytes[(i - 144) as usize % 32] ^ 0x44 }
-                else if i < 176 { product_before_oct[(i - 160) as usize % 32] ^ 0x55 }
-                else if i < 192 { nibble_product[(i - 176) as usize % 32] ^ 0x66 }
-                else if i < 208 { product[(i - 192) as usize % 32] ^ 0x77 }
-                else if i < 224 { hash_bytes[(i - 208) as usize % 32] ^ 0x88 }
-                else if i < 240 { product_before_oct[(i - 224) as usize % 32] ^ 0x99 }
-                else { nibble_product[(i - 240) as usize % 32] ^ 0xAA };
+            let value = if i < 16 { (product[i as usize % 32].wrapping_mul(0x03).wrapping_add(i.wrapping_mul(0xAA))) & 0xFF }
+            else if i < 32 { (hash_bytes[(i - 16) as usize % 32].wrapping_mul(0x05).wrapping_add((i - 16).wrapping_mul(0xBB))) & 0xFF }
+            else if i < 48 { (product_before_oct[(i - 32) as usize % 32].wrapping_mul(0x07).wrapping_add((i - 32).wrapping_mul(0xCC))) & 0xFF }
+            else if i < 64 { (nibble_product[(i - 48) as usize % 32].wrapping_mul(0x0F).wrapping_add((i - 48).wrapping_mul(0xDD))) & 0xFF }
+            else if i < 80 { (product[(i - 64) as usize % 32].wrapping_mul(0x11).wrapping_add((i - 64).wrapping_mul(0xEE))) & 0xFF }
+            else if i < 96 { (hash_bytes[(i - 80) as usize % 32].wrapping_mul(0x13).wrapping_add((i - 80).wrapping_mul(0xFF))) & 0xFF }
+            else if i < 112 { (product_before_oct[(i - 96) as usize % 32].wrapping_mul(0x17).wrapping_add((i - 96).wrapping_mul(0x11))) & 0xFF }
+            else if i < 128 { (nibble_product[(i - 112) as usize % 32].wrapping_mul(0x19).wrapping_add((i - 112).wrapping_mul(0x22))) & 0xFF }
+            else if i < 144 { (product[(i - 128) as usize % 32].wrapping_mul(0x1D).wrapping_add((i - 128).wrapping_mul(0x33))) & 0xFF }
+            else if i < 160 { (hash_bytes[(i - 144) as usize % 32].wrapping_mul(0x1F).wrapping_add((i - 144).wrapping_mul(0x44))) & 0xFF }
+            else if i < 176 { (product_before_oct[(i - 160) as usize % 32].wrapping_mul(0x23).wrapping_add((i - 160).wrapping_mul(0x55))) & 0xFF }
+            else if i < 192 { (nibble_product[(i - 176) as usize % 32].wrapping_mul(0x29).wrapping_add((i - 176).wrapping_mul(0x66))) & 0xFF }
+            else if i < 208 { (product[(i - 192) as usize % 32].wrapping_mul(0x2F).wrapping_add((i - 192).wrapping_mul(0x77))) & 0xFF }
+            else if i < 224 { (hash_bytes[(i - 208) as usize % 32].wrapping_mul(0x31).wrapping_add((i - 208).wrapping_mul(0x88))) & 0xFF }
+            else if i < 240 { (product_before_oct[(i - 224) as usize % 32].wrapping_mul(0x37).wrapping_add((i - 224).wrapping_mul(0x99))) & 0xFF }
+            else { (nibble_product[(i - 240) as usize % 32].wrapping_mul(0x3F).wrapping_add((i - 240).wrapping_mul(0xAA))) & 0xFF };
         
             // **Rotations and Index Calculation for S-box Assignment**  
             // This section performs bitwise rotation operations and computes the index used for accessing values from a source array.  
