@@ -99,46 +99,32 @@ impl Matrix {
         rank
     }
 
-    /* 
-    // Sin Lookup
-    const SIN_LOOKUP: [u8; 360] = [
-        0, 4, 8, 13, 17, 22, 26, 31, 35, 39, 44, 48, 53, 57, 61, 65, 70, 74, 78, 83, 87, 91, 95, 99, 103, 107, 111, 115, 119, 123, 127, 131, 135, 138, 142, 146, 149, 153, 156, 160,
-        163, 167, 170, 173, 177, 180, 183, 186, 189, 192, 195, 198, 200, 203, 206, 208, 211, 213, 216, 218, 220, 223, 225, 227, 229, 231, 232, 234, 236, 238, 239, 241, 242, 243, 245, 246, 247, 248, 249, 250,
-        251, 251, 252, 253, 253, 254, 254, 254, 254, 254, 255, 254, 254, 254, 254, 254, 253, 253, 252, 251, 251, 250, 249, 248, 247, 246, 245, 243, 242, 241, 239, 238, 236, 234, 232, 231, 229, 227, 225, 223,
-        220, 218, 216, 213, 211, 208, 206, 203, 200, 198, 195, 192, 189, 186, 183, 180, 177, 173, 170, 167, 163, 160, 156, 153, 149, 146, 142, 138, 135, 131, 127, 123, 119, 115, 111, 107, 103, 99, 95, 91,
-        87, 83, 78, 74, 70, 65, 61, 57, 53, 48, 44, 39, 35, 31, 26, 22, 17, 13, 8, 4, 0, 4, 8, 13, 17, 22, 26, 31, 35, 39, 44, 48, 53, 57, 61, 65, 70, 74, 78, 83,
-        87, 91, 95, 99, 103, 107, 111, 115, 119, 123, 127, 131, 135, 138, 142, 146, 149, 153, 156, 160, 163, 167, 170, 173, 177, 180, 183, 186, 189, 192, 195, 198, 200, 203, 206, 208, 211, 213, 216, 218,
-        220, 223, 225, 227, 229, 231, 232, 234, 236, 238, 239, 241, 242, 243, 245, 246, 247, 248, 249, 250, 251, 251, 252, 253, 253, 254, 254, 254, 254, 254, 255, 254, 254, 254, 254, 254, 253, 253, 252, 251,
-        251, 250, 249, 248, 247, 246, 245, 243, 242, 241, 239, 238, 236, 234, 232, 231, 229, 227, 225, 223, 220, 218, 216, 213, 211, 208, 206, 203, 200, 198, 195, 192, 189, 186, 183, 180, 177, 173, 170, 167,
-        163, 160, 156, 153, 149, 146, 142, 138, 135, 131, 127, 123, 119, 115, 111, 107, 103, 99, 95, 91, 87, 83, 78, 74, 70, 65, 61, 57, 53, 48, 44, 39, 35, 31, 26, 22, 17, 13, 8, 4
-    ];
-
-    // Sinusoidal Multiply
+    // Sinusoidal (It needs to be tested in the testnet first due to arch rounding errors)
     fn sinusoidal_multiply(sinus_in: u8) -> u8 {
         let mut left = (sinus_in >> 4) & 0x0F; 
-        let mut right = sinus_in & 0x0F;
-
-        for _ in 0..16 {
+        let mut right = sinus_in & 0x0F;  
+    
+        for _i in 0..16 {
             let temp = right;
-            right = (left ^ ((right * 31 + 13) & 0xFF) ^ (right >> 3) ^ (right * 5)) & 0x0F;
+            right = (left ^ ((right * 31 + 13) & 0xFF) ^ (right >> 3) ^ (right * 5)) & 0x0F; 
             left = temp;
         }
-
-        let complex_op = (left * right + 97) & 0xFF;
+    
+        let complex_op = (left * right + 97) & 0xFF; 
         let nonlinear_op = (complex_op ^ (right >> 4) ^ (left * 11)) & 0xFF;
-
-        let index = (sinus_in as usize) % 360;
-        let sin_value = Self::SIN_LOOKUP[index];
-
-        let modulated_value = (sin_value ^ (sin_value >> 3) ^ (sin_value << 1) ^ 0xA5) & 0xFF;
+    
+        let angle: f32 = (sinus_in as u16 % 360) as f32 * (3.14159265359f32 / 180.0f32);
+        let sin_value: f32 = angle.sin();
+        let sin_lookup = (f32::abs(sin_value) * 255.0) as u8;  
+    
+        let modulated_value = (sin_lookup ^ (sin_lookup >> 3) ^ (sin_lookup << 1) ^ 0xA5) & 0xFF;
         let sbox_val = ((modulated_value ^ (modulated_value >> 4)) * 43 + 17) & 0xFF;
-        let obfuscated = sbox_val.rotate_right(2) ^ 0xF3 ^ 0xA5;
-
-        let sinus_out = ((obfuscated as u16 ^ (sbox_val as u16 * 7) ^ nonlinear_op as u16) + 0xF1) as u8;
-
+        let obfuscated = ((sbox_val >> 2) | (sbox_val << 6)) ^ 0xF3 ^ 0xA5;
+    
+        let sinus_out = ((obfuscated ^ (sbox_val * 7) ^ nonlinear_op) + 0xF1) & 0xFF;
+    
         sinus_out
     }
-    */
 
     // **Octonion Multiply Function**  
     // This function multiplies two 8-dimensional octonions, `a` and `b`, and returns the resulting octonion.
@@ -428,6 +414,27 @@ impl Matrix {
             // Each case modifies the rotation values through XOR operations to add more complexity to the transformation.  
             // The rotations (both left and right) are used in later steps for shifting the bits in the respective arrays, further obfuscating the data.  
 
+                /*
+            let (source_array, rotate_left_val, rotate_right_val) =  
+                if i < 16 { (&product, nibble_product[((i * 3 + 7) ^ 0x1F) % 8] ^ 0x4F, hash_bytes[((i * 5 + 13) ^ 0x2A) % 8] ^ 0xD3) }  
+                else if i < 32 { (&hash_bytes, product[((i * 2 + 9) ^ 0x2B) % 8] ^ 0xA6, nibble_product[((i / 3 + 11) ^ 0x33) % 8] ^ 0x5B) }  
+                else if i < 48 { (&nibble_product, product_before_oct[((i * 7 + 17) ^ 0x12) % 8] ^ 0x9C, product[((i + 5) ^ 0x44) % 8] ^ 0x8E) }  
+                else if i < 64 { (&hash_bytes, product[((i * 11 + 21) ^ 0x19) % 8] ^ 0x71, product_before_oct[((i * 2 + 5) ^ 0x6A) % 8] ^ 0x2F) }  
+                else if i < 80 { (&product_before_oct, nibble_product[((i * 3 + 13) ^ 0x7F) % 8] ^ 0xB2, hash_bytes[((i * 7 + 23) ^ 0x4E) % 8] ^ 0x6D) }  
+                else if i < 96 { (&hash_bytes, product[((i * 5 + 3) ^ 0x2D) % 8] ^ 0x58, nibble_product[((i * 8 + 9) ^ 0x49) % 8] ^ 0xEE) }  
+                else if i < 112 { (&product, product_before_oct[((i * 3 + 17) ^ 0x6E) % 8] ^ 0x37, hash_bytes[((i * 7 + 5) ^ 0x9A) % 8] ^ 0x44) }  
+                else if i < 128 { (&hash_bytes, product[((i * 6 + 23) ^ 0x1A) % 8] ^ 0x1A, hash_bytes[((i * 8 + 9) ^ 0x59) % 8] ^ 0x7C) }  
+                else if i < 144 { (&product_before_oct, nibble_product[((i * 2 + 11) ^ 0x43) % 8] ^ 0x93, product[((i * 4 + 3) ^ 0xB5) % 8] ^ 0xAF) }  
+                else if i < 160 { (&hash_bytes, product[((i * 3 + 17) ^ 0x2A) % 8] ^ 0x29, nibble_product[((i * 5 + 21) ^ 0xDC) % 8] ^ 0xDC) }  
+                else if i < 176 { (&nibble_product, product_before_oct[((i * 4 + 9) ^ 0x5B) % 8] ^ 0x4E, hash_bytes[((i * 7 + 11) ^ 0x23) % 8] ^ 0x8B) }  
+                else if i < 192 { (&hash_bytes, nibble_product[((i * 6 + 13) ^ 0x89) % 8] ^ 0xF3, product_before_oct[((i * 7 + 19) ^ 0x72) % 8] ^ 0x62) }  
+                else if i < 208 { (&product_before_oct, product[((i * 5 + 23) ^ 0xB7) % 8] ^ 0xB7, product[((i * 4 + 5) ^ 0x47) % 8] ^ 0x15) }  
+                else if i < 224 { (&hash_bytes, product[((i * 2 + 15) ^ 0x2D) % 8] ^ 0x2D, product_before_oct[((i * 3 + 7) ^ 0xC8) % 8] ^ 0xC8) }  
+                else if i < 240 { (&product, product_before_oct[((i * 3 + 11) ^ 0x5F) % 8] ^ 0x6F, nibble_product[((i * 6 + 23) ^ 0x99) % 8] ^ 0x99) }  
+                else { (&hash_bytes, nibble_product[((i * 4 + 7) ^ 0xE1) % 8] ^ 0xE1, hash_bytes[((i * 8 + 19) ^ 0x3B) % 8] ^ 0x3B) };
+
+                */
+
             let (source_array, rotate_left_val, rotate_right_val) = 
                 if i < 16 { (&product, nibble_product[3] ^ 0x4F, hash_bytes[2] ^ 0xD3) }
                 else if i < 32 { (&hash_bytes, product[7] ^ 0xA6, nibble_product[5] ^ 0x5B) }
@@ -451,6 +458,27 @@ impl Matrix {
             // The value is selected from one of the byte arrays (`product`, `hash_bytes`, `product_before_oct`, `nibble_product`) with a corresponding XOR operation for each index range.  
             // The XOR operation uses different constants (0xAA, 0xBB, etc.) to further introduce complexity in the transformation.  
             // The use of modular arithmetic (`i % 32`) ensures that the index wraps around and accesses values in a cyclic manner within the respective byte array.  
+
+           /* 
+            let value = 
+                if i < 16 { product[((i as usize / 7) % 251) ^ 0xAA] }
+                else if i < 32 { hash_bytes[((i - 16) as usize / 5) % 251] ^ 0xBB }
+                else if i < 48 { product_before_oct[((i - 32) as usize / 3) % 251] ^ 0xCC }
+                else if i < 64 { nibble_product[((i - 48) as usize / 11) % 251] ^ 0xDD }
+                else if i < 80 { product[((i - 64) as usize / 9) % 251] ^ 0xEE }
+                else if i < 96 { hash_bytes[((i - 80) as usize / 13) % 251] ^ 0xFF }
+                else if i < 112 { product_before_oct[((i - 96) as usize / 17) % 251] ^ 0x11 }
+                else if i < 128 { nibble_product[((i - 112) as usize / 19) % 251] ^ 0x22 }
+                else if i < 144 { product[((i - 128) as usize / 23) % 251] ^ 0x33 }
+                else if i < 160 { hash_bytes[((i - 144) as usize / 29) % 251] ^ 0x44 }
+                else if i < 176 { product_before_oct[((i - 160) as usize / 31) % 251] ^ 0x55 }
+                else if i < 192 { nibble_product[((i - 176) as usize / 37) % 251] ^ 0x66 }
+                else if i < 208 { product[((i - 192) as usize / 41) % 251] ^ 0x77 }
+                else if i < 224 { hash_bytes[((i - 208) as usize / 43) % 251] ^ 0x88 }
+                else if i < 240 { product_before_oct[((i - 224) as usize / 47) % 251] ^ 0x99 }
+                else { nibble_product[((i - 240) as usize / 53) % 251] ^ 0xAA };
+            */
+
 
             let value = 
                 if i < 16 { product[i as usize % 32] ^ 0xAA }
