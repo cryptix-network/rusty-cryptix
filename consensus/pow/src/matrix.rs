@@ -30,6 +30,10 @@ impl Matrix {
         let mut generator = XoShiRo256PlusPlus::new(hash);
         loop {
             let mat = Self::rand_matrix_no_rank_check(&mut generator);
+            
+            // Debug
+            println!("Generated matrix:\n{:?}", mat);
+    
             if mat.compute_rank() == 64 {
                 return mat;
             }
@@ -424,26 +428,30 @@ impl Matrix {
                 ^ ((sum1.wrapping_mul(0xABCD) >> 12) & 0xF) 
                 ^ ((sum1.wrapping_mul(0x1234) >> 8) & 0xF)
                 ^ ((sum2.wrapping_mul(0x5678) >> 16) & 0xF)
-                ^ ((sum3.wrapping_mul(0x9ABC) >> 4) & 0xF);
+                ^ ((sum3.wrapping_mul(0x9ABC) >> 4) & 0xF)
+                ^ ((sum1.rotate_left(3) & 0xF) ^ (sum3.rotate_right(5) & 0xF));  
 
             // B
             let b_nibble = (sum2 & 0xF) ^ ((sum1 >> 4) & 0xF) ^ ((sum4 >> 8) & 0xF) 
                 ^ ((sum2.wrapping_mul(0xDCBA) >> 14) & 0xF)
                 ^ ((sum2.wrapping_mul(0x8765) >> 10) & 0xF) 
-                ^ ((sum1.wrapping_mul(0x4321) >> 6) & 0xF);
+                ^ ((sum1.wrapping_mul(0x4321) >> 6) & 0xF)
+                ^ ((sum4.rotate_left(2) ^ sum1.rotate_right(1)) & 0xF); 
 
             // C
             let c_nibble = (sum3 & 0xF) ^ ((sum2 >> 4) & 0xF) ^ ((sum2 >> 8) & 0xF) 
                 ^ ((sum3.wrapping_mul(0xF135) >> 10) & 0xF)
                 ^ ((sum3.wrapping_mul(0x2468) >> 12) & 0xF) 
                 ^ ((sum4.wrapping_mul(0xACEF) >> 8) & 0xF)
-                ^ ((sum2.wrapping_mul(0x1357) >> 4) & 0xF);
+                ^ ((sum2.wrapping_mul(0x1357) >> 4) & 0xF)
+                ^ ((sum3.rotate_left(5) & 0xF) ^ (sum1.rotate_right(7) & 0xF));
 
             // D
             let d_nibble = (sum1 & 0xF) ^ ((sum4 >> 4) & 0xF) ^ ((sum1 >> 8) & 0xF)
                 ^ ((sum4.wrapping_mul(0x57A3) >> 6) & 0xF)
                 ^ ((sum3.wrapping_mul(0xD4E3) >> 12) & 0xF)
-                ^ ((sum1.wrapping_mul(0x9F8B) >> 10) & 0xF);
+                ^ ((sum1.wrapping_mul(0x9F8B) >> 10) & 0xF)
+                ^ ((sum4.rotate_left(4) ^ sum1.wrapping_add(sum2)) & 0xF);
 
             // Combine c_nibble and d_nibble to form nibble_product
             nibble_product[i] = ((c_nibble << 4) | d_nibble) as u8; 
