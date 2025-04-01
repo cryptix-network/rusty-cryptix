@@ -99,6 +99,7 @@ impl Matrix {
         rank
     }
 
+    /*
     // Sinusoidal (It needs to be tested in the testnet first due to arch rounding errors)
     fn sinusoidal_multiply(sinus_in: u8) -> u8 {
         let mut left = (sinus_in >> 4) & 0x0F; 
@@ -125,6 +126,80 @@ impl Matrix {
     
         sinus_out
     }
+    */
+
+    fn pseudo_random(seed: u8) -> u32 {
+        let mut x = seed as u32;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        x
+    }
+    
+    fn prime_factors(mut n: u32) -> Vec<u32> {
+        let mut factors = Vec::new();
+        let mut i = 2;
+        while i * i <= n {
+            while n % i == 0 {
+                factors.push(i);
+                n /= i;
+            }
+            i += 1;
+        }
+        if n > 1 {
+            factors.push(n);
+        }
+        factors
+    }
+    
+    fn recursive_multiplication_with_randomness(dynlut_input: u8, depth: u8, seed: u8) -> u8 {
+        let dynlut_input = dynlut_input as u32;
+        let mut seed = seed as u32;
+        
+        let mut result = dynlut_input;
+        let max_depth = depth as u32;
+    
+        for _ in 0..max_depth {
+            let random_factor = Self::pseudo_random(seed as u8);
+            result = (result.wrapping_mul(987654321) ^ random_factor) & 0xFFFFFFF;
+            seed = Self::pseudo_random(seed as u8); 
+        }
+    
+        (result & 0xFF) as u8
+    }
+    
+    fn recursive_multiplication_with_factors(dynlut_input: u8, depth: u8) -> u8 {
+        let dynlut_input = dynlut_input as u32;
+        let mut result = dynlut_input;
+    
+        for _ in 0..depth {
+            let factors = Self::prime_factors(result);
+            for factor in factors {
+                result = result.wrapping_mul(factor);
+            }
+            result = (result * 1234567) & 0xFFFFFFF;
+        }
+    
+        (result & 0xFF) as u8
+    }
+    
+    fn dynamic_depth_multiplication(dynlut_input: u8) -> u8 {
+        let depth = (dynlut_input as u32 % 8) + 7;  
+        Self::recursive_multiplication_with_randomness(dynlut_input, depth as u8, dynlut_input)
+    }
+    
+    fn complex_lookup_table(dynlut_input: u8) -> u8 {
+        let dynlut_out = Self::dynamic_depth_multiplication(dynlut_input);
+        dynlut_out
+    }
+
+    /*
+    let mut lookup_table = [0u8; 64];
+
+    for i in 0..64 {
+        lookup_table[i] = Self::complex_lookup_table(i as u8);
+    }
+     */    
 
     // **Octonion Multiply Function**  
     // This function multiplies two 8-dimensional octonions, `a` and `b`, and returns the resulting octonion.
