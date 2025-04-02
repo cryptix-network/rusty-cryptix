@@ -7,23 +7,6 @@ pub struct Matrix([[u16; 64]; 64]);
 
 
 impl Matrix {
-    // pub fn generate(hash: Hash) -> Self {
-    //     let mut generator = XoShiRo256PlusPlus::new(hash);
-    //     let mut mat = Matrix([[0u16; 64]; 64]);
-    //     loop {
-    //         for i in 0..64 {
-    //             for j in (0..64).step_by(16) {
-    //                 let val = generator.u64();
-    //                 for shift in 0..16 {
-    //                     mat.0[i][j + shift] = (val >> (4 * shift) & 0x0F) as u16;
-    //                 }
-    //             }
-    //         }
-    //         if mat.compute_rank() == 64 {
-    //             return mat;
-    //         }
-    //     }
-    // }
 
     #[inline(always)]
     pub fn generate(hash: Hash) -> Self {
@@ -392,6 +375,7 @@ impl Matrix {
         // Create an array containing the nibbles (4-bit halves of the bytes)
         let nibbles: [u8; 64] = {
             let o_bytes = hash.as_bytes();
+
             let mut arr = [0u8; 64];
             for (i, &byte) in o_bytes.iter().enumerate() {
                 arr[2 * i]     = byte >> 4;               // Store the high nibble
@@ -399,6 +383,18 @@ impl Matrix {
             }
             arr
         };
+
+        /* 
+        let mut arr = [0u8; 64];
+        for (i, &byte) in o_bytes.iter().enumerate() {
+            let high = byte >> 4;
+            let low = byte & 0x0F;
+            
+            let mixed = high ^ low;
+            
+            arr[(i + 3) % 64] = mixed;  
+        }
+        */
     
         // Matrix and vector multiplication
         let mut product = [0u8; 32];
