@@ -15,7 +15,7 @@ impl Matrix {
             let mat = Self::rand_matrix_no_rank_check(&mut generator);
             
             // Debug
-            println!("Generated matrix:\n{:?}", mat);
+            // println!("Generated matrix:\n{:?}", mat);
     
             if mat.compute_rank() == 64 {
                 return mat;
