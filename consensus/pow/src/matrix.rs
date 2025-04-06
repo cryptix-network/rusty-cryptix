@@ -86,27 +86,20 @@ impl Matrix {
         rank
     }
 
-    // ***Anti-FPGA Sidedoor***
-    fn prime_factors(mut n: u32) -> Vec<u32> {
-        let mut factors = Vec::new();
-        let mut i = 2;
-        while i * i <= n {
-            while n % i == 0 {
-                factors.push(i);
-                n /= i;
-            }
-            i += 1;
-        }
-        if n > 1 {
-            factors.push(n);
-        }
-        factors
-    }
+    // **Anti-FPGA Sidedoor**  
+    // This set of functions aims to create a computationally difficult process for FPGA-based execution.  
+    // The `chaotic_random` function generates a pseudo-random output based on the input `x` using a non-linear transformation.  
+    // The `memory_intensive_mix` function performs a sequence of mixing operations on the input `seed`, involving multiple iterations and multiplications.  
+    // The `recursive_fibonacci_modulated` function modulates a Fibonacci sequence with rotations and bitwise operations, making it difficult to parallelize.  
+    // The `anti_fpga_hash` combines these functions to generate a complex hash, incorporating dynamic depth, prime factor calculations, and memory mixing.  
+    // Finally, the `compute_after_comp_product` function hashes each byte of the input array using `anti_fpga_hash` and stores the results in an output array.
 
+    // Chaotic Mul
     fn chaotic_random(x: u32) -> u32 {
         (x.wrapping_mul(362605)) ^ 0xA5A5A5A5
     }
     
+    // Mix the Values
     fn memory_intensive_mix(seed: u32) -> u32 {
         let mut acc = seed;
         for i in 0..32 {
@@ -114,7 +107,8 @@ impl Matrix {
         }
         acc
     }
-    
+
+    // Fibonacci 
     fn recursive_fibonacci_modulated(mut x: u32, depth: u8) -> u32 {
         let mut a = 1u32;
         let mut b = x | 1;
@@ -130,7 +124,8 @@ impl Matrix {
     
         x
     }
-    
+
+    // Hashing
     fn anti_fpga_hash(input: u32) -> u32 {
         let mut x = input;
         let noise = Self::memory_intensive_mix(x);
@@ -146,6 +141,7 @@ impl Matrix {
         x
     }
     
+    // In and Out - Main
     fn compute_after_comp_product(pre_comp_product: [u8; 32]) -> [u8; 32] {
         let mut after_comp_product = [0u8; 32];
     
@@ -558,7 +554,7 @@ impl Matrix {
             sbox = temp_sbox;
         }
 
-        // Anti FPGA Sidedoor
+        // **Anti-FPGA Sidedoor**  
         let pre_comp_product: [u8; 32] = product;
         let after_comp_product = Self::compute_after_comp_product(pre_comp_product);
 
