@@ -655,7 +655,12 @@ impl Matrix {
                         + i * 41) % 256;  
             
            b3_hash_array[i] ^= sbox[index]; 
-           // b3_hash_array[i] ^= sbox[index] ^ sinus_out;
+        }
+
+       // Final Xor
+        for i in 0..32 {
+            b3_hash_array[i] ^= after_comp_product[i];
+            // b3_hash_array[i] ^= after_comp_product[i]^ sinus_out[i];
         }
 
         // ** Tada Cryptix Hash v2 **  
