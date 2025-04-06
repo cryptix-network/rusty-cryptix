@@ -103,81 +103,64 @@ impl Matrix {
         factors
     }
 
-    fn chaotic_random(mut x: u32) -> u32 {
-        for _ in 0..3 { 
-            x = x.wrapping_mul(362605).rotate_left(13) ^ 0xA5A5A5A5;
-        }
-        x
+    fn chaotic_random(x: u32) -> u32 {
+        (x.wrapping_mul(362605)) ^ 0xA5A5A5A5
     }
-
+    
     fn memory_intensive_mix(seed: u32) -> u32 {
-        let mut state = [0u32; 32]; 
         let mut acc = seed;
-
         for i in 0..32 {
-            acc = acc.wrapping_mul(16625).rotate_left(11) ^ (i as u32);
-            state[i] = acc;
+            acc = (acc.wrapping_mul(16625)) ^ i;
         }
-
-        for _ in 0..2 { 
-            for i in 0..32 {
-                let index = (state[i] ^ acc) as usize % 32;
-                acc = acc.wrapping_add(state[index]).rotate_left((acc % 31) as u32);
-                state[i] ^= acc;
-            }
-        }
-
-        acc ^ state[(acc as usize) % 32]
+        acc
     }
-
+    
     fn recursive_fibonacci_modulated(mut x: u32, depth: u8) -> u32 {
         let mut a = 1u32;
         let mut b = x | 1;
-
-        let actual_depth = depth.min(8); 
-
+        
+        let actual_depth = depth.min(8);
+    
         for _ in 0..actual_depth {
             let temp = b;
             b = b.wrapping_add(a ^ (x.rotate_left((b % 17) as u32)));
             a = temp;
             x = x.rotate_right((a % 13) as u32) ^ b;
         }
-
+    
         x
     }
-
+    
     fn anti_fpga_hash(input: u32) -> u32 {
         let mut x = input;
         let noise = Self::memory_intensive_mix(x);
-        let depth = ((noise & 0x0F) + 10) as u8; 
-
-        let factors = Self::prime_factors(x);
-        let prime_factor_sum = factors.iter().fold(0, |acc, &factor| acc + factor);
-
+        let depth = ((noise & 0x0F) + 10) as u8;
+    
+        let prime_factor_sum = x.count_ones() as u32;
+    
         x ^= prime_factor_sum;
-
+    
         x = Self::recursive_fibonacci_modulated(x ^ noise, depth);
         x ^= Self::memory_intensive_mix(x.rotate_left(9));
-        x = x.wrapping_mul(0xA5A5A5A5).rotate_left((x % 29) as u32);
-
+    
         x
     }
-
+    
     fn compute_after_comp_product(pre_comp_product: [u8; 32]) -> [u8; 32] {
         let mut after_comp_product = [0u8; 32];
-
+    
         for i in 0..32 {
             let input = pre_comp_product[i] as u32 ^ ((i as u32) << 8);
             let normalized_input = input % 256;
             let modified_input = Self::chaotic_random(normalized_input);
-
+    
             let hashed = Self::anti_fpga_hash(modified_input);
             after_comp_product[i] = (hashed & 0xFF) as u8;
         }
-
+    
         after_comp_product
     }
-
+    
     // **Octonion Multiply Function**  
     // This function multiplies two 8-dimensional octonions, `a` and `b`, and returns the resulting octonion.
     // Octonion multiplication is non-commutative and follows a set of specific rules as shown in the multiplication table below.  
