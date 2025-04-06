@@ -661,14 +661,9 @@ impl Matrix {
         }
 
        // Final Xor
-       println!("Before XOR: b3_hash_array = {:?}", b3_hash_array);
-       println!("             after_comp_product = {:?}", after_comp_product);
-       
        for i in 0..32 {
            b3_hash_array[i] ^= after_comp_product[i];
        }
-       
-       println!("After XOR: b3_hash_array = {:?}", b3_hash_array);
 
         // ** Tada Cryptix Hash v2 **  
         // He is a little shy, but still sexy
