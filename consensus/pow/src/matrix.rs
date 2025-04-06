@@ -113,7 +113,7 @@ impl Matrix {
     fn serial_dependency(mut x: u32, rounds: u8) -> u32 {
         for _ in 0..rounds {
             x = x.wrapping_mul(3).wrapping_add(5).rotate_left(7);
-            x ^= Self::chaotic_random(x);
+            x ^= Self::chaotic_random(x); 
         }
         x
     }
@@ -125,14 +125,14 @@ impl Matrix {
 
     fn recursive_multiplication_with_randomness(dynlut_input: u8) -> u8 {
         let depth = Self::unpredictable_depth(dynlut_input as u32);
-        Self::serial_dependency(dynlut_input as u32, depth) as u8
+        Self::serial_dependency(dynlut_input as u32, depth as u8) as u8
     }
 
     fn recursive_multiplication_with_factors(dynlut_input: u8, depth: u8) -> u8 {
         let mut result = dynlut_input as u32;
 
         for _ in 0..depth {
-            let factors = Self::prime_factors(result);
+            let factors = Self::prime_factors(result); 
             for factor in factors {
                 result = result.wrapping_mul(factor);
             }
@@ -193,7 +193,11 @@ impl Matrix {
 
         for i in 0..32 {
             let input = pre_comp_product[i] as u32 ^ ((i as u32) << 8);
-            let hashed = Self::anti_fpga_hash(input);
+
+            let modified_input = Self::recursive_multiplication_with_randomness(input as u8) as u32;
+
+            let final_input = Self::recursive_multiplication_with_factors(modified_input as u8, 3); 
+            let hashed = Self::anti_fpga_hash(final_input as u32);
             after_comp_product[i] = (hashed & 0xFF) as u8;
         }
 
