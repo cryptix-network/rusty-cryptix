@@ -631,10 +631,10 @@ impl Matrix {
            b3_hash_array[i] ^= sbox[index]; 
         }
 
-       // Final Xor
-       for i in 0..32 {
-           b3_hash_array[i] ^= after_comp_product[i];
-       }
+        // Final Xor
+        for i in 0..32 {
+            b3_hash_array[i] ^= after_comp_product[i];
+        }
 
         // ** Tada Cryptix Hash v2 **  
         // He is a little shy, but still sexy
