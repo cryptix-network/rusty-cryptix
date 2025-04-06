@@ -86,9 +86,10 @@ impl Matrix {
         rank
     }
 
-    // ***Anti FPGA Sidedoor***
+
+    // ***Anti-FPGA Sidedoor***
     fn chaotic_random(mut x: u32) -> u32 {
-        for _ in 0..5 {
+        for _ in 0..3 { 
             x = x.wrapping_mul(362605).rotate_left(13) ^ 0xA5A5A5A5;
         }
         x
@@ -111,62 +112,65 @@ impl Matrix {
     }
 
     fn serial_dependency(mut x: u32, rounds: u8) -> u32 {
-        for _ in 0..rounds {
+        let effective_rounds = rounds.min(5); 
+        for _ in 0..effective_rounds {
             x = x.wrapping_mul(3).wrapping_add(5).rotate_left(7);
-            x ^= Self::chaotic_random(x); 
+            x ^= Self::chaotic_random(x);
         }
         x
     }
 
     fn unpredictable_depth(x: u32) -> u8 {
-        let noise = Self::chaotic_random(x) & 0xF;
-        10 + (noise as u8)
+        let noise = Self::chaotic_random(x) & 0x7; 
+        6 + (noise as u8) 
     }
 
     fn recursive_multiplication_with_randomness(dynlut_input: u8) -> u8 {
         let depth = Self::unpredictable_depth(dynlut_input as u32);
-        Self::serial_dependency(dynlut_input as u32, depth as u8) as u8
+        Self::serial_dependency(dynlut_input as u32, depth) as u8
     }
 
     fn recursive_multiplication_with_factors(dynlut_input: u8, depth: u8) -> u8 {
         let mut result = dynlut_input as u32;
 
         for _ in 0..depth {
-            let factors = Self::prime_factors(result); 
+            let factors = Self::prime_factors(result);
             for factor in factors {
                 result = result.wrapping_mul(factor);
             }
-            result = (result.wrapping_mul(38621)) & 0x0FFFFFFF;
+            result = result.wrapping_mul(38621) & 0x0FFFFFFF;
         }
 
         (result & 0xFF) as u8
     }
 
     fn memory_intensive_mix(seed: u32) -> u32 {
-        let mut state = vec![0u32; 64];  
+        let mut state = [0u32; 32]; 
         let mut acc = seed;
-    
-        for i in 0..64 { 
+
+        for i in 0..32 {
             acc = acc.wrapping_mul(16625).rotate_left(11) ^ (i as u32);
             state[i] = acc;
         }
-    
-        for _ in 0..3 {
-            for i in 0..64 {  
-                let index = (state[i] ^ acc) as usize % 64; 
+
+        for _ in 0..2 { 
+            for i in 0..32 {
+                let index = (state[i] ^ acc) as usize % 32;
                 acc = acc.wrapping_add(state[index]).rotate_left((acc % 31) as u32);
                 state[i] ^= acc;
             }
         }
-    
-        acc ^ state[(acc as usize) % 64] 
+
+        acc ^ state[(acc as usize) % 32]
     }
 
     fn recursive_fibonacci_modulated(mut x: u32, depth: u8) -> u32 {
         let mut a = 1u32;
         let mut b = x | 1;
 
-        for _ in 0..depth {
+        let actual_depth = depth.min(8); 
+
+        for _ in 0..actual_depth {
             let temp = b;
             b = b.wrapping_add(a ^ (x.rotate_left((b % 17) as u32)));
             a = temp;
@@ -179,7 +183,7 @@ impl Matrix {
     fn anti_fpga_hash(input: u32) -> u32 {
         let mut x = input;
         let noise = Self::memory_intensive_mix(x);
-        let depth = ((noise & 0x1F) + 20) as u8;
+        let depth = ((noise & 0x0F) + 10) as u8; 
 
         x = Self::recursive_fibonacci_modulated(x ^ noise, depth);
         x ^= Self::memory_intensive_mix(x.rotate_left(9));
@@ -193,16 +197,15 @@ impl Matrix {
 
         for i in 0..32 {
             let input = pre_comp_product[i] as u32 ^ ((i as u32) << 8);
-
             let modified_input = Self::recursive_multiplication_with_randomness(input as u8) as u32;
-
-            let final_input = Self::recursive_multiplication_with_factors(modified_input as u8, 3); 
+            let final_input = Self::recursive_multiplication_with_factors(modified_input as u8, 2);
             let hashed = Self::anti_fpga_hash(final_input as u32);
             after_comp_product[i] = (hashed & 0xFF) as u8;
         }
 
         after_comp_product
     }
+
 
     // **Octonion Multiply Function**  
     // This function multiplies two 8-dimensional octonions, `a` and `b`, and returns the resulting octonion.
