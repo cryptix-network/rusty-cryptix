@@ -397,7 +397,8 @@ pub const MAINNET_PARAMS: Params = Params {
     max_block_level: 225,
     pruning_proof_m: 1000,
 
-    payload_activation: ForkActivation::never(),
+    // payload_activation: ForkActivation::never(),
+    payload_activation: ForkActivation::new(100),
     runtime_sig_op_counting: ForkActivation::never(),
 };
 
