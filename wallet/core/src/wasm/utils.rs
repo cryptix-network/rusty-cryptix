@@ -33,8 +33,8 @@ pub fn sompi_to_cryptix_string(sompi: ISompiToCryptix) -> Result<String> {
 
 ///
 /// Format a Sompi amount to a string representation of the amount in Cryptix with a suffix
-/// based on the network type (e.g. `CYTX` for mainnet, `TCYTX` for testnet,
-/// `SCYTX` for simnet, `DCYTX` for devnet).
+/// based on the network type (e.g. `CPAY` for mainnet, `TCPAY` for testnet,
+/// `SCPAY` for simnet, `DCPAY` for devnet).
 ///
 /// @category Wallet SDK
 ///

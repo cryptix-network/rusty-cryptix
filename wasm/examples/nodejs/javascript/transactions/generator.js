@@ -82,7 +82,7 @@ const { encoding, networkId, address : destinationAddress } = require("../utils"
 
         // transaction generator creates a 
         // sequence of transactions
-        // for a requested amount of CYTX.
+        // for a requested amount of CPAY.
         // sign and submit these transactions
         let pending;
         while (pending = await generator.next()) {

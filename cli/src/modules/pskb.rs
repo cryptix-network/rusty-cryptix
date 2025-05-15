@@ -130,7 +130,7 @@ impl Pskb {
 
                         tprintln!(
                             ctx,
-                            "{} locked UTXO{} found with total amount of {} CYTX",
+                            "{} locked UTXO{} found with total amount of {} CPAY",
                             spend_utxos.len(),
                             if spend_utxos.len() == 1 { "" } else { "s" },
                             sompi_to_cryptix(total_locked_sompi)

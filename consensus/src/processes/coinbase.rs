@@ -71,7 +71,7 @@ impl CoinbaseManager {
 
         // Precomputed subsidy by month table for the actual block per second rate
         // Here values are rounded up so that we keep the same number of rewarding months as in the original 1 BPS table.
-        // In a 10 BPS network, the induced increase in total rewards is 51 CYTX (see tests::calc_high_bps_total_rewards_delta())
+        // In a 10 BPS network, the induced increase in total rewards is 51 CPAY (see tests::calc_high_bps_total_rewards_delta())
         let subsidy_by_month_table: SubsidyByMonthTable = core::array::from_fn(|i| SUBSIDY_BY_MONTH_TABLE[i].div_ceil(bps));
         Self {
             coinbase_payload_script_public_key_max_len,
@@ -297,9 +297,9 @@ mod tests {
 
         let delta = total_high_bps_rewards as i64 - total_rewards as i64;
 
-        println!("Total rewards: {} sompi => {} CYTX", total_rewards, total_rewards / SOMPI_PER_CRYPTIX);
-        println!("Total high bps rewards: {} sompi => {} CYTX", total_high_bps_rewards, total_high_bps_rewards / SOMPI_PER_CRYPTIX);
-        println!("Delta: {} sompi => {} CYTX", delta, delta / SOMPI_PER_CRYPTIX as i64);
+        println!("Total rewards: {} sompi => {} CPAY", total_rewards, total_rewards / SOMPI_PER_CRYPTIX);
+        println!("Total high bps rewards: {} sompi => {} CPAY", total_high_bps_rewards, total_high_bps_rewards / SOMPI_PER_CRYPTIX);
+        println!("Delta: {} sompi => {} CPAY", delta, delta / SOMPI_PER_CRYPTIX as i64);
     }
 
     #[test]

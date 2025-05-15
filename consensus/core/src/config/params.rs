@@ -104,7 +104,7 @@ pub struct Params {
     pub mass_per_sig_op: u64,
     pub max_block_mass: u64,
 
-    /// The parameter for scaling inverse CYTX value to mass units (unpublished KIP-0009)
+    /// The parameter for scaling inverse CPAY value to mass units (unpublished KIP-0009)
     pub storage_mass_parameter: u64,
 
     /// DAA score from which storage mass calculation and transaction mass field are activated as a consensus rule

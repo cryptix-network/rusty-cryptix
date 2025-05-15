@@ -52,25 +52,25 @@ pub fn sompi_to_cryptix_string_with_trailing_zeroes(sompi: u64) -> String {
 
 pub fn cryptix_suffix(network_type: &NetworkType) -> &'static str {
     match network_type {
-        NetworkType::Mainnet => "CYTX",
-        NetworkType::Testnet => "TCYTX",
-        NetworkType::Simnet => "SCYTX",
-        NetworkType::Devnet => "DCYTX",
+        NetworkType::Mainnet => "CPAY",
+        NetworkType::Testnet => "TCPAY",
+        NetworkType::Simnet => "SCPAY",
+        NetworkType::Devnet => "DCPAY",
     }
 }
 
 #[inline]
 pub fn sompi_to_cryptix_string_with_suffix(sompi: u64, network_type: &NetworkType) -> String {
-    let cytx = sompi_to_cryptix_string(sompi);
+    let cpay = sompi_to_cryptix_string(sompi);
     let suffix = cryptix_suffix(network_type);
-    format!("{cytx} {suffix}")
+    format!("{cpay} {suffix}")
 }
 
 #[inline]
 pub fn sompi_to_cryptix_string_with_trailing_zeroes_and_suffix(sompi: u64, network_type: &NetworkType) -> String {
-    let cytx = sompi_to_cryptix_string_with_trailing_zeroes(sompi);
+    let cpay = sompi_to_cryptix_string_with_trailing_zeroes(sompi);
     let suffix = cryptix_suffix(network_type);
-    format!("{cytx} {suffix}")
+    format!("{cpay} {suffix}")
 }
 
 pub fn format_address_colors(address: &Address, range: Option<usize>) -> String {

@@ -9,10 +9,10 @@ pub const LOCK_TIME_THRESHOLD: u64 = 500_000_000_000;
 /// MAX_SCRIPT_PUBLIC_KEY_VERSION is the current latest supported public key script version.
 pub const MAX_SCRIPT_PUBLIC_KEY_VERSION: u16 = 0;
 
-/// SompiPerCryptix is the number of sompi in one cryptix (1 CYTX).
+/// SompiPerCryptix is the number of sompi in one cryptix (1 CPAY).
 pub const SOMPI_PER_CRYPTIX: u64 = 100_000_000;
 
-/// The parameter for scaling inverse CYTX value to mass units (KIP-0009)
+/// The parameter for scaling inverse CPAY value to mass units (KIP-0009)
 pub const STORAGE_MASS_PARAMETER: u64 = SOMPI_PER_CRYPTIX * 10_000;
 
 /// MaxSompi is the maximum transaction amount allowed in sompi.
