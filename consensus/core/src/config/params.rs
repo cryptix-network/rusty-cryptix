@@ -391,7 +391,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // The network was down for three days shortly after launch
     // Three days in seconds = 3 * 24 * 60 * 60 = 259200
     deflationary_phase_daa_score: 86400,
-    pre_deflationary_phase_base_subsidy: 117900000000,
+    pre_deflationary_phase_base_subsidy: 167300000000,
     coinbase_maturity: 100,
     skip_proof_of_work: false,
     max_block_level: 225,

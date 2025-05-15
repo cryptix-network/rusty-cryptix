@@ -144,7 +144,7 @@ impl<const BPS: u64> Bps<BPS> {
     }
 
     pub const fn pre_deflationary_phase_base_subsidy() -> u64 {
-        117900000000 / BPS
+        167300000000 / BPS
     }
 }
 
