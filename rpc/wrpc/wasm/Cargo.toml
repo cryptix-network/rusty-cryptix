@@ -1,0 +1,46 @@
+[package]
+name = "cryptix-wrpc-wasm"
+description = "Cryptix wRPC WASM client"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+wasm32-sdk = ["cryptix-wrpc-client/wasm32-sdk"]
+default = []
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+ahash.workspace = true
+async-std.workspace = true
+cfg-if.workspace = true
+cryptix-addresses.workspace = true
+cryptix-consensus-core.workspace = true
+cryptix-consensus-client.workspace = true
+cryptix-consensus-wasm.workspace = true
+cryptix-notify.workspace = true
+cryptix-wrpc-client.workspace = true
+cryptix-rpc-core.workspace = true
+cryptix-rpc-macros.workspace = true
+cryptix-wasm-core.workspace = true
+serde_json.workspace = true
+serde-wasm-bindgen.workspace = true
+serde.workspace = true
+workflow-log.workspace = true
+workflow-rpc.workspace = true
+workflow-wasm.workspace = true
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+wasm-bindgen-futures.workspace = true
+workflow-core.workspace = true
+futures.workspace = true
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+
+[lints]
+workspace = true

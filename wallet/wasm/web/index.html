@@ -1,0 +1,23 @@
+<html>
+    <head>
+        <script type="module">
+            import * as cryptix from './cryptix-wallet/cryptix-wallet.js';
+            (async () => {
+                const wasm = await cryptix.default('./cryptix-wallet/cryptix-wallet_bg.wasm');
+                await wasm.load_cryptix_wallet_cli();
+            })();
+        </script>
+        <style>
+            body {
+                margin: 0;
+                padding: 0;
+            }
+            .terminal {
+                margin: 8px;
+                width: calc(100vw - 16px);
+                height: calc(100vh - 16px);
+            }
+        </style>
+    </head>
+    <body></body>
+</html>

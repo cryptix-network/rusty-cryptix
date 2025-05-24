@@ -1,0 +1,28 @@
+#!/bin/bash
+set -e
+
+./build-web $@
+
+if [ "$1" == "--keygen" ]; then
+    echo "building keygen"
+    typedoc --name "Cryptix WASM32 SDK - Key Generation" --sourceLinkExternal --readme ./README.md --options ./build/docs/ --out ./docs/cryptix-keygen ./build/docs/cryptix-keygen.ts
+elif [ "$1" == "--rpc" ]; then
+    echo "building rpc"
+    typedoc --name "Cryptix WASM32 SDK - RPC" --sourceLinkExternal --readme ./README.md --options ./build/docs/ --out ./docs/cryptix-rpc ./build/docs/cryptix-rpc.ts
+elif [ "$1" == "--core" ]; then
+    echo "building core"
+    typedoc --name "Cryptix WASM32 SDK - Core" --sourceLinkExternal --readme ./README.md --options ./build/docs/ --out ./docs/cryptix-core ./build/docs/cryptix-core.ts
+elif [ "$1" == "--sdk" ]; then
+    echo "building full"
+    typedoc --name "Cryptix WASM32 SDK" --sourceLinkExternal --readme ./README.md --options ./build/docs/ --out ./docs/cryptix ./build/docs/cryptix.ts
+else
+    echo "building keygen"
+    typedoc --name "Cryptix WASM32 SDK - Key Generation" --sourceLinkExternal --readme ./README.md --options ./build/docs/ --out ./docs/cryptix-keygen ./build/docs/cryptix-keygen.ts
+    echo "building rpc"
+    typedoc --name "Cryptix WASM32 SDK - RPC" --sourceLinkExternal --readme ./README.md --options ./build/docs/ --out ./docs/cryptix-rpc ./build/docs/cryptix-rpc.ts
+    echo "building core"
+    typedoc --name "Cryptix WASM32 SDK - Core" --sourceLinkExternal --readme ./README.md --options ./build/docs/ --out ./docs/cryptix-core ./build/docs/cryptix-core.ts
+    echo "building full"
+    typedoc --name "Cryptix WASM32 SDK" --sourceLinkExternal --readme ./README.md --options ./build/docs/ --out ./docs/cryptix ./build/docs/cryptix.ts
+
+fi

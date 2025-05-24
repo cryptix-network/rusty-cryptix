@@ -1,0 +1,12 @@
+<html>
+    <head>
+        <script type="module">
+            import * as cryptix from './cryptix-rpc/cryptix-rpc.js';
+            (async () => {
+                await cryptix.default('./cryptix-rpc/cryptix-rpc_bg.wasm');
+                console.log(cryptix.version());
+            })();
+        </script>
+    </head>
+    <body></body>
+</html>

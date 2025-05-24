@@ -1,0 +1,31 @@
+[package]
+name = "cryptix-addressmanager"
+description = "Cryptix address manager"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+borsh.workspace = true
+igd-next.workspace = true
+itertools.workspace = true
+cryptix-consensus-core.workspace = true
+cryptix-core.workspace = true
+cryptix-database.workspace = true
+cryptix-utils.workspace = true
+local-ip-address.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+rocksdb.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+statrs.workspace = true
+statest.workspace = true

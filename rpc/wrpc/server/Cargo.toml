@@ -1,0 +1,37 @@
+[package]
+name = "cryptix-wrpc-server"
+description = "Cryptix wRPC server"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+async-trait.workspace = true
+borsh = { workspace = true, features = ["rc"] }
+futures.workspace = true
+cryptix-consensus-core.workspace = true
+cryptix-core.workspace = true
+cryptix-grpc-client.workspace = true
+cryptix-notify.workspace = true
+cryptix-rpc-core.workspace = true
+cryptix-rpc-macros.workspace = true
+cryptix-rpc-service.workspace = true
+cryptix-utils.workspace = true
+log.workspace = true
+num_cpus.workspace = true
+paste.workspace = true
+serde = { workspace = true, features = ["rc"] }
+thiserror.workspace = true
+tokio.workspace = true
+workflow-core.workspace = true
+workflow-log.workspace = true
+workflow-rpc.workspace = true
+workflow-serializer.workspace = true
+rustls.workspace = true

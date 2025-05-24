@@ -1,0 +1,65 @@
+[package]
+name = "cryptixd"
+description = "Cryptix full node daemon"
+keywords = ["cryptix", "blockdag"]
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "cryptixd_lib"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+cryptix-alloc.workspace = true # This changes the global allocator for all of the next dependencies so should be kept first
+
+cryptix-addresses.workspace = true
+cryptix-addressmanager.workspace = true
+cryptix-consensus-core.workspace = true
+cryptix-consensus-notify.workspace = true
+cryptix-consensus.workspace = true
+cryptix-consensusmanager.workspace = true
+cryptix-core.workspace = true
+cryptix-database.workspace = true
+cryptix-grpc-server.workspace = true
+cryptix-hashes.workspace = true
+cryptix-index-processor.workspace = true
+cryptix-mining.workspace = true
+cryptix-notify.workspace = true
+cryptix-p2p-flows.workspace = true
+cryptix-perf-monitor.workspace = true
+cryptix-rpc-core.workspace = true
+cryptix-rpc-service.workspace = true
+cryptix-txscript.workspace = true
+cryptix-utils.workspace = true
+cryptix-utils-tower.workspace = true
+cryptix-utxoindex.workspace = true
+cryptix-wrpc-server.workspace = true
+
+async-channel.workspace = true
+cfg-if.workspace = true
+clap.workspace = true
+dhat = { workspace = true, optional = true }
+dirs.workspace = true
+futures-util.workspace = true
+log.workspace = true
+num_cpus.workspace = true
+rand.workspace = true
+rayon.workspace = true
+serde.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
+workflow-log.workspace = true
+
+toml = "0.8.10"
+serde_with = "3.7.0"
+
+[features]
+heap = ["dhat", "cryptix-alloc/heap"]
+devnet-prealloc = ["cryptix-consensus/devnet-prealloc"]
+semaphore-trace = ["cryptix-utils/semaphore-trace"]

@@ -1,0 +1,58 @@
+[package]
+name = "cryptix-consensus-core"
+description = "Cryptix consensus core"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+devnet-prealloc = []
+wasm32-sdk = []
+default = []
+
+[dependencies]
+async-trait.workspace = true
+borsh.workspace = true
+cfg-if.workspace = true
+faster-hex.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+itertools.workspace = true
+js-sys.workspace = true
+cryptix-addresses.workspace = true
+cryptix-core.workspace = true
+cryptix-hashes.workspace = true
+cryptix-math.workspace = true
+cryptix-merkle.workspace = true
+cryptix-muhash.workspace = true
+cryptix-txscript-errors.workspace = true
+cryptix-utils.workspace = true
+rand.workspace = true
+secp256k1.workspace = true
+serde_json.workspace = true
+serde-wasm-bindgen.workspace = true
+serde.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+wasm-bindgen.workspace = true
+workflow-core.workspace = true
+workflow-log.workspace = true
+workflow-serializer.workspace = true
+workflow-wasm.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+bincode.workspace = true
+wasm-bindgen-test.workspace = true
+web-sys.workspace = true
+
+[[bench]]
+name = "serde_benchmark"
+harness = false
+
+[lints]
+workspace = true

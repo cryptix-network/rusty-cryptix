@@ -1,0 +1,38 @@
+[package]
+name = "cryptix-index-processor"
+description = "Cryptix index processor"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cryptix-consensus-core.workspace = true
+cryptix-consensus-notify.workspace = true
+cryptix-consensusmanager.workspace = true
+cryptix-core.workspace = true
+cryptix-database.workspace = true
+cryptix-hashes.workspace = true
+cryptix-index-core.workspace = true
+cryptix-notify.workspace = true
+cryptix-utils.workspace = true
+cryptix-utxoindex.workspace = true
+
+async-channel.workspace = true
+async-trait.workspace = true
+derive_more.workspace = true
+futures.workspace = true
+log.workspace = true
+paste.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [ "rt-multi-thread", "macros", "signal" ]}
+triggered.workspace = true
+
+[dev-dependencies]
+cryptix-consensus.workspace = true
+parking_lot.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+rand = {workspace = true,  features = [ "small_rng" ]}

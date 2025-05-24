@@ -1,0 +1,25 @@
+[package]
+name = "cryptix-consensus-notify"
+description = "Cryptix consensus notifier"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-channel.workspace = true
+cfg-if.workspace = true
+derive_more.workspace = true
+futures.workspace = true
+cryptix-consensus-core.workspace = true
+cryptix-core.workspace = true
+cryptix-hashes.workspace = true
+cryptix-notify.workspace = true
+cryptix-utils.workspace = true
+log.workspace = true
+paste.workspace = true
+thiserror.workspace = true
+triggered.workspace = true

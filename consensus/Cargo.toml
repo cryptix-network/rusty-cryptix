@@ -1,0 +1,64 @@
+[package]
+name = "cryptix-consensus"
+description = "Cryptix consensus library"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+async-channel.workspace = true
+bincode.workspace = true
+crossbeam-channel.workspace = true
+faster-hex.workspace = true
+futures-util.workspace = true
+indexmap.workspace = true
+itertools.workspace = true
+cryptix-consensus-core.workspace = true
+cryptix-consensus-notify.workspace = true
+cryptix-consensusmanager.workspace = true
+cryptix-core.workspace = true
+cryptix-database.workspace = true
+cryptix-hashes.workspace = true
+cryptix-math.workspace = true
+cryptix-merkle.workspace = true
+cryptix-muhash.workspace = true
+cryptix-notify.workspace = true
+cryptix-pow.workspace = true
+cryptix-txscript.workspace = true
+cryptix-txscript-errors.workspace = true
+cryptix-utils.workspace = true
+log.workspace = true
+once_cell.workspace = true
+parking_lot.workspace = true
+rayon.workspace = true
+rocksdb.workspace = true
+secp256k1.workspace = true
+serde.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+rand = { workspace = true, features = ["small_rng"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[dev-dependencies]
+criterion.workspace = true
+serde_json.workspace = true
+flate2.workspace = true
+rand_distr.workspace = true
+cryptix-txscript-errors.workspace = true
+
+[[bench]]
+name = "hash_benchmarks"
+harness = false
+
+[features]
+html_reports = []
+devnet-prealloc = ["cryptix-consensus-core/devnet-prealloc"]

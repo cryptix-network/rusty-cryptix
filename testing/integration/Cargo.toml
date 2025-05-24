@@ -1,0 +1,77 @@
+[package]
+name = "cryptix-testing-integration"
+publish = false
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cryptix-alloc.workspace = true            # This changes the global allocator for all of the next dependencies so should be kept first
+
+cryptix-addresses.workspace = true
+cryptix-bip32.workspace = true
+cryptix-consensus-core.workspace = true
+cryptix-consensus-notify.workspace = true
+cryptix-consensus.workspace = true
+cryptix-consensusmanager.workspace = true
+cryptix-core.workspace = true
+cryptix-database.workspace = true
+cryptix-grpc-client.workspace = true
+cryptix-grpc-core.workspace = true
+cryptix-grpc-server.workspace = true
+cryptix-hashes.workspace = true
+cryptix-index-processor.workspace = true
+cryptix-math.workspace = true
+cryptix-merkle.workspace = true
+cryptix-muhash.workspace = true
+cryptix-notify.workspace = true
+cryptix-pow.workspace = true
+cryptix-rpc-core.workspace = true
+cryptix-rpc-service.workspace = true
+cryptix-txscript.workspace = true
+cryptix-utils.workspace = true
+cryptix-utxoindex.workspace = true
+cryptix-wrpc-server.workspace = true
+cryptixd.workspace = true
+
+async-channel.workspace = true
+async-trait.workspace = true
+bincode.workspace = true
+clap.workspace = true
+chrono.workspace = true
+crossbeam-channel.workspace = true
+dhat = { workspace = true, optional = true }
+faster-hex.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
+indexmap.workspace = true
+itertools.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+rand_distr.workspace = true
+rand.workspace = true
+rayon.workspace = true
+rocksdb.workspace = true
+secp256k1.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+smallvec.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+workflow-perf-monitor.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+rand = { workspace = true, features = ["small_rng"] }
+tokio = { workspace = true, features = ["rt", "macros", "process"] }
+cryptix-txscript-errors.workspace = true
+
+[features]
+heap = ["dhat"]
+html_reports = []
+devnet-prealloc = ["cryptixd/devnet-prealloc"]

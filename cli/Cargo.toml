@@ -1,0 +1,86 @@
+[package]
+name = "cryptix-cli"
+description = "Cryptix CLI"
+keywords = ["cryptix", "wallet", "cli", "rpc"]
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+include = [
+    "src/**/*.rs",
+    "src/**/*.txt",
+    "src/**/*.css",
+    "Cargo.toml",
+    "Cargo.lock",
+]
+
+[features]
+default = []
+
+[lib]
+name = "cryptix_cli_lib"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+async-trait.workspace = true
+borsh.workspace = true
+cfg-if.workspace = true
+convert_case.workspace = true
+dashmap.workspace = true
+downcast.workspace = true
+faster-hex.workspace = true
+futures.workspace = true
+js-sys.workspace = true
+hex.workspace = true
+cryptix-addresses.workspace = true
+cryptix-bip32.workspace = true
+cryptix-consensus-core.workspace = true
+cryptix-core.workspace = true
+cryptix-daemon.workspace = true
+cryptix-metrics-core.workspace = true
+cryptix-rpc-core.workspace = true
+cryptix-utils.workspace = true
+cryptix-wallet-core.workspace = true
+cryptix-wallet-keys.workspace = true
+cryptix-wallet-pskt.workspace = true
+cryptix-wrpc-client.workspace = true
+nw-sys.workspace = true
+pad.workspace = true
+regex.workspace = true
+separator.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+textwrap.workspace = true
+thiserror.workspace = true
+wasm-bindgen.workspace = true
+workflow-core.workspace = true
+workflow-dom.workspace = true
+workflow-log.workspace = true
+workflow-node.workspace = true
+workflow-nw.workspace = true
+workflow-store.workspace = true
+workflow-terminal.workspace = true
+workflow-wasm.workspace = true
+
+[dependencies.web-sys]
+workspace = true
+features = [
+    'console',
+    'Document',
+    'Window',
+    'Node',
+    'Element',
+    'HtmlElement',
+    'DomTokenList',
+    # 'HtmlElement',
+    # 'CustomEvent',
+    # 'MouseEvent'
+]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

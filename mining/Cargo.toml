@@ -1,0 +1,41 @@
+[package]
+name = "cryptix-mining"
+description = "Cryptix mining"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cryptix-addresses.workspace = true
+cryptix-consensus-core.workspace = true
+cryptix-consensusmanager.workspace = true
+cryptix-core.workspace = true
+cryptix-hashes.workspace = true
+cryptix-mining-errors.workspace = true
+cryptix-muhash.workspace = true
+cryptix-txscript.workspace = true
+cryptix-utils.workspace = true
+
+futures-util.workspace = true
+itertools.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+serde.workspace = true
+smallvec.workspace = true
+sweep-bptree = "0.4.1"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+
+[dev-dependencies]
+cryptix-txscript.workspace = true
+criterion.workspace = true
+secp256k1.workspace = true
+
+[[bench]]
+name = "bench"
+harness = false

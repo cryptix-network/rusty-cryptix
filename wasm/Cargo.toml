@@ -1,0 +1,69 @@
+[package]
+name = "cryptix-wasm"
+description = "CRYPTIX WASM bindings"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+repository.workspace = true
+# wasm-pack requires this value to be a string
+# (it can not be derived from the workspace)
+license = "ISC"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cfg-if.workspace = true
+js-sys.workspace = true
+cryptix-addresses.workspace = true
+cryptix-bip32.workspace = true
+cryptix-consensus-core.workspace = true
+cryptix-consensus-wasm.workspace = true
+cryptix-core.workspace = true
+cryptix-math.workspace = true
+cryptix-pow.workspace = true
+cryptix-txscript.workspace = true
+cryptix-rpc-core.workspace = true
+cryptix-utils.workspace = true
+cryptix-wasm-core.workspace = true
+cryptix-wallet-core.workspace = true
+cryptix-wallet-keys.workspace = true
+cryptix-wrpc-client.workspace = true
+cryptix-wrpc-wasm.workspace = true
+num.workspace = true
+wasm-bindgen.workspace = true
+workflow-log.workspace = true
+workflow-core.workspace = true
+workflow-wasm.workspace = true
+
+[features] 
+wasm32-sdk = [
+    "cryptix-wallet-core/wasm32-sdk",
+    "cryptix-pow/wasm32-sdk",
+    "cryptix-txscript/wasm32-sdk",
+]
+wasm32-core = [
+    "cryptix-wallet-core/wasm32-core",
+    "cryptix-pow/wasm32-sdk",
+    "cryptix-txscript/wasm32-sdk",
+]
+wasm32-rpc = [
+    "cryptix-consensus-core/wasm32-sdk",
+    "cryptix-consensus-wasm/wasm32-sdk",
+    "cryptix-wrpc-client/wasm32-sdk",
+    "cryptix-wrpc-wasm/wasm32-sdk",
+]
+wasm32-keygen = []
+default = []
+
+[package.metadata.docs.rs]
+targets = ["wasm32-unknown-unknown"]
+
+[package.metadata.emanate.wasm]
+targets = [
+    { target = "nodejs", out-dir = "nodejs/cryptix" },
+    { target = "web", out-dir = "web/cryptix" }
+]
+folder = "setup"

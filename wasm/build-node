@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+
+wasm-pack build --weak-refs --target nodejs --out-name cryptix --out-dir nodejs/cryptix --features wasm32-sdk
