@@ -135,7 +135,7 @@ pub const GENESIS: GenesisBlock = GenesisBlock {
         0xbc,
     ]),
     utxo_commitment: EMPTY_MUHASH,
-    timestamp: 1747339735780,
+    timestamp: 1747339735779,
     bits: 486962709,
     nonce: 0x3392c,
     daa_score:  0, // Checkpoint DAA score
