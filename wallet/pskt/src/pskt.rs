@@ -123,6 +123,7 @@ impl<R> PSKT<R> {
                 .map(|Output { amount, script_public_key, .. }: &Output| TransactionOutput {
                     value: *amount,
                     script_public_key: script_public_key.clone(),
+                    payload: vec![],
                 })
                 .collect(),
             self.determine_lock_time(),

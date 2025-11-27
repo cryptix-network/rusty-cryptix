@@ -1,3 +1,4 @@
+use cryptix_addresses::Address as CryptixAddress;
 use dashmap::DashMap;
 use std::fmt;
 use std::str::FromStr;
@@ -79,4 +80,61 @@ impl Flags {
     pub fn get(&self, track: Track) -> bool {
         self.0.get(&track).unwrap().load(Ordering::SeqCst)
     }
+}
+
+/// Attempts to convert a wallet address string to a 32-byte token address hash.
+/// Returns Ok(hash) if successful, or Err with an error message if the address is invalid.
+pub fn try_convert_to_token_address(address: &str) -> Result<[u8; 32], String> {
+    // First try to parse as hex directly
+    if let Ok(bytes) = hex::decode(address.trim_start_matches("0x")) {
+        if bytes.len() == 32 {
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&bytes);
+            return Ok(hash);
+        } else {
+            return Err(format!("Hex address must be 32 bytes (64 hex characters), got {} bytes", bytes.len()));
+        }
+    }
+    
+    // If not hex, try to parse as a Cryptix address
+    match CryptixAddress::try_from(address) {
+        Ok(addr) => {
+            let payload = addr.payload.as_slice();
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(payload);
+            Ok(hash)
+        },
+        Err(e) => Err(format!("Invalid address format: {}", e))
+    }
+}
+
+/// Asks the user if they want to convert a wallet address to a token address.
+/// Returns true if the user confirms, false otherwise.
+pub fn ask_convert_address() -> bool {
+    println!("The provided address appears to be a wallet address, not a token address (32-byte hex).");
+    println!("Token operations require addresses in raw 32-byte hex format.");
+    println!("Would you like to automatically convert this wallet address to a token address? (y/N)");
+    
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_ok() {
+        matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+    } else {
+        false
+    }
+}
+
+/// Attempts to convert a wallet address string to a 32-byte token address hash.
+/// This version is specifically for handling Option<String> inputs.
+/// Returns Ok(hash) if successful, or Err with an error message if the address is invalid.
+pub fn try_convert_option_to_token_address(address: &Option<String>) -> Result<[u8; 32], String> {
+    match address {
+        Some(addr) => try_convert_to_token_address(addr),
+        None => Err("Address is required".to_string())
+    }
+}
+
+/// Helper function to safely get a string from an Option<String> for display purposes.
+/// Returns the string if Some, or a default message if None.
+pub fn option_string_to_display(opt: &Option<String>, default: &str) -> String {
+    opt.as_ref().map(|s| s.clone()).unwrap_or_else(|| default.to_string())
 }

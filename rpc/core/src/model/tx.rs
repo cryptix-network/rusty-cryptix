@@ -49,6 +49,7 @@ impl From<RpcUtxoEntry> for UtxoEntry {
             script_public_key: entry.script_public_key,
             block_daa_score: entry.block_daa_score,
             is_coinbase: entry.is_coinbase,
+            payload: Vec::new(),
         }
     }
 }
@@ -223,6 +224,8 @@ impl Deserializer for RpcTransactionInputVerboseData {
 pub struct RpcTransactionOutput {
     pub value: u64,
     pub script_public_key: RpcScriptPublicKey,
+    #[serde(with = "hex::serde")]
+    pub payload: Vec<u8>,
     pub verbose_data: Option<RpcTransactionOutputVerboseData>,
 }
 
@@ -234,7 +237,12 @@ impl RpcTransactionOutput {
 
 impl From<TransactionOutput> for RpcTransactionOutput {
     fn from(output: TransactionOutput) -> Self {
-        Self { value: output.value, script_public_key: output.script_public_key, verbose_data: None }
+        Self { 
+            value: output.value, 
+            script_public_key: output.script_public_key, 
+            payload: output.payload,
+            verbose_data: None 
+        }
     }
 }
 
@@ -243,6 +251,7 @@ impl Serializer for RpcTransactionOutput {
         store!(u8, &1, writer)?;
         store!(u64, &self.value, writer)?;
         store!(RpcScriptPublicKey, &self.script_public_key, writer)?;
+        store!(Vec<u8>, &self.payload, writer)?;
         serialize!(Option<RpcTransactionOutputVerboseData>, &self.verbose_data, writer)?;
 
         Ok(())
@@ -254,9 +263,10 @@ impl Deserializer for RpcTransactionOutput {
         let _version = load!(u8, reader)?;
         let value = load!(u64, reader)?;
         let script_public_key = load!(RpcScriptPublicKey, reader)?;
+        let payload = load!(Vec<u8>, reader)?;
         let verbose_data = deserialize!(Option<RpcTransactionOutputVerboseData>, reader)?;
 
-        Ok(Self { value, script_public_key, verbose_data })
+        Ok(Self { value, script_public_key, payload, verbose_data })
     }
 }
 

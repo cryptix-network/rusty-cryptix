@@ -6,6 +6,7 @@ use cryptix_consensus_core::{
     blockstatus::BlockStatus,
     coinbase::MinerData,
     config::{params::MAINNET_PARAMS, ConfigBuilder},
+    subnets::SubnetworkId,
     tx::{ScriptPublicKey, ScriptVec, Transaction},
     BlockHashSet,
 };
@@ -13,22 +14,22 @@ use cryptix_hashes::Hash;
 use std::{collections::VecDeque, thread::JoinHandle};
 
 struct OnetimeTxSelector {
-    txs: Option<Vec<Transaction>>,
+    txs: Vec<Transaction>,
 }
 
 impl OnetimeTxSelector {
     fn new(txs: Vec<Transaction>) -> Self {
-        Self { txs: Some(txs) }
+        Self { txs }
     }
 }
 
 impl TemplateTransactionSelector for OnetimeTxSelector {
     fn select_transactions(&mut self) -> Vec<Transaction> {
-        self.txs.take().unwrap()
+        std::mem::take(&mut self.txs)
     }
 
-    fn reject_selection(&mut self, _tx_id: cryptix_consensus_core::tx::TransactionId) {
-        unimplemented!()
+    fn reject_selection(&mut self, tx_id: cryptix_consensus_core::tx::TransactionId) {
+        self.txs.retain(|tx| tx.id() != tx_id);
     }
 
     fn is_successful(&self) -> bool {
@@ -91,7 +92,6 @@ impl TestContext {
     }
 
     pub async fn build_and_insert_disqualified_chain(&mut self, mut parents: Vec<Hash>, len: usize) -> Hash {
-        // The chain will be disqualified since build_block_with_parents builds utxo-invalid blocks
         for _ in 0..len {
             self.simulated_time += self.consensus.params().target_time_per_block;
             let b = self.build_block_with_parents(parents, 0, self.simulated_time);
@@ -120,7 +120,7 @@ impl TestContext {
         let mut b = self.consensus.build_block_with_parents_and_transactions(blockhash::NONE, parents, Default::default());
         b.header.timestamp = timestamp;
         b.header.nonce = nonce;
-        b.header.finalize(); // This overrides the NONE hash we passed earlier with the actual hash
+        b.header.finalize();
         b
     }
 
@@ -146,7 +146,6 @@ impl TestContext {
     }
 
     pub fn assert_valid_utxo_tip(&mut self) -> &mut Self {
-        // Assert that at least one body tip was resolved with valid UTXO
         assert!(self.consensus.body_tips().iter().copied().any(|h| self.consensus.block_status(h) == BlockStatus::StatusUTXOValid));
         self
     }
@@ -181,7 +180,6 @@ async fn antichain_merge_test() {
 
     let mut ctx = TestContext::new(TestConsensus::new(&config));
 
-    // Build a large 32-wide antichain
     ctx.build_block_template_row(0..32)
         .validate_and_insert_row()
         .await
@@ -189,7 +187,6 @@ async fn antichain_merge_test() {
         .assert_virtual_parents_subset()
         .assert_valid_utxo_tip();
 
-    // Mine a long enough chain s.t. the antichain is fully merged
     for _ in 0..32 {
         ctx.build_block_template_row(0..1).validate_and_insert_row().await.assert_valid_utxo_tip();
     }
@@ -209,15 +206,12 @@ async fn basic_utxo_disqualified_test() {
 
     let mut ctx = TestContext::new(TestConsensus::new(&config));
 
-    // Mine a valid chain
     for _ in 0..10 {
         ctx.build_block_template_row(0..1).validate_and_insert_row().await.assert_valid_utxo_tip();
     }
 
-    // Get current sink
     let sink = ctx.consensus.get_sink();
 
-    // Mine a longer disqualified chain
     let disqualified_tip = ctx.build_and_insert_disqualified_chain(vec![config.genesis.hash], 20).await;
 
     assert_ne!(sink, disqualified_tip);
@@ -228,8 +222,6 @@ async fn basic_utxo_disqualified_test() {
 
 #[tokio::test]
 async fn double_search_disqualified_test() {
-    // TODO: add non-coinbase transactions and concurrency in order to complicate the test
-
     cryptix_core::log::try_init_logger("info");
     let config = ConfigBuilder::new(MAINNET_PARAMS)
         .skip_proof_of_work()
@@ -241,7 +233,6 @@ async fn double_search_disqualified_test() {
         .build();
     let mut ctx = TestContext::new(TestConsensus::new(&config));
 
-    // Mine 3 valid blocks over genesis
     ctx.build_block_template_row(0..3)
         .validate_and_insert_row()
         .await
@@ -249,10 +240,8 @@ async fn double_search_disqualified_test() {
         .assert_virtual_parents_subset()
         .assert_valid_utxo_tip();
 
-    // Mark the one expected to remain on virtual chain
     let original_sink = ctx.consensus.get_sink();
 
-    // Find the roots to be used for the disqualified chains
     let mut virtual_parents = ctx.consensus.get_virtual_parents();
     assert!(virtual_parents.remove(&original_sink));
     let mut iter = virtual_parents.into_iter();
@@ -260,20 +249,16 @@ async fn double_search_disqualified_test() {
     let root_2 = iter.next().unwrap();
     assert_eq!(iter.next(), None);
 
-    // Mine a valid chain
     for _ in 0..10 {
         ctx.build_block_template_row(0..1).validate_and_insert_row().await.assert_valid_utxo_tip();
     }
 
-    // Get current sink
     let sink = ctx.consensus.get_sink();
 
     assert!(ctx.consensus.reachability_service().is_chain_ancestor_of(original_sink, sink));
 
-    // Mine a long disqualified chain
     let disqualified_tip_1 = ctx.build_and_insert_disqualified_chain(vec![root_1], 30).await;
 
-    // And another shorter disqualified chain
     let disqualified_tip_2 = ctx.build_and_insert_disqualified_chain(vec![root_2], 20).await;
 
     assert_eq!(ctx.consensus.get_block_status(root_1), Some(BlockStatus::StatusUTXOValid));
@@ -289,11 +274,147 @@ async fn double_search_disqualified_test() {
     assert!(!ctx.consensus.get_virtual_parents().contains(&disqualified_tip_1));
     assert!(!ctx.consensus.get_virtual_parents().contains(&disqualified_tip_2));
 
-    // Mine a long enough valid chain s.t. both disqualified chains are fully merged
     for _ in 0..30 {
         ctx.build_block_template_row(0..1).validate_and_insert_row().await.assert_valid_utxo_tip();
     }
     ctx.assert_tips_num(1);
+}
+
+#[tokio::test]
+async fn payload_limit_test() {
+    let config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+
+    let tx_with_payload_1 = Transaction::new(
+        0,
+        vec![],
+        vec![],
+        0,
+        SubnetworkId::from_byte(0),
+        0,
+        ScriptVec::from_slice(b"payload1").to_vec(),
+    );
+    let tx_with_payload_2 = Transaction::new(
+        0,
+        vec![],
+        vec![],
+        0,
+        SubnetworkId::from_byte(0),
+        0,
+        ScriptVec::from_slice(b"payload2").to_vec(),
+    );
+    let tx_without_payload =
+        Transaction::new(0, vec![], vec![], 0, SubnetworkId::from_byte(0), 0, ScriptVec::new().to_vec());
+
+    let txs = vec![
+        tx_with_payload_1.clone(),
+        tx_with_payload_2.clone(),
+        tx_without_payload.clone(),
+    ];
+    let template = ctx
+        .consensus
+        .build_block_template(
+            ctx.miner_data.clone(),
+            Box::new(OnetimeTxSelector::new(txs)),
+            TemplateBuildMode::Standard,
+        )
+        .unwrap();
+
+    let payload_count = template
+        .block
+        .transactions
+        .iter()
+        .skip(1)
+        .filter(|tx| !tx.payload.is_empty())
+        .count();
+    assert!(payload_count <= 1);
+
+    let txs_single = vec![tx_with_payload_1.clone(), tx_without_payload.clone()];
+    let template_single = ctx
+        .consensus
+        .build_block_template(
+            ctx.miner_data.clone(),
+            Box::new(OnetimeTxSelector::new(txs_single)),
+            TemplateBuildMode::Standard,
+        )
+        .unwrap();
+
+    let payload_count_single = template_single
+        .block
+        .transactions
+        .iter()
+        .skip(1)
+        .filter(|tx| !tx.payload.is_empty())
+        .count();
+    assert!(payload_count_single <= 1);
+
+    let txs_none = vec![tx_without_payload.clone()];
+    let template_none = ctx
+        .consensus
+        .build_block_template(
+            ctx.miner_data.clone(),
+            Box::new(OnetimeTxSelector::new(txs_none)),
+            TemplateBuildMode::Standard,
+        )
+        .unwrap();
+
+    let payload_count_none = template_none
+        .block
+        .transactions
+        .iter()
+        .skip(1)
+        .filter(|tx| !tx.payload.is_empty())
+        .count();
+    assert_eq!(payload_count_none, 0);
+}
+
+#[tokio::test]
+async fn execution_invalid_tx_filtered_from_template() {
+    use core::str::FromStr;
+    use cryptix_consensus_core::contract::ContractPayload;
+    use cryptix_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+    use cryptix_consensus_core::tx::{
+        ScriptPublicKey, ScriptVec, Transaction, TransactionId, TransactionInput, TransactionOutpoint, TransactionOutput,
+    };
+    use cryptix_txscript::pay_to_contract_script;
+
+    // Given a contracts-enabled consensus without PoW
+    let config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+
+    // Build an execution payload (action_id > 0) but with no valid state input
+    let cid: u64 = 81001;
+    let payload = ContractPayload { v: 1, c: cid, a: 1, d: vec![] }.encode().unwrap();
+
+    // Create a dummy input referencing a non-existent outpoint (ensures it's invalid)
+    let prev_tx_id =
+        TransactionId::from_str("0000000000000000000000000000000000000000000000000000000000000000").unwrap();
+    let input = TransactionInput {
+        previous_outpoint: TransactionOutpoint { transaction_id: prev_tx_id, index: 0 },
+        signature_script: vec![],
+        sequence: 0,
+        sig_op_count: 0,
+    };
+
+    // Create a state-like output for the same cid (this alone is not sufficient without a valid state input)
+    let spk_state = ScriptVec::from_slice(&pay_to_contract_script(cid));
+    let output = TransactionOutput { value: 0, script_public_key: ScriptPublicKey::new(0, spk_state), payload: vec![1, 2, 3] };
+
+    let tx = Transaction::new(0, vec![input], vec![output], 0, SUBNETWORK_ID_NATIVE, 0, payload);
+
+    // Try to build a block template including the invalid execution tx
+    let template = ctx
+        .consensus
+        .build_block_template(
+            ctx.miner_data.clone(),
+            Box::new(OnetimeTxSelector::new(vec![tx.clone()])),
+            TemplateBuildMode::Standard,
+        )
+        .unwrap();
+
+    // The invalid execution tx must be filtered out by the template builder (integration enforcement)
+    let included = template.block.transactions.iter().skip(1).any(|t| t.id() == tx.id());
+    assert!(!included);
 }
 
 fn new_miner_data() -> MinerData {

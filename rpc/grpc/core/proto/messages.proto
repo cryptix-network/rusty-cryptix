@@ -65,6 +65,12 @@ message CryptixdRequest {
     GetFeeEstimateRequestMessage getFeeEstimateRequest = 1106;
     GetFeeEstimateExperimentalRequestMessage getFeeEstimateExperimentalRequest = 1108;
     GetCurrentBlockColorRequestMessage getCurrentBlockColorRequest = 1110;
+    // Contract RPCs
+    DeployContractRequestMessage deployContractRequest = 1120;
+    SubmitContractCallRequestMessage submitContractCallRequest = 1122;
+    GetContractStateRequestMessage getContractStateRequest = 1124;
+    ListContractsRequestMessage listContractsRequest = 1126;
+    SimulateContractCallRequestMessage simulateContractCallRequest = 1128;
   }
 }
 
@@ -130,6 +136,12 @@ message CryptixdResponse {
     GetFeeEstimateResponseMessage getFeeEstimateResponse = 1107;
     GetFeeEstimateExperimentalResponseMessage getFeeEstimateExperimentalResponse = 1109;
     GetCurrentBlockColorResponseMessage getCurrentBlockColorResponse = 1111;
+    // Contract RPCs
+    DeployContractResponseMessage deployContractResponse = 1121;
+    SubmitContractCallResponseMessage submitContractCallResponse = 1123;
+    GetContractStateResponseMessage getContractStateResponse = 1125;
+    ListContractsResponseMessage listContractsResponse = 1127;
+    SimulateContractCallResponseMessage simulateContractCallResponse = 1129;
   }
 }
 

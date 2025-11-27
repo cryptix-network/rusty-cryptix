@@ -72,6 +72,12 @@ pub mod cryptixd_request_convert {
     impl_into_cryptixd_request!(NotifyVirtualDaaScoreChanged);
     impl_into_cryptixd_request!(NotifyVirtualChainChanged);
     impl_into_cryptixd_request!(NotifySinkBlueScoreChanged);
+    // Contract RPCs
+    impl_into_cryptixd_request!(DeployContract);
+    impl_into_cryptixd_request!(SubmitContractCall);
+    impl_into_cryptixd_request!(GetContractState);
+    impl_into_cryptixd_request!(ListContracts);
+    impl_into_cryptixd_request!(SimulateContractCall);
 
     macro_rules! impl_into_cryptixd_request {
         ($name:tt) => {
@@ -200,6 +206,12 @@ pub mod cryptixd_response_convert {
     impl_into_cryptixd_response!(GetFeeEstimate);
     impl_into_cryptixd_response!(GetFeeEstimateExperimental);
     impl_into_cryptixd_response!(GetCurrentBlockColor);
+    // Contract RPCs
+    impl_into_cryptixd_response!(DeployContract);
+    impl_into_cryptixd_response!(SubmitContractCall);
+    impl_into_cryptixd_response!(GetContractState);
+    impl_into_cryptixd_response!(ListContracts);
+    impl_into_cryptixd_response!(SimulateContractCall);
 
     impl_into_cryptixd_notify_response!(NotifyBlockAdded);
     impl_into_cryptixd_notify_response!(NotifyNewBlockTemplate);

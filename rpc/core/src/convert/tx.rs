@@ -27,6 +27,7 @@ impl From<&TransactionOutput> for RpcTransactionOutput {
         Self {
             value: item.value,
             script_public_key: item.script_public_key.clone(),
+            payload: item.payload.clone(),
             // TODO: Implement a populating process inspired from cryptixd\app\rpc\rpccontext\verbosedata.go
             verbose_data: None,
         }
@@ -76,7 +77,7 @@ impl TryFrom<RpcTransaction> for Transaction {
 impl TryFrom<RpcTransactionOutput> for TransactionOutput {
     type Error = RpcError;
     fn try_from(item: RpcTransactionOutput) -> RpcResult<Self> {
-        Ok(Self::new(item.value, item.script_public_key))
+        Ok(Self::new_with_payload(item.value, item.script_public_key, item.payload))
     }
 }
 

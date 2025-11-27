@@ -229,7 +229,7 @@ mod mockery {
 
     impl Mock for RpcTransactionOutput {
         fn mock() -> Self {
-            RpcTransactionOutput { value: mock(), script_public_key: mock(), verbose_data: mock() }
+            RpcTransactionOutput { value: mock(), script_public_key: mock(), payload: Vec::new(), verbose_data: mock() }
         }
     }
 

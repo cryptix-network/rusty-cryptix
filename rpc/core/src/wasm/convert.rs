@@ -41,7 +41,12 @@ cfg_if::cfg_if! {
         impl From<TransactionOutput> for RpcTransactionOutput {
             fn from(output: TransactionOutput) -> Self {
                 let inner = output.inner();
-                RpcTransactionOutput { value: inner.value, script_public_key: inner.script_public_key.clone(), verbose_data: None }
+                RpcTransactionOutput { 
+                    value: inner.value, 
+                    script_public_key: inner.script_public_key.clone(), 
+                    payload: Vec::new(),
+                    verbose_data: None 
+                }
             }
         }
 

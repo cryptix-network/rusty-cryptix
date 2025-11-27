@@ -68,6 +68,7 @@ impl TryFrom<&SerializableUtxoEntry> for cctx::UtxoEntry {
             script_public_key: utxo.script_public_key.clone(),
             block_daa_score: utxo.block_daa_score,
             is_coinbase: utxo.is_coinbase,
+            payload: Vec::new(),
         })
     }
 }
@@ -194,7 +195,7 @@ impl From<&cctx::TransactionOutput> for SerializableTransactionOutput {
 impl TryFrom<SerializableTransactionOutput> for cctx::TransactionOutput {
     type Error = Error;
     fn try_from(output: SerializableTransactionOutput) -> Result<Self> {
-        Ok(Self { value: output.value, script_public_key: output.script_public_key })
+        Ok(Self { value: output.value, script_public_key: output.script_public_key, payload: vec![] })
     }
 }
 

@@ -138,6 +138,7 @@ try_from!(item: &protowire::RpcTransactionOutput, cryptix_rpc_core::RpcTransacti
             .as_ref()
             .ok_or_else(|| RpcError::MissingRpcFieldError("RpcTransactionOutput".to_string(), "script_public_key".to_string()))?
             .try_into()?,
+        payload: Vec::new(),
         verbose_data: item.verbose_data.as_ref().map(cryptix_rpc_core::RpcTransactionOutputVerboseData::try_from).transpose()?,
     }
 });

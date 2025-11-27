@@ -19,10 +19,65 @@ impl BlockBodyProcessor {
 
     fn check_block_transactions_in_context(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         let (pmt, _) = self.window_manager.calc_past_median_time(&self.ghostdag_store.get_data(block.hash()).unwrap())?;
+        
+        // Log block processing with contract information
+        let mut contract_txs_count = 0;
+        
         for tx in block.transactions.iter() {
+            // Check if this is a contract transaction
+            let is_contract_tx = tx.payload.len() >= 3 && &tx.payload[0..3] == b"CX\x01";
+            
+            if is_contract_tx {
+                contract_txs_count += 1;
+                
+                // Try to parse contract payload to extract contract_id and action_id
+                if let Ok(payload) = cryptix_consensus_core::contract::ContractPayload::parse(&tx.payload) {
+                    let tx_id = tx.id();
+                    
+                    // Log contract transaction details at INFO level for better visibility
+                    if payload.a == 0 {
+                        // Deploy operation
+                        cryptix_core::info!("[CONTRACT_DEPLOY] Block {} contains transaction {} deploying contract_id={}", 
+                              block.hash(), tx_id, payload.c);
+                    } else {
+                        // Execution operation
+                        cryptix_core::info!("[CONTRACT_EXEC] Block {} contains transaction {} executing contract_id={}, action_id={}", 
+                              block.hash(), tx_id, payload.c, payload.a);
+                    }
+                    
+                    // Find contract state output to log instance ID
+                    for (i, output) in tx.outputs.iter().enumerate() {
+                        if cryptix_txscript::is_contract_script(output.script_public_key.script()) {
+                            if let Some(cid) = cryptix_txscript::extract_contract_id(output.script_public_key.script()) {
+                                if cid == payload.c {
+                                    // Log the instance ID (txid:vout) for this contract state
+                                    let instance_id = format!("{}:{}", tx_id, i);
+                                    
+                                    if payload.a == 0 {
+                                        // Deploy operation
+                                        cryptix_core::info!("[CONTRACT_INSTANCE] Block {} contains contract instance_id={} for contract_id={}", 
+                                              block.hash(), instance_id, cid);
+                                    } else {
+                                        // Execution operation
+                                        cryptix_core::info!("[CONTRACT_INSTANCE] Block {} updates contract instance_id={} for contract_id={}", 
+                                              block.hash(), instance_id, cid);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
             if let Err(e) = self.transaction_validator.utxo_free_tx_validation(tx, block.header.daa_score, pmt) {
                 return Err(RuleError::TxInContextFailed(tx.id(), e));
             }
+        }
+        
+        // Log summary of contract transactions in the block
+        if contract_txs_count > 0 {
+            cryptix_core::info!("[CONTRACT_SUMMARY] Block {} contains {} contract transactions", 
+                  block.hash(), contract_txs_count);
         }
 
         Ok(())

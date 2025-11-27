@@ -468,6 +468,64 @@ pub trait RpcApi: Sync + Send + AnySync {
     ) -> RpcResult<GetCurrentBlockColorResponse>;
 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    // Contract API 
+
+    async fn deploy_contract(&self, contract_id: u64, initial_state: Vec<u8>) -> RpcResult<DeployContractResponse> {
+        self.deploy_contract_call(None, DeployContractRequest { contract_id, initial_state }).await
+    }
+    async fn deploy_contract_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: DeployContractRequest,
+    ) -> RpcResult<DeployContractResponse>;
+
+    async fn submit_contract_call(&self, instance_id: String, action_id: u16, data: Vec<u8>) -> RpcResult<SubmitContractCallResponse> {
+        self.submit_contract_call_call(None, SubmitContractCallRequest { instance_id, action_id, data }).await
+    }
+    async fn submit_contract_call_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: SubmitContractCallRequest,
+    ) -> RpcResult<SubmitContractCallResponse>;
+
+    async fn get_contract_state(&self, instance_id: String) -> RpcResult<GetContractStateResponse> {
+        self.get_contract_state_call(None, GetContractStateRequest { instance_id }).await
+    }
+    async fn get_contract_state_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetContractStateRequest,
+    ) -> RpcResult<GetContractStateResponse>;
+
+    async fn list_contracts(&self) -> RpcResult<ListContractsResponse> {
+        self.list_contracts_call(None, ListContractsRequest {}).await
+    }
+    async fn list_contracts_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: ListContractsRequest,
+    ) -> RpcResult<ListContractsResponse>;
+
+    async fn simulate_contract_call(
+        &self,
+        instance_id: String,
+        action_id: u16,
+        data: Vec<u8>,
+        hypothetical_state: Option<Vec<u8>>,
+    ) -> RpcResult<SimulateContractCallResponse> {
+        self.simulate_contract_call_call(
+            None,
+            SimulateContractCallRequest { instance_id, action_id, data, hypothetical_state },
+        )
+        .await
+    }
+    async fn simulate_contract_call_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: SimulateContractCallRequest,
+    ) -> RpcResult<SimulateContractCallResponse>;
+
+    // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Notification API
 
     /// Register a new listener and returns an id identifying it.

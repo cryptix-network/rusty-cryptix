@@ -155,7 +155,12 @@ impl ConsensusConverter {
         let address = extract_script_pub_key_address(&output.script_public_key, self.config.prefix()).ok();
         let verbose_data =
             address.map(|address| RpcTransactionOutputVerboseData { script_public_key_type, script_public_key_address: address });
-        RpcTransactionOutput { value: output.value, script_public_key: output.script_public_key.clone(), verbose_data }
+        RpcTransactionOutput { 
+            value: output.value, 
+            script_public_key: output.script_public_key.clone(), 
+            payload: output.payload.clone(),
+            verbose_data 
+        }
     }
 
     pub async fn get_virtual_chain_accepted_transaction_ids(

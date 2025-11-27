@@ -92,7 +92,10 @@ impl Mempool {
             }
 
             if ScriptClass::from_script(&output.script_public_key) == ScriptClass::NonStandard {
-                return Err(NonStandardError::RejectOutputScriptClass(transaction_id, i));
+                // Allow OP_CONTRACT state outputs as standard policy
+                if !cryptix_txscript::is_contract_script(output.script_public_key.script()) {
+                    return Err(NonStandardError::RejectOutputScriptClass(transaction_id, i));
+                }
             }
 
             if self.is_transaction_output_dust(output) {
@@ -116,6 +119,12 @@ impl Mempool {
         // Unspendable outputs are considered dust.
         if is_unspendable::<PopulatedTransaction>(transaction_output.script_public_key.script()) {
             return true;
+        }
+
+        // Contract state outputs (OP_CONTRACT) are allowed to have zero value by consensus rules.
+        // Do not consider them dust for mempool relay policy.
+        if cryptix_txscript::is_contract_script(transaction_output.script_public_key.script()) {
+            return false;
         }
 
         // The total serialized size consists of the output and the associated
@@ -183,7 +192,10 @@ impl Mempool {
             let entry = transaction.entries[i].as_ref().unwrap();
             match ScriptClass::from_script(&entry.script_public_key) {
                 ScriptClass::NonStandard => {
-                    return Err(NonStandardError::RejectInputScriptClass(transaction_id, i));
+                    // Allow spending contract state UTXOs (OP_CONTRACT) as standard policy
+                    if !cryptix_txscript::is_contract_script(entry.script_public_key.script()) {
+                        return Err(NonStandardError::RejectInputScriptClass(transaction_id, i));
+                    }
                 }
                 ScriptClass::PubKey => {}
                 ScriptClass::PubKeyECDSA => {}

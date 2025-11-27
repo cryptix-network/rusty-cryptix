@@ -32,9 +32,17 @@ use cryptix_rpc_core::{
     error::RpcError,
     error::RpcResult,
     model::message::*,
+    model::contract::{
+        DeployContractRequest, DeployContractResponse,
+        SubmitContractCallRequest, SubmitContractCallResponse,
+        GetContractStateRequest, GetContractStateResponse,
+        ListContractsRequest, ListContractsResponse,
+        SimulateContractCallRequest, SimulateContractCallResponse
+    },
     notify::{collector::RpcCoreConverter, connection::ChannelConnection, mode::NotificationMode},
     Notification,
 };
+use cryptix_rpc_core::api::connection::DynRpcConnection;
 use cryptix_utils::{channel::Channel, triggers::DuplexTrigger};
 use cryptix_utils_tower::{
     counters::TowerConnectionCounters,
@@ -277,6 +285,15 @@ impl RpcApi for GrpcClient {
     route!(get_fee_estimate_call, GetFeeEstimate);
     route!(get_fee_estimate_experimental_call, GetFeeEstimateExperimental);
     route!(get_current_block_color_call, GetCurrentBlockColor);
+
+    // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    // Contract API (gRPC transport wired)
+
+    route!(deploy_contract_call, DeployContract);
+    route!(submit_contract_call_call, SubmitContractCall);
+    route!(get_contract_state_call, GetContractState);
+    route!(list_contracts_call, ListContracts);
+    route!(simulate_contract_call_call, SimulateContractCall);
 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Notification API

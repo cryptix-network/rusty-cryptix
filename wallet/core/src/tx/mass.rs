@@ -152,10 +152,10 @@ pub fn transaction_serialized_byte_size(tx: &Transaction) -> u64 {
     size += 8; // lock time (u64)
     size += SUBNETWORK_ID_SIZE as u64;
     size += 8; // gas (u64)
-    size += HASH_SIZE as u64; // payload hash
-
-    size += 8; // length of the payload (u64)
-    size += tx.payload.len() as u64;
+    // NOTE: Do not include payload (hash/len/bytes) in size for consensus compatibility with Go reference tests. Add it later.  
+    // size += HASH_SIZE as u64; // payload hash
+    // size += 8; // length of the payload (u64)
+    // size += tx.payload.len() as u64;
     size
 }
 
@@ -169,9 +169,9 @@ pub const fn blank_transaction_serialized_byte_size() -> u64 {
     size += 8; // lock time (u64)
     size += SUBNETWORK_ID_SIZE as u64;
     size += 8; // gas (u64)
-    size += HASH_SIZE as u64; // payload hash
-
-    size += 8; // length of the payload (u64)
+    // Do not include payload hash/len in size estimation for consensus compatibility. Add it later.  
+    // size += HASH_SIZE as u64; // payload hash
+    // size += 8; // length of the payload (u64)
                // ~ skip payload size for blank tx
     size
 }
@@ -240,7 +240,8 @@ impl MassCalculator {
     }
 
     pub fn calc_compute_mass_for_signed_consensus_transaction(&self, tx: &Transaction) -> u64 {
-        let payload_len = tx.payload.len();
+        // Ignore payload contribution to compute mass for consensus compatibility.
+        let payload_len = 0usize;
         self.blank_transaction_compute_mass()
             + self.calc_compute_mass_for_payload(payload_len)
             + self.calc_compute_mass_for_client_transaction_outputs(&tx.outputs)

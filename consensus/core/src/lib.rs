@@ -15,6 +15,8 @@ pub mod blockstatus;
 pub mod coinbase;
 pub mod config;
 pub mod constants;
+pub mod contract;
+pub mod contracts_extension;
 pub mod daa_score_timestamp;
 pub mod errors;
 pub mod hashing;

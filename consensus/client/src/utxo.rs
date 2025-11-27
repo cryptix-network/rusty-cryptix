@@ -114,6 +114,7 @@ impl From<&UtxoEntry> for cctx::UtxoEntry {
             script_public_key: utxo.script_public_key.clone(),
             block_daa_score: utxo.block_daa_score,
             is_coinbase: utxo.is_coinbase,
+            payload: Vec::new(),
         }
         // value.entry.clone()
     }

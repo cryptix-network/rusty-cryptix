@@ -18,6 +18,55 @@ pub enum TxRuleError {
     #[error("a non coinbase transaction has a payload")]
     NonCoinbaseTxHasPayload,
 
+    #[error("block already contains a non-coinbase transaction with payload")]
+    MultiplePayloadsInBlock,
+
+    #[error("non coinbase transaction payload size {0} exceeds maximum allowed size of {1} bytes")]
+    NonCoinbasePayloadTooLarge(usize, usize),
+
+    #[error("transaction payload starts with contract magic bytes but contract parsing failed or CBOR is invalid")]
+    BadContractPayload,
+
+    #[error("contract with id {0} is unknown or not implemented")]
+    UnknownContract(u64),
+
+    #[error("action {0} is invalid for contract {1}")]
+    InvalidAction(u16, u64),
+
+    #[error("contract state too large: {0} bytes (max: {1} bytes)")]
+    StateTooLarge(usize, usize),
+
+    #[error("multiple state UTXOs found for contract ID: {0}")]
+    MultipleStateUtxos(u64),
+
+    #[error("contract already deployed: {0}")]
+    ContractAlreadyDeployed(u64),
+
+    #[error("missing contract state UTXO for contract ID: {0}")]
+    MissingContractState(u64),
+
+    #[error("missing contract state output in transaction")]
+    MissingContractStateOutput,
+
+    #[error("contract state output for contract {0} has non-zero value {1}")]
+    NonZeroContractStateValue(u64, u64),
+
+    #[error("invalid contract action {0} for contract {1}")]
+    InvalidContractAction(u64, u16),
+
+    #[error("invalid contract state for contract {0}")]
+    InvalidContractState(u64),
+
+    #[error("contract custom error: contract {0}, code {1}")]
+    ContractCustomError(u64, u32),
+
+    #[error("transaction spends contract state without a contract execution payload")]
+    ContractStateSpendWithoutExecution,
+
+    // Contract identity/authentication errors
+    #[error("contract transaction is missing a signed non-contract auth input")]
+    MissingAuthInput,
+
     #[error("transaction version {0} is unknown")]
     UnknownTxVersion(u16),
 

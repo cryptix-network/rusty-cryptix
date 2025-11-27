@@ -380,6 +380,49 @@ impl RpcApi for RpcCoreMock {
     }
 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    // Contract API (tests: stub as unsupported)
+
+    async fn deploy_contract_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: DeployContractRequest,
+    ) -> RpcResult<DeployContractResponse> {
+        Err(RpcError::UnsupportedFeature)
+    }
+
+    async fn submit_contract_call_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: SubmitContractCallRequest,
+    ) -> RpcResult<SubmitContractCallResponse> {
+        Err(RpcError::UnsupportedFeature)
+    }
+
+    async fn get_contract_state_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetContractStateRequest,
+    ) -> RpcResult<GetContractStateResponse> {
+        Err(RpcError::UnsupportedFeature)
+    }
+
+    async fn list_contracts_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: ListContractsRequest,
+    ) -> RpcResult<ListContractsResponse> {
+        Err(RpcError::UnsupportedFeature)
+    }
+
+    async fn simulate_contract_call_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: SimulateContractCallRequest,
+    ) -> RpcResult<SimulateContractCallResponse> {
+        Err(RpcError::UnsupportedFeature)
+    }
+
+    // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Notification API
 
     fn register_new_listener(&self, connection: ChannelConnection) -> ListenerId {

@@ -14,7 +14,7 @@ use cryptix_consensus_core::{
 };
 
 pub(crate) struct MempoolUtxoSet {
-    pool_unspent_outputs: UtxoCollection,
+    pub(crate) pool_unspent_outputs: UtxoCollection,
     outpoint_owner_id: OutpointIndex,
 }
 

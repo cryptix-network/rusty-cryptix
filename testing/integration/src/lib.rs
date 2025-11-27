@@ -25,3 +25,21 @@ pub mod subscribe_benchmarks;
 
 #[cfg(test)]
 pub mod rpc_tests;
+
+#[cfg(test)]
+pub mod contract_rpc_tests;
+
+#[cfg(test)]
+pub mod contract_simulation_tests;
+
+#[cfg(test)]
+pub mod contract_grpc_smoke_tests;
+
+#[cfg(test)]
+pub mod contract_wrpc_smoke_tests;
+
+#[cfg(test)]
+pub mod contract_engine_safety_tests;
+
+#[cfg(test)]
+pub mod contract_state_transition_tests;

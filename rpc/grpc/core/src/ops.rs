@@ -87,6 +87,12 @@ pub enum CryptixdPayloadOps {
     GetFeeEstimate,
     GetFeeEstimateExperimental,
     GetCurrentBlockColor,
+    // Contract RPCs
+    DeployContract,
+    SubmitContractCall,
+    GetContractState,
+    ListContracts,
+    SimulateContractCall,
 
     // Subscription commands for starting/stopping notifications
     NotifyBlockAdded,

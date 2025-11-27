@@ -185,16 +185,15 @@ mod tests {
                 Transaction::new(
                     0,
                     vec![],
-                    vec![TransactionOutput {
-                        value: 0x12a05f200,
-                        script_public_key: ScriptPublicKey::new(
+                    vec![TransactionOutput { value: 0x12a05f200, script_public_key: ScriptPublicKey::new(
                             0,
                             scriptvec!(
                                 0xa9, 0x14, 0xda, 0x17, 0x45, 0xe9, 0xb5, 0x49, 0xbd, 0x0b, 0xfa, 0x1a, 0x56, 0x99, 0x71, 0xc7, 0x7e,
                                 0xba, 0x30, 0xcd, 0x5a, 0x4b, 0x87
                             ),
                         ),
-                    }],
+                    
+                        payload: vec![] }],
                     0,
                     SUBNETWORK_ID_COINBASE,
                     0,
@@ -261,9 +260,7 @@ mod tests {
                         sig_op_count: 0,
                     }],
                     vec![
-                        TransactionOutput {
-                            value: 0x2123e300,
-                            script_public_key: ScriptPublicKey::new(
+                        TransactionOutput { value: 0x2123e300, script_public_key: ScriptPublicKey::new(
                                 0,
                                 scriptvec!(
                                     0x76, // OP_DUP
@@ -274,10 +271,8 @@ mod tests {
                                     0xac  // OP_CHECKSIG
                                 ),
                             ),
-                        },
-                        TransactionOutput {
-                            value: 0x108e20f00,
-                            script_public_key: ScriptPublicKey::new(
+                         payload: vec![] },
+                        TransactionOutput { value: 0x108e20f00, script_public_key: ScriptPublicKey::new(
                                 0,
                                 scriptvec!(
                                     0x76, // OP_DUP
@@ -288,7 +283,7 @@ mod tests {
                                     0xac  // OP_CHECKSIG
                                 ),
                             ),
-                        },
+                         payload: vec![] },
                     ],
                     0,
                     SUBNETWORK_ID_NATIVE,
@@ -321,9 +316,7 @@ mod tests {
                         sig_op_count: 0,
                     }],
                     vec![
-                        TransactionOutput {
-                            value: 0xf4240,
-                            script_public_key: ScriptPublicKey::new(
+                        TransactionOutput { value: 0xf4240, script_public_key: ScriptPublicKey::new(
                                 0,
                                 scriptvec!(
                                     0x76, // OP_DUP
@@ -334,10 +327,8 @@ mod tests {
                                     0xac  // OP_CHECKSIG
                                 ),
                             ),
-                        },
-                        TransactionOutput {
-                            value: 0x11d260c0,
-                            script_public_key: ScriptPublicKey::new(
+                         payload: vec![] },
+                        TransactionOutput { value: 0x11d260c0, script_public_key: ScriptPublicKey::new(
                                 0,
                                 scriptvec!(
                                     0x76, // OP_DUP
@@ -348,7 +339,8 @@ mod tests {
                                     0xac  // OP_CHECKSIG
                                 ),
                             ),
-                        },
+                        
+                     payload: vec![] },
                     ],
                     0,
                     SUBNETWORK_ID_NATIVE,
@@ -381,9 +373,7 @@ mod tests {
                         sequence: u64::MAX,
                         sig_op_count: 0,
                     }],
-                    vec![TransactionOutput {
-                        value: 0xf4240,
-                        script_public_key: ScriptPublicKey::new(
+                    vec![TransactionOutput { value: 0xf4240, script_public_key: ScriptPublicKey::new(
                             0,
                             scriptvec!(
                                 0x76, // OP_DUP
@@ -394,7 +384,7 @@ mod tests {
                                 0xac  // OP_CHECKSIG
                             ),
                         ),
-                    }],
+                     payload: vec![] }],
                     0,
                     SUBNETWORK_ID_NATIVE,
                     0,

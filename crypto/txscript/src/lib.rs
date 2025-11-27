@@ -146,6 +146,39 @@ pub fn is_unspendable<T: VerifiableTransaction>(script: &[u8]) -> bool {
     parse_script::<T>(script).enumerate().any(|(index, op)| op.is_err() || (index == 0 && op.unwrap().value() == OpReturn))
 }
 
+
+/// Returns whether the script is an OP_CONTRACT script.
+/// 
+/// An OP_CONTRACT script has the format: [OP_CONTRACT (0xb2), contract_id (8 bytes)]
+/// Total length: 9 bytes
+pub fn is_contract_script(script: &[u8]) -> bool {
+    script.len() == 9 && script[0] == codes::OpContract
+}
+
+/// Extracts the contract_id from an OP_CONTRACT script.
+/// 
+/// Returns Some(contract_id) if the script is a valid OP_CONTRACT script,
+/// None otherwise.
+pub fn extract_contract_id(script: &[u8]) -> Option<u64> {
+    if !is_contract_script(script) {
+        return None;
+    }
+    
+    // Parse 8 bytes as little-endian u64
+    let id_bytes: [u8; 8] = script[1..9].try_into().ok()?;
+    Some(u64::from_le_bytes(id_bytes))
+}
+
+/// Creates an OP_CONTRACT script for the given contract_id.
+/// 
+/// Returns a 9-byte script: [OP_CONTRACT (0xb2), contract_id (8 bytes LE)]
+pub fn pay_to_contract_script(contract_id: u64) -> Vec<u8> {
+    let mut script = Vec::with_capacity(9);
+    script.push(codes::OpContract);
+    script.extend_from_slice(&contract_id.to_le_bytes());
+    script
+}
+
 impl<'a, T: VerifiableTransaction> TxScriptEngine<'a, T> {
     pub fn new(reused_values: &'a mut SigHashReusedValues, sig_cache: &'a Cache<SigCacheKey, bool>) -> Self {
         Self {
@@ -558,7 +591,7 @@ mod tests {
                 sequence: 4294967295,
                 sig_op_count: 0,
             };
-            let output = TransactionOutput { value: 1000000000, script_public_key: ScriptPublicKey::new(0, test.script.into()) };
+            let output = TransactionOutput { value: 1000000000, script_public_key: ScriptPublicKey::new(0, test.script.into()), payload: vec![] };
 
             let tx = Transaction::new(1, vec![input.clone()], vec![output.clone()], 0, Default::default(), 0, vec![]);
             let utxo_entry = UtxoEntry::new(output.value, output.script_public_key.clone(), 0, tx.is_coinbase());
@@ -914,6 +947,144 @@ mod tests {
                 "failed for '{}'",
                 test.name
             );
+        }
+    }
+
+    #[test]
+    fn test_is_contract_script() {
+        struct Test<'a> {
+            name: &'a str,
+            script: &'a [u8],
+            expected: bool,
+        }
+        
+        let tests = vec![
+            Test {
+                name: "valid OP_CONTRACT script",
+                script: &[0xb2, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // OP_CONTRACT + contract_id=1
+                expected: true,
+            },
+            Test {
+                name: "valid OP_CONTRACT script with large id",
+                script: &[0xb2, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], // OP_CONTRACT + contract_id=u64::MAX
+                expected: true,
+            },
+            Test {
+                name: "too short",
+                script: &[0xb2, 0x01, 0x00, 0x00, 0x00],
+                expected: false,
+            },
+            Test {
+                name: "too long",
+                script: &[0xb2, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                expected: false,
+            },
+            Test {
+                name: "wrong opcode",
+                script: &[0x51, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // OP_TRUE instead
+                expected: false,
+            },
+            Test {
+                name: "empty script",
+                script: &[],
+                expected: false,
+            },
+        ];
+
+        for test in tests {
+            assert_eq!(
+                is_contract_script(test.script),
+                test.expected,
+                "failed for '{}'",
+                test.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_contract_id() {
+        struct Test<'a> {
+            name: &'a str,
+            script: &'a [u8],
+            expected: Option<u64>,
+        }
+        
+        let tests = vec![
+            Test {
+                name: "contract_id = 1",
+                script: &[0xb2, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                expected: Some(1),
+            },
+            Test {
+                name: "contract_id = 1234",
+                script: &[0xb2, 0xd2, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                expected: Some(1234),
+            },
+            Test {
+                name: "contract_id = u64::MAX",
+                script: &[0xb2, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                expected: Some(u64::MAX),
+            },
+            Test {
+                name: "invalid script (too short)",
+                script: &[0xb2, 0x01],
+                expected: None,
+            },
+            Test {
+                name: "invalid script (wrong opcode)",
+                script: &[0x51, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                expected: None,
+            },
+            Test {
+                name: "empty script",
+                script: &[],
+                expected: None,
+            },
+        ];
+
+        for test in tests {
+            assert_eq!(
+                extract_contract_id(test.script),
+                test.expected,
+                "failed for '{}'",
+                test.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_pay_to_contract_script() {
+        struct Test {
+            name: &'static str,
+            contract_id: u64,
+            expected: Vec<u8>,
+        }
+        
+        let tests = vec![
+            Test {
+                name: "contract_id = 1",
+                contract_id: 1,
+                expected: vec![0xb2, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            },
+            Test {
+                name: "contract_id = 1234",
+                contract_id: 1234,
+                expected: vec![0xb2, 0xd2, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            },
+            Test {
+                name: "contract_id = u64::MAX",
+                contract_id: u64::MAX,
+                expected: vec![0xb2, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            },
+        ];
+
+        for test in tests {
+            let script = pay_to_contract_script(test.contract_id);
+            assert_eq!(script, test.expected, "failed for '{}'", test.name);
+            
+            // Verify roundtrip
+            assert!(is_contract_script(&script), "generated script should be recognized as contract script for '{}'", test.name);
+            assert_eq!(extract_contract_id(&script), Some(test.contract_id), "roundtrip failed for '{}'", test.name);
         }
     }
 }

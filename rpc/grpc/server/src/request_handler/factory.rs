@@ -81,6 +81,12 @@ impl Factory {
                 GetFeeEstimate,
                 GetFeeEstimateExperimental,
                 GetCurrentBlockColor,
+                // Contract RPCs
+                DeployContract,
+                SubmitContractCall,
+                GetContractState,
+                ListContracts,
+                SimulateContractCall,
                 NotifyBlockAdded,
                 NotifyNewBlockTemplate,
                 NotifyFinalityConflict,

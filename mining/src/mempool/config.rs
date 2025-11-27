@@ -14,6 +14,10 @@ pub(crate) const DEFAULT_ORPHAN_EXPIRE_SCAN_INTERVAL_SECONDS: u64 = 10;
 pub(crate) const DEFAULT_MAXIMUM_ORPHAN_TRANSACTION_MASS: u64 = 100_000;
 pub(crate) const DEFAULT_MAXIMUM_ORPHAN_TRANSACTION_COUNT: u64 = 500;
 
+/// DEFAULT_MAXIMUM_PAYLOAD_TRANSACTIONS_PER_WALLET specifies the maximum number of non-coinbase transactions
+/// with payload that a single wallet (identified by script public key) can have in the mempool.
+pub(crate) const DEFAULT_MAXIMUM_PAYLOAD_TRANSACTIONS_PER_WALLET: usize = 25;
+
 /// DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE specifies the minimum transaction fee for a transaction to be accepted to
 /// the mempool and relayed. It is specified in sompi per 1kg (or 1000 grams) of transaction mass.
 pub(crate) const DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE: u64 = 1000;
@@ -46,6 +50,7 @@ pub struct Config {
     pub minimum_standard_transaction_version: u16,
     pub maximum_standard_transaction_version: u16,
     pub network_blocks_per_second: u64,
+    pub maximum_payload_transactions_per_wallet: usize,
 }
 
 impl Config {
@@ -70,6 +75,7 @@ impl Config {
         minimum_standard_transaction_version: u16,
         maximum_standard_transaction_version: u16,
         network_blocks_per_second: u64,
+        maximum_payload_transactions_per_wallet: usize,
     ) -> Self {
         Self {
             maximum_transaction_count,
@@ -91,6 +97,7 @@ impl Config {
             minimum_standard_transaction_version,
             maximum_standard_transaction_version,
             network_blocks_per_second,
+            maximum_payload_transactions_per_wallet,
         }
     }
 
@@ -120,6 +127,7 @@ impl Config {
             minimum_standard_transaction_version: DEFAULT_MINIMUM_STANDARD_TRANSACTION_VERSION,
             maximum_standard_transaction_version: DEFAULT_MAXIMUM_STANDARD_TRANSACTION_VERSION,
             network_blocks_per_second: 1000 / target_milliseconds_per_block,
+            maximum_payload_transactions_per_wallet: DEFAULT_MAXIMUM_PAYLOAD_TRANSACTIONS_PER_WALLET,
         }
     }
 

@@ -459,7 +459,7 @@ fn generate_tx(
         .collect_vec();
 
     let outputs = (0..num_outs)
-        .map(|_| TransactionOutput { value: send_amount / num_outs, script_public_key: script_public_key.clone() })
+        .map(|_| TransactionOutput { value: send_amount / num_outs, script_public_key: script_public_key.clone(), payload: vec![] })
         .collect_vec();
     let unsigned_tx = Transaction::new_non_finalized(TX_VERSION, inputs, outputs, 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
     let signed_tx =

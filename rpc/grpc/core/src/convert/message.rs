@@ -1041,6 +1041,179 @@ try_from!(item: &protowire::NotifySinkBlueScoreChangedRequestMessage, cryptix_rp
 });
 try_from!(&protowire::NotifySinkBlueScoreChangedResponseMessage, RpcResult<cryptix_rpc_core::NotifySinkBlueScoreChangedResponse>);
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Contract RPCs
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+// -------------------------
+// rpc_core -> protowire
+// -------------------------
+
+from!(item: &cryptix_rpc_core::DeployContractRequest, protowire::DeployContractRequestMessage, {
+    Self {
+        contract_id: item.contract_id,
+        initial_state: item.initial_state.clone(),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::DeployContractResponse>, protowire::DeployContractResponseMessage, {
+    Self {
+        transaction_id: item.transaction_id.to_string(),
+        state_outpoint: item.state_outpoint.as_ref().map(|x| x.into()),
+        instance_id: item.instance_id.clone().unwrap_or_default(),
+        needs_signing: item.needs_signing,
+        unsigned_transaction: item.unsigned_transaction.as_ref().map(|x| x.into()),
+        error: None,
+    }
+});
+
+from!(item: &cryptix_rpc_core::SubmitContractCallRequest, protowire::SubmitContractCallRequestMessage, {
+    Self {
+        instance_id: item.instance_id.clone(),
+        action_id: item.action_id as u32,
+        data: item.data.clone(),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::SubmitContractCallResponse>, protowire::SubmitContractCallResponseMessage, {
+    Self {
+        transaction_id: item.transaction_id.to_string(),
+        state_outpoint: item.state_outpoint.as_ref().map(|x| x.into()),
+        needs_signing: item.needs_signing,
+        unsigned_transaction: item.unsigned_transaction.as_ref().map(|x| x.into()),
+        error: None,
+    }
+});
+
+from!(item: &cryptix_rpc_core::GetContractStateRequest, protowire::GetContractStateRequestMessage, {
+    Self { instance_id: item.instance_id.clone() }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetContractStateResponse>, protowire::GetContractStateResponseMessage, {
+    Self {
+        has_state: item.has_state,
+        state: item.state.clone(),
+        state_outpoint: item.state_outpoint.as_ref().map(|x| x.into()),
+        error: None,
+    }
+});
+
+from!(&cryptix_rpc_core::ListContractsRequest, protowire::ListContractsRequestMessage);
+from!(item: RpcResult<&cryptix_rpc_core::ListContractsResponse>, protowire::ListContractsResponseMessage, {
+    Self {
+        contracts: item.contracts.iter().map(|x| x.into()).collect(),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::RpcContractStateEntry, protowire::RpcContractStateEntry, {
+    Self {
+        contract_id: item.contract_id,
+        state_size: item.state_size,
+        state_hash: item.state_hash.to_string(),
+        state_outpoint: Some((&item.state_outpoint).into()),
+        instance_id: item.instance_id.clone(),
+    }
+});
+
+from!(item: &cryptix_rpc_core::SimulateContractCallRequest, protowire::SimulateContractCallRequestMessage, {
+    Self {
+        instance_id: item.instance_id.clone(),
+        action_id: item.action_id as u32,
+        data: item.data.clone(),
+        hypothetical_state: item.hypothetical_state.clone(),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::SimulateContractCallResponse>, protowire::SimulateContractCallResponseMessage, {
+    Self {
+        new_state: item.new_state.clone(),
+        error_code: item.error_code,
+        state_size_ok: item.state_size_ok,
+        would_be_valid_tx: item.would_be_valid_tx,
+        error: None,
+    }
+});
+
+// -------------------------
+// protowire -> rpc_core
+// -------------------------
+
+try_from!(item: &protowire::DeployContractRequestMessage, cryptix_rpc_core::DeployContractRequest, {
+    Self {
+        contract_id: item.contract_id,
+        initial_state: item.initial_state.clone(),
+    }
+});
+try_from!(item: &protowire::DeployContractResponseMessage, RpcResult<cryptix_rpc_core::DeployContractResponse>, {
+    Self {
+        transaction_id: cryptix_rpc_core::RpcTransactionId::from_str(&item.transaction_id)?,
+        state_outpoint: item.state_outpoint.as_ref().map(|x| x.try_into()).transpose()?,
+        instance_id: (!item.instance_id.is_empty()).then_some(item.instance_id.clone()),
+        needs_signing: item.needs_signing,
+        unsigned_transaction: item.unsigned_transaction.as_ref().map(|x| x.try_into()).transpose()?,
+    }
+});
+
+try_from!(item: &protowire::SubmitContractCallRequestMessage, cryptix_rpc_core::SubmitContractCallRequest, {
+    Self {
+        instance_id: item.instance_id.clone(),
+        action_id: u16::try_from(item.action_id).map_err(|_| RpcError::PrimitiveToEnumConversionError)?,
+        data: item.data.clone(),
+    }
+});
+try_from!(item: &protowire::SubmitContractCallResponseMessage, RpcResult<cryptix_rpc_core::SubmitContractCallResponse>, {
+    Self {
+        transaction_id: cryptix_rpc_core::RpcTransactionId::from_str(&item.transaction_id)?,
+        state_outpoint: item.state_outpoint.as_ref().map(|x| x.try_into()).transpose()?,
+        needs_signing: item.needs_signing,
+        unsigned_transaction: item.unsigned_transaction.as_ref().map(|x| x.try_into()).transpose()?,
+    }
+});
+
+try_from!(item: &protowire::GetContractStateRequestMessage, cryptix_rpc_core::GetContractStateRequest, {
+    Self { instance_id: item.instance_id.clone() }
+});
+try_from!(item: &protowire::GetContractStateResponseMessage, RpcResult<cryptix_rpc_core::GetContractStateResponse>, {
+    Self {
+        has_state: item.has_state,
+        state: item.state.clone(),
+        state_outpoint: item.state_outpoint.as_ref().map(|x| x.try_into()).transpose()?,
+    }
+});
+
+try_from!(&protowire::ListContractsRequestMessage, cryptix_rpc_core::ListContractsRequest);
+try_from!(item: &protowire::ListContractsResponseMessage, RpcResult<cryptix_rpc_core::ListContractsResponse>, {
+    Self {
+        contracts: item.contracts.iter().map(cryptix_rpc_core::RpcContractStateEntry::try_from).collect::<Result<Vec<_>, _>>()?,
+    }
+});
+try_from!(item: &protowire::RpcContractStateEntry, cryptix_rpc_core::RpcContractStateEntry, {
+    Self {
+        contract_id: item.contract_id,
+        state_size: item.state_size,
+        state_hash: RpcHash::from_str(&item.state_hash)?,
+        state_outpoint: item
+            .state_outpoint
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("RpcContractStateEntry".to_string(), "stateOutpoint".to_string()))?
+            .try_into()?,
+        instance_id: item.instance_id.clone(),
+    }
+});
+
+try_from!(item: &protowire::SimulateContractCallRequestMessage, cryptix_rpc_core::SimulateContractCallRequest, {
+    Self {
+        instance_id: item.instance_id.clone(),
+        action_id: u16::try_from(item.action_id).map_err(|_| RpcError::PrimitiveToEnumConversionError)?,
+        data: item.data.clone(),
+        hypothetical_state: item.hypothetical_state.clone(),
+    }
+});
+try_from!(item: &protowire::SimulateContractCallResponseMessage, RpcResult<cryptix_rpc_core::SimulateContractCallResponse>, {
+    Self {
+        new_state: item.new_state.clone(),
+        error_code: item.error_code,
+        state_size_ok: item.state_size_ok,
+        would_be_valid_tx: item.would_be_valid_tx,
+    }
+});
+
 // ----------------------------------------------------------------------------
 // Unit tests
 // ----------------------------------------------------------------------------

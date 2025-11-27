@@ -1,3 +1,6 @@
+// #Todo - add more Logs in Debug. 
+// # Done
+
 use crate::{
     consensus::{
         services::{
@@ -63,6 +66,7 @@ use cryptix_consensus_core::{
     },
     BlockHashSet, ChainPath,
 };
+use cryptix_math::Uint192;
 use cryptix_consensus_notify::{
     notification::{
         NewBlockTemplateNotification, Notification, SinkBlueScoreChangedNotification, UtxosChangedNotification,
@@ -284,13 +288,76 @@ impl VirtualStateProcessor {
         let prev_sink = prev_state.ghostdag_data.selected_parent;
         let mut accumulated_diff = prev_state.utxo_diff.clone().to_reversed();
 
+        // Log information about the virtual state before updating
+        debug!("RESOLVE VIRTUAL: Starting with prev_sink: {}, finality_point: {}, tips count: {}", 
+            prev_sink, 
+            finality_point, 
+            tips.len()
+        );
+        
         let (new_sink, virtual_parent_candidates) =
             self.sink_search_algorithm(&virtual_read, &mut accumulated_diff, prev_sink, tips, finality_point, pruning_point);
+        
+        // Log information about the selected sink
+        if let Ok(new_sink_daa) = self.headers_store.get_daa_score(new_sink) {
+            if let Ok(prev_sink_daa) = self.headers_store.get_daa_score(prev_sink) {
+                debug!("RESOLVE VIRTUAL: Selected new_sink: {}, DAA score: {}, DAA difference: {}, candidates count: {}", 
+                    new_sink, 
+                    new_sink_daa, 
+                    new_sink_daa.saturating_sub(prev_sink_daa),
+                    virtual_parent_candidates.len()
+                );
+            }
+        }
+        
         let (virtual_parents, virtual_ghostdag_data) = self.pick_virtual_parents(new_sink, virtual_parent_candidates, pruning_point);
         assert_eq!(virtual_ghostdag_data.selected_parent, new_sink);
+        
+        // Log information about the selected virtual parents
+        debug!("RESOLVE VIRTUAL: Selected {} virtual parents, blue score: {}, blue work: {}", 
+            virtual_parents.len(),
+            virtual_ghostdag_data.blue_score,
+            virtual_ghostdag_data.blue_work
+        );
 
         let sink_multiset = self.utxo_multisets_store.get(new_sink).unwrap();
         let chain_path = self.dag_traversal_manager.calculate_chain_path(prev_sink, new_sink, None);
+        
+        // Log information about the chain path
+        debug!("RESOLVE VIRTUAL: Chain path calculated - {} blocks added, {} blocks removed", 
+            chain_path.added.len(), 
+            chain_path.removed.len()
+        );
+        
+        // Log more detailed information about added and removed blocks if there are any
+        if !chain_path.added.is_empty() || !chain_path.removed.is_empty() {
+            // Log DAA scores of first few added blocks
+            let added_blocks_info: Vec<String> = chain_path.added.iter()
+                .take(5) // Limit to first 5 blocks to avoid excessive logging
+                .map(|&hash| {
+                    let daa_score = self.headers_store.get_daa_score(hash).unwrap_or(0);
+                    format!("{}(DAA:{})", hash, daa_score)
+                })
+                .collect();
+            
+            // Log DAA scores of first few removed blocks
+            let removed_blocks_info: Vec<String> = chain_path.removed.iter()
+                .take(5) // Limit to first 5 blocks to avoid excessive logging
+                .map(|&hash| {
+                    let daa_score = self.headers_store.get_daa_score(hash).unwrap_or(0);
+                    format!("{}(DAA:{})", hash, daa_score)
+                })
+                .collect();
+            
+            if !chain_path.added.is_empty() {
+                debug!("RESOLVE VIRTUAL: First few added blocks: {}", added_blocks_info.join(", "));
+            }
+            
+            if !chain_path.removed.is_empty() {
+                debug!("RESOLVE VIRTUAL: First few removed blocks: {}", removed_blocks_info.join(", "));
+            }
+        }
+        
         let new_virtual_state = self
             .calculate_and_commit_virtual_state(
                 virtual_read,
@@ -416,7 +483,32 @@ impl VirtualStateProcessor {
                     let res = self.verify_expected_utxo_state(&mut ctx, &selected_parent_utxo_view, &header);
 
                     if let Err(rule_error) = res {
-                        info!("Block {} is disqualified from virtual chain: {}", current, rule_error);
+                        info!("Block {} is disqualified from virtual chain: {} (details: {:?})", current, rule_error, rule_error);
+                        
+                       
+                        debug!("Disqualified block details - Hash: {}, DAA Score: {}, Header Time: {}, Blue Score: {}, Blue Work: {}",
+                            current,
+                            header.daa_score,
+                            header.timestamp,
+                            self.ghostdag_primary_store.get_blue_score(current).unwrap_or(0),
+                            self.ghostdag_primary_store.get_blue_work(current).unwrap_or_default()
+                        );
+                        
+                      
+                        if let Ok(txs) = self.block_transactions_store.get(current) {
+                            debug!("Disqualified block has {} transactions", txs.len());
+                            
+                        
+                            if !txs.is_empty() {
+                                let coinbase = &txs[0];
+                                debug!("Coinbase transaction ID: {}, Outputs: {}, Payload size: {}",
+                                    coinbase.id(),
+                                    coinbase.outputs.len(),
+                                    coinbase.payload.len()
+                                );
+                            }
+                        }
+                        
                         self.statuses_store.write().set(current, StatusDisqualifiedFromChain).unwrap();
                         chain_disqualified_counter += 1;
                     } else {
@@ -439,6 +531,28 @@ impl VirtualStateProcessor {
         self.counters.chain_block_counts.fetch_add(chain_block_counter, Ordering::Relaxed);
         if chain_disqualified_counter > 0 {
             self.counters.chain_disqualified_counts.fetch_add(chain_disqualified_counter, Ordering::Relaxed);
+            
+
+            debug!("UTXO STATE: Disqualified {} blocks while processing chain from {} to {}. Current diff_point: {}, Split point: {}",
+                chain_disqualified_counter,
+                from,
+                to,
+                diff_point,
+                split_point
+            );
+            
+            if let Ok(from_daa) = self.headers_store.get_daa_score(from) {
+                if let Ok(to_daa) = self.headers_store.get_daa_score(to) {
+                    if let Ok(diff_point_daa) = self.headers_store.get_daa_score(diff_point) {
+                        debug!("UTXO STATE: DAA scores - from: {}, to: {}, diff_point: {}, DAA difference: {}",
+                            from_daa,
+                            to_daa,
+                            diff_point_daa,
+                            to_daa.saturating_sub(from_daa)
+                        );
+                    }
+                }
+            }
         }
 
         diff_point
@@ -585,6 +699,12 @@ impl VirtualStateProcessor {
                 diff_point = self.calculate_utxo_state_relatively(stores, diff, diff_point, candidate);
                 if diff_point == candidate {
                     // This indicates that candidate has valid UTXO state and that `diff` represents its diff from virtual
+                    debug!("SINK SEARCH: Found valid sink candidate {} with DAA score {}, blue score {}, blue work {}",
+                        candidate,
+                        self.headers_store.get_daa_score(candidate).unwrap_or(0),
+                        self.ghostdag_primary_store.get_blue_score(candidate).unwrap_or(0),
+                        self.ghostdag_primary_store.get_blue_work(candidate).unwrap_or_default()
+                    );
 
                     // All blocks with lower blue work than filtering_root are:
                     // 1. not in its future (bcs blue work is monotonic),
@@ -592,12 +712,42 @@ impl VirtualStateProcessor {
                     // Hence as an optimization we prefer removing such blocks in advance to allow valid tips to be considered.
                     let filtering_root = self.depth_store.merge_depth_root(candidate).unwrap();
                     let filtering_blue_work = self.ghostdag_primary_store.get_blue_work(filtering_root).unwrap_or_default();
+                    
+                    // Log remaining candidates in heap
+                    let remaining_candidates = heap.len();
+                    debug!("SINK SEARCH: Selected sink {} with {} remaining candidates in heap", candidate, remaining_candidates);
+                    
                     return (
                         candidate,
                         heap.into_sorted_iter().take_while(|s| s.blue_work >= filtering_blue_work).map(|s| s.hash).collect(),
                     );
                 } else {
-                    debug!("Block candidate {} has invalid UTXO state and is ignored from Virtual chain.", candidate)
+                    // Get more details about the invalid candidate
+                    let header = self.headers_store.get_header(candidate).unwrap_or_else(|_| {
+                        // Create a dummy header with default values
+                        Arc::new(Header {
+                            version: 0,
+                            parents_by_level: vec![],
+                            hash_merkle_root: Hash::default(),
+                            accepted_id_merkle_root: Hash::default(),
+                            utxo_commitment: Hash::default(),
+                            timestamp: 0,
+                            bits: 0,
+                            nonce: 0,
+                            daa_score: 0,
+                            blue_work: Uint192::default(),
+                            blue_score: 0,
+                            pruning_point: Hash::default(),
+                            hash: Hash::default(),
+                        })
+                    });
+                    
+                    debug!("SINK SEARCH: Block candidate {} has invalid UTXO state and is ignored from Virtual chain. DAA score: {}, timestamp: {}, diff_point: {}",
+                        candidate,
+                        header.daa_score,
+                        header.timestamp,
+                        diff_point
+                    );
                 }
             } else if finality_point != pruning_point {
                 // `finality_point == pruning_point` indicates we are at IBD start hence no warning required
@@ -840,8 +990,72 @@ impl VirtualStateProcessor {
         virtual_state: &VirtualState,
         utxo_view: &V,
     ) -> Vec<TxResult<u64>> {
-        self.thread_pool
-            .install(|| txs.par_iter().map(|tx| self.validate_block_template_transaction(tx, virtual_state, &utxo_view)).collect())
+        // Check if any transaction has contract payloads
+        let has_contracts = txs.iter().any(|tx| !tx.payload.is_empty());
+
+        if has_contracts {
+            // Use sequential validation with UTXO updates for contract transactions
+            self.validate_block_template_transactions_sequential(txs, virtual_state, utxo_view)
+        } else {
+            // Use parallel validation for non-contract transactions
+            self.thread_pool
+                .install(|| txs.par_iter().map(|tx| self.validate_block_template_transaction(tx, virtual_state, &utxo_view)).collect())
+        }
+    }
+
+    fn validate_block_template_transactions_sequential<V: UtxoView + Sync>(
+        &self,
+        txs: &[Transaction],
+        virtual_state: &VirtualState,
+        utxo_view: &V,
+    ) -> Vec<TxResult<u64>> {
+        use cryptix_consensus_core::utxo::utxo_diff::UtxoDiff;
+        use cryptix_consensus_core::tx::TransactionOutpoint;
+        use cryptix_consensus_core::utxo::utxo_view::UtxoViewComposition;
+
+        // Runtime safety check: only allow blocks with contract transactions
+        if !txs.iter().any(|tx| !tx.payload.is_empty()) {
+            return txs.iter().map(|_| Err(crate::processes::transaction_validator::errors::TxRuleError::BadContractPayload)).collect();
+        }
+
+        let mut results = Vec::with_capacity(txs.len());
+        let mut cumulative_diff = UtxoDiff::default();
+
+        for tx in txs {
+            // Create a composed view with cumulative changes from previous transactions
+            let composed_view = utxo_view.compose(&cumulative_diff);
+
+            match self.validate_block_template_transaction(tx, virtual_state, &composed_view) {
+                Ok(fee) => {
+                    // Add transaction outputs to cumulative diff for next transaction validation
+                    for (index, output) in tx.outputs.iter().enumerate() {
+                        let outpoint = TransactionOutpoint::new(tx.id(), index as u32);
+                        let entry = cryptix_consensus_core::tx::UtxoEntry::new(
+                            output.value,
+                            output.script_public_key.clone(),
+                            virtual_state.daa_score,
+                            tx.is_coinbase(),
+                        );
+                        cumulative_diff.add.insert(outpoint, entry);
+                    }
+
+                    // Remove consumed inputs from cumulative diff
+                    for input in &tx.inputs {
+                        // For inputs, we need to find the entry that was spent
+                        if let Some(entry) = utxo_view.get(&input.previous_outpoint) {
+                            cumulative_diff.remove.insert(input.previous_outpoint, entry);
+                        }
+                    }
+
+                    results.push(Ok(fee));
+                }
+                Err(e) => {
+                    results.push(Err(e));
+                }
+            }
+        }
+
+        results
     }
 
     fn validate_block_template_transaction(
@@ -854,8 +1068,27 @@ impl VirtualStateProcessor {
         // which were previously validated through `validate_mempool_transaction_and_populate`, hence we only perform
         // in-context validations
         self.transaction_validator.utxo_free_tx_validation(tx, virtual_state.daa_score, virtual_state.past_median_time)?;
-        let ValidatedTransaction { calculated_fee, .. } =
-            self.validate_transaction_in_utxo_context(tx, utxo_view, virtual_state.daa_score, TxValidationFlags::Full)?;
+        
+
+        let mut entries = Vec::with_capacity(tx.inputs.len());
+        for input in tx.inputs.iter() {
+            if let Some(entry) = utxo_view.get(&input.previous_outpoint) {
+                entries.push(entry);
+            } else {
+               
+                return Err(crate::processes::transaction_validator::errors::TxRuleError::MissingTxOutpoints);
+            }
+        }
+        
+      
+        let populated_tx = cryptix_consensus_core::tx::PopulatedTransaction::new(tx, entries);
+        let calculated_fee = self.transaction_validator.validate_populated_transaction_and_get_fee(
+            &populated_tx, 
+            virtual_state.daa_score, 
+            TxValidationFlags::Full,
+            None
+        )?;
+        
         Ok(calculated_fee)
     }
 
@@ -873,6 +1106,28 @@ impl VirtualStateProcessor {
         // optimizing for the common case where all txs are valid. Following selection calls
         // are called within the lock in order to preserve validness of already validated txs
         let mut txs = tx_selector.select_transactions();
+
+    
+        let mut found_payload: Option<Hash> = None;
+        let mut filtered_txs = Vec::new();
+
+        for tx in txs.iter() {
+            let has_payload = !tx.payload.is_empty();
+
+            if has_payload {
+                if found_payload.is_none() {
+                    found_payload = Some(tx.id());
+                    filtered_txs.push(tx.clone());
+                } else {
+                    tx_selector.reject_selection(tx.id());
+                }
+            } else {
+                filtered_txs.push(tx.clone());
+            }
+        }
+
+        txs = filtered_txs;
+      
         let mut calculated_fees = Vec::with_capacity(txs.len());
         let virtual_read = self.virtual_stores.read();
         let virtual_state = virtual_read.state.get().unwrap();
@@ -899,10 +1154,31 @@ impl VirtualStateProcessor {
 
         while has_rejections {
             has_rejections = false;
-            let next_batch = tx_selector.select_transactions(); // Note that once next_batch is empty the loop will exit
+            let next_batch = tx_selector.select_transactions(); 
+
+            let mut next_batch_filtered = Vec::new();
+            for tx in next_batch.into_iter() {
+                let has_payload = !tx.payload.is_empty();
+                if has_payload {
+                    if found_payload.is_none() {
+                        found_payload = Some(tx.id());
+                        next_batch_filtered.push(tx);
+                    } else {
+                        tx_selector.reject_selection(tx.id());
+                        has_rejections = true; 
+                    }
+                } else {
+                    next_batch_filtered.push(tx);
+                }
+            }
+
+            if next_batch_filtered.is_empty() {
+                continue;
+            }
+
             let next_batch_results =
-                self.validate_block_template_transactions_in_parallel(&next_batch, &virtual_state, &virtual_utxo_view);
-            for (tx, res) in next_batch.into_iter().zip(next_batch_results) {
+                self.validate_block_template_transactions_in_parallel(&next_batch_filtered, &virtual_state, &virtual_utxo_view);
+            for (tx, res) in next_batch_filtered.into_iter().zip(next_batch_results) {
                 match res {
                     Err(e) => {
                         invalid_transactions.insert(tx.id(), e);

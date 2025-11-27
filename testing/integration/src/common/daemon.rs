@@ -146,6 +146,36 @@ impl Daemon {
         Daemon { client_manager, core, grpc_server_started, shutdown_requested, workers: None, _appdir_tempdir: appdir_tempdir }
     }
 
+    /// Create a daemon preserving a preconfigured appdir in Args (no override).
+    /// NOTE: This does not take ownership of the provided appdir; the directory will persist after drop.
+    pub fn with_manager_keep_appdir(client_manager: Arc<ClientManager>, fd_total_budget: i32) -> Daemon {
+        // Expect appdir to be already set by the caller
+        let appdir = client_manager.args.read().appdir.clone().expect("appdir must be set in Args");
+        // Do NOT override the appdir here. Just create the core with the provided args.
+        let (core, _) = create_core_with_runtime(&Default::default(), &client_manager.args.read(), fd_total_budget);
+        let async_service = &Arc::downcast::<AsyncRuntime>(core.find(AsyncRuntime::IDENT).unwrap().arc_any()).unwrap();
+        let rpc_core_service = &Arc::downcast::<RpcCoreService>(async_service.find(RpcCoreService::IDENT).unwrap().arc_any()).unwrap();
+        let shutdown_requested = rpc_core_service.core_shutdown_request_listener();
+        let grpc_server = &Arc::downcast::<GrpcService>(async_service.find(GrpcService::IDENT).unwrap().arc_any()).unwrap();
+        let grpc_server_started = grpc_server.started();
+
+        // Create a dummy tempdir just to satisfy the struct field; we do not want to delete the real appdir on drop.
+        let dummy_tempdir = get_cryptix_tempdir();
+        // Keep the original appdir variable in scope to emphasize intent (unused warning avoided)
+        let _ = appdir;
+
+        Daemon { client_manager, core, grpc_server_started, shutdown_requested, workers: None, _appdir_tempdir: dummy_tempdir }
+    }
+
+    /// Build a daemon with random ports but a fixed, provided appdir path (persisted across restarts).
+    pub fn new_random_with_args_and_appdir(mut args: Args, appdir: String, fd_total_budget: i32) -> Daemon {
+        // Respect the provided appdir and randomize ports
+        args.appdir = Some(appdir);
+        Self::fill_args_with_random_ports(&mut args);
+        let client_manager = Arc::new(ClientManager::new(args));
+        Self::with_manager_keep_appdir(client_manager, fd_total_budget)
+    }
+
     pub fn client_manager(&self) -> Arc<ClientManager> {
         self.client_manager.clone()
     }

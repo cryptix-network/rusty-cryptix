@@ -1182,6 +1182,7 @@ name = "cryptix-cli"
 version = "0.15.5"
 dependencies = [
  "async-trait",
+ "blake3",
  "borsh",
  "cfg-if 1.0.0",
  "convert_case 0.6.0",
@@ -1203,12 +1204,14 @@ dependencies = [
  "futures",
  "hex",
  "js-sys",
+ "num_cpus",
  "nw-sys",
  "pad",
  "regex",
  "separator",
  "serde",
  "serde_json",
+ "sha3",
  "textwrap 0.16.2",
  "thiserror 1.0.69",
  "tokio",
@@ -1318,8 +1321,10 @@ version = "0.15.5"
 dependencies = [
  "async-trait",
  "bincode",
+ "blake3",
  "borsh",
  "cfg-if 1.0.0",
+ "ciborium",
  "criterion",
  "cryptix-addresses",
  "cryptix-core",
@@ -1339,6 +1344,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "sha3",
  "smallvec",
  "thiserror 1.0.69",
  "wasm-bindgen",
@@ -1977,6 +1983,7 @@ dependencies = [
  "cryptix-txscript-errors",
  "cryptix-utils",
  "cryptix-utxoindex",
+ "cryptix-wrpc-client",
  "cryptix-wrpc-server",
  "cryptixd",
  "dhat",
@@ -6098,6 +6105,22 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+
+[[package]]
+name = "token_miner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap 4.5.34",
+ "cryptix-addresses",
+ "cryptix-grpc-client",
+ "cryptix-rpc-core",
+ "hex",
+ "num_cpus",
+ "sha3",
+ "tokio",
+]
 
 [[package]]
 name = "tokio"

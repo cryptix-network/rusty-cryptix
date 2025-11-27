@@ -5,6 +5,7 @@ pub mod address;
 pub mod broadcast;
 pub mod close;
 pub mod connect;
+pub mod contract;
 #[path = "create-unsigned-tx.rs"]
 pub mod create_unsigned_tx;
 pub mod details;
@@ -39,6 +40,8 @@ pub mod stop;
 pub mod sweep;
 // pub mod test;
 pub mod theme;
+pub mod token;
+pub mod token_transfer;
 pub mod track;
 pub mod transfer;
 pub mod wallet;
@@ -57,8 +60,8 @@ pub fn register_handlers(cli: &Arc<CryptixCli>) -> Result<()> {
         cli,
         cli.handlers(),
         [
-            account, address, close, connect, details, disconnect, estimate, exit, export, guide, help, history, rpc, list, miner,
-            message, monitor, mute, network, node, open, ping, pskb, reload, select, send, server, settings, sweep, track, transfer,
+            account, address, close, connect, contract, details, disconnect, estimate, exit, export, guide, help, history, rpc, list, miner,
+            message, monitor, mute, network, node, open, ping, pskb, reload, select, send, server, settings, sweep, token, track, transfer,
             wallet,
             // halt,
             // theme,  start, stop

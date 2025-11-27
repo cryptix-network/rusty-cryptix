@@ -132,6 +132,13 @@ pub enum RpcApiOps {
     GetFeeEstimateExperimental = 148,
     /// Block color determination by iterating DAG.
     GetCurrentBlockColor = 149,
+
+    // Contract RPCs
+    DeployContract = 150,
+    SubmitContractCall = 151,
+    GetContractState = 152,
+    ListContracts = 153,
+    SimulateContractCall = 154,
 }
 
 impl RpcApiOps {

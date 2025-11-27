@@ -11,6 +11,8 @@ use cryptix_rpc_core::{
     notify::collector::{RpcCoreCollector, RpcCoreConverter},
 };
 pub use cryptix_rpc_macros::build_wrpc_client_interface;
+use cryptix_rpc_core::api::connection::DynRpcConnection;
+use cryptix_rpc_core::RpcError;
 use std::fmt::Debug;
 use workflow_core::{channel::Multiplexer, runtime as application_runtime};
 use workflow_dom::utils::window;
@@ -649,9 +651,67 @@ impl RpcApi for CryptixRpcClient {
             Unban,
         ]
     );
+ 
+     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     // Contract API (wRPC transport wired)
 
-    // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    // Notification API
+     async fn deploy_contract_call(
+         &self,
+         _connection: Option<&cryptix_rpc_core::api::connection::DynRpcConnection>,
+         request: cryptix_rpc_core::model::contract::DeployContractRequest,
+     ) -> RpcResult<cryptix_rpc_core::model::contract::DeployContractResponse> {
+         use workflow_serializer::prelude::*;
+         let resp: ClientResult<Serializable<cryptix_rpc_core::model::contract::DeployContractResponse>> =
+             self.inner.rpc_client.call(RpcApiOps::DeployContract, Serializable(request)).await;
+         Ok(resp.map_err(|e| cryptix_rpc_core::error::RpcError::RpcSubsystem(e.to_string()))?.into_inner())
+     }
+
+     async fn submit_contract_call_call(
+         &self,
+         _connection: Option<&cryptix_rpc_core::api::connection::DynRpcConnection>,
+         request: cryptix_rpc_core::model::contract::SubmitContractCallRequest,
+     ) -> RpcResult<cryptix_rpc_core::model::contract::SubmitContractCallResponse> {
+         use workflow_serializer::prelude::*;
+         let resp: ClientResult<Serializable<cryptix_rpc_core::model::contract::SubmitContractCallResponse>> =
+             self.inner.rpc_client.call(RpcApiOps::SubmitContractCall, Serializable(request)).await;
+         Ok(resp.map_err(|e| cryptix_rpc_core::error::RpcError::RpcSubsystem(e.to_string()))?.into_inner())
+     }
+
+     async fn get_contract_state_call(
+         &self,
+         _connection: Option<&cryptix_rpc_core::api::connection::DynRpcConnection>,
+         request: cryptix_rpc_core::model::contract::GetContractStateRequest,
+     ) -> RpcResult<cryptix_rpc_core::model::contract::GetContractStateResponse> {
+         use workflow_serializer::prelude::*;
+         let resp: ClientResult<Serializable<cryptix_rpc_core::model::contract::GetContractStateResponse>> =
+             self.inner.rpc_client.call(RpcApiOps::GetContractState, Serializable(request)).await;
+         Ok(resp.map_err(|e| cryptix_rpc_core::error::RpcError::RpcSubsystem(e.to_string()))?.into_inner())
+     }
+
+     async fn list_contracts_call(
+         &self,
+         _connection: Option<&cryptix_rpc_core::api::connection::DynRpcConnection>,
+         request: cryptix_rpc_core::model::contract::ListContractsRequest,
+     ) -> RpcResult<cryptix_rpc_core::model::contract::ListContractsResponse> {
+         use workflow_serializer::prelude::*;
+         let resp: ClientResult<Serializable<cryptix_rpc_core::model::contract::ListContractsResponse>> =
+             self.inner.rpc_client.call(RpcApiOps::ListContracts, Serializable(request)).await;
+         Ok(resp.map_err(|e| cryptix_rpc_core::error::RpcError::RpcSubsystem(e.to_string()))?.into_inner())
+     }
+
+     async fn simulate_contract_call_call(
+         &self,
+         _connection: Option<&cryptix_rpc_core::api::connection::DynRpcConnection>,
+         request: cryptix_rpc_core::model::contract::SimulateContractCallRequest,
+     ) -> RpcResult<cryptix_rpc_core::model::contract::SimulateContractCallResponse> {
+         use workflow_serializer::prelude::*;
+         let resp: ClientResult<Serializable<cryptix_rpc_core::model::contract::SimulateContractCallResponse>> =
+             self.inner.rpc_client.call(RpcApiOps::SimulateContractCall, Serializable(request)).await;
+         Ok(resp.map_err(|e| cryptix_rpc_core::error::RpcError::RpcSubsystem(e.to_string()))?.into_inner())
+     }
+
+     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     // Notification API
 
     /// Register a new listener and returns an id and a channel receiver.
     fn register_new_listener(&self, connection: ChannelConnection) -> ListenerId {

@@ -68,6 +68,9 @@ pub struct Params {
     pub pruning_depth: u64,
     pub coinbase_payload_script_public_key_max_len: u8,
     pub max_coinbase_payload_len: usize,
+    pub max_non_coinbase_payload_len: usize,
+    pub non_coinbase_payload_activation_daa_score: u64,
+    pub contracts_hardfork_daa_score: u64,
     pub max_tx_inputs: usize,
     pub max_tx_outputs: usize,
     pub max_signature_script_len: usize,
@@ -322,6 +325,9 @@ pub const MAINNET_PARAMS: Params = Params {
     pruning_depth: 185798,
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
+    max_non_coinbase_payload_len: 35 * 1024, // 35 KB
+    non_coinbase_payload_activation_daa_score: 1,
+    contracts_hardfork_daa_score: 1,
 
     // This is technically a soft fork from the Go implementation since cryptixd's consensus doesn't
     // check these rules, but in practice it's enforced by the network layer that limits the message
@@ -353,7 +359,7 @@ pub const MAINNET_PARAMS: Params = Params {
 };
 
 pub const TESTNET_PARAMS: Params = Params {
-          dns_seeders: &[
+    dns_seeders: &[
 
         "t.seed1.cryptix-network.org",
         "t.seed2.cryptix-network.org",
@@ -387,6 +393,9 @@ pub const TESTNET_PARAMS: Params = Params {
     pruning_depth: 185798,
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
+    max_non_coinbase_payload_len: 35 * 1024, // 35 KB
+    non_coinbase_payload_activation_daa_score: 1,
+    contracts_hardfork_daa_score: 1,
 
     // This is technically a soft fork from the Go implementation since cryptixd's consensus doesn't
     // check these rules, but in practice it's enforced by the network layer that limits the message
@@ -461,6 +470,9 @@ pub const TESTNET11_PARAMS: Params = Params {
 
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
+    max_non_coinbase_payload_len: 35 * 1024, // 35 KB
+    non_coinbase_payload_activation_daa_score: 1, // test
+    contracts_hardfork_daa_score: 1,  // test
 
     max_tx_inputs: 10_000,
     max_tx_outputs: 10_000,
@@ -514,6 +526,9 @@ pub const SIMNET_PARAMS: Params = Params {
 
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
+    max_non_coinbase_payload_len: 35 * 1024, // 35 KB
+    non_coinbase_payload_activation_daa_score:  1,
+    contracts_hardfork_daa_score: 0, // Contracts activated from genesis for simnet test
 
     max_tx_inputs: 10_000,
     max_tx_outputs: 10_000,
@@ -556,6 +571,9 @@ pub const DEVNET_PARAMS: Params = Params {
     pruning_depth: 185798,
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
+    max_non_coinbase_payload_len: 35 * 1024, // 35 KB
+    non_coinbase_payload_activation_daa_score:  1,
+    contracts_hardfork_daa_score: 1,
 
     // This is technically a soft fork from the Go implementation since cryptixd's consensus doesn't
     // check these rules, but in practice it's enforced by the network layer that limits the message

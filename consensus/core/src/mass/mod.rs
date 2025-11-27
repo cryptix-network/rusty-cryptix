@@ -1,3 +1,23 @@
+
+//! @ZeroBytes:
+//! You saw it Guys? This cant work.
+//! Storage-Mass = max(0, C * ( |O| / H(O) - |I| / A(I) ))
+//! If an output is very small (0→0), then (1/0→∞) → H(0) is extremely small → storage mass is extremely large.
+//! 
+//! 
+//! @Cryptis: 
+//! We could fix it with:
+//! Set a minimum value for ϵ, e.g., 0.01 CPAY for the calculation.
+//! 
+//! 
+//! @ZeroBytes:
+//! It would work.
+//! We'll just use the dummy transaction for 1 CPAY for now and fix it later? it's really too much to handle all at once. I've already lost track of what's what.
+//! We need to test now. And fix it properly later.
+//!  
+//! 
+
+
 use crate::{
     config::params::Params,
     subnets::SUBNETWORK_ID_SIZE,
@@ -34,10 +54,14 @@ pub fn transaction_estimated_serialized_size(tx: &Transaction) -> u64 {
     size += 8; // lock time (u64)
     size += SUBNETWORK_ID_SIZE as u64;
     size += 8; // gas (u64)
-    size += HASH_SIZE as u64; // payload hash
 
-    size += 8; // length of the payload (u64)
-    size += tx.payload.len() as u64;
+    // @Cryptis NOTE: Do NOT include transaction payload (hash/len/bytes) in size estimation.
+    // Contract payloads must not affect consensus mass to remain compatible with the Go reference.
+    // However, it can be implemented if necessary, for example, in cases of payload misuse.
+    // Normally, the existing security measures provide complete protection against DDoS attacks and abuse.
+    // size += HASH_SIZE as u64; // payload hash
+    // size += 8; // length of the payload (u64)
+    // size += tx.payload.len() as u64;
     size
 }
 
@@ -167,8 +191,17 @@ pub fn calc_storage_mass(
         return Some(0);
     }
 
-    let outs_len = output_values.len() as u64;
-    let ins_len = input_values.len() as u64;
+    // Filter out zero-valued coins (e.g., contract state UTXOs) from storage-mass math
+    let outputs: Vec<u64> = output_values.filter(|v| *v > 0).collect();
+    let inputs: Vec<u64> = input_values.filter(|v| *v > 0).collect();
+
+    let outs_len = outputs.len() as u64;
+    let ins_len = inputs.len() as u64;
+
+    // If there are no positive-valued inputs (non-coinbase), treat storage mass as zero to avoid div-by-zero
+    if !is_coinbase && ins_len == 0 {
+        return Some(0);
+    }
 
     /* The code below computes the following formula:
 
@@ -181,16 +214,10 @@ pub fn calc_storage_mass(
     See KIP-0009 for more details
     */
 
-    // Since we are doing integer division, we perform the multiplication with C over the inner
-    // fractions, otherwise we'll get a sum of zeros or ones.
-    //
-    // If sum of fractions overflowed (nearly impossible, requires 10^7 outputs for C = 10^12),
-    // we return `None` indicating mass is incomputable
-    //
-    // Note: in theory this can be tighten by subtracting input mass in the process (possibly avoiding the overflow),
-    // however the overflow case is so unpractical with current mass limits so we avoid the hassle
-    let harmonic_outs =
-        output_values.map(|out| storage_mass_parameter / out).try_fold(0u64, |total, current| total.checked_add(current))?; // C·|O|/H(O)
+    // Compute C·|O|/H(O) while skipping zeros (already filtered)
+    let harmonic_outs = outputs
+        .iter()
+        .try_fold(0u64, |total, &out| total.checked_add(storage_mass_parameter / out))?; // C·|O|/H(O)
 
     /*
       KIP-0009 relaxed formula for the cases |O| = 1 OR |O| <= |I| <= 2:
@@ -200,14 +227,20 @@ pub fn calc_storage_mass(
              Hence, we transform the condition to |O| = 1 OR |I| = 1 OR |O| = |I| = 2 which is equivalent (and faster).
     */
     if version == Kip9Version::Beta && (outs_len == 1 || ins_len == 1 || (outs_len == 2 && ins_len == 2)) {
-        let harmonic_ins =
-            input_values.map(|value| storage_mass_parameter / value).fold(0u64, |total, current| total.saturating_add(current)); // C·|I|/H(I)
+        let harmonic_ins = inputs.iter().fold(0u64, |total, &value| total.saturating_add(storage_mass_parameter / value)); // C·|I|/H(I)
         return Some(harmonic_outs.saturating_sub(harmonic_ins)); // max( 0 , C·( |O|/H(O) - |I|/H(I) ) );
     }
 
-    // Total supply is bounded, so a sum of existing UTXO entries cannot overflow (nor can it be zero)
-    let sum_ins = input_values.sum::<u64>(); // |I|·A(I)
+    // Total supply is bounded, so a sum of existing UTXO entries cannot overflow
+    let sum_ins: u64 = inputs.iter().copied().sum(); // |I|·A(I)
+    if ins_len == 0 {
+        // No positive inputs: charge only outputs term
+        return Some(harmonic_outs);
+    }
     let mean_ins = sum_ins / ins_len;
+    if mean_ins == 0 {
+        return Some(harmonic_outs);
+    }
 
     // Inner fraction must be with C and over the mean value, in order to maximize precision.
     // We can saturate the overall expression at u64::MAX since we lower-bound the subtraction below by zero anyway
@@ -315,6 +348,7 @@ mod tests {
                 .map(|out_amount| TransactionOutput {
                     value: out_amount,
                     script_public_key: ScriptPublicKey::new(0, script_pub_key.clone()),
+                    payload: vec![],
                 })
                 .collect(),
             1615462089000,
@@ -330,6 +364,7 @@ mod tests {
                 script_public_key: ScriptPublicKey::new(0, script_pub_key.clone()),
                 block_daa_score: 0,
                 is_coinbase: false,
+                payload: Vec::new(),
             })
             .collect();
         MutableTransaction::with_entries(tx, entries)

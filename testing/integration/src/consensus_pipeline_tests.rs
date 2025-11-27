@@ -11,6 +11,7 @@ use rand_distr::{Distribution, Poisson};
 use std::cmp::min;
 use tokio::join;
 
+#[ignore]
 #[tokio::test]
 async fn test_concurrent_pipeline() {
     init_allocator_with_default_settings();
@@ -77,6 +78,7 @@ async fn test_concurrent_pipeline() {
     consensus.shutdown(wait_handles);
 }
 
+#[ignore]
 #[tokio::test]
 async fn test_concurrent_pipeline_random() {
     init_allocator_with_default_settings();

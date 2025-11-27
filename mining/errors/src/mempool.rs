@@ -81,6 +81,9 @@ pub enum RuleError {
 
     #[error("Rejected tx {0} from mempool due to incomputable storage mass")]
     RejectStorageMassIncomputable(TransactionId),
+
+    #[error("wallet with script {0} has exceeded the maximum payload transactions per wallet limit of {1}")]
+    RejectWalletPayloadTransactionLimitExceeded(String, usize),
 }
 
 impl From<NonStandardError> for RuleError {

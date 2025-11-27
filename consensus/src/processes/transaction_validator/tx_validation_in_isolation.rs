@@ -108,10 +108,10 @@ fn check_gas(tx: &Transaction) -> TxResult<()> {
 }
 
 fn check_transaction_payload(tx: &Transaction) -> TxResult<()> {
-    // This should be revised if subnetworks are activated (along with other validations that weren't copied from cryptixd)
-    if !tx.is_coinbase() && !tx.payload.is_empty() {
-        return Err(TxRuleError::NonCoinbaseTxHasPayload);
-    }
+    // Allow non-coinbase payloads at isolation stage.
+    // Full payload rules (activation, max length, contract CBOR parsing) are validated in populated context
+    // with DAA score in `TransactionValidator::check_transaction_payload`.
+    let _ = tx;
     Ok(())
 }
 
@@ -126,7 +126,10 @@ fn check_transaction_output_value_ranges(tx: &Transaction) -> TxResult<()> {
     let mut total: u64 = 0;
     for (i, output) in tx.outputs.iter().enumerate() {
         if output.value == 0 {
-            return Err(TxRuleError::TxOutZero(i));
+            // Allow zero-value outputs only for OP_CONTRACT state UTXOs
+            if !cryptix_txscript::is_contract_script(output.script_public_key.script()) {
+                return Err(TxRuleError::TxOutZero(i));
+            }
         }
 
         if output.value > MAX_SOMPI {
@@ -163,10 +166,11 @@ mod tests {
     };
     use cryptix_core::assert_match;
 
+    use super::super::errors::TxRuleError;
     use crate::{
         constants::TX_VERSION,
         params::MAINNET_PARAMS,
-        processes::transaction_validator::{errors::TxRuleError, TransactionValidator},
+        processes::transaction_validator::TransactionValidator,
     };
 
     #[test]
@@ -188,16 +192,13 @@ mod tests {
         let valid_cb = Transaction::new(
             0,
             vec![],
-            vec![TransactionOutput {
-                value: 0x12a05f200,
-                script_public_key: ScriptPublicKey::new(
+            vec![TransactionOutput { value: 0x12a05f200, script_public_key: ScriptPublicKey::new(
                     0,
                     scriptvec!(
                         0xa9, 0x14, 0xda, 0x17, 0x45, 0xe9, 0xb5, 0x49, 0xbd, 0x0b, 0xfa, 0x1a, 0x56, 0x99, 0x71, 0xc7, 0x7e, 0xba,
                         0x30, 0xcd, 0x5a, 0x4b, 0x87
                     ),
-                ),
-            }],
+                ), payload: vec![] }],
             0,
             SUBNETWORK_ID_COINBASE,
             0,
@@ -233,9 +234,7 @@ mod tests {
                 sig_op_count: 0,
             }],
             vec![
-                TransactionOutput {
-                    value: 0x2123e300,
-                    script_public_key: ScriptPublicKey::new(
+                TransactionOutput { value: 0x2123e300, script_public_key: ScriptPublicKey::new(
                         0,
                         scriptvec!(
                             0x76, // OP_DUP
@@ -245,11 +244,8 @@ mod tests {
                             0xf5, 0x8b, 0x32, 0x88, // OP_EQUALVERIFY
                             0xac  // OP_CHECKSIG
                         ),
-                    ),
-                },
-                TransactionOutput {
-                    value: 0x108e20f00,
-                    script_public_key: ScriptPublicKey::new(
+                    ), payload: vec![] },
+                TransactionOutput { value: 0x108e20f00, script_public_key: ScriptPublicKey::new(
                         0,
                         scriptvec!(
                             0x76, // OP_DUP
@@ -259,8 +255,7 @@ mod tests {
                             0xde, 0x3d, 0x7c, 0x88, // OP_EQUALVERIFY
                             0xac  // OP_CHECKSIG
                         ),
-                    ),
-                },
+                    ), payload: vec![] },
             ],
             0,
             SUBNETWORK_ID_NATIVE,
@@ -304,10 +299,62 @@ mod tests {
 
         let mut tx = valid_tx.clone();
         tx.payload = vec![0];
-        assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::NonCoinbaseTxHasPayload));
+        assert_eq!(tv.validate_tx_in_isolation(&tx), Ok(()));
 
         let mut tx = valid_tx;
         tx.version = TX_VERSION + 1;
         assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::UnknownTxVersion(_)));
+    }
+
+    #[test]
+    fn test_payload_validation_in_isolation() {
+        let mut params = MAINNET_PARAMS.clone();
+        params.max_tx_inputs = 10;
+        params.max_tx_outputs = 15;
+        let tv = TransactionValidator::new_for_tests(
+            params.max_tx_inputs,
+            params.max_tx_outputs,
+            params.max_signature_script_len,
+            params.max_script_public_key_len,
+            params.ghostdag_k,
+            params.coinbase_payload_script_public_key_max_len,
+            params.coinbase_maturity,
+            Default::default(),
+        );
+
+        // Test: Non-Coinbase TX with payload should fail in isolation validation
+        let mut tx = Transaction::new(
+            0,
+            vec![TransactionInput {
+                previous_outpoint: TransactionOutpoint {
+                    transaction_id: TransactionId::from_slice(&[
+                        0x03, 0x2e, 0x38, 0xe9, 0xc0, 0xa8, 0x4c, 0x60, 0x46, 0xd6, 0x87, 0xd1, 0x05, 0x56, 0xdc, 0xac, 0xc4, 0x1d,
+                        0x27, 0x5e, 0xc5, 0x5f, 0xc0, 0x07, 0x79, 0xac, 0x88, 0xfd, 0xf3, 0x57, 0xa1, 0x87,
+                    ]),
+                    index: 0,
+                },
+                signature_script: vec![],
+                sequence: u64::MAX,
+                sig_op_count: 0,
+            }],
+            vec![TransactionOutput { value: 0x2123e300, script_public_key: ScriptPublicKey::new(
+                    0,
+                    scriptvec!(
+                        0x76, // OP_DUP
+                        0xa9, // OP_HASH160
+                        0x14, // OP_DATA_20
+                        0xc3, 0x98, 0xef, 0xa9, 0xc3, 0x92, 0xba, 0x60, 0x13, 0xc5, 0xe0, 0x4e, 0xe7, 0x29, 0x75, 0x5e, 0xf7,
+                        0xf5, 0x8b, 0x32, 0x88, // OP_EQUALVERIFY
+                        0xac  // OP_CHECKSIG
+                    ),
+                ), payload: vec![] }],
+            0,
+            SUBNETWORK_ID_NATIVE,
+            0,
+            vec![1, 2, 3], // Small payload
+        );
+
+        // Should pass: isolation validation no longer forbids non-coinbase payloads. Full checks occur in populated validation.
+        assert_eq!(tv.validate_tx_in_isolation(&tx), Ok(()));
     }
 }

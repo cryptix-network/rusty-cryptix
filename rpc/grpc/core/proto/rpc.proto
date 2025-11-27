@@ -974,3 +974,93 @@ message GetCurrentBlockColorResponseMessage {
 
   RPCError error = 1000;
 }
+
+// ===============================
+// Contract RPC Messages 
+// ===============================
+
+// DeployContract
+message DeployContractRequestMessage {
+  uint64 contractId = 1;
+  bytes initialState = 2;
+}
+
+message DeployContractResponseMessage {
+  string transactionId = 1;
+  RpcOutpoint stateOutpoint = 2;
+  // explicit instance id string "<txid>:<vout>"
+  string instanceId = 3;
+  // Indicates if the transaction needs signing before submission (mainnet/testnet)
+  bool needsSigning = 4;
+  // The unsigned transaction (if needsSigning is true)
+  RpcTransaction unsignedTransaction = 5;
+  RPCError error = 1000;
+}
+
+// SubmitContractCall
+message SubmitContractCallRequestMessage {
+  // Instance id format: "<txid>:<vout>"
+  string instanceId = 1;
+  uint32 actionId = 2;
+  bytes data = 3;
+}
+
+message SubmitContractCallResponseMessage {
+  string transactionId = 1;
+  RpcOutpoint stateOutpoint = 2;
+  // Indicates if the transaction needs signing before submission (mainnet/testnet)
+  bool needsSigning = 3;
+  // The unsigned transaction (if needsSigning is true)
+  RpcTransaction unsignedTransaction = 4;
+  RPCError error = 1000;
+}
+
+// GetContractState
+message GetContractStateRequestMessage {
+  // Instance id format: "<txid>:<vout>"
+  string instanceId = 1;
+}
+
+message GetContractStateResponseMessage {
+  bool hasState = 1;
+  bytes state = 2;
+  RpcOutpoint stateOutpoint = 3;
+  RPCError error = 1000;
+}
+
+// ListContracts
+message ListContractsRequestMessage {}
+
+message RpcContractStateEntry {
+  uint64 contractId = 1;
+  uint32 stateSize = 2;
+  string stateHash = 3;
+  RpcOutpoint stateOutpoint = 4;
+  //  explicit instance id string "<txid>:<vout>"
+  string instanceId = 5;
+}
+
+message ListContractsResponseMessage {
+  repeated RpcContractStateEntry contracts = 1;
+  RPCError error = 1000;
+}
+
+// SimulateContractCall
+message SimulateContractCallRequestMessage {
+  // Instance id format: "<txid>:<vout>"
+  string instanceId = 1;
+  uint32 actionId = 2;
+  bytes data = 3;
+  // Optional: if omitted -> None; if present and empty -> Some([])
+  optional bytes hypotheticalState = 4;
+}
+
+message SimulateContractCallResponseMessage {
+  // Optional: if omitted -> None; if present -> Some(bytes)
+  optional bytes newState = 1;
+  // Optional: if omitted -> None
+  optional uint32 errorCode = 2;
+  bool stateSizeOk = 3;
+  bool wouldBeValidTx = 4;
+  RPCError error = 1000;
+}

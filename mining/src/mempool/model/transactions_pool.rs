@@ -20,7 +20,7 @@ use cryptix_consensus_core::{
 };
 use cryptix_core::{debug, time::unix_now, trace};
 use std::{
-    collections::{hash_map::Keys, hash_set::Iter},
+    collections::{hash_map::Keys, hash_set::Iter, HashMap},
     iter::once,
     sync::Arc,
 };
@@ -77,6 +77,9 @@ pub(crate) struct TransactionsPool {
 
     /// Store of UTXOs
     utxo_set: MempoolUtxoSet,
+
+    /// Tracks the number of payload transactions per script public key (wallet)
+    payload_transaction_count_per_wallet: HashMap<Vec<u8>, usize>,
 }
 
 impl TransactionsPool {
@@ -91,6 +94,7 @@ impl TransactionsPool {
             last_expire_scan_time: unix_now(),
             utxo_set: MempoolUtxoSet::new(),
             estimated_size: 0,
+            payload_transaction_count_per_wallet: HashMap::new(),
         }
     }
 
@@ -108,6 +112,20 @@ impl TransactionsPool {
         Ok(self.get(&id).unwrap())
     }
 
+    fn collect_input_wallet_scripts(&self, mtx: &MutableTransaction) -> std::collections::HashSet<Vec<u8>> {
+        let mut scripts = std::collections::HashSet::new();
+
+        for (i, input) in mtx.tx.inputs.iter().enumerate() {
+            if let Some(utxo_entry) = &mtx.entries[i] {
+                scripts.insert(utxo_entry.script_public_key.script().to_vec());
+            } else if let Some(utxo_entry) = self.utxo_set.pool_unspent_outputs.get(&input.previous_outpoint) {
+                scripts.insert(utxo_entry.script_public_key.script().to_vec());
+            }
+        }
+
+        scripts
+    }
+
     /// Add a mempool transaction to the pool
     pub(crate) fn add_mempool_transaction(&mut self, transaction: MempoolTransaction, transaction_size: usize) -> RuleResult<()> {
         let id = transaction.id();
@@ -115,10 +133,18 @@ impl TransactionsPool {
         assert!(!self.all_transactions.contains_key(&id), "transaction {id} to be added already exists in the transactions pool");
         assert!(transaction.mtx.is_fully_populated(), "transaction {id} to be added in the transactions pool is not fully populated");
 
-        // Create the bijective parent/chained relations.
-        // This concerns only the parents of the added transaction.
-        // The transactions chained to the added transaction cannot be stored
-        // here yet since, by definition, they would have been orphans.
+        let mut wallet_scripts = std::collections::HashSet::new();
+        if !transaction.mtx.tx.is_coinbase() && !transaction.mtx.tx.payload.is_empty() {
+            wallet_scripts = self.collect_input_wallet_scripts(&transaction.mtx);
+
+            for script in &wallet_scripts {
+                let count = self.payload_transaction_count_per_wallet.get(script).copied().unwrap_or(0);
+                if count >= self.config.maximum_payload_transactions_per_wallet {
+                    return Err(RuleError::RejectWalletPayloadTransactionLimitExceeded(format!("{:x?}", script), count));
+                }
+            }
+        }
+
         let parents = self.get_parent_transaction_ids_in_pool(&transaction.mtx);
         self.parent_transactions.insert(id, parents.clone());
         if parents.is_empty() {
@@ -131,14 +157,33 @@ impl TransactionsPool {
 
         self.utxo_set.add_transaction(&transaction.mtx);
         self.estimated_size += transaction_size;
+
+        if !wallet_scripts.is_empty() {
+            for script in wallet_scripts {
+                *self.payload_transaction_count_per_wallet.entry(script).or_insert(0) += 1;
+            }
+        }
+
         self.all_transactions.insert(id, transaction);
         trace!("Added transaction {}", id);
         Ok(())
     }
 
-    /// Fully removes the transaction from all relational sets, as well as from the UTXO set
     pub(crate) fn remove_transaction(&mut self, transaction_id: &TransactionId) -> RuleResult<MempoolTransaction> {
-        // Remove all bijective parent/chained relations
+        if let Some(removed_tx) = self.all_transactions.get(transaction_id) {
+            if !removed_tx.mtx.tx.is_coinbase() && !removed_tx.mtx.tx.payload.is_empty() {
+                let wallet_scripts = self.collect_input_wallet_scripts(&removed_tx.mtx);
+                for script in wallet_scripts {
+                    if let Some(count) = self.payload_transaction_count_per_wallet.get_mut(&script) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            self.payload_transaction_count_per_wallet.remove(&script);
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(parents) = self.parent_transactions.get(transaction_id) {
             for parent in parents.iter() {
                 if let Some(chains) = self.chained_transactions.get_mut(parent) {
@@ -362,5 +407,191 @@ impl Pool for TransactionsPool {
     #[inline]
     fn chained(&self) -> &TransactionsEdges {
         &self.chained_transactions
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cryptix_consensus_core::{
+        constants::TX_VERSION,
+        subnets::SUBNETWORK_ID_NATIVE,
+        tx::{
+            ScriptPublicKey, Transaction, TransactionInput, TransactionOutput, TransactionOutpoint,
+            UtxoEntry,
+        },
+    };
+    use cryptix_core::time::unix_now;
+    use std::sync::Arc;
+
+    fn create_test_config() -> Arc<Config> {
+        Arc::new(Config {
+            maximum_transaction_count: 1000,
+            mempool_size_limit: 1_000_000,
+            maximum_build_block_template_attempts: 5,
+            transaction_expire_interval_daa_score: 24 * 60 * 60 * 1000,
+            transaction_expire_scan_interval_daa_score: 60 * 1000,
+            transaction_expire_scan_interval_milliseconds: 60 * 1000,
+            accepted_transaction_expire_interval_daa_score: 120 * 1000,
+            accepted_transaction_expire_scan_interval_daa_score: 10 * 1000,
+            accepted_transaction_expire_scan_interval_milliseconds: 10 * 1000,
+            orphan_expire_interval_daa_score: 60 * 1000,
+            orphan_expire_scan_interval_daa_score: 10 * 1000,
+            maximum_orphan_transaction_mass: 100_000,
+            maximum_orphan_transaction_count: 500,
+            accept_non_standard: false,
+            maximum_mass_per_block: 500_000,
+            minimum_relay_transaction_fee: 1000,
+            minimum_standard_transaction_version: TX_VERSION,
+            maximum_standard_transaction_version: TX_VERSION,
+            maximum_payload_transactions_per_wallet: 25,
+            network_blocks_per_second: 1,
+        })
+    }
+
+    fn create_test_script() -> ScriptPublicKey {
+        use smallvec::SmallVec;
+        let script: SmallVec<[u8; 36]> = vec![
+            0x76, 0xa9, 0x14,
+            0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00,
+            0x88, 0xac,
+        ]
+        .into();
+        ScriptPublicKey::new(0, script)
+    }
+
+    fn create_payload_transaction(script: &ScriptPublicKey, payload: Vec<u8>) -> MutableTransaction {
+        let tx = Transaction::new(
+            TX_VERSION,
+            vec![TransactionInput {
+                previous_outpoint: TransactionOutpoint::new(
+                    TransactionId::from_slice(&[0; 32]),
+                    0,
+                ),
+                signature_script: vec![],
+                sequence: u64::MAX,
+                sig_op_count: 0,
+            }],
+            vec![TransactionOutput {
+                value: 1000,
+                script_public_key: script.clone(),
+                payload: vec![],
+            }],
+            0,
+            SUBNETWORK_ID_NATIVE,
+            0,
+            payload,
+        );
+
+        let mut mtx = MutableTransaction::from_tx(tx);
+
+        mtx.entries = vec![Some(UtxoEntry::new(
+            2000,
+            script.clone(),
+            0,
+            false,
+        ))];
+
+        mtx.calculated_compute_mass = Some(1000);
+        mtx.calculated_fee = Some(1000);
+        mtx.tx.set_mass(1000);
+
+        mtx
+    }
+
+    #[test]
+    fn test_wallet_payload_limit() {
+        let config = create_test_config();
+        let mut pool = TransactionsPool::new(config.clone());
+        let script = create_test_script();
+
+        for i in 0..25 {
+            let tx = create_payload_transaction(&script, vec![i as u8]);
+            let mempool_tx = MempoolTransaction::new(tx, Priority::Low, unix_now());
+            assert!(pool.add_mempool_transaction(mempool_tx, 1000).is_ok());
+        }
+
+        assert_eq!(
+            pool.payload_transaction_count_per_wallet.get(&script.script().to_vec()),
+            Some(&25)
+        );
+
+        let tx = create_payload_transaction(&script, vec![25]);
+        let mempool_tx = MempoolTransaction::new(tx, Priority::Low, unix_now());
+        assert!(matches!(
+            pool.add_mempool_transaction(mempool_tx, 1000),
+            Err(RuleError::RejectWalletPayloadTransactionLimitExceeded(_, 25))
+        ));
+
+        let tx_id = pool.all_transactions.keys().next().unwrap().clone();
+        assert!(pool.remove_transaction(&tx_id).is_ok());
+        assert_eq!(
+            pool.payload_transaction_count_per_wallet.get(&script.script().to_vec()),
+            Some(&24)
+        );
+
+        let tx = create_payload_transaction(&script, vec![26]);
+        let mempool_tx = MempoolTransaction::new(tx, Priority::Low, unix_now());
+        assert!(pool.add_mempool_transaction(mempool_tx, 1000).is_ok());
+        assert_eq!(
+            pool.payload_transaction_count_per_wallet.get(&script.script().to_vec()),
+            Some(&25)
+        );
+    }
+
+    #[test]
+    fn test_non_payload_transactions_not_counted() {
+        let config = create_test_config();
+        let mut pool = TransactionsPool::new(config.clone());
+        let script = create_test_script();
+
+        for _ in 0..50 {
+            let tx = create_payload_transaction(&script, vec![]);
+            let mempool_tx = MempoolTransaction::new(tx, Priority::Low, unix_now());
+            assert!(pool.add_mempool_transaction(mempool_tx, 1000).is_ok());
+        }
+
+        assert_eq!(
+            pool.payload_transaction_count_per_wallet.get(&script.script().to_vec()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_coinbase_transactions_not_counted() {
+        let config = create_test_config();
+        let mut pool = TransactionsPool::new(config.clone());
+        let script = create_test_script();
+
+        let tx = Transaction::new(
+            TX_VERSION,
+            vec![], 
+            vec![TransactionOutput {
+                value: 1000,
+                script_public_key: script.clone(),
+                payload: vec![],
+            }],
+            0,
+            SUBNETWORK_ID_NATIVE,
+            0,
+            vec![1, 2, 3],
+        );
+
+        let mut mtx = MutableTransaction::from_tx(tx);
+
+        mtx.entries = vec![];
+
+        mtx.calculated_compute_mass = Some(1000); 
+        mtx.calculated_fee = Some(0); 
+        mtx.tx.set_mass(1000); 
+
+        let mempool_tx = MempoolTransaction::new(mtx, Priority::Low, unix_now());
+        assert!(pool.add_mempool_transaction(mempool_tx, 1000).is_ok());
+
+        assert_eq!(
+            pool.payload_transaction_count_per_wallet.get(&script.script().to_vec()),
+            None
+        );
     }
 }

@@ -875,7 +875,12 @@ opcode_list! {
     }
 
     // Undefined opcodes.
-    opcode OpUnknown178<0xb2, 1>(self, vm) Err(TxScriptError::InvalidOpcode(format!("{self:?}")))
+    // Contract opcodes (Phase 3a)
+    opcode OpContract<0xb2, 9>(self, vm) {
+        // OP_CONTRACT is only valid in script_public_key, not in signature scripts
+        // Execution logic will be implemented in Phase 3d
+        Err(TxScriptError::InvalidOpcode(format!("OP_CONTRACT can only be used in script_public_key, not in execution")))
+    }
     opcode OpUnknown179<0xb3, 1>(self, vm) Err(TxScriptError::InvalidOpcode(format!("{self:?}")))
     opcode OpUnknown180<0xb4, 1>(self, vm) Err(TxScriptError::InvalidOpcode(format!("{self:?}")))
     opcode OpUnknown181<0xb5, 1>(self, vm) Err(TxScriptError::InvalidOpcode(format!("{self:?}")))
@@ -1083,7 +1088,7 @@ mod test {
         let tests: Vec<Box<dyn OpCodeImplementation<PopulatedTransaction>>> = vec![
             opcodes::OpUnknown166::empty().expect("Should accept empty"),
             opcodes::OpUnknown167::empty().expect("Should accept empty"),
-            opcodes::OpUnknown178::empty().expect("Should accept empty"),
+            // OpUnknown178 (0xb2) is now OpContract - not tested here as it's not an "invalid" opcode
             opcodes::OpUnknown179::empty().expect("Should accept empty"),
             opcodes::OpUnknown180::empty().expect("Should accept empty"),
             opcodes::OpUnknown181::empty().expect("Should accept empty"),

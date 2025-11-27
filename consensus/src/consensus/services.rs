@@ -158,6 +158,9 @@ impl ConsensusServices {
             tx_script_cache_counters,
             mass_calculator.clone(),
             params.storage_mass_activation_daa_score,
+            params.max_non_coinbase_payload_len,
+            params.non_coinbase_payload_activation_daa_score,
+            params.contracts_hardfork_daa_score,
         );
 
         let pruning_point_manager = PruningPointManager::new(
