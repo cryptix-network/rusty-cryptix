@@ -17,6 +17,9 @@ sig_op_count: 0 (on Simnet) or sig_op_count: 1 (should be on Mainnet)
 
 However: The signature is still missing!
 
+2. Empty State Error on Deploy 
+The Wallet needs the Initial State Connection - its still missing
+
 # Switches und Bridges
 Switching all functions to Mainnet; some connections are still missing, which were switched due to Simnet and Rust tests.
 
@@ -26,7 +29,7 @@ Extend contracts must be RWA compatible.
 Mini contracts should also include max supply, start supply, and decimal options.
 Staking could be completely removed, since it comes on-chain without contract. We could use the current code as a basis.
 
-#Payload
+# Payload
 1. Pay per Byte integration
 
 # Optimizations:
@@ -45,6 +48,9 @@ If so, then we would have to integrate a wallet system, which would then be the 
 # Info:
 The first hard fork will only activate the following smart contracts (Token Extend, Token Mini, Mining Token, NFT Extend, NFT Mini); the others do not need to be wired up and can continue as they are.
 We will further prepare, reprogram, and connect everything during the next hard fork. The VM will be introduced in the final hard fork.
+
+
+
 ############
 
 @cryptis:
