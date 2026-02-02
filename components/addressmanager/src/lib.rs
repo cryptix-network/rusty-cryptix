@@ -251,6 +251,30 @@ impl AddressManager {
         }
     }
 
+    // If the data center returns false positives for port scans, use this function.
+    /* 
+    pub fn add_address(&mut self, address: NetAddress) {
+            // Filter loopback / unspecified
+            if address.ip.is_loopback() || address.ip.is_unspecified() {
+                debug!("[Address manager] skipping local address {}", address.ip);
+                return;
+            }
+
+            // Filter private / unroutable IPs
+            if !address.ip.is_publicly_routable() {
+                debug!("[Address manager] skipping private or unroutable address {}", address.ip);
+                return;
+            }
+
+            if self.address_store.has(address) {
+                return;
+            }
+
+            // We mark `connection_failed_count` as 0 only after first success
+            self.address_store.set(address, 1);
+        }
+    */
+
     pub fn add_address(&mut self, address: NetAddress) {
         if address.ip.is_loopback() || address.ip.is_unspecified() {
             debug!("[Address manager] skipping local address {}", address.ip);
