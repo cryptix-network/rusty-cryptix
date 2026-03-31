@@ -79,9 +79,9 @@ use cryptix_notify::{events::EventType, notifier::Notify};
 
 use super::errors::{PruningImportError, PruningImportResult};
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
-use itertools::Itertools;
 use cryptix_consensus_core::tx::ValidatedTransaction;
 use cryptix_utils::binary_heap::BinaryHeapExtensions;
+use itertools::Itertools;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use rand::{seq::SliceRandom, Rng};
 use rayon::{

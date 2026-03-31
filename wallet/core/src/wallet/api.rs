@@ -377,17 +377,39 @@ impl WalletApi for super::Wallet {
     }
 
     async fn accounts_send_call(self: Arc<Self>, request: AccountsSendRequest) -> Result<AccountsSendResponse> {
-        let AccountsSendRequest { account_id, wallet_secret, payment_secret, destination, priority_fee_sompi, payload } = request;
+        let AccountsSendRequest { account_id, wallet_secret, payment_secret, destination, priority_fee_sompi, payload, fast_path } =
+            request;
 
         let guard = self.guard();
         let guard = guard.lock().await;
         let account = self.get_account_by_id(&account_id, &guard).await?.ok_or(Error::AccountNotFound(account_id))?;
 
         let abortable = Abortable::new();
-        let (generator_summary, transaction_ids) =
-            account.send(destination, priority_fee_sompi, payload, wallet_secret, payment_secret, &abortable, None).await?;
+        let fast_submit = fast_path.and_then(|fast_path| {
+            if fast_path.enabled {
+                Some(crate::tx::FastSubmitOptions {
+                    enabled: true,
+                    intent_nonce: fast_path.intent_nonce,
+                    client_created_at_ms: fast_path.client_created_at_ms,
+                    max_fee_sompi: fast_path.max_fee_sompi,
+                })
+            } else {
+                None
+            }
+        });
+        let (generator_summary, transaction_ids, fast_summary) = account
+            .send(destination, priority_fee_sompi, payload, fast_submit, wallet_secret, payment_secret, &abortable, None)
+            .await?;
 
-        Ok(AccountsSendResponse { generator_summary, transaction_ids })
+        Ok(AccountsSendResponse {
+            generator_summary,
+            transaction_ids,
+            fast_path_requested: fast_summary.requested,
+            fast_path_used: fast_summary.used,
+            fast_path_status: fast_summary.status,
+            fast_path_reason: fast_summary.reason,
+            basechain_submitted: fast_summary.basechain_submitted,
+        })
     }
 
     async fn accounts_transfer_call(self: Arc<Self>, request: AccountsTransferRequest) -> Result<AccountsTransferResponse> {

@@ -4,11 +4,11 @@
 
 use crate::imports::{AccountId, AccountKind, AssocPrvKeyDataIds, PrvKeyDataId};
 use base64::DecodeError;
-use downcast::DowncastError;
 use cryptix_bip32::Error as BIP32Error;
 use cryptix_consensus_core::sign::Error as CoreSignError;
 use cryptix_rpc_core::RpcError as CryptixRpcError;
 use cryptix_wrpc_client::error::Error as CryptixWorkflowRpcError;
+use downcast::DowncastError;
 use std::sync::PoisonError;
 use thiserror::Error;
 use wasm_bindgen::JsValue;

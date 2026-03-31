@@ -37,7 +37,9 @@ impl Interface {
                 match cryptixd_request.payload {
                     Some(ref request) => Ok(CryptixdResponse {
                         id: cryptixd_request.id,
-                        payload: Some(CryptixdPayloadOps::from(request).to_error_response(GrpcServerError::MethodNotImplemented.into())),
+                        payload: Some(
+                            CryptixdPayloadOps::from(request).to_error_response(GrpcServerError::MethodNotImplemented.into()),
+                        ),
                     }),
                     None => Err(GrpcServerError::InvalidRequestPayload),
                 }

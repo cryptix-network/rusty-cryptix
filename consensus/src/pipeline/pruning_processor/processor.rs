@@ -23,7 +23,6 @@ use crate::{
     processes::{pruning_proof::PruningProofManager, reachability::inquirer as reachability, relations},
 };
 use crossbeam_channel::Receiver as CrossbeamReceiver;
-use itertools::Itertools;
 use cryptix_consensus_core::{
     blockhash::ORIGIN,
     blockstatus::BlockStatus::StatusHeaderOnly,
@@ -39,6 +38,7 @@ use cryptix_database::prelude::{BatchDbWriter, MemoryWriter, StoreResultExtensio
 use cryptix_hashes::Hash;
 use cryptix_muhash::MuHash;
 use cryptix_utils::iter::IterExtensions;
+use itertools::Itertools;
 use parking_lot::RwLockUpgradableReadGuard;
 use rocksdb::WriteBatch;
 use std::{

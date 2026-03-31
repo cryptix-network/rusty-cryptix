@@ -16,6 +16,7 @@ impl From<&Transaction> for RpcTransaction {
             gas: item.gas,
             payload: item.payload.clone(),
             mass: item.mass(),
+            fast_path: None,
             // TODO: Implement a populating process inspired from cryptixd\app\rpc\rpccontext\verbosedata.go
             verbose_data: None,
         }

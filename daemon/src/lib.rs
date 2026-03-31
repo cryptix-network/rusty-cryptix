@@ -1,7 +1,7 @@
 pub mod cpu_miner;
+pub mod cryptixd;
 pub mod error;
 pub mod imports;
-pub mod cryptixd;
 pub mod result;
 
 use std::fmt::Display;

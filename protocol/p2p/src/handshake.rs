@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::pb::{cryptixd_message::Payload, ReadyMessage, VerackMessage, VersionMessage};
 use crate::{common::ProtocolError, dequeue_with_timeout, make_message};
-use crate::{IncomingRoute, CryptixdMessagePayloadType, Router};
+use crate::{CryptixdMessagePayloadType, IncomingRoute, Router};
 use cryptix_core::debug;
 
 /// Implements the Cryptix peer-to-peer handshake protocol

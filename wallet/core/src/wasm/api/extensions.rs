@@ -1,6 +1,6 @@
 use crate::imports::*;
-use js_sys::Object;
 use cryptix_consensus_core::Hash;
+use js_sys::Object;
 
 pub trait WalletApiObjectExtension {
     fn get_secret(&self, key: &str) -> Result<Secret>;

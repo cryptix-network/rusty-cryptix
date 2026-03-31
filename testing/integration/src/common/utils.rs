@@ -1,5 +1,4 @@
 use super::client::ListeningClient;
-use itertools::Itertools;
 use cryptix_addresses::Address;
 use cryptix_consensus_core::{
     constants::TX_VERSION,
@@ -19,6 +18,7 @@ use cryptix_core::info;
 use cryptix_grpc_client::GrpcClient;
 use cryptix_rpc_core::{api::rpc::RpcApi, BlockAddedNotification, Notification, RpcUtxoEntry, VirtualDaaScoreChangedNotification};
 use cryptix_txscript::pay_to_address_script;
+use itertools::Itertools;
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use secp256k1::Keypair;
 use std::{

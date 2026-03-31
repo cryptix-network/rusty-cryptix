@@ -1,6 +1,5 @@
 use crate::imports::*;
 use crate::result::Result;
-use js_sys::Array;
 use cryptix_consensus_client::{sign_with_multiple_v3, Transaction};
 use cryptix_consensus_core::hashing::wasm::SighashType;
 use cryptix_consensus_core::sign::sign_input;
@@ -9,6 +8,7 @@ use cryptix_consensus_core::{hashing::sighash_type::SIG_HASH_ALL, sign::verify};
 use cryptix_hashes::Hash;
 use cryptix_wallet_keys::privatekey::PrivateKey;
 use cryptix_wasm_core::types::HexString;
+use js_sys::Array;
 use serde_wasm_bindgen::from_value;
 
 #[wasm_bindgen]

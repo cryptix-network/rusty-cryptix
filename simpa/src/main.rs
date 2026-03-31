@@ -1,7 +1,5 @@
 use async_channel::unbounded;
 use clap::Parser;
-use futures::{future::try_join_all, Future};
-use itertools::Itertools;
 use cryptix_alloc::init_allocator_with_default_settings;
 use cryptix_consensus::{
     config::ConfigBuilder,
@@ -31,6 +29,8 @@ use cryptix_database::{create_temp_db, load_existing_db};
 use cryptix_hashes::Hash;
 use cryptix_perf_monitor::{builder::Builder, counters::CountersSnapshot};
 use cryptix_utils::fd_budget;
+use futures::{future::try_join_all, Future};
+use itertools::Itertools;
 use simulator::network::CryptixNetworkSimulator;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 

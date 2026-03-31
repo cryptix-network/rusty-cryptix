@@ -2,12 +2,12 @@
 mod utxo_set_override_inner {
     use std::sync::Arc;
 
-    use itertools::Itertools;
     use cryptix_consensus_core::{
         api::ConsensusApi, config::Config, header::Header, muhash::MuHashExtensions, utxo::utxo_collection::UtxoCollection,
     };
     use cryptix_hashes::Hash;
     use cryptix_muhash::MuHash;
+    use itertools::Itertools;
 
     use crate::consensus::Consensus;
 

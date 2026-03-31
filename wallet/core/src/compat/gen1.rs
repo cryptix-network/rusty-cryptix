@@ -22,8 +22,8 @@ pub fn decrypt_mnemonic<T: AsRef<[u8]>>(
 #[cfg(test)]
 mod test {
     use super::*;
-    use hex_literal::hex;
     use cryptix_addresses::Address;
+    use hex_literal::hex;
 
     #[test]
     fn decrypt_go_encrypted_mnemonics_test() {

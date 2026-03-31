@@ -3,6 +3,7 @@
 use super::collector::{CollectorFromConsensus, CollectorFromIndex};
 use crate::converter::feerate_estimate::{FeeEstimateConverter, FeeEstimateVerboseConverter};
 use crate::converter::{consensus::ConsensusConverter, index::IndexConverter, protocol::ProtocolConverter};
+use crate::hfa::{FastIngressSource, HfaEngine, HfaRuntimeConfig};
 use crate::service::NetworkType::{Mainnet, Testnet};
 use async_trait::async_trait;
 use cryptix_consensus_core::api::counters::ProcessingCounters;
@@ -23,8 +24,8 @@ use cryptix_consensusmanager::ConsensusManager;
 use cryptix_core::time::unix_now;
 use cryptix_core::{
     core::Core,
-    debug,
     cryptixd_env::version,
+    debug, info,
     signals::Shutdown,
     task::service::{AsyncService, AsyncServiceError, AsyncServiceFuture},
     task::tick::TickService,
@@ -51,6 +52,7 @@ use cryptix_notify::{
     subscriber::{Subscriber, SubscriptionManager},
 };
 use cryptix_p2p_flows::flow_context::FlowContext;
+use cryptix_p2p_flows::hfa::FastIntentP2pData;
 use cryptix_p2p_lib::common::ProtocolError;
 use cryptix_perf_monitor::{counters::CountersSnapshot, Monitor as PerfMonitor};
 use cryptix_rpc_core::{
@@ -118,12 +120,38 @@ pub struct RpcCoreService {
     system_info: SystemInfo,
     fee_estimate_cache: ExpiringCache<RpcFeeEstimate>,
     fee_estimate_verbose_cache: ExpiringCache<cryptix_mining::errors::MiningManagerResult<GetFeeEstimateExperimentalResponse>>,
+    hfa_engine: Arc<HfaEngine>,
 }
 
 const RPC_CORE: &str = "rpc-core";
+const NORMAL_POLICY_REJECT_FAST_LOCK_CONFLICT: &str = "normal_policy_reject_fast_lock_conflict";
 
 impl RpcCoreService {
     pub const IDENT: &'static str = "rpc-core-service";
+
+    fn annotate_transaction_fast_path(&self, transaction: &mut RpcTransaction) {
+        let tx_id = transaction
+            .verbose_data
+            .as_ref()
+            .map(|verbose| verbose.transaction_id)
+            .or_else(|| Transaction::try_from(transaction.clone()).ok().map(|tx| tx.id()));
+
+        if let Some(tx_id) = tx_id {
+            if self.hfa_engine.is_fast_tx_route(tx_id) {
+                transaction.fast_path = Some(true);
+            }
+        }
+    }
+
+    fn annotate_block_fast_paths(&self, block: &mut RpcBlock) {
+        for transaction in &mut block.transactions {
+            self.annotate_transaction_fast_path(transaction);
+        }
+    }
+
+    fn annotate_mempool_entry_fast_path(&self, entry: &mut RpcMempoolEntry) {
+        self.annotate_transaction_fast_path(&mut entry.transaction);
+    }
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -143,6 +171,7 @@ impl RpcCoreService {
         p2p_tower_counters: Arc<TowerConnectionCounters>,
         grpc_tower_counters: Arc<TowerConnectionCounters>,
         system_info: SystemInfo,
+        hfa_config: HfaRuntimeConfig,
     ) -> Self {
         // This notifier UTXOs subscription granularity to index-processor or consensus notifier
         let policies = match index_notifier {
@@ -199,6 +228,9 @@ impl RpcCoreService {
         let notifier =
             Arc::new(Notifier::new(RPC_CORE, EVENT_TYPE_ARRAY[..].into(), collectors, subscribers, subscription_context, 1, policies));
 
+        let hfa_engine = Arc::new(HfaEngine::new(hfa_config));
+        flow_context.set_hfa_bridge(hfa_engine.clone());
+
         Self {
             consensus_manager,
             notifier,
@@ -221,6 +253,7 @@ impl RpcCoreService {
             system_info,
             fee_estimate_cache: ExpiringCache::new(Duration::from_millis(500), Duration::from_millis(1000)),
             fee_estimate_verbose_cache: ExpiringCache::new(Duration::from_millis(500), Duration::from_millis(1000)),
+            hfa_engine,
         }
     }
 
@@ -403,12 +436,145 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         // TODO: test
         let session = self.consensus_manager.consensus().session().await;
         let block = session.async_get_block_even_if_header_only(request.hash).await?;
+        let mut rpc_block = self
+            .consensus_converter
+            .get_block(&session, &block, request.include_transactions, request.include_transactions)
+            .await?;
+        self.annotate_block_fast_paths(&mut rpc_block);
         Ok(GetBlockResponse {
-            block: self
-                .consensus_converter
-                .get_block(&session, &block, request.include_transactions, request.include_transactions)
-                .await?,
+            block: rpc_block,
         })
+    }
+
+    async fn submit_fast_intent_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: SubmitFastIntentRequest,
+    ) -> RpcResult<SubmitFastIntentResponse> {
+        let mut request = request;
+        let now_ms = unix_now();
+        let configured_drift_ms = self.hfa_engine.config().clock_drift_max_ms;
+        let drift_ms = now_ms.abs_diff(request.client_created_at_ms);
+        if drift_ms > configured_drift_ms {
+            warn!(
+                "Fastchain RPC clock drift correction: client_created_at_ms={} node_now_ms={} drift={}ms > {}ms, rewriting timestamp to node time",
+                request.client_created_at_ms, now_ms, drift_ms, configured_drift_ms
+            );
+            request.client_created_at_ms = now_ms;
+        }
+        let request_for_p2p = request.clone();
+
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let is_synced = self.has_sufficient_peer_connectivity() && session.async_is_nearly_synced().await;
+        let sink_timestamp_ms = session.async_get_sink_timestamp().await;
+        let basechain_block_latency_ms = unix_now().saturating_sub(sink_timestamp_ms) as f64;
+        let cpu_ratio = (self.perf_monitor.snapshot().cpu_usage as f64 / 100.0).clamp(0.0, 1.0);
+        let mut response = self
+            .hfa_engine
+            .submit_fast_intent(
+                &self.config.net.to_string(),
+                request,
+                session.clone(),
+                self.mining_manager.clone(),
+                is_synced,
+                cpu_ratio,
+                basechain_block_latency_ms,
+                FastIngressSource::Rpc,
+            )
+            .await;
+
+        let base_tx_for_normal: Transaction = match request_for_p2p.base_tx.clone().try_into() {
+            Ok(tx) => tx,
+            Err(_) => {
+                self.flow_context.broadcast_outbound_fast_microblocks().await;
+                if matches!(response.status, RpcFastIntentStatus::Rejected) && response.reason.as_deref() == Some("invalid_base_tx") {
+                    return Ok(response);
+                }
+                return Err(RpcError::General("submit_fast_intent received an invalid base transaction".to_string()));
+            }
+        };
+        let tx_id = base_tx_for_normal.id();
+
+        let normal_submit_result =
+            self.flow_context.submit_rpc_transaction(&session, base_tx_for_normal.clone(), Orphan::Forbidden).await;
+        if let Err(err) = normal_submit_result {
+            let tx_already_known = self.mining_manager.clone().has_transaction(tx_id, TransactionQuery::All).await
+                || self.mining_manager.clone().has_accepted_transaction(tx_id).await;
+            if !tx_already_known {
+                if let Some(cancel_token) = response.cancel_token.clone() {
+                    let _ = self.hfa_engine.cancel_fast_intent(CancelFastIntentRequest {
+                        intent_id: response.intent_id,
+                        cancel_token,
+                        node_epoch: response.node_epoch,
+                    });
+                }
+                return Err(RpcError::RejectedTransaction(tx_id, err.to_string()));
+            }
+        }
+        response.basechain_submitted = true;
+        if matches!(response.status, RpcFastIntentStatus::Locked | RpcFastIntentStatus::FastConfirmed) && response.reason.is_none() {
+            self.hfa_engine.mark_fast_tx_route(tx_id);
+        }
+
+        let should_broadcast_fast_intent = response.reason.is_none()
+            && matches!(response.status, RpcFastIntentStatus::Locked | RpcFastIntentStatus::FastConfirmed)
+            && self.hfa_engine.should_broadcast_intent_once(response.intent_id);
+
+        if should_broadcast_fast_intent {
+            self.processing_counters.fast_txs_counts.fetch_add(1, Ordering::Relaxed);
+            info!(
+                "Fastchain send accepted: intent {} tx {} status={:?} basechain_submitted=true",
+                response.intent_id, tx_id, response.status
+            );
+            self.flow_context
+                .broadcast_fast_intent(&FastIntentP2pData {
+                    intent_id: response.intent_id,
+                    base_tx: base_tx_for_normal,
+                    intent_nonce: request_for_p2p.intent_nonce,
+                    client_created_at_ms: request_for_p2p.client_created_at_ms,
+                    max_fee: request_for_p2p.max_fee,
+                })
+                .await;
+        } else {
+            info!(
+                "Fastchain send not activated: intent {} tx {} status={:?} reason={:?} basechain_submitted={}",
+                response.intent_id, tx_id, response.status, response.reason, response.basechain_submitted
+            );
+        }
+        self.flow_context.broadcast_outbound_fast_microblocks().await;
+        Ok(response)
+    }
+
+    async fn get_fast_intent_status_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetFastIntentStatusRequest,
+    ) -> RpcResult<GetFastIntentStatusResponse> {
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let is_synced = self.has_sufficient_peer_connectivity() && session.async_is_nearly_synced().await;
+        let sink_timestamp_ms = session.async_get_sink_timestamp().await;
+        let basechain_block_latency_ms = unix_now().saturating_sub(sink_timestamp_ms) as f64;
+        let cpu_ratio = (self.perf_monitor.snapshot().cpu_usage as f64 / 100.0).clamp(0.0, 1.0);
+        self.hfa_engine.revalidate_active_budgeted(session, is_synced, cpu_ratio, basechain_block_latency_ms).await;
+        let response = self.hfa_engine.get_fast_intent_status(request);
+        self.flow_context.broadcast_outbound_fast_microblocks().await;
+        Ok(response)
+    }
+
+    async fn cancel_fast_intent_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: CancelFastIntentRequest,
+    ) -> RpcResult<CancelFastIntentResponse> {
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let is_synced = self.has_sufficient_peer_connectivity() && session.async_is_nearly_synced().await;
+        let sink_timestamp_ms = session.async_get_sink_timestamp().await;
+        let basechain_block_latency_ms = unix_now().saturating_sub(sink_timestamp_ms) as f64;
+        let cpu_ratio = (self.perf_monitor.snapshot().cpu_usage as f64 / 100.0).clamp(0.0, 1.0);
+        self.hfa_engine.revalidate_active_budgeted(session, is_synced, cpu_ratio, basechain_block_latency_ms).await;
+        let response = self.hfa_engine.cancel_fast_intent(request);
+        self.flow_context.broadcast_outbound_fast_microblocks().await;
+        Ok(response)
     }
 
     async fn get_blocks_call(
@@ -451,10 +617,11 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             let mut blocks = Vec::with_capacity(block_hashes.len());
             for hash in block_hashes.iter().copied() {
                 let block = session.async_get_block_even_if_header_only(hash).await?;
-                let rpc_block = self
+                let mut rpc_block = self
                     .consensus_converter
                     .get_block(&session, &block, request.include_transactions, request.include_transactions)
                     .await?;
+                self.annotate_block_fast_paths(&mut rpc_block);
                 blocks.push(rpc_block)
             }
             blocks
@@ -487,7 +654,9 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             return Err(RpcError::TransactionNotFound(request.transaction_id));
         };
         let session = self.consensus_manager.consensus().unguarded_session();
-        Ok(GetMempoolEntryResponse::new(self.consensus_converter.get_mempool_entry(&session, &transaction)))
+        let mut entry = self.consensus_converter.get_mempool_entry(&session, &transaction);
+        self.annotate_mempool_entry_fast_path(&mut entry);
+        Ok(GetMempoolEntryResponse::new(entry))
     }
 
     async fn get_mempool_entries_call(
@@ -498,11 +667,14 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let query = self.extract_tx_query(request.filter_transaction_pool, request.include_orphan_pool)?;
         let session = self.consensus_manager.consensus().unguarded_session();
         let (transactions, orphans) = self.mining_manager.clone().get_all_transactions(query).await;
-        let mempool_entries = transactions
+        let mut mempool_entries = transactions
             .iter()
             .chain(orphans.iter())
             .map(|transaction| self.consensus_converter.get_mempool_entry(&session, transaction))
-            .collect();
+            .collect::<Vec<_>>();
+        for entry in &mut mempool_entries {
+            self.annotate_mempool_entry_fast_path(entry);
+        }
         Ok(GetMempoolEntriesResponse::new(mempool_entries))
     }
 
@@ -515,7 +687,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let session = self.consensus_manager.consensus().unguarded_session();
         let script_public_keys = request.addresses.iter().map(pay_to_address_script).collect();
         let grouped_txs = self.mining_manager.clone().get_transactions_by_addresses(script_public_keys, query).await;
-        let mempool_entries = grouped_txs
+        let mut mempool_entries = grouped_txs
             .owners
             .iter()
             .map(|(script_public_key, owner_transactions)| {
@@ -528,7 +700,15 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                     &grouped_txs.transactions,
                 )
             })
-            .collect();
+            .collect::<Vec<_>>();
+        for owner_entry in &mut mempool_entries {
+            for tx in &mut owner_entry.sending {
+                self.annotate_mempool_entry_fast_path(tx);
+            }
+            for tx in &mut owner_entry.receiving {
+                self.annotate_mempool_entry_fast_path(tx);
+            }
+        }
         Ok(GetMempoolEntriesByAddressesResponse::new(mempool_entries))
     }
 
@@ -545,6 +725,11 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let transaction: Transaction = request.transaction.try_into()?;
         let transaction_id = transaction.id();
         let session = self.consensus_manager.consensus().unguarded_session();
+        if self.hfa_engine.has_fast_lock_conflict_for_tx(&transaction) {
+            let err = RpcError::RejectedTransaction(transaction_id, NORMAL_POLICY_REJECT_FAST_LOCK_CONFLICT.to_string());
+            debug!("{err}");
+            return Err(err);
+        }
         let orphan = match allow_orphan {
             true => Orphan::Allowed,
             false => Orphan::Forbidden,
@@ -565,6 +750,11 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let transaction: Transaction = request.transaction.try_into()?;
         let transaction_id = transaction.id();
         let session = self.consensus_manager.consensus().unguarded_session();
+        if self.hfa_engine.has_fast_lock_conflict_for_tx(&transaction) {
+            let err = RpcError::RejectedTransaction(transaction_id, NORMAL_POLICY_REJECT_FAST_LOCK_CONFLICT.to_string());
+            debug!("{err}");
+            return Err(err);
+        }
         let replaced_transaction =
             self.flow_context.submit_rpc_transaction_replacement(&session, transaction).await.map_err(|err| {
                 let err = RpcError::RejectedTransaction(transaction_id, err.to_string());
@@ -1051,7 +1241,93 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
 
         let storage_metrics = req.storage_metrics.then_some(StorageMetrics { storage_size_bytes: 0 });
 
-        let custom_metrics: Option<HashMap<String, CustomMetricValue>> = None;
+        let minimum_relay_feerate = if req.custom_metrics {
+            Some(self.mining_manager.clone().minimum_relay_feerate().await.max(0.0))
+        } else {
+            None
+        };
+
+        let custom_metrics: Option<HashMap<String, CustomMetricValue>> = req.custom_metrics.then(|| {
+            let hfa = self.hfa_engine.metrics_snapshot();
+            let minimum_relay_feerate = minimum_relay_feerate.unwrap_or(0.0);
+            let configured_hfa_feerate_floor = self.hfa_engine.config().min_feerate_floor.max(0.0);
+            let effective_hfa_feerate_floor = self.hfa_engine.effective_feerate_floor(minimum_relay_feerate);
+            let mut out = HashMap::new();
+            out.insert("hfa_enabled".to_string(), CustomMetricValue::Bool(hfa.enabled));
+            out.insert("hfa_node_epoch".to_string(), CustomMetricValue::U64(hfa.node_epoch));
+            out.insert("hfa_mode".to_string(), CustomMetricValue::Text(hfa.mode.to_string()));
+            let fast_recent_route_ids = self
+                .hfa_engine
+                .recent_fast_tx_route_ids(128)
+                .into_iter()
+                .map(|tx_id| tx_id.to_string())
+                .collect::<Vec<_>>();
+            out.insert("fast_recent_tx_ids".to_string(), CustomMetricValue::Text(fast_recent_route_ids.join(",")));
+            out.insert("hfa_minimum_relay_feerate".to_string(), CustomMetricValue::F64(minimum_relay_feerate));
+            out.insert("hfa_min_feerate_floor_config".to_string(), CustomMetricValue::F64(configured_hfa_feerate_floor));
+            out.insert("hfa_effective_feerate_floor".to_string(), CustomMetricValue::F64(effective_hfa_feerate_floor));
+            out.insert("fast_minimum_relay_feerate".to_string(), CustomMetricValue::F64(minimum_relay_feerate));
+            out.insert("fast_effective_feerate_floor".to_string(), CustomMetricValue::F64(effective_hfa_feerate_floor));
+            out.insert("hfa_paused_for_ms".to_string(), CustomMetricValue::U64(hfa.paused_for_ms));
+            out.insert("fast_active_locks".to_string(), CustomMetricValue::U64(hfa.active_locks as u64));
+            out.insert("fast_pending_intents".to_string(), CustomMetricValue::U64(hfa.pending_intents as u64));
+            out.insert("fast_prelock_intents".to_string(), CustomMetricValue::U64(hfa.prelock_intents as u64));
+            out.insert("fast_active_intents".to_string(), CustomMetricValue::U64(hfa.active_intents as u64));
+            out.insert("fast_submit_total".to_string(), CustomMetricValue::U64(hfa.submit_total));
+            out.insert("fast_submit_total_rpc".to_string(), CustomMetricValue::U64(hfa.submit_rpc_total));
+            out.insert("fast_submit_total_p2p".to_string(), CustomMetricValue::U64(hfa.submit_p2p_total));
+            out.insert("fast_reject_total".to_string(), CustomMetricValue::U64(hfa.rejected_total));
+            out.insert("fast_overload_reject_total".to_string(), CustomMetricValue::U64(hfa.overload_reject_total));
+            out.insert("fast_normal_conflict_reject_total".to_string(), CustomMetricValue::U64(hfa.normal_conflict_reject_total));
+            out.insert("fast_drop_total".to_string(), CustomMetricValue::U64(hfa.dropped_total));
+            out.insert("fast_expired_total".to_string(), CustomMetricValue::U64(hfa.expired_total));
+            out.insert("fast_terminal_entries".to_string(), CustomMetricValue::U64(hfa.terminal_entries as u64));
+            out.insert("fast_terminal_bytes".to_string(), CustomMetricValue::U64(hfa.terminal_bytes as u64));
+            out.insert(
+                "fast_terminal_evictions_total_retention".to_string(),
+                CustomMetricValue::U64(hfa.terminal_evictions_retention_total),
+            );
+            out.insert(
+                "fast_terminal_evictions_total_expired".to_string(),
+                CustomMetricValue::U64(hfa.terminal_evictions_expired_total),
+            );
+            out.insert(
+                "fast_terminal_evictions_total_oldest".to_string(),
+                CustomMetricValue::U64(hfa.terminal_evictions_oldest_total),
+            );
+            out.insert("fast_arbiter_queue_len".to_string(), CustomMetricValue::U64(hfa.fast_arbiter_queue_len as u64));
+            out.insert("fast_arbiter_queue_ratio".to_string(), CustomMetricValue::F64(hfa.fast_arbiter_queue_ratio));
+            out.insert("fast_arbiter_wait_ms".to_string(), CustomMetricValue::F64(hfa.fast_arbiter_wait_ms));
+            out.insert("fast_arbiter_hold_ms".to_string(), CustomMetricValue::F64(hfa.fast_arbiter_hold_ms));
+            out.insert("fast_validation_queue_ratio".to_string(), CustomMetricValue::F64(hfa.fast_validation_queue_ratio));
+            out.insert("fast_worker_cpu_ratio".to_string(), CustomMetricValue::F64(hfa.fast_worker_cpu_ratio));
+            out.insert("basechain_block_latency_ms".to_string(), CustomMetricValue::F64(hfa.basechain_block_latency_ms));
+            out.insert(
+                "basechain_latency_delta_vs_baseline_ms".to_string(),
+                CustomMetricValue::F64(hfa.basechain_latency_delta_vs_baseline_ms),
+            );
+            out.insert("fast_pull_miss_total".to_string(), CustomMetricValue::U64(hfa.pull_miss_total));
+            out.insert("fast_pull_fail_total".to_string(), CustomMetricValue::U64(hfa.pull_fail_total));
+            out.insert("fast_mode_transition_total".to_string(), CustomMetricValue::U64(hfa.mode_transition_total));
+            out.insert(
+                "fast_mode_transition_normal_to_degraded_total".to_string(),
+                CustomMetricValue::U64(hfa.mode_transition_normal_to_degraded_total),
+            );
+            out.insert(
+                "fast_mode_transition_degraded_to_paused_total".to_string(),
+                CustomMetricValue::U64(hfa.mode_transition_degraded_to_paused_total),
+            );
+            out.insert(
+                "fast_mode_transition_paused_to_degraded_total".to_string(),
+                CustomMetricValue::U64(hfa.mode_transition_paused_to_degraded_total),
+            );
+            out.insert(
+                "fast_mode_transition_degraded_to_normal_total".to_string(),
+                CustomMetricValue::U64(hfa.mode_transition_degraded_to_normal_total),
+            );
+            out.insert("fast_revalidation_backlog_seconds".to_string(), CustomMetricValue::F64(hfa.revalidation_backlog_seconds));
+            out
+        });
 
         let server_time = unix_now();
 

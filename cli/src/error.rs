@@ -1,7 +1,7 @@
 use std::net::AddrParseError;
 
-use downcast::DowncastError;
 use cryptix_wallet_core::error::Error as WalletError;
+use downcast::DowncastError;
 use workflow_core::channel::ChannelError;
 use workflow_terminal::error::Error as TerminalError;
 

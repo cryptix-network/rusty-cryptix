@@ -6,13 +6,13 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use duration_string::DurationString;
-use futures_util::future::{join_all, try_join_all};
-use itertools::Itertools;
 use cryptix_addressmanager::{AddressManager, NetAddress};
 use cryptix_core::{debug, info, warn};
 use cryptix_p2p_lib::{common::ProtocolError, ConnectionError, Peer};
 use cryptix_utils::triggers::SingleTrigger;
+use duration_string::DurationString;
+use futures_util::future::{join_all, try_join_all};
+use itertools::Itertools;
 use parking_lot::Mutex as ParkingLotMutex;
 use rand::{seq::SliceRandom, thread_rng};
 use tokio::{

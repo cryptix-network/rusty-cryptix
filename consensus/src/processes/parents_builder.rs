@@ -1,7 +1,7 @@
-use indexmap::IndexSet;
-use itertools::Itertools;
 use cryptix_consensus_core::{blockhash::ORIGIN, header::Header, BlockHashMap, BlockHasher, BlockLevel};
 use cryptix_hashes::Hash;
+use indexmap::IndexSet;
+use itertools::Itertools;
 use smallvec::{smallvec, SmallVec};
 use std::sync::Arc;
 
@@ -211,7 +211,6 @@ mod tests {
     };
 
     use super::ParentsManager;
-    use itertools::Itertools;
     use cryptix_consensus_core::{
         blockhash::{BlockHashes, ORIGIN},
         header::Header,
@@ -219,6 +218,7 @@ mod tests {
     };
     use cryptix_database::prelude::{ReadLock, StoreError, StoreResult};
     use cryptix_hashes::Hash;
+    use itertools::Itertools;
     use parking_lot::RwLock;
 
     struct HeaderStoreMock {

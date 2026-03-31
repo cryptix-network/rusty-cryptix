@@ -14,13 +14,13 @@ use crate::{
         relations::{delete_reachability_relations, init as relations_init, RelationsStoreExtensions},
     },
 };
-use itertools::Itertools;
 use cryptix_consensus_core::{
     blockhash::{BlockHashExtensions, BlockHashes, ORIGIN},
     BlockHashMap, BlockHashSet,
 };
 use cryptix_database::prelude::{DirectWriter, StoreError};
 use cryptix_hashes::Hash;
+use itertools::Itertools;
 use std::collections::{
     hash_map::Entry::{Occupied, Vacant},
     VecDeque,

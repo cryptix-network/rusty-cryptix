@@ -5,8 +5,8 @@ pub mod result;
 pub use data::{Metric, MetricGroup, MetricsData, MetricsSnapshot};
 
 use crate::result::Result;
-use futures::{pin_mut, select, FutureExt, StreamExt};
 use cryptix_rpc_core::api::rpc::RpcApi;
+use futures::{pin_mut, select, FutureExt, StreamExt};
 use std::{
     future::Future,
     pin::Pin,

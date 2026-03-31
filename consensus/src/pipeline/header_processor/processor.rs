@@ -28,7 +28,6 @@ use crate::{
     processes::{ghostdag::ordering::SortableBlock, reachability::inquirer as reachability, relations::RelationsStoreExtensions},
 };
 use crossbeam_channel::{Receiver, Sender};
-use itertools::Itertools;
 use cryptix_consensus_core::{
     blockhash::{BlockHashes, ORIGIN},
     blockstatus::BlockStatus::{self, StatusHeaderOnly, StatusInvalid},
@@ -40,6 +39,7 @@ use cryptix_consensusmanager::SessionLock;
 use cryptix_database::prelude::{StoreResultEmptyTuple, StoreResultExtensions};
 use cryptix_hashes::Hash;
 use cryptix_utils::vec::VecExtensions;
+use itertools::Itertools;
 use parking_lot::RwLock;
 use rayon::ThreadPool;
 use rocksdb::WriteBatch;

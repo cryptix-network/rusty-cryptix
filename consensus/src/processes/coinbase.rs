@@ -268,8 +268,6 @@ const SUBSIDY_BY_MONTH_TABLE: [u64; 426] = [
     0,
 ];
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,7 +356,7 @@ mod tests {
                 Test {
                     name: "start of deflationary phase",
                     daa_score: params.deflationary_phase_daa_score,
-                    
+
                     expected: deflationary_phase_initial_subsidy,
                 },
                 Test {

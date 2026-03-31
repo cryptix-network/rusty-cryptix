@@ -64,6 +64,7 @@ message RpcTransaction {
   string payload = 8;
   RpcTransactionVerboseData verboseData = 9;
   uint64 mass = 10;
+  bool fastPath = 11;
 }
 
 message RpcTransactionInput {
@@ -829,6 +830,15 @@ message StorageMetrics{
   uint64 storageSizeBytes = 1;
 }
 
+message CustomMetricValue {
+  oneof value {
+    uint64 u64Value = 1;
+    double f64Value = 2;
+    bool boolValue = 3;
+    string textValue = 4;
+  }
+}
+
 message GetConnectionsRequestMessage{
   bool includeProfileData = 1;
 }
@@ -875,6 +885,7 @@ message GetMetricsResponseMessage{
   BandwidthMetrics bandwidthMetrics = 13;
   ConsensusMetrics consensusMetrics = 14;
   StorageMetrics storageMetrics = 15;
+  map<string, CustomMetricValue> customMetrics = 16;
   RPCError error = 1000;
 }
 
@@ -972,5 +983,59 @@ message GetCurrentBlockColorRequestMessage {
 message GetCurrentBlockColorResponseMessage {
   bool blue = 1;
 
+  RPCError error = 1000;
+}
+
+message SubmitFastIntentRequestMessage {
+  RpcTransaction base_tx = 1;
+  uint64 intent_nonce = 2;
+  uint64 client_created_at_ms = 3;
+  uint64 max_fee = 4;
+}
+
+message SubmitFastIntentResponseMessage {
+  string intent_id = 1;
+  string status = 2;
+  string reason = 3;
+  uint64 node_epoch = 4;
+  uint64 expires_at_ms = 5;
+  uint64 retention_until_ms = 6;
+  string cancel_token = 7;
+  bool basechain_submitted = 8;
+  string base_tx_id = 9;
+  RPCError error = 1000;
+}
+
+message GetFastIntentStatusRequestMessage {
+  string intent_id = 1;
+  uint64 client_last_node_epoch = 2;
+}
+
+message GetFastIntentStatusResponseMessage {
+  string status = 1;
+  string reason = 2;
+  uint64 node_epoch = 3;
+  uint64 expires_at_ms = 4;
+  uint64 retention_until_ms = 5;
+  string cancel_token = 6;
+  bool has_epoch_changed = 7;
+  bool epoch_changed = 8;
+  string base_tx_id = 9;
+  RPCError error = 1000;
+}
+
+message CancelFastIntentRequestMessage {
+  string intent_id = 1;
+  string cancel_token = 2;
+  uint64 node_epoch = 3;
+}
+
+message CancelFastIntentResponseMessage {
+  string status = 1;
+  string reason = 2;
+  uint64 node_epoch = 3;
+  uint64 retention_until_ms = 4;
+  bool has_epoch_changed = 5;
+  bool epoch_changed = 6;
   RPCError error = 1000;
 }

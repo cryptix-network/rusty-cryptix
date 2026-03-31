@@ -68,6 +68,7 @@ cfg_if::cfg_if! {
                     gas: inner.gas,
                     payload: inner.payload.clone(),
                     mass: inner.mass,
+                    fast_path: None,
                     verbose_data: None,
                 }
             }

@@ -343,7 +343,6 @@ pub const MAINNET_PARAMS: Params = Params {
     // deflationary_phase_daa_score is the DAA score after which the pre-deflationary period
     // switches to the deflationary period. This number is calculated as follows:
     // We define a year as 365.25 days
-
     deflationary_phase_daa_score: 86400,
     pre_deflationary_phase_base_subsidy: 167300000000,
     coinbase_maturity: 100,
@@ -353,15 +352,13 @@ pub const MAINNET_PARAMS: Params = Params {
 };
 
 pub const TESTNET_PARAMS: Params = Params {
-          dns_seeders: &[
-
+    dns_seeders: &[
         "t.seed1.cryptix-network.org",
         "t.seed2.cryptix-network.org",
         "t.seed3.cryptix-network.org",
         "t.dyn1.cryptix-network.org",
         "t.dyn2.cryptix-network.org",
         "t.dyn3.cryptix-network.org",
-
         "t.cryptix-network-dns.duckdns.org",
         "t.cryptix-network-dns2.duckdns.org",
     ],
@@ -408,7 +405,6 @@ pub const TESTNET_PARAMS: Params = Params {
     // deflationary_phase_daa_score is the DAA score after which the pre-deflationary period
     // switches to the deflationary period. This number is calculated as follows:
     // We define a year as 365.25 days
-
     deflationary_phase_daa_score: 86400,
     pre_deflationary_phase_base_subsidy: 167300000000,
     coinbase_maturity: 100,
@@ -419,14 +415,12 @@ pub const TESTNET_PARAMS: Params = Params {
 
 pub const TESTNET11_PARAMS: Params = Params {
     dns_seeders: &[
-
         "t11.seed1.cryptix-network.org",
         "t11.seed2.cryptix-network.org",
         "t11.seed3.cryptix-network.org",
         "t11.dyn1.cryptix-network.org",
         "t11.dyn2.cryptix-network.org",
         "t11.dyn3.cryptix-network.org",
-
         "t11.cryptix-network-dns.duckdns.org",
         "t11.cryptix-network-dns2.duckdns.org",
     ],

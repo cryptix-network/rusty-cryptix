@@ -4,12 +4,11 @@ use crate::{
     manager::ManagerEvent,
     request_handler::{
         factory::Factory,
-        interface::{Interface, CryptixdRoutingPolicy},
+        interface::{CryptixdRoutingPolicy, Interface},
         method::RoutingPolicy,
     },
 };
 use async_channel::{bounded, Receiver as MpmcReceiver, Sender as MpmcSender, TrySendError as MpmcTrySendError};
-use itertools::Itertools;
 use cryptix_core::{debug, info, trace, warn};
 use cryptix_grpc_core::{
     ops::CryptixdPayloadOps,
@@ -22,6 +21,7 @@ use cryptix_notify::{
     notifier::Notifier,
 };
 use cryptix_rpc_core::Notification;
+use itertools::Itertools;
 use parking_lot::Mutex;
 use std::{
     collections::{hash_map::Entry, HashMap},

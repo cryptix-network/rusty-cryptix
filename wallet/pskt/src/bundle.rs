@@ -8,8 +8,8 @@ use cryptix_addresses::{Address, Prefix};
 use cryptix_consensus_core::network::{NetworkId, NetworkType};
 use cryptix_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint, UtxoEntry};
 
-use hex;
 use cryptix_txscript::{extract_script_pub_key_address, pay_to_address_script, pay_to_script_hash_script};
+use hex;
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 

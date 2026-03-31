@@ -1,7 +1,6 @@
 pub use crate::error::Error;
 use crate::imports::*;
 use crate::tx::PaymentOutputs;
-use futures::stream;
 use cryptix_bip32::{DerivationPath, KeyFingerprint, PrivateKey};
 use cryptix_consensus_client::UtxoEntry as ClientUTXO;
 use cryptix_consensus_core::hashing::sighash::{calc_schnorr_signature_hash, SigHashReusedValues};
@@ -15,6 +14,7 @@ pub use cryptix_wallet_pskt::bundle::Bundle;
 use cryptix_wallet_pskt::prelude::KeySource;
 use cryptix_wallet_pskt::prelude::{Finalizer, Inner, SignInputOk, Signature, Signer};
 pub use cryptix_wallet_pskt::pskt::{Creator, PSKT};
+use futures::stream;
 use secp256k1::schnorr;
 use secp256k1::{Message, PublicKey};
 use std::iter;

@@ -335,7 +335,9 @@ async fn daemon_utxos_propagation_test() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn daemon_cleaning_test() {
     init_allocator_with_default_settings();
-    cryptix_core::log::try_init_logger("info,cryptix_grpc_core=trace,cryptix_grpc_server=trace,cryptix_grpc_client=trace,cryptix_core=trace");
+    cryptix_core::log::try_init_logger(
+        "info,cryptix_grpc_core=trace,cryptix_grpc_server=trace,cryptix_grpc_client=trace,cryptix_core=trace",
+    );
     let args = Args { devnet: true, ..Default::default() };
     let consensus_manager;
     let async_runtime;

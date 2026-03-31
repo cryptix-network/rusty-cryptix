@@ -76,6 +76,11 @@ pub struct Args {
     pub perf_metrics: bool,
     pub perf_metrics_interval_sec: u64,
     pub block_template_cache_lifetime: Option<u64>,
+    pub datacenter: bool,
+    pub hfa: bool,
+    pub hfa_cpu: f64,
+    pub hfa_drift_ms: u64,
+    pub hfa_microblock_interval_ms_normal: u64,
 
     #[cfg(feature = "devnet-prealloc")]
     pub num_prealloc_utxos: Option<u64>,
@@ -128,6 +133,11 @@ impl Default for Args {
             perf_metrics_interval_sec: 10,
             externalip: None,
             block_template_cache_lifetime: None,
+            datacenter: false,
+            hfa: false,
+            hfa_cpu: 0.7,
+            hfa_drift_ms: 5_000,
+            hfa_microblock_interval_ms_normal: 50,
 
             #[cfg(feature = "devnet-prealloc")]
             num_prealloc_utxos: None,
@@ -358,6 +368,47 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
                 .value_parser(clap::value_parser!(u64))
                 .help("Interval in seconds for performance metrics collection."),
         )
+        .arg(
+            Arg::new("datacenter")
+                .long("datacenter")
+                .action(ArgAction::SetTrue)
+                .help("Enable datacenter address filtering mode (skip private/unroutable peer addresses)."),
+        )
+        .arg(
+            Arg::new("hfa")
+                .long("hfa")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("no-hfa")
+                .help("Enable HFA fast rail for this process (default: disabled)."),
+        )
+        .arg(
+            Arg::new("hfa-cpu")
+                .long("hfa-cpu")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(f64))
+                .help("HFA CPU low-water ratio used by mode control resume logic (default: 0.7)."),
+        )
+        .arg(
+            Arg::new("hfa-drift-ms")
+                .long("hfa-drift-ms")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(u64))
+                .help("HFA max accepted clock drift window in milliseconds before correction/reject logic applies (default: 5000)."),
+        )
+        .arg(
+            Arg::new("hfa-microblock-interval-ms-normal")
+                .long("hfa-microblock-interval-ms-normal")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(u64))
+                .help("HFA microblock interval in milliseconds while in normal mode (default: 50)."),
+        )
+        .arg(
+            Arg::new("no-hfa")
+                .long("no-hfa")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("hfa")
+                .help("Disable HFA fast rail for this process (overrides config)."),
+        )
         .arg(arg!(--"disable-upnp" "Disable upnp"))
         .arg(arg!(--"nodnsseed" "Disable DNS seeding for peers"))
         .arg(arg!(--"nogrpc" "Disable gRPC server"))
@@ -409,6 +460,14 @@ impl Args {
             })?;
         }
 
+        let hfa_enabled = if arg_match_unwrap_or::<bool>(&m, "hfa", false) {
+            true
+        } else if arg_match_unwrap_or::<bool>(&m, "no-hfa", false) {
+            false
+        } else {
+            defaults.hfa
+        };
+
         let args = Args {
             appdir: m.get_one::<String>("appdir").cloned().or(defaults.appdir),
             logdir: m.get_one::<String>("logdir").cloned().or(defaults.logdir),
@@ -444,6 +503,15 @@ impl Args {
             perf_metrics_interval_sec: arg_match_unwrap_or::<u64>(&m, "perf-metrics-interval-sec", defaults.perf_metrics_interval_sec),
             // Note: currently used programmatically by benchmarks and not exposed to CLI users
             block_template_cache_lifetime: defaults.block_template_cache_lifetime,
+            datacenter: arg_match_unwrap_or::<bool>(&m, "datacenter", defaults.datacenter),
+            hfa: hfa_enabled,
+            hfa_cpu: arg_match_unwrap_or::<f64>(&m, "hfa-cpu", defaults.hfa_cpu),
+            hfa_drift_ms: arg_match_unwrap_or::<u64>(&m, "hfa-drift-ms", defaults.hfa_drift_ms),
+            hfa_microblock_interval_ms_normal: arg_match_unwrap_or::<u64>(
+                &m,
+                "hfa-microblock-interval-ms-normal",
+                defaults.hfa_microblock_interval_ms_normal,
+            ),
             disable_upnp: arg_match_unwrap_or::<bool>(&m, "disable-upnp", defaults.disable_upnp),
             disable_dns_seeding: arg_match_unwrap_or::<bool>(&m, "nodnsseed", defaults.disable_dns_seeding),
             disable_grpc: arg_match_unwrap_or::<bool>(&m, "nogrpc", defaults.disable_grpc),

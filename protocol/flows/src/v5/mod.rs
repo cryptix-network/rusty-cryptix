@@ -1,6 +1,7 @@
 use self::{
     address::{ReceiveAddressesFlow, SendAddressesFlow},
     blockrelay::{flow::HandleRelayInvsFlow, handle_requests::HandleRelayBlockRequests},
+    hfa::{FastIntentRelayFlow, RequestFastIntentsFlow},
     ibd::IbdFlow,
     ping::{ReceivePingsFlow, SendPingsFlow},
     request_antipast::HandleAntipastRequests,
@@ -21,6 +22,7 @@ use std::sync::Arc;
 
 pub(crate) mod address;
 pub(crate) mod blockrelay;
+pub(crate) mod hfa;
 pub(crate) mod ibd;
 pub(crate) mod ping;
 pub(crate) mod request_antipast;
@@ -33,11 +35,11 @@ pub(crate) mod request_pruning_point_and_anticone;
 pub(crate) mod request_pruning_point_utxo_set;
 pub(crate) mod txrelay;
 
-pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
+pub fn register(ctx: FlowContext, router: Arc<Router>, hfa_capable: bool) -> Vec<Box<dyn Flow>> {
     // IBD flow <-> invs flow communication uses a job channel in order to always
     // maintain at most a single pending job which can be updated
     let (ibd_sender, relay_receiver) = channel::job();
-    let flows: Vec<Box<dyn Flow>> = vec![
+    let mut flows: Vec<Box<dyn Flow>> = vec![
         Box::new(IbdFlow::new(
             ctx.clone(),
             router.clone(),
@@ -119,8 +121,10 @@ pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
         Box::new(RelayTransactionsFlow::new(
             ctx.clone(),
             router.clone(),
-            router
-                .subscribe_with_capacity(vec![CryptixdMessagePayloadType::InvTransactions], RelayTransactionsFlow::invs_channel_size()),
+            router.subscribe_with_capacity(
+                vec![CryptixdMessagePayloadType::InvTransactions],
+                RelayTransactionsFlow::invs_channel_size(),
+            ),
             router.subscribe_with_capacity(
                 vec![CryptixdMessagePayloadType::Transaction, CryptixdMessagePayloadType::TransactionNotFound],
                 RelayTransactionsFlow::txs_channel_size(),
@@ -131,18 +135,38 @@ pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
             router.clone(),
             router.subscribe(vec![CryptixdMessagePayloadType::RequestTransactions]),
         )),
-        Box::new(ReceiveAddressesFlow::new(ctx.clone(), router.clone(), router.subscribe(vec![CryptixdMessagePayloadType::Addresses]))),
+        Box::new(ReceiveAddressesFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe(vec![CryptixdMessagePayloadType::Addresses]),
+        )),
         Box::new(SendAddressesFlow::new(
             ctx.clone(),
             router.clone(),
             router.subscribe(vec![CryptixdMessagePayloadType::RequestAddresses]),
         )),
         Box::new(RequestBlockLocatorFlow::new(
-            ctx,
+            ctx.clone(),
             router.clone(),
             router.subscribe(vec![CryptixdMessagePayloadType::RequestBlockLocator]),
         )),
     ];
+
+    if hfa_capable {
+        flows.push(Box::new(FastIntentRelayFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe_with_capacity(
+                vec![CryptixdMessagePayloadType::FastIntent, CryptixdMessagePayloadType::FastMicroblock],
+                1024,
+            ),
+        )));
+        flows.push(Box::new(RequestFastIntentsFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe(vec![CryptixdMessagePayloadType::RequestFastIntents]),
+        )));
+    }
 
     // The reject message is handled as a special case by the router
     // CryptixdMessagePayloadType::Reject,

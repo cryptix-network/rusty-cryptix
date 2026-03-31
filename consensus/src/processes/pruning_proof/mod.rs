@@ -9,8 +9,8 @@ use std::{
     },
 };
 
-use itertools::Itertools;
 use cryptix_math::int::SignedInteger;
+use itertools::Itertools;
 use parking_lot::{Mutex, RwLock};
 use rocksdb::WriteBatch;
 

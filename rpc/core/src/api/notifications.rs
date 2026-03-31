@@ -1,5 +1,4 @@
 use crate::model::message::*;
-use derive_more::Display;
 use cryptix_notify::{
     events::EventType,
     notification::{full_featured, Notification as NotificationTrait},
@@ -9,6 +8,7 @@ use cryptix_notify::{
         Subscription,
     },
 };
+use derive_more::Display;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use wasm_bindgen::JsValue;

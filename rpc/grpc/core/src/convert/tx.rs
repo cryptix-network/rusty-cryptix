@@ -17,6 +17,7 @@ from!(item: &cryptix_rpc_core::RpcTransaction, protowire::RpcTransaction, {
         gas: item.gas,
         payload: item.payload.to_rpc_hex(),
         mass: item.mass,
+        fast_path: item.fast_path.unwrap_or(false),
         verbose_data: item.verbose_data.as_ref().map(|x| x.into()),
     }
 });
@@ -112,6 +113,7 @@ try_from!(item: &protowire::RpcTransaction, cryptix_rpc_core::RpcTransaction, {
         gas: item.gas,
         payload: Vec::from_rpc_hex(&item.payload)?,
         mass: item.mass,
+        fast_path: Some(item.fast_path),
         verbose_data: item.verbose_data.as_ref().map(cryptix_rpc_core::RpcTransactionVerboseData::try_from).transpose()?,
     }
 });

@@ -190,12 +190,12 @@ fn map_script_err(script_err: TxScriptError, input: &TransactionInput) -> TxRule
 mod tests {
     use super::super::errors::TxRuleError;
     use core::str::FromStr;
-    use itertools::Itertools;
     use cryptix_consensus_core::sign::sign;
     use cryptix_consensus_core::subnets::SubnetworkId;
     use cryptix_consensus_core::tx::{MutableTransaction, PopulatedTransaction, ScriptVec, TransactionId, UtxoEntry};
     use cryptix_consensus_core::tx::{ScriptPublicKey, Transaction, TransactionInput, TransactionOutpoint, TransactionOutput};
     use cryptix_txscript_errors::TxScriptError;
+    use itertools::Itertools;
     use secp256k1::Secp256k1;
     use smallvec::SmallVec;
     use std::iter::once;

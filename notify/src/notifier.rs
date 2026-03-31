@@ -19,9 +19,9 @@ use super::{
 use async_channel::Sender;
 use async_trait::async_trait;
 use core::fmt::Debug;
+use cryptix_core::{debug, trace};
 use futures::future::join_all;
 use itertools::Itertools;
-use cryptix_core::{debug, trace};
 use parking_lot::Mutex;
 use std::{
     collections::{hash_map::Entry, HashMap},

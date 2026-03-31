@@ -1,4 +1,3 @@
-use derive_more::Display;
 use cryptix_consensus_core::{acceptance_data::AcceptanceData, block::Block, utxo::utxo_diff::UtxoDiff};
 use cryptix_hashes::Hash;
 use cryptix_notify::{
@@ -11,6 +10,7 @@ use cryptix_notify::{
         Subscription,
     },
 };
+use derive_more::Display;
 use std::sync::Arc;
 
 full_featured! {

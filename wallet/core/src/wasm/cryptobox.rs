@@ -1,8 +1,8 @@
 use crate::cryptobox::CryptoBox as NativeCryptoBox;
 use crate::imports::*;
 use base64::{engine::general_purpose, Engine as _};
-use crypto_box::{PublicKey, SecretKey, KEY_SIZE};
 use cryptix_wasm_core::types::BinaryT;
+use crypto_box::{PublicKey, SecretKey, KEY_SIZE};
 
 #[wasm_bindgen]
 extern "C" {

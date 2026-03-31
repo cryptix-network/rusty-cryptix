@@ -6,11 +6,11 @@ use crate::{
     },
 };
 use async_trait::async_trait;
-use itertools::chain;
 use cryptix_addresses::Address;
 use cryptix_consensus_core::network::NetworkId;
 use cryptix_core::debug;
 use cryptix_utils::triggers::SingleTrigger;
+use itertools::chain;
 use rand::thread_rng;
 use std::sync::Arc;
 use tokio::task::JoinHandle;

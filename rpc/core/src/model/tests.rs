@@ -256,6 +256,7 @@ mod mockery {
                 gas: mock(),
                 payload: Hash::mock().as_bytes().to_vec(),
                 mass: mock(),
+                fast_path: mock(),
                 verbose_data: mock(),
             }
         }

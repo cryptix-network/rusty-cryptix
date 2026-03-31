@@ -1,7 +1,6 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use clap::{Arg, ArgAction, Command};
-use itertools::Itertools;
 use cryptix_addresses::{Address, Prefix, Version};
 use cryptix_consensus_core::{
     config::params::{TESTNET11_PARAMS, TESTNET_PARAMS},
@@ -10,11 +9,12 @@ use cryptix_consensus_core::{
     subnets::SUBNETWORK_ID_NATIVE,
     tx::{MutableTransaction, Transaction, TransactionInput, TransactionOutpoint, TransactionOutput, UtxoEntry},
 };
-use cryptix_core::{info, cryptixd_env::version, time::unix_now, warn};
+use cryptix_core::{cryptixd_env::version, info, time::unix_now, warn};
 use cryptix_grpc_client::{ClientPool, GrpcClient};
 use cryptix_notify::subscription::context::SubscriptionContext;
 use cryptix_rpc_core::{api::rpc::RpcApi, notify::mode::NotificationMode, RpcUtxoEntry};
 use cryptix_txscript::pay_to_address_script;
+use itertools::Itertools;
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use secp256k1::{rand::thread_rng, Keypair};

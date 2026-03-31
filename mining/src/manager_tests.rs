@@ -14,7 +14,6 @@ mod tests {
         testutils::consensus_mock::ConsensusMock,
         MiningCounters,
     };
-    use itertools::Itertools;
     use cryptix_addresses::{Address, Prefix, Version};
     use cryptix_consensus_core::{
         api::ConsensusApi,
@@ -36,6 +35,7 @@ mod tests {
         test_helpers::{create_transaction, create_transaction_with_change, op_true_script},
     };
     use cryptix_utils::mem_size::MemSizeEstimator;
+    use itertools::Itertools;
     use std::{iter::once, sync::Arc};
     use tokio::sync::mpsc::{error::TryRecvError, unbounded_channel};
 
@@ -1358,7 +1358,8 @@ mod tests {
         // Make the funding amounts always different so that funding txs have different ids
         (0..count)
             .map(|i| {
-                let funding_tx = create_transaction_without_input(vec![1_000 * SOMPI_PER_CRYPTIX, 2_500 * SOMPI_PER_CRYPTIX + i as u64]);
+                let funding_tx =
+                    create_transaction_without_input(vec![1_000 * SOMPI_PER_CRYPTIX, 2_500 * SOMPI_PER_CRYPTIX + i as u64]);
                 consensus.add_transaction(funding_tx.clone(), 1);
                 funding_tx
             })

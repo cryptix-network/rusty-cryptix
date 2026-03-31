@@ -4,13 +4,13 @@ use crate::pb::{
     p2p_client::P2pClient as ProtoP2pClient, p2p_server::P2p as ProtoP2p, p2p_server::P2pServer as ProtoP2pServer, CryptixdMessage,
 };
 use crate::{ConnectionInitializer, Router};
-use futures::FutureExt;
 use cryptix_core::{debug, info};
 use cryptix_utils::networking::NetAddress;
 use cryptix_utils_tower::{
     counters::TowerConnectionCounters,
     middleware::{measure_request_body_size_layer, CountBytesBody, MapResponseBodyLayer, ServiceBuilder},
 };
+use futures::FutureExt;
 use std::net::ToSocketAddrs;
 use std::pin::Pin;
 use std::sync::Arc;

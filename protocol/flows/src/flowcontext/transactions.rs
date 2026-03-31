@@ -1,12 +1,12 @@
 use super::process_queue::ProcessQueue;
-use itertools::Itertools;
 use cryptix_consensus_core::tx::TransactionId;
 use cryptix_core::debug;
 use cryptix_p2p_lib::{
     make_message,
-    pb::{cryptixd_message::Payload, InvTransactionsMessage, CryptixdMessage},
+    pb::{cryptixd_message::Payload, CryptixdMessage, InvTransactionsMessage},
     Hub,
 };
+use itertools::Itertools;
 use std::time::{Duration, Instant};
 
 /// Interval between mempool scanning tasks (in seconds)

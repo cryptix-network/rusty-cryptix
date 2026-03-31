@@ -1,6 +1,6 @@
 use crate::result::Result;
-use js_sys::BigInt;
 use cryptix_consensus_core::network::{NetworkType, NetworkTypeT};
+use js_sys::BigInt;
 use wasm_bindgen::prelude::*;
 use workflow_wasm::prelude::*;
 

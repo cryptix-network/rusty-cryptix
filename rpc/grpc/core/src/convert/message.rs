@@ -23,11 +23,11 @@ use cryptix_consensus_core::network::NetworkId;
 use cryptix_core::debug;
 use cryptix_notify::subscription::Command;
 use cryptix_rpc_core::{
-    RpcContextualPeerAddress, RpcError, RpcExtraData, RpcHash, RpcIpAddress, RpcNetworkType, RpcPeerAddress, RpcResult,
-    SubmitBlockRejectReason, SubmitBlockReport,
+    RpcContextualPeerAddress, RpcError, RpcExtraData, RpcFastIntentStatus, RpcHash, RpcIpAddress, RpcNetworkType, RpcPeerAddress,
+    RpcResult, SubmitBlockRejectReason, SubmitBlockReport,
 };
 use cryptix_utils::hex::*;
-use std::str::FromStr;
+use std::{collections::HashMap, str::FromStr};
 
 macro_rules! from {
     // Response capture
@@ -120,6 +120,35 @@ macro_rules! try_from {
             }
         }
     };
+}
+
+fn fast_intent_status_to_proto(status: RpcFastIntentStatus) -> &'static str {
+    match status {
+        RpcFastIntentStatus::Received => "received",
+        RpcFastIntentStatus::Validated => "validated",
+        RpcFastIntentStatus::Locked => "locked",
+        RpcFastIntentStatus::FastConfirmed => "fast_confirmed",
+        RpcFastIntentStatus::Expired => "expired",
+        RpcFastIntentStatus::Dropped => "dropped",
+        RpcFastIntentStatus::Rejected => "rejected",
+        RpcFastIntentStatus::Cancelled => "cancelled",
+        RpcFastIntentStatus::UnknownIntent => "unknown_intent",
+    }
+}
+
+fn fast_intent_status_from_proto(status: &str) -> RpcResult<RpcFastIntentStatus> {
+    match status {
+        "received" => Ok(RpcFastIntentStatus::Received),
+        "validated" => Ok(RpcFastIntentStatus::Validated),
+        "locked" => Ok(RpcFastIntentStatus::Locked),
+        "fast_confirmed" => Ok(RpcFastIntentStatus::FastConfirmed),
+        "expired" => Ok(RpcFastIntentStatus::Expired),
+        "dropped" => Ok(RpcFastIntentStatus::Dropped),
+        "rejected" => Ok(RpcFastIntentStatus::Rejected),
+        "cancelled" => Ok(RpcFastIntentStatus::Cancelled),
+        "unknown_intent" => Ok(RpcFastIntentStatus::UnknownIntent),
+        _ => Err(RpcError::General(format!("invalid fast intent status: {status}"))),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -430,6 +459,69 @@ from!(item: RpcResult<&cryptix_rpc_core::GetCurrentBlockColorResponse>, protowir
     Self { blue: item.blue, error: None }
 });
 
+from!(item: &cryptix_rpc_core::SubmitFastIntentRequest, protowire::SubmitFastIntentRequestMessage, {
+    Self {
+        base_tx: Some((&item.base_tx).into()),
+        intent_nonce: item.intent_nonce,
+        client_created_at_ms: item.client_created_at_ms,
+        max_fee: item.max_fee,
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::SubmitFastIntentResponse>, protowire::SubmitFastIntentResponseMessage, {
+    Self {
+        intent_id: item.intent_id.to_string(),
+        status: fast_intent_status_to_proto(item.status).to_string(),
+        reason: item.reason.clone().unwrap_or_default(),
+        node_epoch: item.node_epoch,
+        expires_at_ms: item.expires_at_ms.unwrap_or_default(),
+        retention_until_ms: item.retention_until_ms.unwrap_or_default(),
+        cancel_token: item.cancel_token.clone().unwrap_or_default(),
+        basechain_submitted: item.basechain_submitted,
+        base_tx_id: item.base_tx_id.as_ref().map(|id| id.to_string()).unwrap_or_default(),
+        error: None,
+    }
+});
+
+from!(item: &cryptix_rpc_core::GetFastIntentStatusRequest, protowire::GetFastIntentStatusRequestMessage, {
+    Self {
+        intent_id: item.intent_id.to_string(),
+        client_last_node_epoch: item.client_last_node_epoch.unwrap_or_default(),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetFastIntentStatusResponse>, protowire::GetFastIntentStatusResponseMessage, {
+    Self {
+        status: fast_intent_status_to_proto(item.status).to_string(),
+        reason: item.reason.clone().unwrap_or_default(),
+        node_epoch: item.node_epoch,
+        expires_at_ms: item.expires_at_ms.unwrap_or_default(),
+        retention_until_ms: item.retention_until_ms.unwrap_or_default(),
+        cancel_token: item.cancel_token.clone().unwrap_or_default(),
+        has_epoch_changed: item.epoch_changed.is_some(),
+        epoch_changed: item.epoch_changed.unwrap_or_default(),
+        base_tx_id: item.base_tx_id.as_ref().map(|id| id.to_string()).unwrap_or_default(),
+        error: None,
+    }
+});
+
+from!(item: &cryptix_rpc_core::CancelFastIntentRequest, protowire::CancelFastIntentRequestMessage, {
+    Self {
+        intent_id: item.intent_id.to_string(),
+        cancel_token: item.cancel_token.clone(),
+        node_epoch: item.node_epoch,
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::CancelFastIntentResponse>, protowire::CancelFastIntentResponseMessage, {
+    Self {
+        status: fast_intent_status_to_proto(item.status).to_string(),
+        reason: item.reason.clone().unwrap_or_default(),
+        node_epoch: item.node_epoch,
+        retention_until_ms: item.retention_until_ms.unwrap_or_default(),
+        has_epoch_changed: item.epoch_changed.is_some(),
+        epoch_changed: item.epoch_changed.unwrap_or_default(),
+        error: None,
+    }
+});
+
 from!(&cryptix_rpc_core::PingRequest, protowire::PingRequestMessage);
 from!(RpcResult<&cryptix_rpc_core::PingResponse>, protowire::PingResponseMessage);
 
@@ -451,8 +543,11 @@ from!(item: RpcResult<&cryptix_rpc_core::GetMetricsResponse>, protowire::GetMetr
         bandwidth_metrics: item.bandwidth_metrics.as_ref().map(|x| x.into()),
         consensus_metrics: item.consensus_metrics.as_ref().map(|x| x.into()),
         storage_metrics: item.storage_metrics.as_ref().map(|x| x.into()),
-        // TODO
-        // custom_metrics : None,
+        custom_metrics: item
+            .custom_metrics
+            .as_ref()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.into())).collect())
+            .unwrap_or_default(),
         error: None,
     }
 });
@@ -917,6 +1012,68 @@ try_from!(item: &protowire::GetCurrentBlockColorResponseMessage, RpcResult<crypt
     }
 });
 
+try_from!(item: &protowire::SubmitFastIntentRequestMessage, cryptix_rpc_core::SubmitFastIntentRequest, {
+    Self {
+        base_tx: item
+            .base_tx
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("SubmitFastIntentRequestMessage".to_string(), "base_tx".to_string()))?
+            .try_into()?,
+        intent_nonce: item.intent_nonce,
+        client_created_at_ms: item.client_created_at_ms,
+        max_fee: item.max_fee,
+    }
+});
+try_from!(item: &protowire::SubmitFastIntentResponseMessage, RpcResult<cryptix_rpc_core::SubmitFastIntentResponse>, {
+    Self {
+        intent_id: RpcHash::from_str(&item.intent_id)?,
+        status: fast_intent_status_from_proto(&item.status)?,
+        reason: (!item.reason.is_empty()).then(|| item.reason.clone()),
+        base_tx_id: (!item.base_tx_id.is_empty()).then(|| RpcHash::from_str(&item.base_tx_id)).transpose()?,
+        node_epoch: item.node_epoch,
+        expires_at_ms: (item.expires_at_ms != 0).then_some(item.expires_at_ms),
+        retention_until_ms: (item.retention_until_ms != 0).then_some(item.retention_until_ms),
+        cancel_token: (!item.cancel_token.is_empty()).then(|| item.cancel_token.clone()),
+        basechain_submitted: item.basechain_submitted,
+    }
+});
+
+try_from!(item: &protowire::GetFastIntentStatusRequestMessage, cryptix_rpc_core::GetFastIntentStatusRequest, {
+    Self {
+        intent_id: RpcHash::from_str(&item.intent_id)?,
+        client_last_node_epoch: (item.client_last_node_epoch != 0).then_some(item.client_last_node_epoch),
+    }
+});
+try_from!(item: &protowire::GetFastIntentStatusResponseMessage, RpcResult<cryptix_rpc_core::GetFastIntentStatusResponse>, {
+    Self {
+        status: fast_intent_status_from_proto(&item.status)?,
+        reason: (!item.reason.is_empty()).then(|| item.reason.clone()),
+        base_tx_id: (!item.base_tx_id.is_empty()).then(|| RpcHash::from_str(&item.base_tx_id)).transpose()?,
+        node_epoch: item.node_epoch,
+        expires_at_ms: (item.expires_at_ms != 0).then_some(item.expires_at_ms),
+        retention_until_ms: (item.retention_until_ms != 0).then_some(item.retention_until_ms),
+        cancel_token: (!item.cancel_token.is_empty()).then(|| item.cancel_token.clone()),
+        epoch_changed: item.has_epoch_changed.then_some(item.epoch_changed),
+    }
+});
+
+try_from!(item: &protowire::CancelFastIntentRequestMessage, cryptix_rpc_core::CancelFastIntentRequest, {
+    Self {
+        intent_id: RpcHash::from_str(&item.intent_id)?,
+        cancel_token: item.cancel_token.clone(),
+        node_epoch: item.node_epoch,
+    }
+});
+try_from!(item: &protowire::CancelFastIntentResponseMessage, RpcResult<cryptix_rpc_core::CancelFastIntentResponse>, {
+    Self {
+        status: fast_intent_status_from_proto(&item.status)?,
+        reason: (!item.reason.is_empty()).then(|| item.reason.clone()),
+        node_epoch: item.node_epoch,
+        retention_until_ms: (item.retention_until_ms != 0).then_some(item.retention_until_ms),
+        epoch_changed: item.has_epoch_changed.then_some(item.epoch_changed),
+    }
+});
+
 try_from!(&protowire::PingRequestMessage, cryptix_rpc_core::PingRequest);
 try_from!(&protowire::PingResponseMessage, RpcResult<cryptix_rpc_core::PingResponse>);
 
@@ -938,8 +1095,16 @@ try_from!(item: &protowire::GetMetricsResponseMessage, RpcResult<cryptix_rpc_cor
         bandwidth_metrics: item.bandwidth_metrics.as_ref().map(|x| x.try_into()).transpose()?,
         consensus_metrics: item.consensus_metrics.as_ref().map(|x| x.try_into()).transpose()?,
         storage_metrics: item.storage_metrics.as_ref().map(|x| x.try_into()).transpose()?,
-        // TODO
-        custom_metrics: None,
+        custom_metrics: if item.custom_metrics.is_empty() {
+            None
+        } else {
+            Some(
+                item.custom_metrics
+                    .iter()
+                    .map(|(k, v)| Ok((k.clone(), v.try_into()?)))
+                    .collect::<RpcResult<HashMap<String, cryptix_rpc_core::CustomMetricValue>>>()?,
+            )
+        },
     }
 });
 

@@ -11,8 +11,8 @@ use cryptix_database::{
 };
 use cryptix_hashes::Hash;
 
-use itertools::Itertools;
 use cryptix_utils::mem_size::MemSizeEstimator;
+use itertools::Itertools;
 use parking_lot::{RwLockUpgradableReadGuard, RwLockWriteGuard};
 use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};

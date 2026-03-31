@@ -6,12 +6,11 @@ use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
 pub use client_pool::ClientPool;
 use connection_event::ConnectionEvent;
-use futures::{future::FutureExt, pin_mut, select};
 use cryptix_core::{debug, error, trace};
 use cryptix_grpc_core::{
     channel::NotificationChannel,
     ops::CryptixdPayloadOps,
-    protowire::{cryptixd_request, rpc_client::RpcClient, GetInfoRequestMessage, CryptixdRequest, CryptixdResponse},
+    protowire::{cryptixd_request, rpc_client::RpcClient, CryptixdRequest, CryptixdResponse, GetInfoRequestMessage},
     RPC_MAX_MESSAGE_SIZE,
 };
 use cryptix_notify::{
@@ -40,6 +39,7 @@ use cryptix_utils_tower::{
     counters::TowerConnectionCounters,
     middleware::{measure_request_body_size_layer, CountBytesBody, MapResponseBodyLayer, ServiceBuilder},
 };
+use futures::{future::FutureExt, pin_mut, select};
 use regex::Regex;
 use std::{
     sync::{
@@ -277,6 +277,9 @@ impl RpcApi for GrpcClient {
     route!(get_fee_estimate_call, GetFeeEstimate);
     route!(get_fee_estimate_experimental_call, GetFeeEstimateExperimental);
     route!(get_current_block_color_call, GetCurrentBlockColor);
+    route!(submit_fast_intent_call, SubmitFastIntent);
+    route!(get_fast_intent_status_call, GetFastIntentStatus);
+    route!(cancel_fast_intent_call, CancelFastIntent);
 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Notification API

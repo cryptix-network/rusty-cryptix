@@ -9,10 +9,10 @@ use crate::{
         Single, Subscription, UtxosChangedMutationPolicy,
     },
 };
-use itertools::Itertools;
 use cryptix_addresses::{Address, Prefix};
 use cryptix_consensus_core::tx::ScriptPublicKey;
 use cryptix_core::trace;
+use itertools::Itertools;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::{
     collections::hash_set,

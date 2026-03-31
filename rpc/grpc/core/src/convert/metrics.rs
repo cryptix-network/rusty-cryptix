@@ -80,6 +80,17 @@ from!(item: &cryptix_rpc_core::StorageMetrics, protowire::StorageMetrics, {
     }
 });
 
+from!(item: &cryptix_rpc_core::CustomMetricValue, protowire::CustomMetricValue, {
+    let value = match item {
+        cryptix_rpc_core::CustomMetricValue::Placeholder => None,
+        cryptix_rpc_core::CustomMetricValue::U64(v) => Some(protowire::custom_metric_value::Value::U64Value(*v)),
+        cryptix_rpc_core::CustomMetricValue::F64(v) => Some(protowire::custom_metric_value::Value::F64Value(*v)),
+        cryptix_rpc_core::CustomMetricValue::Bool(v) => Some(protowire::custom_metric_value::Value::BoolValue(*v)),
+        cryptix_rpc_core::CustomMetricValue::Text(v) => Some(protowire::custom_metric_value::Value::TextValue(v.clone())),
+    };
+    Self { value }
+});
+
 // ----------------------------------------------------------------------------
 // protowire to rpc_core
 // ----------------------------------------------------------------------------
@@ -153,3 +164,40 @@ try_from!(item: &protowire::StorageMetrics, cryptix_rpc_core::StorageMetrics, {
         storage_size_bytes: item.storage_size_bytes,
     }
 });
+
+try_from!(item: &protowire::CustomMetricValue, cryptix_rpc_core::CustomMetricValue, {
+    match item.value.as_ref() {
+        None => cryptix_rpc_core::CustomMetricValue::Placeholder,
+        Some(protowire::custom_metric_value::Value::U64Value(v)) => cryptix_rpc_core::CustomMetricValue::U64(*v),
+        Some(protowire::custom_metric_value::Value::F64Value(v)) => cryptix_rpc_core::CustomMetricValue::F64(*v),
+        Some(protowire::custom_metric_value::Value::BoolValue(v)) => cryptix_rpc_core::CustomMetricValue::Bool(*v),
+        Some(protowire::custom_metric_value::Value::TextValue(v)) => cryptix_rpc_core::CustomMetricValue::Text(v.clone()),
+    }
+});
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_metric_value_roundtrip() {
+        let variants = vec![
+            cryptix_rpc_core::CustomMetricValue::Placeholder,
+            cryptix_rpc_core::CustomMetricValue::U64(7),
+            cryptix_rpc_core::CustomMetricValue::F64(0.25),
+            cryptix_rpc_core::CustomMetricValue::Bool(true),
+            cryptix_rpc_core::CustomMetricValue::Text("ok".to_string()),
+        ];
+
+        for variant in variants {
+            let proto: protowire::CustomMetricValue = (&variant).into();
+            let back: cryptix_rpc_core::CustomMetricValue = (&proto).try_into().expect("custom metric conversion");
+            match (variant, back) {
+                (cryptix_rpc_core::CustomMetricValue::F64(a), cryptix_rpc_core::CustomMetricValue::F64(b)) => {
+                    assert!((a - b).abs() < f64::EPSILON);
+                }
+                (a, b) => assert_eq!(format!("{a:?}"), format!("{b:?}")),
+            }
+        }
+    }
+}

@@ -1,5 +1,4 @@
 use crate::matrix::Matrix;
-use js_sys::BigInt;
 use cryptix_consensus_client::Header;
 use cryptix_consensus_client::HeaderT;
 use cryptix_consensus_core::hashing;
@@ -8,6 +7,7 @@ use cryptix_hashes::PowHash;
 use cryptix_math::Uint256;
 use cryptix_utils::hex::FromHex;
 use cryptix_utils::hex::ToHex;
+use js_sys::BigInt;
 use num::Float;
 use wasm_bindgen::prelude::*;
 use workflow_wasm::convert::TryCastFromJs;

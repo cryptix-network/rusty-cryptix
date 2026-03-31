@@ -3,7 +3,6 @@
 //! since the syncee no longer uses them in the rusty-cryptix design where the full sub-DAG is sent
 //!
 
-use itertools::Itertools;
 use cryptix_p2p_lib::{
     common::ProtocolError,
     dequeue, dequeue_with_request_id, make_response,
@@ -13,6 +12,7 @@ use cryptix_p2p_lib::{
     },
     IncomingRoute, Router,
 };
+use itertools::Itertools;
 use log::debug;
 use std::sync::Arc;
 

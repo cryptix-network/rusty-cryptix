@@ -1,5 +1,3 @@
-use indexmap::IndexSet;
-use itertools::Itertools;
 use cryptix_consensus::consensus::Consensus;
 use cryptix_consensus::model::stores::virtual_state::VirtualStateStoreReader;
 use cryptix_consensus::params::Params;
@@ -15,6 +13,8 @@ use cryptix_consensus_core::tx::{
 use cryptix_consensus_core::utxo::utxo_view::UtxoView;
 use cryptix_core::trace;
 use cryptix_utils::sim::{Environment, Process, Resumption, Suspension};
+use indexmap::IndexSet;
+use itertools::Itertools;
 use rand::rngs::ThreadRng;
 use rand::Rng;
 use rand_distr::{Distribution, Exp};

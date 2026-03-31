@@ -52,6 +52,9 @@ message CryptixdMessage {
     IbdChainBlockLocatorMessage ibdChainBlockLocator = 54;
     RequestAntipastMessage requestAntipast = 55;
     RequestNextPruningPointAndItsAnticoneBlocksMessage requestNextPruningPointAndItsAnticoneBlocks = 56;
+    RequestFastIntentsMessage requestFastIntents = 57;
+    FastIntentMessage fastIntent = 58;
+    FastMicroblockMessage fastMicroblock = 59;
   }
 }
 

@@ -1,7 +1,7 @@
 use super::events::EventType;
 use borsh::{BorshDeserialize, BorshSerialize};
-use derive_more::Display;
 use cryptix_addresses::Address;
+use derive_more::Display;
 use serde::{Deserialize, Serialize};
 use workflow_serializer::prelude::*;
 

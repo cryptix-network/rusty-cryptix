@@ -1,5 +1,4 @@
 use crate::{flow_context::FlowContext, flow_trait::Flow};
-use itertools::Itertools;
 use cryptix_addressmanager::NetAddress;
 use cryptix_p2p_lib::{
     common::ProtocolError,
@@ -8,6 +7,7 @@ use cryptix_p2p_lib::{
     IncomingRoute, Router,
 };
 use cryptix_utils::networking::IpAddress;
+use itertools::Itertools;
 use rand::seq::SliceRandom;
 use std::sync::Arc;
 

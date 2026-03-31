@@ -15,8 +15,8 @@ pub use crate::settings::WalletSettings;
 pub use crate::storage::{IdT, Interface, PrvKeyDataId, PrvKeyDataInfo, TransactionId, TransactionRecord, WalletDescriptor};
 pub use crate::tx::{Fees, PaymentDestination, PaymentOutput, PaymentOutputs};
 pub use crate::utils::{
-    cryptix_suffix, cryptix_to_sompi, sompi_to_cryptix, sompi_to_cryptix_string, sompi_to_cryptix_string_with_suffix, try_cryptix_str_to_sompi,
-    try_cryptix_str_to_sompi_i64,
+    cryptix_suffix, cryptix_to_sompi, sompi_to_cryptix, sompi_to_cryptix_string, sompi_to_cryptix_string_with_suffix,
+    try_cryptix_str_to_sompi, try_cryptix_str_to_sompi_i64,
 };
 pub use crate::utxo::balance::{Balance, BalanceStrings};
 pub use crate::wallet::args::*;

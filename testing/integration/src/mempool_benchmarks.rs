@@ -8,7 +8,6 @@ use crate::{
     },
     tasks::{block::group::MinerGroupTask, daemon::DaemonTask, tx::group::TxSenderGroupTask, Stopper, TasksRunner},
 };
-use futures_util::future::join_all;
 use cryptix_addresses::Address;
 use cryptix_consensus::params::Params;
 use cryptix_consensus_core::{constants::SOMPI_PER_CRYPTIX, network::NetworkType, tx::Transaction};
@@ -21,6 +20,7 @@ use cryptix_rpc_core::{api::rpc::RpcApi, Notification, RpcError};
 use cryptix_txscript::pay_to_address_script;
 use cryptix_utils::fd_budget;
 use cryptixd_lib::args::Args;
+use futures_util::future::join_all;
 use parking_lot::Mutex;
 use rand::thread_rng;
 use rand_distr::{Distribution, Exp};

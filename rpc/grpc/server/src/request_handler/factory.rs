@@ -3,7 +3,7 @@ use std::sync::Arc;
 use super::{
     handler::RequestHandler,
     handler_trait::Handler,
-    interface::{Interface, CryptixdMethod, CryptixdRoutingPolicy},
+    interface::{CryptixdMethod, CryptixdRoutingPolicy, Interface},
     method::Method,
 };
 use crate::{
@@ -81,6 +81,9 @@ impl Factory {
                 GetFeeEstimate,
                 GetFeeEstimateExperimental,
                 GetCurrentBlockColor,
+                SubmitFastIntent,
+                GetFastIntentStatus,
+                CancelFastIntent,
                 NotifyBlockAdded,
                 NotifyNewBlockTemplate,
                 NotifyFinalityConflict,

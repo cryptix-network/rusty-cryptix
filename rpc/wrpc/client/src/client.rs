@@ -646,6 +646,9 @@ impl RpcApi for CryptixRpcClient {
             SubmitBlock,
             SubmitTransaction,
             SubmitTransactionReplacement,
+            SubmitFastIntent,
+            GetFastIntentStatus,
+            CancelFastIntent,
             Unban,
         ]
     );

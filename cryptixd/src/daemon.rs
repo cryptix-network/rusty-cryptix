@@ -11,6 +11,7 @@ use cryptix_core::{cryptixd_env::version, task::tick::TickService};
 use cryptix_database::prelude::CachePolicy;
 use cryptix_grpc_server::service::GrpcService;
 use cryptix_notify::{address::tracker::Tracker, subscription::context::SubscriptionContext};
+use cryptix_rpc_service::hfa::HfaRuntimeConfig;
 use cryptix_rpc_service::service::RpcCoreService;
 use cryptix_txscript::caches::TxScriptCacheCounters;
 use cryptix_utils::git;
@@ -96,6 +97,15 @@ pub fn validate_args(args: &Args) -> ConfigResult<()> {
     }
     if args.max_tracked_addresses > Tracker::MAX_ADDRESS_UPPER_BOUND {
         return Err(ConfigError::MaxTrackedAddressesTooHigh(Tracker::MAX_ADDRESS_UPPER_BOUND));
+    }
+    if !(args.hfa_cpu > 0.0 && args.hfa_cpu <= 1.0) {
+        return Err(ConfigError::HfaCpuOutOfRange(args.hfa_cpu));
+    }
+    if !(100..=600_000).contains(&args.hfa_drift_ms) {
+        return Err(ConfigError::HfaDriftOutOfRange(args.hfa_drift_ms));
+    }
+    if args.hfa_microblock_interval_ms_normal == 0 {
+        return Err(ConfigError::HfaMicroblockIntervalMsNormalOutOfRange(args.hfa_microblock_interval_ms_normal));
     }
     Ok(())
 }
@@ -236,6 +246,17 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
 
     // Print package name and version
     info!("{} v{}", env!("CARGO_PKG_NAME"), git::with_short_hash(version()));
+    if args.hfa {
+        info!(
+            "Fastchain HWA: ENABLED (runtime fast rail feature is active for this node process, cpu low-water ratio: {:.2}, drift window: {} ms, normal microblock interval: {} ms)",
+            args.hfa_cpu,
+            args.hfa_drift_ms,
+            args.hfa_microblock_interval_ms_normal
+        );
+    }
+    if args.datacenter {
+        info!("Datacenter mode: ENABLED (private/unroutable peer addresses are filtered by address manager)");
+    }
 
     assert!(!db_dir.to_str().unwrap().is_empty());
     info!("Application directory: {}", app_dir.display());
@@ -427,7 +448,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         None
     };
 
-    let (address_manager, port_mapping_extender_svc) = AddressManager::new(config.clone(), meta_db, tick_service.clone());
+    let (address_manager, port_mapping_extender_svc) = AddressManager::new(config.clone(), meta_db, tick_service.clone(), args.datacenter);
 
     let mining_manager = MiningManagerProxy::new(Arc::new(MiningManager::new_with_extended_config(
         config.target_time_per_block,
@@ -460,6 +481,10 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         p2p_tower_counters.clone(),
     ));
 
+    let mut hfa_runtime_config = HfaRuntimeConfig::new(args.hfa, args.hfa_cpu);
+    hfa_runtime_config.clock_drift_max_ms = args.hfa_drift_ms;
+    hfa_runtime_config.microblock_interval_ms_normal = args.hfa_microblock_interval_ms_normal;
+
     let rpc_core_service = Arc::new(RpcCoreService::new(
         consensus_manager.clone(),
         notify_service.notifier(),
@@ -477,6 +502,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         p2p_tower_counters.clone(),
         grpc_tower_counters.clone(),
         system_info,
+        hfa_runtime_config,
     ));
     let grpc_service_broadcasters: usize = 3; // TODO: add a command line argument or derive from other arg/config/host-related fields
     let grpc_service = if !args.disable_grpc {

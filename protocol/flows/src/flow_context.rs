@@ -3,9 +3,9 @@ use crate::flowcontext::{
     process_queue::ProcessQueue,
     transactions::TransactionsSpread,
 };
+use crate::hfa::{FastIntentP2pData, FastMicroblockP2pData, HfaP2pBridge, HFA_P2P_SERVICE_BIT};
 use crate::{v5, v6};
 use async_trait::async_trait;
-use futures::future::join_all;
 use cryptix_addressmanager::AddressManager;
 use cryptix_connectionmanager::ConnectionManager;
 use cryptix_consensus_core::api::{BlockValidationFuture, BlockValidationFutures};
@@ -19,8 +19,8 @@ use cryptix_consensus_notify::{
 };
 use cryptix_consensusmanager::{BlockProcessingBatch, ConsensusInstance, ConsensusManager, ConsensusProxy};
 use cryptix_core::{
-    debug, info,
     cryptixd_env::{name, version},
+    debug, info,
     task::tick::TickService,
 };
 use cryptix_core::{time::unix_now, warn};
@@ -32,11 +32,12 @@ use cryptix_p2p_lib::{
     common::ProtocolError,
     convert::model::version::Version,
     make_message,
-    pb::{cryptixd_message::Payload, InvRelayBlockMessage},
-    ConnectionInitializer, Hub, CryptixdHandshake, PeerKey, PeerProperties, Router,
+    pb::{cryptixd_message::Payload, FastIntentMessage, FastMicroblockMessage, InvRelayBlockMessage},
+    ConnectionInitializer, CryptixdHandshake, Hub, PeerKey, PeerProperties, Router,
 };
 use cryptix_utils::iter::IterExtensions;
 use cryptix_utils::networking::PeerId;
+use futures::future::join_all;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -221,6 +222,7 @@ pub struct FlowContextInner {
     ibd_metadata: Arc<RwLock<Option<IbdMetadata>>>,
     pub address_manager: Arc<Mutex<AddressManager>>,
     connection_manager: RwLock<Option<Arc<ConnectionManager>>>,
+    hfa_bridge: RwLock<Option<Arc<dyn HfaP2pBridge>>>,
     mining_manager: MiningManagerProxy,
     pub(crate) tick_service: Arc<TickService>,
     notification_root: Arc<ConsensusNotificationRoot>,
@@ -324,6 +326,7 @@ impl FlowContext {
                 hub,
                 address_manager,
                 connection_manager: Default::default(),
+                hfa_bridge: Default::default(),
                 mining_manager,
                 tick_service,
                 notification_root,
@@ -363,6 +366,18 @@ impl FlowContext {
 
     pub fn connection_manager(&self) -> Option<Arc<ConnectionManager>> {
         self.connection_manager.read().clone()
+    }
+
+    pub fn set_hfa_bridge(&self, bridge: Arc<dyn HfaP2pBridge>) {
+        self.hfa_bridge.write().replace(bridge);
+    }
+
+    pub fn hfa_bridge(&self) -> Option<Arc<dyn HfaP2pBridge>> {
+        self.hfa_bridge.read().clone()
+    }
+
+    pub fn is_hfa_p2p_enabled(&self) -> bool {
+        self.hfa_bridge().map(|bridge| bridge.hfa_enabled()).unwrap_or(false)
     }
 
     pub fn consensus(&self) -> ConsensusInstance {
@@ -686,6 +701,61 @@ impl FlowContext {
     pub async fn broadcast_transactions<I: IntoIterator<Item = TransactionId>>(&self, transaction_ids: I, should_throttle: bool) {
         self.transactions_spread.write().await.broadcast_transactions(transaction_ids, should_throttle).await
     }
+
+    pub async fn broadcast_fast_intent(&self, intent: &FastIntentP2pData) {
+        if !self.is_hfa_p2p_enabled() {
+            return;
+        }
+
+        let msg = make_message!(
+            Payload::FastIntent,
+            FastIntentMessage {
+                intent_id: Some(intent.intent_id.into()),
+                base_transaction: Some((&intent.base_tx).into()),
+                intent_nonce: intent.intent_nonce,
+                client_created_at_ms: intent.client_created_at_ms,
+                max_fee: intent.max_fee,
+            }
+        );
+        for peer in self.hub.active_peers() {
+            if (peer.properties().services & HFA_P2P_SERVICE_BIT) == 0 {
+                continue;
+            }
+            let _ = self.hub.send(peer.key(), msg.clone()).await;
+        }
+    }
+
+    pub async fn broadcast_fast_microblock(&self, microblock: FastMicroblockP2pData) {
+        if !self.is_hfa_p2p_enabled() {
+            return;
+        }
+
+        let msg = make_message!(
+            Payload::FastMicroblock,
+            FastMicroblockMessage {
+                microblock_time_ms: microblock.microblock_time_ms,
+                intent_ids: microblock.intent_ids.iter().map(Into::into).collect(),
+            }
+        );
+        for peer in self.hub.active_peers() {
+            if (peer.properties().services & HFA_P2P_SERVICE_BIT) == 0 {
+                continue;
+            }
+            let _ = self.hub.send(peer.key(), msg.clone()).await;
+        }
+    }
+
+    pub async fn broadcast_outbound_fast_microblocks(&self) {
+        let Some(bridge) = self.hfa_bridge() else {
+            return;
+        };
+        if !bridge.hfa_enabled() {
+            return;
+        }
+        for microblock in bridge.take_outbound_fast_microblocks() {
+            self.broadcast_fast_microblock(microblock).await;
+        }
+    }
 }
 
 #[async_trait]
@@ -705,6 +775,9 @@ impl ConnectionInitializer for FlowContext {
         // Subnets are not currently supported
         let mut self_version_message = Version::new(local_address, self.node_id, network_name.clone(), None, PROTOCOL_VERSION);
         self_version_message.add_user_agent(name(), version(), &self.config.user_agent_comments);
+        if self.is_hfa_p2p_enabled() {
+            self_version_message.services |= HFA_P2P_SERVICE_BIT;
+        }
         // TODO: get number of live services
         // TODO: disable_relay_tx from config/cmd
 
@@ -731,15 +804,24 @@ impl ConnectionInitializer for FlowContext {
         debug!("protocol versions - self: {}, peer: {}", PROTOCOL_VERSION, peer_version.protocol_version);
 
         // Register all flows according to version
+        let local_hfa_enabled = self.is_hfa_p2p_enabled();
+        let peer_hfa_enabled = (peer_version.services & HFA_P2P_SERVICE_BIT) != 0;
+        let hfa_capable = local_hfa_enabled && peer_hfa_enabled;
+        debug!(
+            "HFA P2P capability for peer {}: local_enabled={} peer_enabled={} peer_services=0x{:x} capable={}",
+            router, local_hfa_enabled, peer_hfa_enabled, peer_version.services, hfa_capable
+        );
+
         let (flows, applied_protocol_version) = match peer_version.protocol_version {
-            v if v >= PROTOCOL_VERSION => (v6::register(self.clone(), router.clone()), PROTOCOL_VERSION),
-            5 => (v5::register(self.clone(), router.clone()), 5),
+            v if v >= PROTOCOL_VERSION => (v6::register(self.clone(), router.clone(), hfa_capable), PROTOCOL_VERSION),
+            5 => (v5::register(self.clone(), router.clone(), hfa_capable), 5),
             v => return Err(ProtocolError::VersionMismatch(PROTOCOL_VERSION, v)),
         };
 
         // Build and register the peer properties
         let peer_properties = Arc::new(PeerProperties {
             user_agent: peer_version.user_agent.to_owned(),
+            services: peer_version.services,
             advertised_protocol_version: peer_version.protocol_version,
             protocol_version: applied_protocol_version,
             disable_relay_tx: peer_version.disable_relay_tx,

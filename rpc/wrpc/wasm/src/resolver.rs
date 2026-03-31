@@ -1,9 +1,9 @@
 use crate::client::{RpcClient, RpcConfig};
 use crate::imports::*;
-use js_sys::Array;
 pub use cryptix_rpc_macros::declare_typescript_wasm_interface as declare;
 use cryptix_wrpc_client::node::NodeDescriptor;
 use cryptix_wrpc_client::Resolver as NativeResolver;
+use js_sys::Array;
 use serde::ser;
 use workflow_wasm::extensions::ObjectExtension;
 

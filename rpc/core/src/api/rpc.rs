@@ -7,8 +7,8 @@
 use crate::api::connection::DynRpcConnection;
 use crate::{model::*, notify::connection::ChannelConnection, RpcResult};
 use async_trait::async_trait;
-use downcast::{downcast_sync, AnySync};
 use cryptix_notify::{listener::ListenerId, scope::Scope, subscription::Command};
+use downcast::{downcast_sync, AnySync};
 use std::sync::Arc;
 
 pub const MAX_SAFE_WINDOW_SIZE: u32 = 10_000;
@@ -223,6 +223,57 @@ pub trait RpcApi: Sync + Send + AnySync {
         connection: Option<&DynRpcConnection>,
         request: SubmitTransactionReplacementRequest,
     ) -> RpcResult<SubmitTransactionReplacementResponse>;
+
+    /// Submits a fast rail intent.
+    async fn submit_fast_intent(
+        &self,
+        base_tx: RpcTransaction,
+        intent_nonce: u64,
+        client_created_at_ms: u64,
+        max_fee: u64,
+    ) -> RpcResult<SubmitFastIntentResponse> {
+        self.submit_fast_intent_call(None, SubmitFastIntentRequest { base_tx, intent_nonce, client_created_at_ms, max_fee }).await
+    }
+    async fn submit_fast_intent_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: SubmitFastIntentRequest,
+    ) -> RpcResult<SubmitFastIntentResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    /// Returns the local status of a fast rail intent.
+    async fn get_fast_intent_status(
+        &self,
+        intent_id: RpcHash,
+        client_last_node_epoch: Option<u64>,
+    ) -> RpcResult<GetFastIntentStatusResponse> {
+        self.get_fast_intent_status_call(None, GetFastIntentStatusRequest { intent_id, client_last_node_epoch }).await
+    }
+    async fn get_fast_intent_status_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetFastIntentStatusRequest,
+    ) -> RpcResult<GetFastIntentStatusResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    /// Cancels a local fast rail intent context.
+    async fn cancel_fast_intent(
+        &self,
+        intent_id: RpcHash,
+        cancel_token: String,
+        node_epoch: u64,
+    ) -> RpcResult<CancelFastIntentResponse> {
+        self.cancel_fast_intent_call(None, CancelFastIntentRequest { intent_id, cancel_token, node_epoch }).await
+    }
+    async fn cancel_fast_intent_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: CancelFastIntentRequest,
+    ) -> RpcResult<CancelFastIntentResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
 
     /// Requests information about a specific block.
     async fn get_block(&self, hash: RpcHash, include_transactions: bool) -> RpcResult<RpcBlock> {

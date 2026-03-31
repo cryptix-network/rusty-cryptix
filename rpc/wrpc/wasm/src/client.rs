@@ -3,7 +3,6 @@
 use crate::imports::*;
 use crate::Resolver;
 use crate::{RpcEventCallback, RpcEventType, RpcEventTypeOrCallback};
-use js_sys::{Function, Object};
 use cryptix_addresses::{Address, AddressOrStringArrayT};
 use cryptix_consensus_client::UtxoEntryReference;
 use cryptix_consensus_core::network::{NetworkType, NetworkTypeT};
@@ -17,6 +16,7 @@ pub use cryptix_rpc_macros::{
     build_wrpc_wasm_bindgen_interface, build_wrpc_wasm_bindgen_subscriptions, declare_typescript_wasm_interface as declare,
 };
 use cryptix_wasm_core::events::{get_event_targets, Sink};
+use js_sys::{Function, Object};
 pub use serde_wasm_bindgen::from_value;
 use workflow_rpc::client::Ctl;
 pub use workflow_rpc::client::IConnectOptions;

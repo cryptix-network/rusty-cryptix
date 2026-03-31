@@ -29,10 +29,11 @@ impl Transfer {
         let outputs = PaymentOutputs::from((target_address.clone(), amount_sompi));
 
         // let ctx_ = ctx.clone();
-        let (summary, _ids) = account
+        let (summary, _ids, _fast_summary) = account
             .send(
                 outputs.into(),
                 priority_fee_sompi.into(),
+                None,
                 None,
                 wallet_secret,
                 payment_secret,

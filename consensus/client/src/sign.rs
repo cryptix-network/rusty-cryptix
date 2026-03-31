@@ -1,6 +1,5 @@
 use crate::transaction::Transaction;
 use core::iter::once;
-use itertools::Itertools;
 use cryptix_consensus_core::{
     hashing::{
         sighash::{calc_schnorr_signature_hash, SigHashReusedValues},
@@ -9,6 +8,7 @@ use cryptix_consensus_core::{
     tx::PopulatedTransaction,
     //sign::Signed,
 };
+use itertools::Itertools;
 use std::collections::BTreeMap;
 
 /// A wrapper enum that represents the transaction signed state. A transaction

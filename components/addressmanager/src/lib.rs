@@ -5,6 +5,10 @@ extern crate self as address_manager;
 use std::{collections::HashSet, iter, net::SocketAddr, sync::Arc, time::Duration};
 
 use address_manager::port_mapping_extender::Extender;
+use cryptix_consensus_core::config::Config;
+use cryptix_core::{debug, info, task::tick::TickService, time::unix_now, warn};
+use cryptix_database::prelude::{CachePolicy, StoreResultExtensions, DB};
+use cryptix_utils::networking::IpAddress;
 use igd_next::{
     self as igd, aio::tokio::Tokio, AddAnyPortError, AddPortError, Gateway, GetExternalIpError, GetGenericPortMappingEntryError,
     SearchError,
@@ -13,10 +17,6 @@ use itertools::{
     Either::{Left, Right},
     Itertools,
 };
-use cryptix_consensus_core::config::Config;
-use cryptix_core::{debug, info, task::tick::TickService, time::unix_now, warn};
-use cryptix_database::prelude::{CachePolicy, StoreResultExtensions, DB};
-use cryptix_utils::networking::IpAddress;
 use local_ip_address::list_afinet_netifas;
 use parking_lot::Mutex;
 use stores::banned_address_store::{BannedAddressesStore, BannedAddressesStoreReader, ConnectionBanTimestamp, DbBannedAddressesStore};
@@ -56,15 +56,22 @@ pub struct AddressManager {
     address_store: address_store_with_cache::Store,
     config: Arc<Config>,
     local_net_addresses: Vec<NetAddress>,
+    datacenter_mode: bool,
 }
 
 impl AddressManager {
-    pub fn new(config: Arc<Config>, db: Arc<DB>, tick_service: Arc<TickService>) -> (Arc<Mutex<Self>>, Option<Extender>) {
+    pub fn new(
+        config: Arc<Config>,
+        db: Arc<DB>,
+        tick_service: Arc<TickService>,
+        datacenter_mode: bool,
+    ) -> (Arc<Mutex<Self>>, Option<Extender>) {
         let mut instance = Self {
             banned_address_store: DbBannedAddressesStore::new(db.clone(), CachePolicy::Count(MAX_ADDRESSES)),
             address_store: address_store_with_cache::new(db),
             local_net_addresses: Vec::new(),
             config,
+            datacenter_mode,
         };
 
         let extender = instance.init_local_addresses(tick_service);
@@ -251,33 +258,13 @@ impl AddressManager {
         }
     }
 
-    // If the data center returns false positives for port scans, use this function.
-    /* 
-    pub fn add_address(&mut self, address: NetAddress) {
-            // Filter loopback / unspecified
-            if address.ip.is_loopback() || address.ip.is_unspecified() {
-                debug!("[Address manager] skipping local address {}", address.ip);
-                return;
-            }
-
-            // Filter private / unroutable IPs
-            if !address.ip.is_publicly_routable() {
-                debug!("[Address manager] skipping private or unroutable address {}", address.ip);
-                return;
-            }
-
-            if self.address_store.has(address) {
-                return;
-            }
-
-            // We mark `connection_failed_count` as 0 only after first success
-            self.address_store.set(address, 1);
-        }
-    */
-
     pub fn add_address(&mut self, address: NetAddress) {
         if address.ip.is_loopback() || address.ip.is_unspecified() {
             debug!("[Address manager] skipping local address {}", address.ip);
+            return;
+        }
+        if self.datacenter_mode && !address.ip.is_publicly_routable() {
+            debug!("[Address manager] datacenter mode: skipping private or unroutable address {}", address.ip);
             return;
         }
 
@@ -360,9 +347,9 @@ mod address_store_with_cache {
         sync::Arc,
     };
 
-    use itertools::Itertools;
     use cryptix_database::prelude::{CachePolicy, DB};
     use cryptix_utils::networking::PrefixBucket;
+    use itertools::Itertools;
     use rand::{
         distributions::{WeightedError, WeightedIndex},
         prelude::Distribution,
@@ -573,7 +560,7 @@ mod address_store_with_cache {
 
             let db = create_temp_db!(ConnBuilder::default().with_files_limit(10));
             let config = Config::new(SIMNET_PARAMS);
-            let (am, _) = AddressManager::new(Arc::new(config), db.1, Arc::new(TickService::default()));
+            let (am, _) = AddressManager::new(Arc::new(config), db.1, Arc::new(TickService::default()), false);
 
             let mut am_guard = am.lock();
 

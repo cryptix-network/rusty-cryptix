@@ -1,11 +1,11 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use itertools::Itertools;
 use cryptix_consensus_core::{
     subnets::SUBNETWORK_ID_NATIVE,
     tx::{Transaction, TransactionInput, TransactionOutpoint},
 };
 use cryptix_hashes::{HasherBase, TransactionID};
 use cryptix_mining::{model::topological_index::TopologicalIndex, FeerateTransactionKey, Frontier, Policy};
+use itertools::Itertools;
 use rand::{thread_rng, Rng};
 use std::{
     collections::{hash_set::Iter, HashMap, HashSet},

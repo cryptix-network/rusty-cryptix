@@ -16,9 +16,9 @@ use crate::{
         transaction_validator::TransactionValidator, traversal_manager::DagTraversalManager, window::DualWindowManager,
     },
 };
-use itertools::Itertools;
 use cryptix_consensus_core::mass::MassCalculator;
 use cryptix_txscript::caches::TxScriptCacheCounters;
+use itertools::Itertools;
 use std::sync::{atomic::AtomicBool, Arc};
 
 pub type DbGhostdagManager =

@@ -1,8 +1,8 @@
 use self::stop::StopTask;
 use async_trait::async_trait;
+use cryptix_utils::triggers::SingleTrigger;
 use futures_util::future::join_all;
 use itertools::Itertools;
-use cryptix_utils::triggers::SingleTrigger;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 

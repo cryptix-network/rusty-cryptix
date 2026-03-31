@@ -4,9 +4,9 @@ use crate::{
     Policy, RebalancingWeightedTransactionSelector,
 };
 
-use feerate_key::FeerateTransactionKey;
 use cryptix_consensus_core::{block::TemplateTransactionSelector, tx::Transaction};
 use cryptix_core::trace;
+use feerate_key::FeerateTransactionKey;
 use rand::{distributions::Uniform, prelude::Distribution, Rng};
 use search_tree::SearchTree;
 use selectors::{SequenceSelector, SequenceSelectorInput, TakeAllSelector};

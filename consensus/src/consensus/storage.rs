@@ -26,10 +26,10 @@ use crate::{
 };
 
 use super::cache_policy_builder::CachePolicyBuilder as PolicyBuilder;
-use itertools::Itertools;
 use cryptix_consensus_core::{blockstatus::BlockStatus, BlockHashSet};
 use cryptix_database::registry::DatabaseStorePrefixes;
 use cryptix_hashes::Hash;
+use itertools::Itertools;
 use parking_lot::RwLock;
 use std::{ops::DerefMut, sync::Arc};
 

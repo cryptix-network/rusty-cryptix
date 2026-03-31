@@ -1,5 +1,5 @@
-use itertools::Itertools;
 use cryptix_consensus_core::tx::Transaction;
+use itertools::Itertools;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     iter::{FusedIterator, Map},

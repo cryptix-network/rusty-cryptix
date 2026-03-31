@@ -4,7 +4,6 @@ use crate::{
     manager::{ManagerEvent, RegistrationRequest},
     request_handler::{factory::Factory, interface::Interface},
 };
-use futures::{FutureExt, Stream};
 use cryptix_core::{debug, info, warn};
 use cryptix_grpc_core::{
     protowire::{
@@ -31,6 +30,7 @@ use cryptix_utils_tower::{
     counters::TowerConnectionCounters,
     middleware::{measure_request_body_size_layer, CountBytesBody, MapResponseBodyLayer},
 };
+use futures::{FutureExt, Stream};
 use std::fmt::Debug;
 use std::{
     pin::Pin,

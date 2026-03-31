@@ -259,7 +259,6 @@ impl TemplateTransactionSelector for RebalancingWeightedTransactionSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use itertools::Itertools;
     use cryptix_consensus_core::{
         constants::{MAX_TX_IN_SEQUENCE_NUM, SOMPI_PER_CRYPTIX, TX_VERSION},
         mass::transaction_estimated_serialized_size,
@@ -267,6 +266,7 @@ mod tests {
         tx::{Transaction, TransactionId, TransactionInput, TransactionOutpoint, TransactionOutput},
     };
     use cryptix_txscript::{pay_to_script_hash_signature_script, test_helpers::op_true_script};
+    use itertools::Itertools;
     use std::{collections::HashSet, sync::Arc};
 
     use crate::{

@@ -3,7 +3,7 @@ use crate::{
     core::adaptor::ConnectionInitializer,
     handshake::CryptixdHandshake,
     pb::{self, VersionMessage},
-    IncomingRoute, CryptixdMessagePayloadType, Router,
+    CryptixdMessagePayloadType, IncomingRoute, Router,
 };
 use cryptix_core::{debug, time::unix_now, trace, warn};
 use std::sync::Arc;

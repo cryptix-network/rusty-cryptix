@@ -6,8 +6,6 @@ pub use crate::result::Result;
 pub use async_std::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 pub use async_trait::async_trait;
 pub use cfg_if::cfg_if;
-pub use futures::*;
-pub use js_sys::Function;
 pub use cryptix_consensus_core::network::{NetworkId, NetworkIdT};
 pub use cryptix_notify::{
     error::{Error as NotifyError, Result as NotifyResult},
@@ -24,6 +22,8 @@ pub use cryptix_rpc_core::{
     notify::{connection::ChannelConnection, mode::NotificationMode},
     prelude::*,
 };
+pub use futures::*;
+pub use js_sys::Function;
 pub use serde::{Deserialize, Serialize};
 pub use std::sync::{
     atomic::{AtomicBool, Ordering},

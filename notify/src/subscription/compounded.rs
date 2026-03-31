@@ -4,8 +4,8 @@ use crate::{
     scope::{Scope, UtxosChangedScope, VirtualChainChangedScope},
     subscription::{context::SubscriptionContext, Command, Compounded, Mutation, Subscription},
 };
-use itertools::Itertools;
 use cryptix_addresses::{Address, Prefix};
+use itertools::Itertools;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OverallSubscription {

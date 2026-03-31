@@ -485,6 +485,15 @@ pub struct AccountsCreateNewAddressResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AccountsSendFastPathOptions {
+    pub enabled: bool,
+    pub intent_nonce: Option<u64>,
+    pub client_created_at_ms: Option<u64>,
+    pub max_fee_sompi: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountsSendRequest {
     pub account_id: AccountId,
     pub wallet_secret: Secret,
@@ -492,6 +501,7 @@ pub struct AccountsSendRequest {
     pub destination: PaymentDestination,
     pub priority_fee_sompi: Fees,
     pub payload: Option<Vec<u8>>,
+    pub fast_path: Option<AccountsSendFastPathOptions>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -499,6 +509,11 @@ pub struct AccountsSendRequest {
 pub struct AccountsSendResponse {
     pub generator_summary: GeneratorSummary,
     pub transaction_ids: Vec<TransactionId>,
+    pub fast_path_requested: bool,
+    pub fast_path_used: bool,
+    pub fast_path_status: Option<String>,
+    pub fast_path_reason: Option<String>,
+    pub basechain_submitted: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]

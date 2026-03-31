@@ -1,9 +1,9 @@
 use crate::error::Error;
-use js_sys::{Array, Object};
 use cryptix_consensus_core::hashing;
 use cryptix_consensus_core::header as native;
 use cryptix_hashes::Hash;
 use cryptix_utils::hex::ToHex;
+use js_sys::{Array, Object};
 use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen::*;
 use wasm_bindgen::prelude::*;

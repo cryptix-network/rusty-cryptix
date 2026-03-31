@@ -1384,6 +1384,22 @@ declare! {
          * If not supplied, the destination will be the change address resulting in a UTXO compound transaction.
          */
         destination? : IPaymentOutput[];
+        /**
+         * Request fast submit path when available.
+         */
+        fastPath? : boolean;
+        /**
+         * Optional fast intent nonce.
+         */
+        fastIntentNonce? : bigint | number;
+        /**
+         * Optional client timestamp (ms) for fast intent.
+         */
+        fastClientCreatedAtMs? : bigint | number;
+        /**
+         * Optional max fee cap used by fast intent admission.
+         */
+        fastMaxFeeSompi? : bigint | number;
     }
     "#,
 }
@@ -1399,7 +1415,22 @@ try_from! ( args: IAccountsSendRequest, AccountsSendRequest, {
     let destination: PaymentDestination =
         if outputs.is_undefined() { PaymentDestination::Change } else { PaymentOutputs::try_owned_from(outputs)?.into() };
 
-    Ok(AccountsSendRequest { account_id, wallet_secret, payment_secret, priority_fee_sompi, destination, payload })
+    let fast_path_enabled = args.try_get_bool("fastPath")?.unwrap_or(false);
+    let fast_intent_nonce = args.try_get_value("fastIntentNonce")?.map(|v| v.try_as_u64()).transpose()?;
+    let fast_client_created_at_ms = args.try_get_value("fastClientCreatedAtMs")?.map(|v| v.try_as_u64()).transpose()?;
+    let fast_max_fee_sompi = args.try_get_value("fastMaxFeeSompi")?.map(|v| v.try_as_u64()).transpose()?;
+    let fast_path = if fast_path_enabled {
+        Some(AccountsSendFastPathOptions {
+            enabled: true,
+            intent_nonce: fast_intent_nonce,
+            client_created_at_ms: fast_client_created_at_ms,
+            max_fee_sompi: fast_max_fee_sompi,
+        })
+    } else {
+        None
+    };
+
+    Ok(AccountsSendRequest { account_id, wallet_secret, payment_secret, priority_fee_sompi, destination, payload, fast_path })
 });
 
 declare! {
@@ -1419,6 +1450,26 @@ declare! {
          * Hex identifiers of successfully submitted transactions.
          */
         transactionIds : HexString[];
+        /**
+         * Whether fast path was requested for this send call.
+         */
+        fastPathRequested : boolean;
+        /**
+         * Whether fast path was effectively used.
+         */
+        fastPathUsed : boolean;
+        /**
+         * Fast path status string (if available).
+         */
+        fastPathStatus? : string;
+        /**
+         * Fast path reason string (if available).
+         */
+        fastPathReason? : string;
+        /**
+         * Whether basechain submission happened.
+         */
+        basechainSubmitted : boolean;
     }
     "#,
 }
@@ -1428,6 +1479,11 @@ try_from!(args: AccountsSendResponse, IAccountsSendResponse, {
     let response = IAccountsSendResponse::default();
     response.set("generatorSummary", &GeneratorSummary::from(args.generator_summary).into())?;
     response.set("transactionIds", &to_value(&args.transaction_ids)?)?;
+    response.set("fastPathRequested", &to_value(&args.fast_path_requested)?)?;
+    response.set("fastPathUsed", &to_value(&args.fast_path_used)?)?;
+    response.set("fastPathStatus", &to_value(&args.fast_path_status)?)?;
+    response.set("fastPathReason", &to_value(&args.fast_path_reason)?)?;
+    response.set("basechainSubmitted", &to_value(&args.basechain_submitted)?)?;
     Ok(response)
 });
 

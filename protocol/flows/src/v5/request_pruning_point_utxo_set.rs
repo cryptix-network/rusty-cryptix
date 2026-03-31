@@ -1,5 +1,4 @@
 use crate::{flow_context::FlowContext, flow_trait::Flow, v5::ibd::IBD_BATCH_SIZE};
-use itertools::Itertools;
 use cryptix_consensus_core::errors::consensus::ConsensusError;
 use cryptix_core::debug;
 use cryptix_hashes::Hash;
@@ -7,10 +6,12 @@ use cryptix_p2p_lib::{
     common::ProtocolError,
     dequeue, make_message,
     pb::{
-        cryptixd_message::Payload, DonePruningPointUtxoSetChunksMessage, PruningPointUtxoSetChunkMessage, UnexpectedPruningPointMessage,
+        cryptixd_message::Payload, DonePruningPointUtxoSetChunksMessage, PruningPointUtxoSetChunkMessage,
+        UnexpectedPruningPointMessage,
     },
     IncomingRoute, Router,
 };
+use itertools::Itertools;
 use std::sync::Arc;
 
 pub struct RequestPruningPointUtxoSetFlow {

@@ -133,7 +133,7 @@ cryptix-wrpc-proxy = { version = "0.15.5", path = "rpc/wrpc/proxy" }
 cryptix-wrpc-server = { version = "0.15.5", path = "rpc/wrpc/server" }
 cryptix-wrpc-wasm = { version = "0.15.5", path = "rpc/wrpc/wasm" }
 cryptix-wrpc-example-subscriber = { version = "0.15.5", path = "rpc/wrpc/examples/subscriber" }
-cryptixd = { version = "0.15.5", path = "cryptixd" }
+cryptixd = { version = "0.16.0", path = "cryptixd" }
 cryptix-alloc = { version = "0.15.5", path = "utils/alloc" }
 
 # external

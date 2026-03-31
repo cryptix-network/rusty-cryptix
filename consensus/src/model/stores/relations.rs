@@ -1,4 +1,3 @@
-use itertools::Itertools;
 use cryptix_consensus_core::BlockHashSet;
 use cryptix_consensus_core::{blockhash::BlockHashes, BlockHashMap, BlockHasher, BlockLevel};
 use cryptix_database::prelude::{BatchDbWriter, CachePolicy, DbWriter};
@@ -8,6 +7,7 @@ use cryptix_database::prelude::{ReadLock, StoreError};
 use cryptix_database::prelude::{StoreResult, DB};
 use cryptix_database::registry::{DatabaseStorePrefixes, SEPARATOR};
 use cryptix_hashes::Hash;
+use itertools::Itertools;
 use rocksdb::WriteBatch;
 use std::collections::hash_map::Entry;
 use std::collections::HashSet;

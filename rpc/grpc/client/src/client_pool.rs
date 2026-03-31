@@ -1,9 +1,9 @@
 use super::GrpcClient;
 use async_channel::{SendError, Sender};
-use futures_util::Future;
-use itertools::Itertools;
 use cryptix_core::trace;
 use cryptix_utils::{any::type_name_short, channel::Channel, triggers::SingleTrigger};
+use futures_util::Future;
+use itertools::Itertools;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,

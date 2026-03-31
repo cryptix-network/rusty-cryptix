@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use itertools::Itertools;
 use cryptix_consensus_core::BlockHashMap;
 use cryptix_p2p_lib::{
     common::ProtocolError,
@@ -11,6 +10,7 @@ use cryptix_p2p_lib::{
     },
     IncomingRoute, Router,
 };
+use itertools::Itertools;
 use log::debug;
 
 use crate::{flow_context::FlowContext, flow_trait::Flow, v5::ibd::IBD_BATCH_SIZE};

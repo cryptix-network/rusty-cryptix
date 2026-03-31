@@ -1,10 +1,10 @@
 use crate::address::error::{Error, Result};
-use indexmap::{map::Entry, IndexMap};
-use itertools::Itertools;
 use cryptix_addresses::{Address, Prefix};
 use cryptix_consensus_core::tx::ScriptPublicKey;
 use cryptix_core::{debug, trace};
 use cryptix_txscript::{extract_script_pub_key_address, pay_to_address_script};
+use indexmap::{map::Entry, IndexMap};
+use itertools::Itertools;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::{
     collections::{hash_map, hash_set, HashMap, HashSet},

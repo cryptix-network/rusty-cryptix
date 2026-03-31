@@ -3,8 +3,6 @@
 pub use ahash::AHashMap;
 pub use async_std::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 pub use cfg_if::cfg_if;
-pub use futures::*;
-pub use js_sys::Function;
 pub use cryptix_consensus_core::network::{NetworkId, NetworkIdError, NetworkIdT};
 pub use cryptix_notify::{
     error::{Error as NotifyError, Result as NotifyResult},
@@ -24,6 +22,8 @@ pub use cryptix_rpc_core::{
 pub use cryptix_wrpc_client::client::*;
 pub use cryptix_wrpc_client::error::Error;
 pub use cryptix_wrpc_client::result::Result;
+pub use futures::*;
+pub use js_sys::Function;
 pub use serde::{Deserialize, Serialize};
 pub use std::str::FromStr;
 pub use std::sync::{

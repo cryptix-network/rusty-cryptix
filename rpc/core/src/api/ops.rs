@@ -132,6 +132,12 @@ pub enum RpcApiOps {
     GetFeeEstimateExperimental = 148,
     /// Block color determination by iterating DAG.
     GetCurrentBlockColor = 149,
+    /// Submit a fast rail transfer intent (node-local, non-final).
+    SubmitFastIntent = 150,
+    /// Query local fast rail intent status.
+    GetFastIntentStatus = 151,
+    /// Cancel a local fast rail intent context.
+    CancelFastIntent = 152,
 }
 
 impl RpcApiOps {

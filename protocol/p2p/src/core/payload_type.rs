@@ -46,6 +46,9 @@ pub enum CryptixdMessagePayloadType {
     IbdChainBlockLocator,
     RequestAntipast,
     RequestNextPruningPointAndItsAnticoneBlocks,
+    RequestFastIntents,
+    FastIntent,
+    FastMicroblock,
 }
 
 impl From<&CryptixdMessagePayload> for CryptixdMessagePayloadType {
@@ -81,7 +84,9 @@ impl From<&CryptixdMessagePayload> for CryptixdMessagePayloadType {
             }
             CryptixdMessagePayload::BlockWithTrustedData(_) => CryptixdMessagePayloadType::BlockWithTrustedData,
             CryptixdMessagePayload::DoneBlocksWithTrustedData(_) => CryptixdMessagePayloadType::DoneBlocksWithTrustedData,
-            CryptixdMessagePayload::RequestPruningPointAndItsAnticone(_) => CryptixdMessagePayloadType::RequestPruningPointAndItsAnticone,
+            CryptixdMessagePayload::RequestPruningPointAndItsAnticone(_) => {
+                CryptixdMessagePayloadType::RequestPruningPointAndItsAnticone
+            }
             CryptixdMessagePayload::BlockHeaders(_) => CryptixdMessagePayloadType::BlockHeaders,
             CryptixdMessagePayload::RequestNextHeaders(_) => CryptixdMessagePayloadType::RequestNextHeaders,
             CryptixdMessagePayload::DoneHeaders(_) => CryptixdMessagePayloadType::DoneHeaders,
@@ -100,6 +105,9 @@ impl From<&CryptixdMessagePayload> for CryptixdMessagePayloadType {
             CryptixdMessagePayload::RequestNextPruningPointAndItsAnticoneBlocks(_) => {
                 CryptixdMessagePayloadType::RequestNextPruningPointAndItsAnticoneBlocks
             }
+            CryptixdMessagePayload::RequestFastIntents(_) => CryptixdMessagePayloadType::RequestFastIntents,
+            CryptixdMessagePayload::FastIntent(_) => CryptixdMessagePayloadType::FastIntent,
+            CryptixdMessagePayload::FastMicroblock(_) => CryptixdMessagePayloadType::FastMicroblock,
         }
     }
 }

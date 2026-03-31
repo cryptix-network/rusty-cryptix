@@ -16,7 +16,6 @@ use crate::{
         Stopper, TasksRunner,
     },
 };
-use itertools::Itertools;
 use cryptix_addresses::Address;
 use cryptix_alloc::init_allocator_with_default_settings;
 use cryptix_consensus::params::Params;
@@ -26,6 +25,7 @@ use cryptix_math::Uint256;
 use cryptix_notify::scope::VirtualDaaScoreChangedScope;
 use cryptix_rpc_core::api::rpc::RpcApi;
 use cryptix_txscript::pay_to_address_script;
+use itertools::Itertools;
 use rand::thread_rng;
 use std::{sync::Arc, time::Duration};
 

@@ -1,13 +1,62 @@
+# Cryptix Rust Node
 
-<h1>Cryptix On Rust</h1>
+This repository contains the Rust implementation of the Cryptix full node and related libraries.
+The goal is simple: a production-ready node that stays compatible with the existing Cryptix network and can replace the legacy Golang daemon in day-to-day operation.
+If you prefer the previous implementation, the <a href="https://github.com/cryptix-network/cryptixd">Golang node</a> remains available as an alternative.
 
-Welcome to the Rust-based implementation of the Cryptix full-node and its ancillary libraries. The contained node release serves as a drop-in replacement to the established <a href="https://github.com/cryptix-network/cryptixd">Golang node</a> and to date is the recommended node software for the Cryptix network, introducing developers to the possibilities of Rust in the Cryptix network's context.
+If you run infrastructure, build tooling, or contribute code, this repo is the main place to work on the Rust node stack.
+Feedback and contributions are always welcome.
 
-We invite developers and blockchain enthusiasts to collaborate, test, and optimize our Rust implementation. Each line of code here is an opportunity to contribute to the open-source blockchain movement, shaping a platform designed for scalability and speed without compromising on security and decentralization.
+## Node Startup Arguments (`cryptixd`)
 
-Your feedback, contributions, and issue reports will be integral to evolving this codebase and continuing its maturity as a reliable node in the Cryptix network.
 
-The default branch of this repository is `master` and new contributions are constantly merged into it. For a stable branch corresponding to the latest stable release please pull and compile the `stable` branch. 
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `-C`, `--configfile=<CONFIG_FILE>` | path | none | Load settings from a TOML config file. |
+| `-b`, `--appdir=<DATA_DIR>` | path | none | Base data directory. |
+| `--logdir=<LOG_DIR>` | path | none | Log file directory. |
+| `--nologfiles` | switch | `false` | Disable logging to files. |
+| `-t`, `--async-threads=<N>` | integer | CPU core count | Number of async runtime threads. |
+| `-d`, `--loglevel=<LEVEL>` | string | `info` | Global/per-subsystem log level. |
+| `--rpclisten[=IP[:PORT]]` | address | auto | gRPC listen address (defaults to network-specific port). |
+| `--rpclisten-borsh[=IP[:PORT]]` | address | auto | wRPC Borsh listen address (defaults to network-specific port). |
+| `--rpclisten-json[=IP[:PORT]]` | address | auto | wRPC JSON listen address (defaults to network-specific port). |
+| `--unsaferpc` | switch | `false` | Enable RPC commands that mutate node state. |
+| `--connect=<IP[:PORT]>` | address (repeatable) | empty | Connect only to specified peers. |
+| `--addpeer=<IP[:PORT]>` | address (repeatable) | empty | Add peers to connect to on startup. |
+| `--listen=<IP[:PORT]>` | address | auto | P2P listen address (defaults to network-specific port). |
+| `--outpeers=<N>` | integer | `8` | Target outbound peer count. |
+| `--maxinpeers=<N>` | integer | `128` | Maximum inbound peer count. |
+| `--rpcmaxclients=<N>` | integer | `128` | Maximum standard RPC clients. |
+| `--reset-db` | switch | `false` | Reset local database before startup. |
+| `--enable-unsynced-mining` | switch | `false` | Accept RPC block submits while unsynced (testing-oriented). |
+| `--enable-mainnet-mining` | switch | `true` (deprecated flag) | Backward-compatible flag; mainnet mining is enabled by default. |
+| `--utxoindex` | switch | `false` | Enable UTXO index. |
+| `--max-tracked-addresses=<N>` | integer | `0` | Preallocated max addresses for UTXO change tracking. |
+| `--testnet` | switch | `false` | Use testnet. |
+| `--netsuffix=<N>` | integer | `10` | Testnet suffix. |
+| `--devnet` | switch | `false` | Use devnet. |
+| `--simnet` | switch | `false` | Use simnet. |
+| `--archival` | switch | `false` | Run in archival mode (increased disk usage). |
+| `--sanity` | switch | `false` | Enable additional sanity checks. |
+| `--yes` | switch | `false` | Auto-confirm interactive prompts. |
+| `--uacomment=<TEXT>` | string (repeatable) | empty | Append user-agent comments. |
+| `--externalip=<IP[:PORT]>` | address | none | Advertised external P2P address. |
+| `--perf-metrics` | switch | `false` | Enable runtime perf metrics collection. |
+| `--perf-metrics-interval-sec=<SECONDS>` | integer | `10` | Perf metrics collection interval. |
+| `--datacenter` | switch | `false` | Enable datacenter peer filter mode (skip private/unroutable peer addresses in address manager). |
+| `--hfa` | switch | `false` | Enable HFA fast rail for this process. |
+| `--hfa-cpu=<RATIO>` | float | `0.7` | HFA CPU low-water ratio (`0.0 < value <= 1.0`). |
+| `--hfa-drift-ms=<MS>` | integer | `5000` | HFA clock drift window in milliseconds for fast-intent admission. |
+| `--hfa-microblock-interval-ms-normal=<MS>` | integer | `50` | HFA microblock interval in milliseconds while in normal mode. |
+| `--no-hfa` | switch | `false` | Force-disable HFA (overrides config). |
+| `--disable-upnp` | switch | `false` | Disable UPnP. |
+| `--nodnsseed` | switch | `false` | Disable DNS peer seeding. |
+| `--nogrpc` | switch | `false` | Disable gRPC server. |
+| `--ram-scale=<FACTOR>` | float | `1.0` | Scale memory-bound internal limits. |
+| `--num-prealloc-utxos=<N>` | integer | none | Devnet preallocation count (`devnet-prealloc` feature only). |
+| `--prealloc-address=<ADDR>` | string | none | Devnet preallocation target address (`devnet-prealloc` feature only). |
+| `--prealloc-amount=<SOMPI>` | integer | `10000000000` | Devnet preallocation amount per UTXO (`devnet-prealloc` feature only). |
 
 ## Installation
   <details>
@@ -262,6 +311,7 @@ disable-upnp = true
 perf-metrics = true
 appdir = "some-dir"
 netsuffix = 11
+hfa-microblock-interval-ms-normal = 50
 addpeer = ["10.0.0.1", "1.2.3.4"]
   ```
  Pass the `--help` flag to view all possible arguments

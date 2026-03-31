@@ -3,8 +3,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use super::error::ConversionError;
 use crate::pb as protowire;
 
-use itertools::Itertools;
 use cryptix_utils::networking::{IpAddress, NetAddress};
+use itertools::Itertools;
 
 // ----------------------------------------------------------------------------
 // consensus_core to protowire

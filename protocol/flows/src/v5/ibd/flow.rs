@@ -5,7 +5,6 @@ use crate::{
         Flow,
     },
 };
-use futures::future::{join_all, select, try_join_all, Either};
 use cryptix_consensus_core::{
     api::BlockValidationFuture,
     block::Block,
@@ -28,6 +27,7 @@ use cryptix_p2p_lib::{
     IncomingRoute, Router,
 };
 use cryptix_utils::channel::JobReceiver;
+use futures::future::{join_all, select, try_join_all, Either};
 use std::{
     sync::Arc,
     time::{Duration, Instant},

@@ -2,7 +2,6 @@
 use super::utxo_set_override::{set_genesis_utxo_commitment_from_config, set_initial_utxo_set};
 use super::{ctl::Ctl, Consensus};
 use crate::{model::stores::U64Key, pipeline::ProcessingCounters};
-use itertools::Itertools;
 use cryptix_consensus_core::config::Config;
 use cryptix_consensus_notify::root::ConsensusNotificationRoot;
 use cryptix_consensusmanager::{ConsensusFactory, ConsensusInstance, DynConsensusCtl, SessionLock};
@@ -13,6 +12,7 @@ use cryptix_database::{
     },
     registry::DatabaseStorePrefixes,
 };
+use itertools::Itertools;
 
 use cryptix_txscript::caches::TxScriptCacheCounters;
 use cryptix_utils::mem_size::MemSizeEstimator;

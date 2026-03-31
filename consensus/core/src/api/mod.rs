@@ -1,5 +1,5 @@
-use futures_util::future::BoxFuture;
 use cryptix_muhash::MuHash;
+use futures_util::future::BoxFuture;
 use std::sync::Arc;
 
 use crate::{

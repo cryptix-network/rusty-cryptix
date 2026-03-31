@@ -1,4 +1,3 @@
-use indexmap::{map::Entry::Occupied, IndexMap};
 use cryptix_consensus_core::{
     api::{BlockValidationFuture, BlockValidationFutures},
     block::Block,
@@ -7,6 +6,7 @@ use cryptix_consensusmanager::{BlockProcessingBatch, ConsensusProxy};
 use cryptix_core::debug;
 use cryptix_hashes::Hash;
 use cryptix_utils::option::OptionExtensions;
+use indexmap::{map::Entry::Occupied, IndexMap};
 use rand::Rng;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -283,7 +283,6 @@ impl OrphanBlocksPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::future::try_join_all;
     use cryptix_consensus_core::{
         api::{BlockValidationFutures, ConsensusApi},
         blockstatus::BlockStatus,
@@ -291,6 +290,7 @@ mod tests {
     };
     use cryptix_consensusmanager::{ConsensusInstance, SessionLock};
     use cryptix_core::assert_match;
+    use futures::future::try_join_all;
     use parking_lot::RwLock;
     use std::sync::Arc;
 

@@ -4,7 +4,6 @@ use crate::model::{
     services::reachability::{MTReachabilityService, ReachabilityService},
     stores::{ghostdag::GhostdagStoreReader, reachability::ReachabilityStoreReader, relations::RelationsStoreReader},
 };
-use itertools::Itertools;
 use cryptix_consensus_core::{
     blockhash::BlockHashExtensions,
     errors::traversal::{TraversalError, TraversalResult},
@@ -12,6 +11,7 @@ use cryptix_consensus_core::{
 };
 use cryptix_core::trace;
 use cryptix_hashes::Hash;
+use itertools::Itertools;
 
 #[derive(Clone)]
 pub struct DagTraversalManager<T: GhostdagStoreReader, U: ReachabilityStoreReader, V: RelationsStoreReader> {

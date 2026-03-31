@@ -8,9 +8,9 @@ use cryptix_database::prelude::{CachePolicy, StoreError};
 use cryptix_database::registry::{DatabaseStorePrefixes, SEPARATOR};
 use cryptix_hashes::Hash;
 
+use cryptix_utils::mem_size::MemSizeEstimator;
 use itertools::EitherOrBoth::{Both, Left, Right};
 use itertools::Itertools;
-use cryptix_utils::mem_size::MemSizeEstimator;
 use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};
 use std::iter::once;

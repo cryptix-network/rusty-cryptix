@@ -20,7 +20,6 @@ use crate::{
     },
     MempoolCountersSnapshot, MiningCounters, P2pTxCountSample,
 };
-use itertools::Itertools;
 use cryptix_consensus_core::{
     api::{
         args::{TransactionValidationArgs, TransactionValidationBatchArgs},
@@ -34,6 +33,7 @@ use cryptix_consensus_core::{
 use cryptix_consensusmanager::{spawn_blocking, ConsensusProxy};
 use cryptix_core::{debug, error, info, time::Stopwatch, warn};
 use cryptix_mining_errors::{manager::MiningManagerError, mempool::RuleError};
+use itertools::Itertools;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -207,6 +207,11 @@ impl MiningManager {
         let args = FeerateEstimatorArgs::new(self.config.network_blocks_per_second, self.config.maximum_mass_per_block);
         let estimator = self.mempool.read().build_feerate_estimator(args);
         estimator.calc_estimations(self.config.minimum_feerate())
+    }
+
+    /// Returns the current minimum relay feerate in sompi/gram units.
+    pub(crate) fn minimum_relay_feerate(&self) -> f64 {
+        self.config.minimum_feerate()
     }
 
     /// Returns realtime feerate estimations based on internal mempool state with additional verbose data
@@ -856,6 +861,11 @@ impl MiningManagerProxy {
     /// Returns realtime feerate estimations based on internal mempool state
     pub async fn get_realtime_feerate_estimations(self) -> FeerateEstimations {
         spawn_blocking(move || self.inner.get_realtime_feerate_estimations()).await.unwrap()
+    }
+
+    /// Returns the current minimum relay feerate in sompi/gram units.
+    pub async fn minimum_relay_feerate(self) -> f64 {
+        spawn_blocking(move || self.inner.minimum_relay_feerate()).await.unwrap()
     }
 
     /// Returns realtime feerate estimations based on internal mempool state with additional verbose data

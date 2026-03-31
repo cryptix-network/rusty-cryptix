@@ -74,8 +74,8 @@ use cryptix_consensus_notify::root::ConsensusNotificationRoot;
 use crossbeam_channel::{
     bounded as bounded_crossbeam, unbounded as unbounded_crossbeam, Receiver as CrossbeamReceiver, Sender as CrossbeamSender,
 };
-use itertools::Itertools;
 use cryptix_consensusmanager::{SessionLock, SessionReadGuard};
+use itertools::Itertools;
 
 use cryptix_database::prelude::StoreResultExtensions;
 use cryptix_hashes::Hash;
@@ -644,9 +644,7 @@ impl ConsensusApi for Consensus {
 
         // Part 1: Add samples from pruning point headers:
         if self.config.net.network_type == NetworkType::Mainnet {
-            const POINTS: &[DaaScoreTimestamp] = &[
-                DaaScoreTimestamp { daa_score: 0, timestamp: 1735689600000 },
-            ];
+            const POINTS: &[DaaScoreTimestamp] = &[DaaScoreTimestamp { daa_score: 0, timestamp: 1735689600000 }];
             sample_headers = Vec::<DaaScoreTimestamp>::with_capacity(prealloc_len + POINTS.len());
             sample_headers.extend_from_slice(POINTS);
         } else {

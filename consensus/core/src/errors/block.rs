@@ -6,8 +6,8 @@ use crate::{
     tx::{TransactionId, TransactionOutpoint},
     BlueWorkType,
 };
-use itertools::Itertools;
 use cryptix_hashes::Hash;
+use itertools::Itertools;
 use thiserror::Error;
 
 #[derive(Clone, Debug)]

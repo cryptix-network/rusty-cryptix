@@ -82,11 +82,11 @@ mod tests {
         address::tracker::{CounterMap, Index, IndexSet, Indexer, RefCount},
         subscription::SubscriptionContext,
     };
-    use itertools::Itertools;
     use cryptix_addresses::{Address, Prefix};
     use cryptix_alloc::init_allocator_with_default_settings;
     use cryptix_core::trace;
     use cryptix_math::Uint256;
+    use itertools::Itertools;
     use std::collections::{HashMap, HashSet};
     use workflow_perf_monitor::mem::get_process_memory_info;
 

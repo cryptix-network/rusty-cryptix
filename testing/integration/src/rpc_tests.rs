@@ -1,7 +1,6 @@
 use std::{str::FromStr, sync::Arc, time::Duration};
 
 use crate::common::{client_notify::ChannelNotify, daemon::Daemon};
-use futures_util::future::try_join_all;
 use cryptix_addresses::{Address, Prefix, Version};
 use cryptix_consensus::params::SIMNET_GENESIS;
 use cryptix_consensus_core::{constants::MAX_SOMPI, header::Header, subnets::SubnetworkId, tx::Transaction};
@@ -18,6 +17,7 @@ use cryptix_notify::{
 use cryptix_rpc_core::{api::rpc::RpcApi, model::*, Notification};
 use cryptix_utils::{fd_budget, networking::ContextualNetAddress};
 use cryptixd_lib::args::Args;
+use futures_util::future::try_join_all;
 use tokio::task::JoinHandle;
 
 #[macro_export]
@@ -653,6 +653,84 @@ async fn sanity_test() {
                     }
                     assert!(response.verbose.is_some());
                     info!("{:?}", response.verbose);
+                })
+            }
+
+            CryptixdPayloadOps::SubmitFastIntent => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let base_tx = RpcTransaction {
+                        version: 1,
+                        inputs: Vec::new(),
+                        outputs: Vec::new(),
+                        lock_time: 0,
+                        subnetwork_id: SubnetworkId::default(),
+                        gas: 0,
+                        payload: Vec::new(),
+                        mass: 0,
+                        verbose_data: None,
+                    };
+                    let result = rpc_client
+                        .submit_fast_intent_call(
+                            None,
+                            SubmitFastIntentRequest {
+                                base_tx,
+                                intent_nonce: 1,
+                                client_created_at_ms: cryptix_core::time::unix_now(),
+                                max_fee: 1,
+                            },
+                        )
+                        .await;
+                    match result {
+                        Ok(response) => {
+                            assert_eq!(response.status, RpcFastIntentStatus::Rejected);
+                            assert_eq!(response.reason.as_deref(), Some("rail_disabled"));
+                        }
+                        Err(err) => {
+                            // In smart-send mode, invalid placeholder transactions may fail on the
+                            // normal mempool submit fallback path.
+                            assert!(err.to_string().contains("Rejected transaction"));
+                        }
+                    }
+                })
+            }
+
+            CryptixdPayloadOps::GetFastIntentStatus => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let response = rpc_client
+                        .get_fast_intent_status_call(
+                            None,
+                            GetFastIntentStatusRequest { intent_id: Hash::from(777u64), client_last_node_epoch: None },
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status, RpcFastIntentStatus::UnknownIntent);
+                })
+            }
+
+            CryptixdPayloadOps::CancelFastIntent => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let status = rpc_client
+                        .get_fast_intent_status_call(
+                            None,
+                            GetFastIntentStatusRequest { intent_id: Hash::from(888u64), client_last_node_epoch: None },
+                        )
+                        .await
+                        .unwrap();
+                    let response = rpc_client
+                        .cancel_fast_intent_call(
+                            None,
+                            CancelFastIntentRequest {
+                                intent_id: Hash::from(888u64),
+                                cancel_token: "dummy".to_string(),
+                                node_epoch: status.node_epoch,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status, RpcFastIntentStatus::UnknownIntent);
                 })
             }
 

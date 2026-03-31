@@ -1,4 +1,3 @@
-use futures_util::future::try_join_all;
 use cryptix_alloc::init_allocator_with_default_settings;
 use cryptix_consensus::{
     config::ConfigBuilder, consensus::test_consensus::TestConsensus, params::MAINNET_PARAMS,
@@ -7,6 +6,7 @@ use cryptix_consensus::{
 use cryptix_consensus_core::{api::ConsensusApi, blockhash};
 use cryptix_database::prelude::CachePolicy;
 use cryptix_hashes::Hash;
+use futures_util::future::try_join_all;
 use rand_distr::{Distribution, Poisson};
 use std::cmp::min;
 use tokio::join;

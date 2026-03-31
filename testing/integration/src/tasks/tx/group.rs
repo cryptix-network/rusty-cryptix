@@ -6,9 +6,9 @@ use crate::{
     },
 };
 use async_trait::async_trait;
-use itertools::chain;
 use cryptix_consensus_core::tx::Transaction;
 use cryptix_utils::triggers::SingleTrigger;
+use itertools::chain;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 

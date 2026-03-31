@@ -73,6 +73,9 @@ impl Router {
                 SubmitBlock,
                 SubmitTransaction,
                 SubmitTransactionReplacement,
+                SubmitFastIntent,
+                GetFastIntentStatus,
+                CancelFastIntent,
                 Unban,
             ]
         );

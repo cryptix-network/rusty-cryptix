@@ -79,9 +79,9 @@ pub mod test_helpers {
     use crate::subscription::{context::SubscriptionContext, Subscription};
 
     use super::*;
-    use derive_more::Display;
     use cryptix_addresses::Address;
     use cryptix_core::trace;
+    use derive_more::Display;
     use std::sync::Arc;
 
     #[derive(Clone, Debug, Default, PartialEq, Eq)]

@@ -139,6 +139,7 @@ impl ConsensusConverter {
                 gas: transaction.gas,
                 payload: transaction.payload.clone(),
                 mass: transaction.mass(),
+                fast_path: None,
                 verbose_data,
             }
         } else {

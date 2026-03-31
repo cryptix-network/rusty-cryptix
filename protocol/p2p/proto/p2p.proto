@@ -294,3 +294,20 @@ message TrustedDataMessage {
   repeated DaaBlockV4 daaWindow = 1; // TODO: rename to `trustedSubDag` once v5 is obsolete
   repeated BlockGhostdagDataHashPair ghostdagData = 2; // TODO: remove once v5 is obsolete
 }
+
+message RequestFastIntentsMessage {
+  repeated Hash intentIds = 1;
+}
+
+message FastIntentMessage {
+  Hash intentId = 1;
+  TransactionMessage baseTransaction = 2;
+  uint64 intentNonce = 3;
+  uint64 clientCreatedAtMs = 4;
+  uint64 maxFee = 5;
+}
+
+message FastMicroblockMessage {
+  uint64 microblockTimeMs = 1;
+  repeated Hash intentIds = 2;
+}

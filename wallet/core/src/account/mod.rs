@@ -23,7 +23,9 @@ use crate::storage::account::AccountSettings;
 use crate::storage::AccountMetadata;
 use crate::storage::{PrvKeyData, PrvKeyDataId};
 use crate::tx::PaymentOutput;
-use crate::tx::{Fees, Generator, GeneratorSettings, GeneratorSummary, PaymentDestination, PendingTransaction, Signer};
+use crate::tx::{
+    FastSubmitOptions, Fees, Generator, GeneratorSettings, GeneratorSummary, PaymentDestination, PendingTransaction, Signer,
+};
 use crate::utxo::balance::{AtomicBalance, BalanceStrings};
 use crate::utxo::UtxoContextBinding;
 use cryptix_bip32::{ChildNumber, ExtendedPrivateKey, PrivateKey};
@@ -37,6 +39,15 @@ pub type GenerationNotifier = Arc<dyn Fn(&PendingTransaction) + Send + Sync>;
 /// Scan notification callback type used by [`DerivationCapableAccount::derivation_scan`].
 /// Provides derivation discovery scan progress information.
 pub type ScanNotifier = Arc<dyn Fn(usize, usize, u64, Option<TransactionId>) + Send + Sync>;
+
+#[derive(Clone, Debug, Default)]
+pub struct AccountSendFastSummary {
+    pub requested: bool,
+    pub used: bool,
+    pub status: Option<String>,
+    pub reason: Option<String>,
+    pub basechain_submitted: bool,
+}
 
 /// General-purpose wrapper around [`AccountSettings`] (managed by [`Inner`]).
 pub struct Context {
@@ -336,11 +347,12 @@ pub trait Account: AnySync + Send + Sync + 'static {
         destination: PaymentDestination,
         priority_fee_sompi: Fees,
         payload: Option<Vec<u8>>,
+        fast_submit: Option<FastSubmitOptions>,
         wallet_secret: Secret,
         payment_secret: Option<Secret>,
         abortable: &Abortable,
         notifier: Option<GenerationNotifier>,
-    ) -> Result<(GeneratorSummary, Vec<cryptix_hashes::Hash>)> {
+    ) -> Result<(GeneratorSummary, Vec<cryptix_hashes::Hash>, AccountSendFastSummary)> {
         let keydata = self.prv_key_data(wallet_secret).await?;
         let signer = Arc::new(Signer::new(self.clone().as_dyn_arc(), keydata, payment_secret));
 
@@ -350,9 +362,26 @@ pub trait Account: AnySync + Send + Sync + 'static {
 
         let mut stream = generator.stream();
         let mut ids = vec![];
+        let mut fast_summary = AccountSendFastSummary {
+            requested: fast_submit.as_ref().map(|options| options.enabled).unwrap_or(false),
+            used: false,
+            status: None,
+            reason: None,
+            basechain_submitted: true,
+        };
         while let Some(transaction) = stream.try_next().await? {
             transaction.try_sign()?;
-            ids.push(transaction.try_submit(&self.wallet().rpc_api()).await?);
+            let submit_result = transaction.try_submit_with_fast_options(&self.wallet().rpc_api(), fast_submit.as_ref()).await?;
+            fast_summary.requested |= submit_result.fast.requested;
+            fast_summary.used |= submit_result.fast.used;
+            fast_summary.basechain_submitted &= submit_result.fast.basechain_submitted;
+            if submit_result.fast.status.is_some() {
+                fast_summary.status = submit_result.fast.status.clone();
+            }
+            if submit_result.fast.reason.is_some() {
+                fast_summary.reason = submit_result.fast.reason.clone();
+            }
+            ids.push(submit_result.tx_id);
 
             if let Some(notifier) = notifier.as_ref() {
                 notifier(&transaction);
@@ -360,7 +389,7 @@ pub trait Account: AnySync + Send + Sync + 'static {
             yield_executor().await;
         }
 
-        Ok((generator.summary(), ids))
+        Ok((generator.summary(), ids, fast_summary))
     }
 
     async fn pskb_from_send_generator(

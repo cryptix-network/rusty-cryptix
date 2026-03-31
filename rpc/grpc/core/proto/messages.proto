@@ -65,6 +65,9 @@ message CryptixdRequest {
     GetFeeEstimateRequestMessage getFeeEstimateRequest = 1106;
     GetFeeEstimateExperimentalRequestMessage getFeeEstimateExperimentalRequest = 1108;
     GetCurrentBlockColorRequestMessage getCurrentBlockColorRequest = 1110;
+    SubmitFastIntentRequestMessage submitFastIntentRequest = 1112;
+    GetFastIntentStatusRequestMessage getFastIntentStatusRequest = 1114;
+    CancelFastIntentRequestMessage cancelFastIntentRequest = 1116;
   }
 }
 
@@ -130,6 +133,9 @@ message CryptixdResponse {
     GetFeeEstimateResponseMessage getFeeEstimateResponse = 1107;
     GetFeeEstimateExperimentalResponseMessage getFeeEstimateExperimentalResponse = 1109;
     GetCurrentBlockColorResponseMessage getCurrentBlockColorResponse = 1111;
+    SubmitFastIntentResponseMessage submitFastIntentResponse = 1113;
+    GetFastIntentStatusResponseMessage getFastIntentStatusResponse = 1115;
+    CancelFastIntentResponseMessage cancelFastIntentResponse = 1117;
   }
 }
 

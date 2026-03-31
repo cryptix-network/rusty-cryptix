@@ -87,6 +87,9 @@ pub enum CryptixdPayloadOps {
     GetFeeEstimate,
     GetFeeEstimateExperimental,
     GetCurrentBlockColor,
+    SubmitFastIntent,
+    GetFastIntentStatus,
+    CancelFastIntent,
 
     // Subscription commands for starting/stopping notifications
     NotifyBlockAdded,

@@ -1,11 +1,11 @@
 use std::{cmp::min, ops::Deref, sync::Arc};
 
-use itertools::Itertools;
 use cryptix_consensus_core::errors::sync::{SyncManagerError, SyncManagerResult};
 use cryptix_database::prelude::StoreResultExtensions;
 use cryptix_hashes::Hash;
 use cryptix_math::uint::malachite_base::num::arithmetic::traits::CeilingLogBase2;
 use cryptix_utils::option::OptionExtensions;
+use itertools::Itertools;
 use parking_lot::RwLock;
 
 use crate::model::{

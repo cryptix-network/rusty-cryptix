@@ -9,10 +9,10 @@ use crate::{
 };
 use async_channel::{Receiver, Sender};
 use core::fmt::Debug;
+use cryptix_core::{debug, trace};
 use derive_more::Deref;
 use futures::{future::FutureExt, select_biased};
 use indexmap::IndexMap;
-use cryptix_core::{debug, trace};
 use std::{
     collections::HashMap,
     fmt::Display,

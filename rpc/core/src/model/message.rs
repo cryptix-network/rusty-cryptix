@@ -1947,8 +1947,8 @@ impl Deserializer for GetSystemInfoResponse {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default, Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct GetMetricsRequest {
     pub process_metrics: bool,
     pub connection_metrics: bool,
@@ -1960,13 +1960,16 @@ pub struct GetMetricsRequest {
 
 impl Serializer for GetMetricsRequest {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        let version: u16 = if self.custom_metrics { 2 } else { 1 };
+        store!(u16, &version, writer)?;
         store!(bool, &self.process_metrics, writer)?;
         store!(bool, &self.connection_metrics, writer)?;
         store!(bool, &self.bandwidth_metrics, writer)?;
         store!(bool, &self.consensus_metrics, writer)?;
         store!(bool, &self.storage_metrics, writer)?;
-        store!(bool, &self.custom_metrics, writer)?;
+        if version >= 2 {
+            store!(bool, &self.custom_metrics, writer)?;
+        }
 
         Ok(())
     }
@@ -1974,13 +1977,13 @@ impl Serializer for GetMetricsRequest {
 
 impl Deserializer for GetMetricsRequest {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let process_metrics = load!(bool, reader)?;
         let connection_metrics = load!(bool, reader)?;
         let bandwidth_metrics = load!(bool, reader)?;
         let consensus_metrics = load!(bool, reader)?;
         let storage_metrics = load!(bool, reader)?;
-        let custom_metrics = load!(bool, reader)?;
+        let custom_metrics = if version >= 2 { load!(bool, reader)? } else { false };
 
         Ok(Self { process_metrics, connection_metrics, bandwidth_metrics, consensus_metrics, storage_metrics, custom_metrics })
     }
@@ -2257,15 +2260,39 @@ impl Deserializer for StorageMetrics {
     }
 }
 
-// TODO: Custom metrics dictionary
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CustomMetricValue {
     Placeholder,
+    U64(u64),
+    F64(f64),
+    Bool(bool),
+    Text(String),
 }
 
 impl Serializer for CustomMetricValue {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
+        match self {
+            CustomMetricValue::Placeholder => {
+                store!(u8, &0, writer)?;
+            }
+            CustomMetricValue::U64(value) => {
+                store!(u8, &1, writer)?;
+                store!(u64, value, writer)?;
+            }
+            CustomMetricValue::F64(value) => {
+                store!(u8, &2, writer)?;
+                store!(f64, value, writer)?;
+            }
+            CustomMetricValue::Bool(value) => {
+                store!(u8, &3, writer)?;
+                store!(bool, value, writer)?;
+            }
+            CustomMetricValue::Text(value) => {
+                store!(u8, &4, writer)?;
+                store!(String, value, writer)?;
+            }
+        }
 
         Ok(())
     }
@@ -2273,14 +2300,24 @@ impl Serializer for CustomMetricValue {
 
 impl Deserializer for CustomMetricValue {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
-
-        Ok(CustomMetricValue::Placeholder)
+        let version = load!(u16, reader)?;
+        if version == 1 {
+            return Ok(CustomMetricValue::Placeholder);
+        }
+        let tag = load!(u8, reader)?;
+        match tag {
+            0 => Ok(CustomMetricValue::Placeholder),
+            1 => Ok(CustomMetricValue::U64(load!(u64, reader)?)),
+            2 => Ok(CustomMetricValue::F64(load!(f64, reader)?)),
+            3 => Ok(CustomMetricValue::Bool(load!(bool, reader)?)),
+            4 => Ok(CustomMetricValue::Text(load!(String, reader)?)),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid CustomMetricValue tag: {tag}"))),
+        }
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default, Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct GetMetricsResponse {
     pub server_time: u64,
     pub process_metrics: Option<ProcessMetrics>,
@@ -2288,7 +2325,7 @@ pub struct GetMetricsResponse {
     pub bandwidth_metrics: Option<BandwidthMetrics>,
     pub consensus_metrics: Option<ConsensusMetrics>,
     pub storage_metrics: Option<StorageMetrics>,
-    // TODO: this is currently a placeholder
+    // Optional implementation-defined custom metrics map.
     pub custom_metrics: Option<HashMap<String, CustomMetricValue>>,
 }
 
@@ -2316,14 +2353,17 @@ impl GetMetricsResponse {
 
 impl Serializer for GetMetricsResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        let version: u16 = if self.custom_metrics.is_some() { 2 } else { 1 };
+        store!(u16, &version, writer)?;
         store!(u64, &self.server_time, writer)?;
         serialize!(Option<ProcessMetrics>, &self.process_metrics, writer)?;
         serialize!(Option<ConnectionMetrics>, &self.connection_metrics, writer)?;
         serialize!(Option<BandwidthMetrics>, &self.bandwidth_metrics, writer)?;
         serialize!(Option<ConsensusMetrics>, &self.consensus_metrics, writer)?;
         serialize!(Option<StorageMetrics>, &self.storage_metrics, writer)?;
-        serialize!(Option<HashMap<String, CustomMetricValue>>, &self.custom_metrics, writer)?;
+        if version >= 2 {
+            serialize!(Option<HashMap<String, CustomMetricValue>>, &self.custom_metrics, writer)?;
+        }
 
         Ok(())
     }
@@ -2331,14 +2371,18 @@ impl Serializer for GetMetricsResponse {
 
 impl Deserializer for GetMetricsResponse {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let server_time = load!(u64, reader)?;
         let process_metrics = deserialize!(Option<ProcessMetrics>, reader)?;
         let connection_metrics = deserialize!(Option<ConnectionMetrics>, reader)?;
         let bandwidth_metrics = deserialize!(Option<BandwidthMetrics>, reader)?;
         let consensus_metrics = deserialize!(Option<ConsensusMetrics>, reader)?;
         let storage_metrics = deserialize!(Option<StorageMetrics>, reader)?;
-        let custom_metrics = deserialize!(Option<HashMap<String, CustomMetricValue>>, reader)?;
+        let custom_metrics = if version >= 2 {
+            deserialize!(Option<HashMap<String, CustomMetricValue>>, reader)?
+        } else {
+            None
+        };
 
         Ok(Self {
             server_time,
@@ -2663,6 +2707,241 @@ impl Deserializer for GetCurrentBlockColorResponse {
         let blue = load!(bool, reader)?;
 
         Ok(Self { blue })
+    }
+}
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// HFA fast rail
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "snake_case")]
+#[borsh(use_discriminant = true)]
+pub enum RpcFastIntentStatus {
+    Received = 0,
+    Validated = 1,
+    Locked = 2,
+    FastConfirmed = 3,
+    Expired = 4,
+    Dropped = 5,
+    Rejected = 6,
+    Cancelled = 7,
+    UnknownIntent = 8,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitFastIntentRequest {
+    pub base_tx: RpcTransaction,
+    pub intent_nonce: u64,
+    pub client_created_at_ms: u64,
+    pub max_fee: u64,
+}
+
+impl Serializer for SubmitFastIntentRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        serialize!(RpcTransaction, &self.base_tx, writer)?;
+        store!(u64, &self.intent_nonce, writer)?;
+        store!(u64, &self.client_created_at_ms, writer)?;
+        store!(u64, &self.max_fee, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for SubmitFastIntentRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let base_tx = deserialize!(RpcTransaction, reader)?;
+        let intent_nonce = load!(u64, reader)?;
+        let client_created_at_ms = load!(u64, reader)?;
+        let max_fee = load!(u64, reader)?;
+        Ok(Self { base_tx, intent_nonce, client_created_at_ms, max_fee })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitFastIntentResponse {
+    pub intent_id: RpcHash,
+    pub status: RpcFastIntentStatus,
+    pub reason: Option<String>,
+    pub base_tx_id: Option<RpcHash>,
+    pub node_epoch: u64,
+    pub expires_at_ms: Option<u64>,
+    pub retention_until_ms: Option<u64>,
+    pub cancel_token: Option<String>,
+    pub basechain_submitted: bool,
+}
+
+impl Serializer for SubmitFastIntentResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &3, writer)?;
+        store!(RpcHash, &self.intent_id, writer)?;
+        store!(RpcFastIntentStatus, &self.status, writer)?;
+        store!(Option<String>, &self.reason, writer)?;
+        store!(Option<RpcHash>, &self.base_tx_id, writer)?;
+        store!(u64, &self.node_epoch, writer)?;
+        store!(Option<u64>, &self.expires_at_ms, writer)?;
+        store!(Option<u64>, &self.retention_until_ms, writer)?;
+        store!(Option<String>, &self.cancel_token, writer)?;
+        store!(bool, &self.basechain_submitted, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for SubmitFastIntentResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let intent_id = load!(RpcHash, reader)?;
+        let status = load!(RpcFastIntentStatus, reader)?;
+        let reason = load!(Option<String>, reader)?;
+        let base_tx_id = if version >= 3 { load!(Option<RpcHash>, reader)? } else { None };
+        let node_epoch = load!(u64, reader)?;
+        let expires_at_ms = load!(Option<u64>, reader)?;
+        let retention_until_ms = load!(Option<u64>, reader)?;
+        let cancel_token = load!(Option<String>, reader)?;
+        let basechain_submitted = if version >= 2 { load!(bool, reader)? } else { false };
+        Ok(Self {
+            intent_id,
+            status,
+            reason,
+            base_tx_id,
+            node_epoch,
+            expires_at_ms,
+            retention_until_ms,
+            cancel_token,
+            basechain_submitted,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetFastIntentStatusRequest {
+    pub intent_id: RpcHash,
+    pub client_last_node_epoch: Option<u64>,
+}
+
+impl Serializer for GetFastIntentStatusRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcHash, &self.intent_id, writer)?;
+        store!(Option<u64>, &self.client_last_node_epoch, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetFastIntentStatusRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let intent_id = load!(RpcHash, reader)?;
+        let client_last_node_epoch = load!(Option<u64>, reader)?;
+        Ok(Self { intent_id, client_last_node_epoch })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetFastIntentStatusResponse {
+    pub status: RpcFastIntentStatus,
+    pub reason: Option<String>,
+    pub base_tx_id: Option<RpcHash>,
+    pub node_epoch: u64,
+    pub expires_at_ms: Option<u64>,
+    pub retention_until_ms: Option<u64>,
+    pub cancel_token: Option<String>,
+    pub epoch_changed: Option<bool>,
+}
+
+impl Serializer for GetFastIntentStatusResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &2, writer)?;
+        store!(RpcFastIntentStatus, &self.status, writer)?;
+        store!(Option<String>, &self.reason, writer)?;
+        store!(Option<RpcHash>, &self.base_tx_id, writer)?;
+        store!(u64, &self.node_epoch, writer)?;
+        store!(Option<u64>, &self.expires_at_ms, writer)?;
+        store!(Option<u64>, &self.retention_until_ms, writer)?;
+        store!(Option<String>, &self.cancel_token, writer)?;
+        store!(Option<bool>, &self.epoch_changed, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetFastIntentStatusResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let status = load!(RpcFastIntentStatus, reader)?;
+        let reason = load!(Option<String>, reader)?;
+        let base_tx_id = if version >= 2 { load!(Option<RpcHash>, reader)? } else { None };
+        let node_epoch = load!(u64, reader)?;
+        let expires_at_ms = load!(Option<u64>, reader)?;
+        let retention_until_ms = load!(Option<u64>, reader)?;
+        let cancel_token = load!(Option<String>, reader)?;
+        let epoch_changed = load!(Option<bool>, reader)?;
+        Ok(Self { status, reason, base_tx_id, node_epoch, expires_at_ms, retention_until_ms, cancel_token, epoch_changed })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelFastIntentRequest {
+    pub intent_id: RpcHash,
+    pub cancel_token: String,
+    pub node_epoch: u64,
+}
+
+impl Serializer for CancelFastIntentRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcHash, &self.intent_id, writer)?;
+        store!(String, &self.cancel_token, writer)?;
+        store!(u64, &self.node_epoch, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for CancelFastIntentRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let intent_id = load!(RpcHash, reader)?;
+        let cancel_token = load!(String, reader)?;
+        let node_epoch = load!(u64, reader)?;
+        Ok(Self { intent_id, cancel_token, node_epoch })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelFastIntentResponse {
+    pub status: RpcFastIntentStatus,
+    pub reason: Option<String>,
+    pub node_epoch: u64,
+    pub retention_until_ms: Option<u64>,
+    pub epoch_changed: Option<bool>,
+}
+
+impl Serializer for CancelFastIntentResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcFastIntentStatus, &self.status, writer)?;
+        store!(Option<String>, &self.reason, writer)?;
+        store!(u64, &self.node_epoch, writer)?;
+        store!(Option<u64>, &self.retention_until_ms, writer)?;
+        store!(Option<bool>, &self.epoch_changed, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for CancelFastIntentResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let status = load!(RpcFastIntentStatus, reader)?;
+        let reason = load!(Option<String>, reader)?;
+        let node_epoch = load!(u64, reader)?;
+        let retention_until_ms = load!(Option<u64>, reader)?;
+        let epoch_changed = load!(Option<bool>, reader)?;
+        Ok(Self { status, reason, node_epoch, retention_until_ms, epoch_changed })
     }
 }
 

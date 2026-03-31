@@ -215,6 +215,21 @@ impl RelayTransactionsFlow {
                 transactions.push(transaction);
             }
         }
+
+        if let Some(bridge) = self.ctx.hfa_bridge() {
+            if bridge.hfa_enabled() {
+                let before = transactions.len();
+                transactions.retain(|tx| !bridge.has_fast_lock_conflict_for_tx(tx));
+                let dropped = before.saturating_sub(transactions.len());
+                if dropped > 0 {
+                    warn!("Filtered {} incoming P2P txs due to active HFA fast-lock conflict (peer: {})", dropped, self.router);
+                }
+            }
+        }
+        if transactions.is_empty() {
+            return Ok(());
+        }
+
         let insert_results = self
             .ctx
             .mining_manager()

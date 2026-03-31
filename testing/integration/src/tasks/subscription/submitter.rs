@@ -1,13 +1,13 @@
 use crate::tasks::Task;
 use async_channel::Sender;
 use async_trait::async_trait;
-use itertools::Itertools;
 use cryptix_addresses::Address;
 use cryptix_core::warn;
 use cryptix_grpc_client::GrpcClient;
 use cryptix_notify::scope::{Scope, UtxosChangedScope};
 use cryptix_rpc_core::api::rpc::RpcApi;
 use cryptix_utils::{channel::Channel, triggers::SingleTrigger};
+use itertools::Itertools;
 use parking_lot::Mutex;
 use rand::thread_rng;
 use rand_distr::{Distribution, Exp};

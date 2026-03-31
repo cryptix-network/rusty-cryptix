@@ -9,10 +9,10 @@ use crate::{
     },
 };
 use async_trait::async_trait;
-use itertools::{chain, Itertools};
 use cryptix_addresses::Address;
 use cryptix_notify::scope::Scope;
 use cryptix_utils::triggers::SingleTrigger;
+use itertools::{chain, Itertools};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 

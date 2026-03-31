@@ -301,6 +301,8 @@ pub struct RpcTransaction {
     #[serde(with = "hex::serde")]
     pub payload: Vec<u8>,
     pub mass: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fast_path: Option<bool>,
     pub verbose_data: Option<RpcTransactionVerboseData>,
 }
 
@@ -313,6 +315,7 @@ impl std::fmt::Debug for RpcTransaction {
             .field("gas", &self.gas)
             .field("payload", &self.payload.to_hex())
             .field("mass", &self.mass)
+            .field("fast_path", &self.fast_path)
             .field("inputs", &self.inputs) // Inputs and outputs are placed purposely at the end for better debug visibility 
             .field("outputs", &self.outputs)
             .field("verbose_data", &self.verbose_data)
@@ -331,6 +334,7 @@ impl Serializer for RpcTransaction {
         store!(u64, &self.gas, writer)?;
         store!(Vec<u8>, &self.payload, writer)?;
         store!(u64, &self.mass, writer)?;
+        // NOTE: `fast_path` intentionally remains out-of-band for binary codecs.
         serialize!(Option<RpcTransactionVerboseData>, &self.verbose_data, writer)?;
 
         Ok(())
@@ -350,7 +354,7 @@ impl Deserializer for RpcTransaction {
         let mass = load!(u64, reader)?;
         let verbose_data = deserialize!(Option<RpcTransactionVerboseData>, reader)?;
 
-        Ok(Self { version, inputs, outputs, lock_time, subnetwork_id, gas, payload, mass, verbose_data })
+        Ok(Self { version, inputs, outputs, lock_time, subnetwork_id, gas, payload, mass, fast_path: None, verbose_data })
     }
 }
 
