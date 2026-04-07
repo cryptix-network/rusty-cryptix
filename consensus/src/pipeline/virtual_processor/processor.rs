@@ -766,7 +766,7 @@ impl VirtualStateProcessor {
         virtual_past_median_time: u64,
         args: &TransactionValidationArgs,
     ) -> TxResult<()> {
-        self.transaction_validator.validate_tx_in_isolation(&mutable_tx.tx)?;
+        self.transaction_validator.validate_tx_in_isolation(&mutable_tx.tx, virtual_daa_score)?;
         self.transaction_validator.utxo_free_tx_validation(&mutable_tx.tx, virtual_daa_score, virtual_past_median_time)?;
         self.validate_mempool_transaction_in_utxo_context(mutable_tx, virtual_utxo_view, virtual_daa_score, args)?;
         Ok(())

@@ -14,6 +14,9 @@ use cryptix_consensus_core::tx::{SignableTransaction, Transaction, TransactionId
 use cryptix_rpc_core::{RpcFastIntentStatus, RpcTransaction, RpcTransactionId};
 use workflow_core::time::unixtime_as_millis_u64;
 
+pub const DEFAULT_FAST_MAX_FEE_HEADROOM_BPS: u64 = 1000; // 10%
+pub const DEFAULT_FAST_MAX_FEE_HEADROOM_MIN_SOMPI: u64 = 1_000;
+
 #[derive(Clone, Debug, Default)]
 pub struct FastSubmitOptions {
     pub enabled: bool,
@@ -53,6 +56,12 @@ fn fast_status_name(status: RpcFastIntentStatus) -> &'static str {
 
 fn unix_now_ms_u64() -> u64 {
     unixtime_as_millis_u64()
+}
+
+/// Applies a conservative headroom to avoid fast-rail rejection due to minor fee/mass drift.
+pub fn default_fast_max_fee_cap(base_fee_sompi: u64) -> u64 {
+    let ratio_headroom = base_fee_sompi.saturating_mul(DEFAULT_FAST_MAX_FEE_HEADROOM_BPS) / 10_000;
+    base_fee_sompi.saturating_add(ratio_headroom).saturating_add(DEFAULT_FAST_MAX_FEE_HEADROOM_MIN_SOMPI)
 }
 
 pub(crate) struct PendingTransactionInner {
@@ -251,7 +260,7 @@ impl PendingTransaction {
             let now_ms = unix_now_ms_u64();
             let intent_nonce = options.intent_nonce.unwrap_or_else(|| now_ms ^ (self.id().as_bytes()[0] as u64));
             let client_created_at_ms = options.client_created_at_ms.unwrap_or(now_ms);
-            let max_fee = options.max_fee_sompi.unwrap_or(self.fees());
+            let max_fee = options.max_fee_sompi.unwrap_or_else(|| default_fast_max_fee_cap(self.fees()));
 
             match rpc.submit_fast_intent(rpc_transaction.clone(), intent_nonce, client_created_at_ms, max_fee).await {
                 Ok(response) => {
@@ -282,13 +291,7 @@ impl PendingTransaction {
         let tx_id = rpc.submit_transaction(rpc_transaction, false).await?;
         Ok(SubmitResult {
             tx_id,
-            fast: FastSubmitResult {
-                requested: false,
-                used: false,
-                status: None,
-                reason: None,
-                basechain_submitted: true,
-            },
+            fast: FastSubmitResult { requested: false, used: false, status: None, reason: None, basechain_submitted: true },
         })
     }
 

@@ -364,7 +364,7 @@ impl RpcApi for RpcCoreService {
             Err(ProtocolError::RuleError(RuleError::BadMerkleRoot(h1, h2))) => {
                 warn!(
                     "The RPC submitted block triggered a {} error: {}. 
-NOTE: This error usually indicates an RPC conversion error between the node and the miner. If you are on TN11 this is likely to reflect using a NON-SUPPORTED miner.",
+NOTE: This error usually indicates an RPC conversion error between the node and the miner or a mismatched miner implementation.",
                     stringify!(RuleError::BadMerkleRoot),
                     RuleError::BadMerkleRoot(h1, h2)
                 );
@@ -436,14 +436,10 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         // TODO: test
         let session = self.consensus_manager.consensus().session().await;
         let block = session.async_get_block_even_if_header_only(request.hash).await?;
-        let mut rpc_block = self
-            .consensus_converter
-            .get_block(&session, &block, request.include_transactions, request.include_transactions)
-            .await?;
+        let mut rpc_block =
+            self.consensus_converter.get_block(&session, &block, request.include_transactions, request.include_transactions).await?;
         self.annotate_block_fast_paths(&mut rpc_block);
-        Ok(GetBlockResponse {
-            block: rpc_block,
-        })
+        Ok(GetBlockResponse { block: rpc_block })
     }
 
     async fn submit_fast_intent_call(
@@ -970,13 +966,22 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             let consensus_manager = self.consensus_manager.clone();
             let prefix = self.config.prefix();
 
-            let response = self
+            let mut response = self
                 .fee_estimate_verbose_cache
                 .get(async move {
                     let session = consensus_manager.consensus().unguarded_session();
                     mining_manager.get_realtime_feerate_estimations_verbose(&session, prefix).await.map(FeeEstimateVerbose::into_rpc)
                 })
                 .await?;
+
+            if let Some(verbose) = response.verbose.as_mut() {
+                let minimum_relay_feerate = self.mining_manager.clone().minimum_relay_feerate().await.max(0.0);
+                let payload_overcap_feerate_floor = self.mining_manager.clone().payload_overcap_feerate_floor().await.max(0.0);
+                let effective_hfa_feerate_floor = self.hfa_engine.effective_feerate_floor(minimum_relay_feerate);
+                verbose.minimum_relay_feerate = Some(minimum_relay_feerate);
+                verbose.payload_overcap_feerate_floor = Some(payload_overcap_feerate_floor);
+                verbose.effective_hfa_feerate_floor = Some(effective_hfa_feerate_floor);
+            }
             Ok(response)
         } else {
             let estimate = self.get_fee_estimate_call(connection, GetFeeEstimateRequest {}).await?.estimate;
@@ -1241,11 +1246,8 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
 
         let storage_metrics = req.storage_metrics.then_some(StorageMetrics { storage_size_bytes: 0 });
 
-        let minimum_relay_feerate = if req.custom_metrics {
-            Some(self.mining_manager.clone().minimum_relay_feerate().await.max(0.0))
-        } else {
-            None
-        };
+        let minimum_relay_feerate =
+            if req.custom_metrics { Some(self.mining_manager.clone().minimum_relay_feerate().await.max(0.0)) } else { None };
 
         let custom_metrics: Option<HashMap<String, CustomMetricValue>> = req.custom_metrics.then(|| {
             let hfa = self.hfa_engine.metrics_snapshot();
@@ -1256,12 +1258,8 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             out.insert("hfa_enabled".to_string(), CustomMetricValue::Bool(hfa.enabled));
             out.insert("hfa_node_epoch".to_string(), CustomMetricValue::U64(hfa.node_epoch));
             out.insert("hfa_mode".to_string(), CustomMetricValue::Text(hfa.mode.to_string()));
-            let fast_recent_route_ids = self
-                .hfa_engine
-                .recent_fast_tx_route_ids(128)
-                .into_iter()
-                .map(|tx_id| tx_id.to_string())
-                .collect::<Vec<_>>();
+            let fast_recent_route_ids =
+                self.hfa_engine.recent_fast_tx_route_ids(128).into_iter().map(|tx_id| tx_id.to_string()).collect::<Vec<_>>();
             out.insert("fast_recent_tx_ids".to_string(), CustomMetricValue::Text(fast_recent_route_ids.join(",")));
             out.insert("hfa_minimum_relay_feerate".to_string(), CustomMetricValue::F64(minimum_relay_feerate));
             out.insert("hfa_min_feerate_floor_config".to_string(), CustomMetricValue::F64(configured_hfa_feerate_floor));

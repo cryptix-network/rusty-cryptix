@@ -2378,11 +2378,7 @@ impl Deserializer for GetMetricsResponse {
         let bandwidth_metrics = deserialize!(Option<BandwidthMetrics>, reader)?;
         let consensus_metrics = deserialize!(Option<ConsensusMetrics>, reader)?;
         let storage_metrics = deserialize!(Option<StorageMetrics>, reader)?;
-        let custom_metrics = if version >= 2 {
-            deserialize!(Option<HashMap<String, CustomMetricValue>>, reader)?
-        } else {
-            None
-        };
+        let custom_metrics = if version >= 2 { deserialize!(Option<HashMap<String, CustomMetricValue>>, reader)? } else { None };
 
         Ok(Self {
             server_time,

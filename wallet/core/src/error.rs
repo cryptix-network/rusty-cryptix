@@ -76,7 +76,7 @@ pub enum Error {
     #[error("Wallet is not connected")]
     NotConnected,
 
-    #[error("No network selected. Please use `network (mainnet|testnet-10|testnet-11)` to select a network.")]
+    #[error("No network selected. Please use `network (mainnet|testnet|devnet)` to select a network.")]
     MissingNetworkId,
 
     #[error("RPC client version mismatch, please upgrade you client (needs: v{0}, connected to: v{1})")]
@@ -276,6 +276,15 @@ pub enum Error {
 
     #[error("Transaction exceeds the maximum allowed mass")]
     GeneratorTransactionIsTooHeavy,
+
+    #[error("Payload length {actual} exceeds wallet v1 hard limit {max} bytes")]
+    WalletPayloadTooLarge { actual: usize, max: usize },
+
+    #[error("Unsupported messenger payload version {version}")]
+    WalletUnsupportedMessengerVersion { version: u8 },
+
+    #[error("Invalid messenger payload envelope: {details}")]
+    WalletInvalidMessengerEnvelope { details: String },
 
     #[error("Storage mass exceeds maximum")]
     StorageMassExceedsMaximumTransactionMass { storage_mass: u64 },

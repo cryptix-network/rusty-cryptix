@@ -77,7 +77,7 @@ mod tests {
         errors::RuleError,
         model::stores::ghostdag::GhostdagStoreReader,
         params::DEVNET_PARAMS,
-        processes::{transaction_validator::errors::TxRuleError, window::WindowManager},
+        processes::{coinbase::CoinbaseManager, transaction_validator::errors::TxRuleError, window::WindowManager},
     };
     use cryptix_consensus_core::{
         api::ConsensusApi,
@@ -101,6 +101,13 @@ mod tests {
         let consensus = TestConsensus::new(&config);
         let wait_handles = consensus.init();
         let body_processor = consensus.block_body_processor();
+        let coinbase_manager = CoinbaseManager::new(
+            config.params.coinbase_payload_script_public_key_max_len,
+            config.params.max_coinbase_payload_len,
+            config.params.deflationary_phase_daa_score,
+            config.params.pre_deflationary_phase_base_subsidy,
+            config.params.target_time_per_block,
+        );
 
         consensus.add_block_with_parents(1.into(), vec![config.genesis.hash]).await.unwrap();
 
@@ -116,9 +123,10 @@ mod tests {
             let mut block = consensus.build_block_with_parents_and_transactions(2.into(), vec![3.into()], vec![]);
             block.transactions[0].payload[8..16].copy_from_slice(&(5_u64).to_le_bytes());
             block.header.hash_merkle_root = calc_hash_merkle_root(block.transactions.iter());
+            let expected_subsidy = coinbase_manager.calc_block_subsidy(block.header.daa_score);
 
             assert_match!(
-                consensus.validate_and_insert_block(block.clone().to_immutable()).virtual_state_task.await, Err(RuleError::WrongSubsidy(expected,_)) if expected == 20000000);
+                consensus.validate_and_insert_block(block.clone().to_immutable()).virtual_state_task.await, Err(RuleError::WrongSubsidy(expected,_)) if expected == expected_subsidy);
 
             // The second time we send an invalid block we expect it to be a known invalid.
             assert_match!(
@@ -156,7 +164,8 @@ mod tests {
             let mut block = consensus.build_block_with_parents_and_transactions(7.into(), vec![6.into()], vec![]);
             block.transactions[0].payload[8..16].copy_from_slice(&(5_u64).to_le_bytes());
             block.header.hash_merkle_root = calc_hash_merkle_root(block.transactions.iter());
-            assert_match!(consensus.validate_and_insert_block(block.to_immutable()).virtual_state_task.await, Err(RuleError::WrongSubsidy(expected,_)) if expected == 3900000000);
+            let expected_subsidy = coinbase_manager.calc_block_subsidy(block.header.daa_score);
+            assert_match!(consensus.validate_and_insert_block(block.to_immutable()).virtual_state_task.await, Err(RuleError::WrongSubsidy(expected,_)) if expected == expected_subsidy);
         }
 
         {

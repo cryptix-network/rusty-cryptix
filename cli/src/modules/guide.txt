@@ -1,6 +1,6 @@
 Before you start, you must configure the default network setting.  There are currently
-3 networks available.  `mainnet`, `testnet-10` and `testnet-11`.  If you wish to experiment,
-you should select `testnet-11` by entering `network testnet-11`
+3 networks available.  `mainnet`, `testnet` and `devnet`.  If you wish to experiment,
+you should select `testnet` by entering `network testnet`
 
 The `server` command configures the target server.  You can connect to any Rusty Cryptix
 node that has wRPC enabled with `--rpclisten-borsh=0.0.0.0`. If the server setting 
@@ -52,4 +52,3 @@ the selected account to an account named 'pete' (starts with a 'p' letter)
 `monitor` - A test screen environment that periodically updates account balances.
 
 `rpc` - Allows you to execute RPC methods against the node (not all methods are currently available)
-

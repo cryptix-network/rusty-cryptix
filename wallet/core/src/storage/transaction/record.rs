@@ -87,6 +87,17 @@ export enum TransactionDataType {
 }
 
 /**
+ * Availability state for transaction payload resolution in the wallet core.
+ * @category Wallet SDK
+ */
+export enum PayloadAvailability {
+    Available = "available",
+    Pruned = "pruned",
+    Missing = "missing",
+    PendingUnresolved = "pending-unresolved",
+}
+
+/**
  * Contains UTXO entries and value for a transaction
  * that has been invalidated due to a BlockDAG reorganization.
  * @category Wallet SDK
@@ -94,6 +105,7 @@ export enum TransactionDataType {
 export interface ITransactionDataReorg {
     utxoEntries: IUtxoRecord[];
     value: bigint;
+    transaction?: ITransaction;
 }
 
 /**
@@ -103,6 +115,7 @@ export interface ITransactionDataReorg {
 export interface ITransactionDataIncoming {
     utxoEntries: IUtxoRecord[];
     value: bigint;
+    transaction?: ITransaction;
 }
 
 /**
@@ -112,6 +125,7 @@ export interface ITransactionDataIncoming {
 export interface ITransactionDataStasis {
     utxoEntries: IUtxoRecord[];
     value: bigint;
+    transaction?: ITransaction;
 }
 
 /**
@@ -123,6 +137,7 @@ export interface ITransactionDataStasis {
 export interface ITransactionDataExternal {
     utxoEntries: IUtxoRecord[];
     value: bigint;
+    transaction?: ITransaction;
 }
 
 /**
@@ -265,6 +280,10 @@ export interface ITransactionRecord {
      */
     data: ITransactionData;
     /**
+     * Payload availability state as resolved by wallet core.
+     */
+    payloadAvailability: PayloadAvailability;
+    /**
      * Optional transaction note as a human-readable string.
      */
     note?: string;
@@ -310,6 +329,19 @@ impl TransactionRecordNotification {
     }
 }
 
+/// Payload availability state for a transaction record.
+/// @category Wallet SDK
+#[wasm_bindgen]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Eq, PartialEq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PayloadAvailability {
+    Available,
+    Pruned,
+    #[default]
+    Missing,
+    PendingUnresolved,
+}
+
 /// @category Wallet SDK
 #[wasm_bindgen(inspectable)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +365,10 @@ pub struct TransactionRecord {
     #[serde(rename = "data")]
     #[wasm_bindgen(skip)]
     pub transaction_data: TransactionData,
+    #[serde(rename = "payloadAvailability")]
+    #[serde(default)]
+    #[wasm_bindgen(js_name = payloadAvailability)]
+    pub payload_availability: PayloadAvailability,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[wasm_bindgen(getter_with_clone)]
     pub note: Option<String>,
@@ -343,7 +379,7 @@ pub struct TransactionRecord {
 
 impl TransactionRecord {
     const STORAGE_MAGIC: u32 = 0x5854414b;
-    const STORAGE_VERSION: u32 = 0;
+    const STORAGE_VERSION: u32 = 1;
 
     pub fn id(&self) -> &TransactionId {
         &self.id
@@ -428,6 +464,48 @@ impl TransactionRecord {
         &self.transaction_data
     }
 
+    pub fn payload_availability(&self) -> PayloadAvailability {
+        self.payload_availability
+    }
+
+    fn infer_payload_availability(&self, current_daa_score: Option<u64>) -> PayloadAvailability {
+        if self.has_embedded_transaction() {
+            return PayloadAvailability::Available;
+        }
+
+        if let Some(current_daa_score) = current_daa_score {
+            if matches!(self.maturity(current_daa_score), Maturity::Pending) {
+                return PayloadAvailability::PendingUnresolved;
+            }
+
+            let pruning_depth = cryptix_consensus_core::config::params::Params::from(self.network_id).pruning_depth;
+            if current_daa_score.saturating_sub(self.block_daa_score()) >= pruning_depth {
+                return PayloadAvailability::Pruned;
+            }
+        }
+
+        PayloadAvailability::Missing
+    }
+
+    pub fn refresh_payload_availability(&mut self, current_daa_score: Option<u64>) {
+        self.payload_availability = self.infer_payload_availability(current_daa_score);
+    }
+
+    pub fn transaction(&self) -> Option<&cryptix_consensus_core::tx::Transaction> {
+        self.transaction_data.transaction()
+    }
+
+    pub fn has_embedded_transaction(&self) -> bool {
+        self.transaction().is_some()
+    }
+
+    pub fn try_attach_transaction(&mut self, transaction: cryptix_consensus_core::tx::Transaction) -> bool {
+        if transaction.id() != self.id {
+            return false;
+        }
+        self.transaction_data.attach_transaction_if_supported(transaction)
+    }
+
     // Transaction maturity ignores the stasis period and provides
     // a progress value based on the pending period. It is assumed
     // that transactions in stasis are not visible to the user.
@@ -466,16 +544,31 @@ impl TransactionRecord {
 }
 
 impl TransactionRecord {
-    pub fn new_incoming(utxo_context: &UtxoContext, id: TransactionId, utxos: &[UtxoEntryReference]) -> Self {
-        Self::new_incoming_impl(utxo_context, TransactionKind::Incoming, id, utxos)
+    pub fn new_incoming(
+        utxo_context: &UtxoContext,
+        id: TransactionId,
+        utxos: &[UtxoEntryReference],
+        transaction: Option<&cryptix_consensus_core::tx::Transaction>,
+    ) -> Self {
+        Self::new_incoming_impl(utxo_context, TransactionKind::Incoming, id, utxos, transaction)
     }
 
-    pub fn new_reorg(utxo_context: &UtxoContext, id: TransactionId, utxos: &[UtxoEntryReference]) -> Self {
-        Self::new_incoming_impl(utxo_context, TransactionKind::Reorg, id, utxos)
+    pub fn new_reorg(
+        utxo_context: &UtxoContext,
+        id: TransactionId,
+        utxos: &[UtxoEntryReference],
+        transaction: Option<&cryptix_consensus_core::tx::Transaction>,
+    ) -> Self {
+        Self::new_incoming_impl(utxo_context, TransactionKind::Reorg, id, utxos, transaction)
     }
 
-    pub fn new_stasis(utxo_context: &UtxoContext, id: TransactionId, utxos: &[UtxoEntryReference]) -> Self {
-        Self::new_incoming_impl(utxo_context, TransactionKind::Stasis, id, utxos)
+    pub fn new_stasis(
+        utxo_context: &UtxoContext,
+        id: TransactionId,
+        utxos: &[UtxoEntryReference],
+        transaction: Option<&cryptix_consensus_core::tx::Transaction>,
+    ) -> Self {
+        Self::new_incoming_impl(utxo_context, TransactionKind::Stasis, id, utxos, transaction)
     }
 
     fn new_incoming_impl(
@@ -483,6 +576,7 @@ impl TransactionRecord {
         transaction_type: TransactionKind,
         id: TransactionId,
         utxos: &[UtxoEntryReference],
+        transaction: Option<&cryptix_consensus_core::tx::Transaction>,
     ) -> Self {
         let binding = Binding::from(utxo_context.binding());
         let block_daa_score = utxos[0].utxo.block_daa_score;
@@ -492,13 +586,19 @@ impl TransactionRecord {
         let unixtime = unixtime_as_millis_u64();
 
         let transaction_data = match transaction_type {
-            TransactionKind::Incoming => TransactionData::Incoming { utxo_entries, aggregate_input_value },
-            TransactionKind::Reorg => TransactionData::Reorg { utxo_entries, aggregate_input_value },
-            TransactionKind::Stasis => TransactionData::Stasis { utxo_entries, aggregate_input_value },
+            TransactionKind::Incoming => {
+                TransactionData::Incoming { utxo_entries, aggregate_input_value, transaction: transaction.cloned() }
+            }
+            TransactionKind::Reorg => {
+                TransactionData::Reorg { utxo_entries, aggregate_input_value, transaction: transaction.cloned() }
+            }
+            TransactionKind::Stasis => {
+                TransactionData::Stasis { utxo_entries, aggregate_input_value, transaction: transaction.cloned() }
+            }
             kind => panic!("TransactionRecord::new_incoming() - invalid transaction type: {kind:?}"),
         };
 
-        TransactionRecord {
+        let mut record = TransactionRecord {
             id,
             unixtime_msec: Some(unixtime),
             value: aggregate_input_value,
@@ -506,24 +606,32 @@ impl TransactionRecord {
             transaction_data,
             block_daa_score,
             network_id: utxo_context.processor().network_id().expect("network expected for transaction record generation"),
+            payload_availability: PayloadAvailability::Missing,
             metadata: None,
             note: None,
-        }
+        };
+        record.refresh_payload_availability(utxo_context.processor().current_daa_score());
+        record
     }
 
     /// Transaction that was not issued by this instance of the wallet
     /// but belongs to this address set. This is an "external" transaction
     /// that occurs during the lifetime of this wallet.
-    pub fn new_external(utxo_context: &UtxoContext, id: TransactionId, utxos: &[UtxoEntryReference]) -> Self {
+    pub fn new_external(
+        utxo_context: &UtxoContext,
+        id: TransactionId,
+        utxos: &[UtxoEntryReference],
+        transaction: Option<&cryptix_consensus_core::tx::Transaction>,
+    ) -> Self {
         let binding = Binding::from(utxo_context.binding());
         let block_daa_score = utxos[0].utxo.block_daa_score;
         let utxo_entries = utxos.iter().map(UtxoRecord::from).collect::<Vec<_>>();
         let aggregate_input_value = utxo_entries.iter().map(|utxo| utxo.amount).sum::<u64>();
 
-        let transaction_data = TransactionData::External { utxo_entries, aggregate_input_value };
+        let transaction_data = TransactionData::External { utxo_entries, aggregate_input_value, transaction: transaction.cloned() };
         let unixtime = unixtime_as_millis_u64();
 
-        TransactionRecord {
+        let mut record = TransactionRecord {
             id,
             unixtime_msec: Some(unixtime),
             value: aggregate_input_value,
@@ -531,9 +639,12 @@ impl TransactionRecord {
             transaction_data,
             block_daa_score,
             network_id: utxo_context.processor().network_id().expect("network expected for transaction record generation"),
+            payload_availability: PayloadAvailability::Missing,
             metadata: None,
             note: None,
-        }
+        };
+        record.refresh_payload_availability(utxo_context.processor().current_daa_score());
+        record
     }
 
     pub fn new_outgoing(
@@ -573,7 +684,7 @@ impl TransactionRecord {
             utxo_entries,
         };
 
-        Ok(TransactionRecord {
+        let mut record = TransactionRecord {
             id,
             unixtime_msec: Some(unixtime),
             value: payment_value.unwrap_or(*aggregate_input_value),
@@ -581,9 +692,12 @@ impl TransactionRecord {
             transaction_data,
             block_daa_score,
             network_id: utxo_context.processor().network_id().expect("network expected for transaction record generation"),
+            payload_availability: PayloadAvailability::Missing,
             metadata: None,
             note: None,
-        })
+        };
+        record.refresh_payload_availability(utxo_context.processor().current_daa_score());
+        Ok(record)
     }
 
     pub fn new_batch(utxo_context: &UtxoContext, outgoing_tx: &OutgoingTransaction, accepted_daa_score: Option<u64>) -> Result<Self> {
@@ -619,7 +733,7 @@ impl TransactionRecord {
             utxo_entries,
         };
 
-        Ok(TransactionRecord {
+        let mut record = TransactionRecord {
             id,
             unixtime_msec: Some(unixtime),
             value: payment_value.unwrap_or(*aggregate_input_value),
@@ -627,9 +741,12 @@ impl TransactionRecord {
             transaction_data,
             block_daa_score,
             network_id: utxo_context.processor().network_id().expect("network expected for transaction record generation"),
+            payload_availability: PayloadAvailability::Missing,
             metadata: None,
             note: None,
-        })
+        };
+        record.refresh_payload_availability(utxo_context.processor().current_daa_score());
+        Ok(record)
     }
 
     pub fn new_transfer_incoming(
@@ -671,7 +788,7 @@ impl TransactionRecord {
             utxo_entries,
         };
 
-        Ok(TransactionRecord {
+        let mut record = TransactionRecord {
             id,
             unixtime_msec: Some(unixtime),
             value: payment_value.unwrap_or(*aggregate_input_value),
@@ -679,9 +796,12 @@ impl TransactionRecord {
             transaction_data,
             block_daa_score,
             network_id: utxo_context.processor().network_id().expect("network expected for transaction record generation"),
+            payload_availability: PayloadAvailability::Missing,
             metadata: None,
             note: None,
-        })
+        };
+        record.refresh_payload_availability(utxo_context.processor().current_daa_score());
+        Ok(record)
     }
 
     pub fn new_transfer_outgoing(
@@ -723,7 +843,7 @@ impl TransactionRecord {
             utxo_entries,
         };
 
-        Ok(TransactionRecord {
+        let mut record = TransactionRecord {
             id,
             unixtime_msec: Some(unixtime),
             value: payment_value.unwrap_or(*aggregate_input_value),
@@ -731,9 +851,12 @@ impl TransactionRecord {
             transaction_data,
             block_daa_score,
             network_id: utxo_context.processor().network_id().expect("network expected for transaction record generation"),
+            payload_availability: PayloadAvailability::Missing,
             metadata: None,
             note: None,
-        })
+        };
+        record.refresh_payload_availability(utxo_context.processor().current_daa_score());
+        Ok(record)
     }
 
     pub fn new_change(
@@ -771,7 +894,7 @@ impl TransactionRecord {
             utxo_entries,
         };
 
-        Ok(TransactionRecord {
+        let mut record = TransactionRecord {
             id,
             unixtime_msec: Some(unixtime),
             value: *change_output_value,
@@ -779,9 +902,12 @@ impl TransactionRecord {
             transaction_data,
             block_daa_score,
             network_id: utxo_context.processor().network_id().expect("network expected for transaction record generation"),
+            payload_availability: PayloadAvailability::Missing,
             metadata: None,
             note: None,
-        })
+        };
+        record.refresh_payload_availability(utxo_context.processor().current_daa_score());
+        Ok(record)
     }
 }
 
@@ -844,6 +970,7 @@ impl BorshSerialize for TransactionRecord {
         BorshSerialize::serialize(&self.transaction_data, writer)?;
         BorshSerialize::serialize(&self.note, writer)?;
         BorshSerialize::serialize(&self.metadata, writer)?;
+        BorshSerialize::serialize(&self.payload_availability, writer)?;
 
         Ok(())
     }
@@ -851,7 +978,7 @@ impl BorshSerialize for TransactionRecord {
 
 impl BorshDeserialize for TransactionRecord {
     fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> IoResult<Self> {
-        let StorageHeader { version: _, .. } =
+        let StorageHeader { version, .. } =
             StorageHeader::deserialize_reader(reader)?.try_magic(Self::STORAGE_MAGIC)?.try_version(Self::STORAGE_VERSION)?;
 
         let id = BorshDeserialize::deserialize_reader(reader)?;
@@ -863,8 +990,37 @@ impl BorshDeserialize for TransactionRecord {
         let transaction_data = BorshDeserialize::deserialize_reader(reader)?;
         let note = BorshDeserialize::deserialize_reader(reader)?;
         let metadata = BorshDeserialize::deserialize_reader(reader)?;
+        let payload_availability = if version >= 1 {
+            BorshDeserialize::deserialize_reader(reader)?
+        } else {
+            let mut record = Self {
+                id,
+                unixtime_msec: unixtime,
+                value,
+                binding,
+                block_daa_score,
+                network_id,
+                transaction_data,
+                payload_availability: PayloadAvailability::Missing,
+                note,
+                metadata,
+            };
+            record.refresh_payload_availability(None);
+            return Ok(record);
+        };
 
-        Ok(Self { id, unixtime_msec: unixtime, value, binding, block_daa_score, network_id, transaction_data, note, metadata })
+        Ok(Self {
+            id,
+            unixtime_msec: unixtime,
+            value,
+            binding,
+            block_daa_score,
+            network_id,
+            transaction_data,
+            payload_availability,
+            note,
+            metadata,
+        })
     }
 }
 
@@ -877,5 +1033,64 @@ impl BorshDeserialize for TransactionRecord {
 impl From<TransactionRecord> for TransactionRecordT {
     fn from(record: TransactionRecord) -> Self {
         JsValue::from(record).unchecked_into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utxo::context::UtxoContextId;
+    use cryptix_consensus_core::network::NetworkType;
+    use cryptix_consensus_core::{config::params::Params, subnets::SUBNETWORK_ID_NATIVE, tx::Transaction};
+
+    fn sample_record(transaction: Option<Transaction>, block_daa_score: u64) -> TransactionRecord {
+        TransactionRecord {
+            id: TransactionId::default(),
+            unixtime_msec: None,
+            value: 0,
+            binding: Binding::Custom(UtxoContextId::default()),
+            block_daa_score,
+            network_id: NetworkId::new(NetworkType::Mainnet),
+            transaction_data: TransactionData::Incoming { utxo_entries: vec![], aggregate_input_value: 0, transaction },
+            payload_availability: PayloadAvailability::Missing,
+            note: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn payload_availability_is_available_when_transaction_is_embedded() {
+        let tx = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![1, 2, 3]);
+        let mut record = sample_record(Some(tx), 10);
+        record.refresh_payload_availability(Some(20));
+        assert_eq!(record.payload_availability(), PayloadAvailability::Available);
+    }
+
+    #[test]
+    fn payload_availability_is_pruned_for_old_unresolved_record() {
+        let params = Params::from(NetworkId::new(NetworkType::Mainnet));
+        let mut record = sample_record(None, 10);
+        record.refresh_payload_availability(Some(10 + params.pruning_depth + 1));
+        assert_eq!(record.payload_availability(), PayloadAvailability::Pruned);
+    }
+
+    #[test]
+    fn deserialize_v0_record_without_payload_availability() {
+        let mut bytes = Vec::new();
+        let record = sample_record(None, 42);
+
+        BorshSerialize::serialize(&StorageHeader::new(TransactionRecord::STORAGE_MAGIC, 0), &mut bytes).unwrap();
+        BorshSerialize::serialize(&record.id, &mut bytes).unwrap();
+        BorshSerialize::serialize(&record.unixtime_msec, &mut bytes).unwrap();
+        BorshSerialize::serialize(&record.value, &mut bytes).unwrap();
+        BorshSerialize::serialize(&record.binding, &mut bytes).unwrap();
+        BorshSerialize::serialize(&record.block_daa_score, &mut bytes).unwrap();
+        BorshSerialize::serialize(&record.network_id, &mut bytes).unwrap();
+        BorshSerialize::serialize(&record.transaction_data, &mut bytes).unwrap();
+        BorshSerialize::serialize(&record.note, &mut bytes).unwrap();
+        BorshSerialize::serialize(&record.metadata, &mut bytes).unwrap();
+
+        let decoded = TransactionRecord::deserialize_reader(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded.payload_availability(), PayloadAvailability::Missing);
     }
 }

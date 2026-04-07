@@ -50,7 +50,7 @@ impl BlockBodyProcessor {
 
     fn check_transactions_in_isolation(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         for tx in block.transactions.iter() {
-            if let Err(e) = self.transaction_validator.validate_tx_in_isolation(tx) {
+            if let Err(e) = self.transaction_validator.validate_tx_in_isolation(tx, block.header.daa_score) {
                 return Err(RuleError::TxInIsolationValidationFailed(tx.id(), e));
             }
         }

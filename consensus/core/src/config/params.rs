@@ -1,7 +1,7 @@
 pub use super::{
-    bps::{Bps, Testnet11Bps},
+    bps::Bps,
     constants::consensus::*,
-    genesis::{GenesisBlock, DEVNET_GENESIS, GENESIS, SIMNET_GENESIS, TESTNET11_GENESIS, TESTNET_GENESIS},
+    genesis::{GenesisBlock, DEVNET_GENESIS, GENESIS, SIMNET_GENESIS, TESTNET_GENESIS},
 };
 use crate::{
     constants::STORAGE_MASS_PARAMETER,
@@ -82,6 +82,18 @@ pub struct Params {
 
     /// DAA score from which storage mass calculation and transaction mass field are activated as a consensus rule
     pub storage_mass_activation_daa_score: u64,
+
+    /// DAA score from which payload transactions are activated as a consensus rule
+    pub payload_hf_activation_daa_score: u64,
+
+    /// Consensus hard cap for payload transaction payload length
+    pub payload_max_len_consensus: usize,
+
+    /// Standardness limit for payload transaction payload length
+    pub payload_max_len_standard: usize,
+
+    /// Effective payload byte pricing multiplier applied in mass calculation
+    pub payload_weight_multiplier: u64,
 
     /// DAA score after which the pre-deflationary period switches to the deflationary period
     pub deflationary_phase_daa_score: u64,
@@ -235,8 +247,11 @@ impl Params {
             // This period is smaller than the above mainnet calculation in order to ensure that an IBDing miner
             // with significant testnet hashrate does not overwhelm the network with deep side-DAGs.
             //
-            // We use DAA duration as baseline and scale it down with BPS (and divide by 3 for mining only when very close to current time on TN11)
-            let max_expected_duration_without_blocks_in_milliseconds = self.target_time_per_block * NEW_DIFFICULTY_WINDOW_DURATION / 3; // = DAA duration in milliseconds / bps / 3
+            // We use DAA duration as baseline and, for high-BPS networks, scale it down by 3 in order to
+            // avoid overwhelming low-hashrate test environments with deep side-DAGs from late miners.
+            let divisor = if self.bps() > 1 { 3 } else { 1 };
+            let max_expected_duration_without_blocks_in_milliseconds =
+                self.target_time_per_block * NEW_DIFFICULTY_WINDOW_DURATION / divisor;
             unix_now() < sink_timestamp + max_expected_duration_without_blocks_in_milliseconds
         }
     }
@@ -275,17 +290,30 @@ impl From<NetworkType> for Params {
 
 impl From<NetworkId> for Params {
     fn from(value: NetworkId) -> Self {
-        match value.network_type {
+        let mut params = match value.network_type {
             NetworkType::Mainnet => MAINNET_PARAMS,
-            NetworkType::Testnet => match value.suffix {
-                Some(10) => TESTNET_PARAMS,
-                Some(11) => TESTNET11_PARAMS,
-                Some(x) => panic!("Testnet suffix {} is not supported", x),
-                None => panic!("Testnet suffix not provided"),
-            },
+            NetworkType::Testnet => TESTNET_PARAMS,
             NetworkType::Devnet => DEVNET_PARAMS,
             NetworkType::Simnet => SIMNET_PARAMS,
-        }
+        };
+        // Preserve the exact caller-selected network id (including optional suffix) so
+        // downstream code does not silently collapse suffixed testnets.
+        params.net = value;
+        params
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn params_from_network_id_preserves_testnet_suffix() {
+        let requested = NetworkId::with_suffix(NetworkType::Testnet, 42);
+        let params = Params::from(requested);
+        assert_eq!(params.net, requested);
+        // Suffix selection should not accidentally switch consensus constants.
+        assert_eq!(params.genesis.hash, TESTNET_PARAMS.genesis.hash);
     }
 }
 
@@ -339,6 +367,10 @@ pub const MAINNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     storage_mass_activation_daa_score: u64::MAX,
+    payload_hf_activation_daa_score: u64::MAX,
+    payload_max_len_consensus: 8192,
+    payload_max_len_standard: 2048,
+    payload_weight_multiplier: 4,
 
     // deflationary_phase_daa_score is the DAA score after which the pre-deflationary period
     // switches to the deflationary period. This number is calculated as follows:
@@ -362,7 +394,7 @@ pub const TESTNET_PARAMS: Params = Params {
         "t.cryptix-network-dns.duckdns.org",
         "t.cryptix-network-dns2.duckdns.org",
     ],
-    net: NetworkId::with_suffix(NetworkType::Testnet, 10),
+    net: NetworkId::new(NetworkType::Testnet),
     genesis: TESTNET_GENESIS,
     ghostdag_k: LEGACY_DEFAULT_GHOSTDAG_K,
     legacy_timestamp_deviation_tolerance: LEGACY_TIMESTAMP_DEVIATION_TOLERANCE,
@@ -401,6 +433,10 @@ pub const TESTNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     storage_mass_activation_daa_score: u64::MAX,
+    payload_hf_activation_daa_score: u64::MAX,
+    payload_max_len_consensus: 8192,
+    payload_max_len_standard: 2048,
+    payload_weight_multiplier: 4,
 
     // deflationary_phase_daa_score is the DAA score after which the pre-deflationary period
     // switches to the deflationary period. This number is calculated as follows:
@@ -411,66 +447,6 @@ pub const TESTNET_PARAMS: Params = Params {
     skip_proof_of_work: false,
     max_block_level: 250,
     pruning_proof_m: 1000,
-};
-
-pub const TESTNET11_PARAMS: Params = Params {
-    dns_seeders: &[
-        "t11.seed1.cryptix-network.org",
-        "t11.seed2.cryptix-network.org",
-        "t11.seed3.cryptix-network.org",
-        "t11.dyn1.cryptix-network.org",
-        "t11.dyn2.cryptix-network.org",
-        "t11.dyn3.cryptix-network.org",
-        "t11.cryptix-network-dns.duckdns.org",
-        "t11.cryptix-network-dns2.duckdns.org",
-    ],
-    net: NetworkId::with_suffix(NetworkType::Testnet, 11),
-    genesis: TESTNET11_GENESIS,
-    legacy_timestamp_deviation_tolerance: LEGACY_TIMESTAMP_DEVIATION_TOLERANCE,
-    new_timestamp_deviation_tolerance: NEW_TIMESTAMP_DEVIATION_TOLERANCE,
-    past_median_time_sampled_window_size: MEDIAN_TIME_SAMPLED_WINDOW_SIZE,
-    sampling_activation_daa_score: 0, // Sampling is activated from network inception
-    max_difficulty_target: MAX_DIFFICULTY_TARGET,
-    max_difficulty_target_f64: MAX_DIFFICULTY_TARGET_AS_F64,
-    sampled_difficulty_window_size: DIFFICULTY_SAMPLED_WINDOW_SIZE as usize,
-    legacy_difficulty_window_size: LEGACY_DIFFICULTY_WINDOW_SIZE,
-    min_difficulty_window_len: MIN_DIFFICULTY_WINDOW_LEN,
-
-    //
-    // ~~~~~~~~~~~~~~~~~~ BPS dependent constants ~~~~~~~~~~~~~~~~~~
-    //
-    ghostdag_k: Testnet11Bps::ghostdag_k(),
-    target_time_per_block: Testnet11Bps::target_time_per_block(),
-    past_median_time_sample_rate: Testnet11Bps::past_median_time_sample_rate(),
-    difficulty_sample_rate: Testnet11Bps::difficulty_adjustment_sample_rate(),
-    max_block_parents: Testnet11Bps::max_block_parents(),
-    mergeset_size_limit: Testnet11Bps::mergeset_size_limit(),
-    merge_depth: Testnet11Bps::merge_depth_bound(),
-    finality_depth: Testnet11Bps::finality_depth(),
-    pruning_depth: Testnet11Bps::pruning_depth(),
-    pruning_proof_m: Testnet11Bps::pruning_proof_m(),
-    deflationary_phase_daa_score: Testnet11Bps::deflationary_phase_daa_score(),
-    pre_deflationary_phase_base_subsidy: Testnet11Bps::pre_deflationary_phase_base_subsidy(),
-    coinbase_maturity: Testnet11Bps::coinbase_maturity(),
-
-    coinbase_payload_script_public_key_max_len: 150,
-    max_coinbase_payload_len: 204,
-
-    max_tx_inputs: 10_000,
-    max_tx_outputs: 10_000,
-    max_signature_script_len: 1_000_000,
-    max_script_public_key_len: 1_000_000,
-
-    mass_per_tx_byte: 1,
-    mass_per_script_pub_key_byte: 10,
-    mass_per_sig_op: 1000,
-    max_block_mass: 500_000,
-
-    storage_mass_parameter: STORAGE_MASS_PARAMETER,
-    storage_mass_activation_daa_score: 0,
-
-    skip_proof_of_work: false,
-    max_block_level: 250,
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -491,20 +467,20 @@ pub const SIMNET_PARAMS: Params = Params {
     // ~~~~~~~~~~~~~~~~~~ BPS dependent constants ~~~~~~~~~~~~~~~~~~
     //
     // Note we use a 10 BPS configuration for simnet
-    ghostdag_k: Testnet11Bps::ghostdag_k(),
-    target_time_per_block: Testnet11Bps::target_time_per_block(),
-    past_median_time_sample_rate: Testnet11Bps::past_median_time_sample_rate(),
-    difficulty_sample_rate: Testnet11Bps::difficulty_adjustment_sample_rate(),
-    // For simnet, we deviate from TN11 configuration and allow at least 64 parents in order to support mempool benchmarks out of the box
-    max_block_parents: if Testnet11Bps::max_block_parents() > 64 { Testnet11Bps::max_block_parents() } else { 64 },
-    mergeset_size_limit: Testnet11Bps::mergeset_size_limit(),
-    merge_depth: Testnet11Bps::merge_depth_bound(),
-    finality_depth: Testnet11Bps::finality_depth(),
-    pruning_depth: Testnet11Bps::pruning_depth(),
-    pruning_proof_m: Testnet11Bps::pruning_proof_m(),
-    deflationary_phase_daa_score: Testnet11Bps::deflationary_phase_daa_score(),
-    pre_deflationary_phase_base_subsidy: Testnet11Bps::pre_deflationary_phase_base_subsidy(),
-    coinbase_maturity: Testnet11Bps::coinbase_maturity(),
+    ghostdag_k: Bps::<10>::ghostdag_k(),
+    target_time_per_block: Bps::<10>::target_time_per_block(),
+    past_median_time_sample_rate: Bps::<10>::past_median_time_sample_rate(),
+    difficulty_sample_rate: Bps::<10>::difficulty_adjustment_sample_rate(),
+    // For simnet, we allow at least 64 parents in order to support mempool benchmarks out of the box
+    max_block_parents: if Bps::<10>::max_block_parents() > 64 { Bps::<10>::max_block_parents() } else { 64 },
+    mergeset_size_limit: Bps::<10>::mergeset_size_limit(),
+    merge_depth: Bps::<10>::merge_depth_bound(),
+    finality_depth: Bps::<10>::finality_depth(),
+    pruning_depth: Bps::<10>::pruning_depth(),
+    pruning_proof_m: Bps::<10>::pruning_proof_m(),
+    deflationary_phase_daa_score: Bps::<10>::deflationary_phase_daa_score(),
+    pre_deflationary_phase_base_subsidy: Bps::<10>::pre_deflationary_phase_base_subsidy(),
+    coinbase_maturity: Bps::<10>::coinbase_maturity(),
 
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
@@ -521,6 +497,10 @@ pub const SIMNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     storage_mass_activation_daa_score: 0,
+    payload_hf_activation_daa_score: u64::MAX,
+    payload_max_len_consensus: 8192,
+    payload_max_len_standard: 2048,
+    payload_weight_multiplier: 4,
 
     skip_proof_of_work: true, // For simnet only, PoW can be simulated by default
     max_block_level: 250,
@@ -567,6 +547,10 @@ pub const DEVNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     storage_mass_activation_daa_score: u64::MAX,
+    payload_hf_activation_daa_score: u64::MAX,
+    payload_max_len_consensus: 8192,
+    payload_max_len_standard: 2048,
+    payload_weight_multiplier: 4,
 
     // deflationary_phase_daa_score is the DAA score after which the pre-deflationary period
     // switches to the deflationary period. This number is calculated as follows:

@@ -204,7 +204,12 @@ impl TransactionsPool {
 
     /// Dynamically builds a transaction selector based on the specific state of the ready transactions frontier
     pub(crate) fn build_selector(&self) -> Box<dyn TemplateTransactionSelector> {
-        self.ready_transactions.build_selector(&Policy::new(self.config.maximum_mass_per_block))
+        self.ready_transactions.build_selector(&Policy::new_with_payload_policy(
+            self.config.maximum_mass_per_block,
+            self.config.payload_soft_cap_per_block_bytes,
+            self.config.payload_overcap_feerate_multiplier,
+            self.config.minimum_feerate(),
+        ))
     }
 
     /// Builds a feerate estimator based on internal state of the ready transactions frontier

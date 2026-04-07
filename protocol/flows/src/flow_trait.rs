@@ -16,10 +16,15 @@ where
 
     async fn start(&mut self) -> Result<(), ProtocolError>;
 
+    /// Called before the router is closed due to a flow error.
+    /// Flows may override this in order to report peer-level penalties.
+    async fn on_error(&self, _err: &ProtocolError) {}
+
     fn launch(mut self: Box<Self>) {
         tokio::spawn(async move {
             let res = self.start().await;
             if let Err(err) = res {
+                self.on_error(&err).await;
                 if let Some(router) = self.router() {
                     router.try_sending_reject_message(&err).await;
                     if router.close().await || !err.is_connection_closed_error() {

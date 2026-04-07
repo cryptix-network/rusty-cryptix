@@ -382,7 +382,8 @@ impl UtxoContext {
                 unreachable!("Error: promotion of the outgoing transaction!");
             }
 
-            let record = TransactionRecord::new_incoming(self, txid, &utxos);
+            let transaction = self.processor().confirmed_transaction(&txid);
+            let record = TransactionRecord::new_incoming(self, txid, &utxos, transaction.as_ref());
             self.processor().notify(Events::Maturity { record }).await?;
         }
 
@@ -404,7 +405,8 @@ impl UtxoContext {
                 }
             }
 
-            let record = TransactionRecord::new_incoming(self, txid, &utxos);
+            let transaction = self.processor().confirmed_transaction(&txid);
+            let record = TransactionRecord::new_incoming(self, txid, &utxos, transaction.as_ref());
             self.processor().notify(Events::Pending { record }).await?;
         }
 
@@ -462,13 +464,15 @@ impl UtxoContext {
 
         let pending = HashMap::group_from(pending.into_iter().map(|utxo| (utxo.transaction_id(), utxo)));
         for (id, utxos) in pending.into_iter() {
-            let record = TransactionRecord::new_external(self, id, &utxos);
+            let transaction = self.processor().confirmed_transaction(&id);
+            let record = TransactionRecord::new_external(self, id, &utxos, transaction.as_ref());
             self.processor().handle_discovery(record).await?;
         }
 
         let mature = HashMap::group_from(mature.into_iter().map(|utxo| (utxo.transaction_id(), utxo)));
         for (id, utxos) in mature.into_iter() {
-            let record = TransactionRecord::new_external(self, id, &utxos);
+            let transaction = self.processor().confirmed_transaction(&id);
+            let record = TransactionRecord::new_external(self, id, &utxos, transaction.as_ref());
             self.processor().handle_discovery(record).await?;
         }
 
@@ -561,7 +565,8 @@ impl UtxoContext {
                 }
             } else if !is_coinbase_stasis {
                 // do not notify if coinbase transaction is in stasis
-                let record = TransactionRecord::new_incoming(self, txid, &utxos);
+                let transaction = self.processor().confirmed_transaction(&txid);
+                let record = TransactionRecord::new_incoming(self, txid, &utxos, transaction.as_ref());
                 self.processor().notify(Events::Pending { record }).await?;
             }
         }
@@ -629,17 +634,20 @@ impl UtxoContext {
         let stasis = HashMap::group_from(stasis.into_iter().map(|utxo| (utxo.transaction_id(), utxo)));
 
         for (txid, utxos) in mature.into_iter() {
-            let record = TransactionRecord::new_external(self, txid, &utxos);
+            let transaction = self.processor().confirmed_transaction(&txid);
+            let record = TransactionRecord::new_external(self, txid, &utxos, transaction.as_ref());
             self.processor().notify(Events::Maturity { record }).await?;
         }
 
         for (txid, utxos) in pending.into_iter() {
-            let record = TransactionRecord::new_reorg(self, txid, &utxos);
+            let transaction = self.processor().confirmed_transaction(&txid);
+            let record = TransactionRecord::new_reorg(self, txid, &utxos, transaction.as_ref());
             self.processor().notify(Events::Reorg { record }).await?;
         }
 
         for (txid, utxos) in stasis.into_iter() {
-            let record = TransactionRecord::new_stasis(self, txid, &utxos);
+            let transaction = self.processor().confirmed_transaction(&txid);
+            let record = TransactionRecord::new_stasis(self, txid, &utxos, transaction.as_ref());
             self.processor().notify(Events::Stasis { record }).await?;
         }
 

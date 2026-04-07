@@ -5,7 +5,7 @@ use crate::result::Result;
 use crate::tx::{Fees, MassCalculator, PaymentDestination};
 use crate::utxo::UtxoEntryReference;
 use crate::{tx::PaymentOutputs, utils::cryptix_to_sompi};
-use cryptix_addresses::Address;
+use cryptix_addresses::{Address, Prefix, Version};
 use cryptix_consensus_core::network::{NetworkId, NetworkType};
 use cryptix_consensus_core::tx::Transaction;
 use rand::prelude::*;
@@ -140,7 +140,7 @@ impl GeneratorExtension for Generator {
 
 fn test_network_id() -> NetworkId {
     // TODO make this configurable
-    NetworkId::with_suffix(NetworkType::Testnet, 11)
+    NetworkId::new(NetworkType::Testnet)
 }
 
 #[derive(Default)]
@@ -437,20 +437,16 @@ where
 
 pub(crate) fn change_address(network_type: NetworkType) -> Address {
     match network_type {
-        NetworkType::Mainnet => Address::try_from("cryptix:qpauqsvk7yf9unexwmxsnmg547mhyga37csh0kj53q6xxgl24ydxjsgzthw5j").unwrap(),
-        NetworkType::Testnet => {
-            Address::try_from("cryptixtest:qqz22l98sf8jun72rwh5rqe2tm8lhwtdxdmynrz4ypwak427qed5juktjt7ju").unwrap()
-        }
+        NetworkType::Mainnet => Address::new(Prefix::Mainnet, Version::PubKey, &[1u8; 32]),
+        NetworkType::Testnet => Address::new(Prefix::Testnet, Version::PubKey, &[1u8; 32]),
         _ => unreachable!("network type not supported"),
     }
 }
 
 pub(crate) fn output_address(network_type: NetworkType) -> Address {
     match network_type {
-        NetworkType::Mainnet => Address::try_from("cryptix:qrd9efkvg3pg34sgp6ztwyv3r569qlc43wa5w8nfs302532dzj47knu04aftm").unwrap(),
-        NetworkType::Testnet => {
-            Address::try_from("cryptixtest:qqrewmx4gpuekvk8grenkvj2hp7xt0c35rxgq383f6gy223c4ud5s58ptm6er").unwrap()
-        }
+        NetworkType::Mainnet => Address::new(Prefix::Mainnet, Version::PubKey, &[2u8; 32]),
+        NetworkType::Testnet => Address::new(Prefix::Testnet, Version::PubKey, &[2u8; 32]),
         _ => unreachable!("network type not supported"),
     }
 }
@@ -729,7 +725,8 @@ fn test_generator_inputs_32k_outputs_2_fees_exclude() -> Result<()> {
 #[test]
 fn test_generator_inputs_250k_outputs_2_sweep() -> Result<()> {
     let f = 130.0;
-    let generator = make_generator(test_network_id(), &[f; 250_000], &[], Fees::None, change_address, PaymentDestination::Change);
+    let inputs = vec![f; 250_000];
+    let generator = make_generator(test_network_id(), &inputs, &[], Fees::None, change_address, PaymentDestination::Change);
     generator.unwrap().harness().accumulate(2875).finalize();
     Ok(())
 }

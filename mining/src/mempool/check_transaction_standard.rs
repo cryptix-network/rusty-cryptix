@@ -5,6 +5,7 @@ use crate::mempool::{
 use cryptix_consensus_core::{
     constants::{MAX_SCRIPT_PUBLIC_KEY_VERSION, MAX_SOMPI},
     mass,
+    subnets::SUBNETWORK_ID_PAYLOAD,
     tx::{MutableTransaction, PopulatedTransaction, TransactionOutput},
 };
 use cryptix_txscript::{get_sig_op_count, is_unspendable, script_class::ScriptClass};
@@ -65,6 +66,15 @@ impl Mempool {
                 transaction_id,
                 transaction.calculated_compute_mass.unwrap(),
                 MAXIMUM_STANDARD_TRANSACTION_MASS,
+            ));
+        }
+
+        if transaction.tx.subnetwork_id == SUBNETWORK_ID_PAYLOAD && transaction.tx.payload.len() > self.config.payload_max_len_standard
+        {
+            return Err(NonStandardError::RejectPayloadLength(
+                transaction_id,
+                transaction.tx.payload.len(),
+                self.config.payload_max_len_standard,
             ));
         }
 
@@ -239,7 +249,7 @@ mod tests {
         config::params::Params,
         constants::{MAX_TX_IN_SEQUENCE_NUM, SOMPI_PER_CRYPTIX, TX_VERSION},
         network::NetworkType,
-        subnets::SUBNETWORK_ID_NATIVE,
+        subnets::{SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PAYLOAD},
         tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionInput, TransactionOutpoint, TransactionOutput},
     };
     use cryptix_txscript::{
@@ -429,6 +439,38 @@ mod tests {
                     1000,
                 ),
                 is_standard: true,
+            },
+            Test {
+                name: "Payload tx at standard limit",
+                mtx: new_mtx(
+                    Transaction::new(
+                        TX_VERSION,
+                        vec![dummy_tx_input.clone()],
+                        vec![dummy_tx_out.clone()],
+                        0,
+                        SUBNETWORK_ID_PAYLOAD,
+                        0,
+                        vec![7u8; 2048],
+                    ),
+                    1000,
+                ),
+                is_standard: true,
+            },
+            Test {
+                name: "Payload tx above standard limit",
+                mtx: new_mtx(
+                    Transaction::new(
+                        TX_VERSION,
+                        vec![dummy_tx_input.clone()],
+                        vec![dummy_tx_out.clone()],
+                        0,
+                        SUBNETWORK_ID_PAYLOAD,
+                        0,
+                        vec![7u8; 2049],
+                    ),
+                    1000,
+                ),
+                is_standard: false,
             },
             Test {
                 name: "Transaction version too high",

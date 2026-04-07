@@ -15,6 +15,8 @@ use futures_util::future::{join_all, try_join_all};
 use itertools::Itertools;
 use parking_lot::Mutex as ParkingLotMutex;
 use rand::{seq::SliceRandom, thread_rng};
+use reqwest::{redirect::Policy as RedirectPolicy, Client as HttpClient, Url as ParsedUrl};
+use serde_json::Value as JsonValue;
 use tokio::{
     select,
     sync::{
@@ -23,6 +25,14 @@ use tokio::{
     },
     time::{interval, MissedTickBehavior},
 };
+
+pub const DEFAULT_BANSERVER_URL: &str = "https://antifraud.cryptix-network.org/api/confirmed-cases/iplist";
+const BANSERVER_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const BANSERVER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+const BANSERVER_MAX_IPS: usize = 10_000;
+const BANSERVER_MAX_IP_ENTRY_LEN: usize = 64;
+const BANSERVER_MAX_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+const BANSERVER_BANNED_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 pub struct ConnectionManager {
     p2p_adaptor: Arc<cryptix_p2p_lib::Adaptor>,
@@ -34,6 +44,9 @@ pub struct ConnectionManager {
     connection_requests: TokioMutex<HashMap<SocketAddr, ConnectionRequest>>,
     force_next_iteration: UnboundedSender<()>,
     shutdown_signal: SingleTrigger,
+    banserver_enabled: bool,
+    banserver_url: String,
+    banserver_banned_ips: ParkingLotMutex<HashSet<IpAddr>>,
 }
 
 #[derive(Clone, Debug)]
@@ -57,8 +70,14 @@ impl ConnectionManager {
         dns_seeders: &'static [&'static str],
         default_port: u16,
         address_manager: Arc<ParkingLotMutex<AddressManager>>,
+        banserver_enabled: bool,
+        banserver_url: Option<String>,
     ) -> Arc<Self> {
         let (tx, rx) = unbounded_channel::<()>();
+        let banserver_url = banserver_url
+            .map(|url| url.trim().to_owned())
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| DEFAULT_BANSERVER_URL.to_owned());
         let manager = Arc::new(Self {
             p2p_adaptor,
             outbound_target,
@@ -69,6 +88,9 @@ impl ConnectionManager {
             shutdown_signal: SingleTrigger::new(),
             dns_seeders,
             default_port,
+            banserver_enabled,
+            banserver_url,
+            banserver_banned_ips: ParkingLotMutex::new(HashSet::new()),
         });
         manager.clone().start_event_loop(rx);
         manager.force_next_iteration.send(()).unwrap();
@@ -77,8 +99,15 @@ impl ConnectionManager {
 
     fn start_event_loop(self: Arc<Self>, mut rx: UnboundedReceiver<()>) {
         let mut ticker = interval(Duration::from_secs(30));
+        let mut banserver_ticker = interval(BANSERVER_REFRESH_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        banserver_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         tokio::spawn(async move {
+            if self.banserver_enabled {
+                self.clone().refresh_banserver_bans().await;
+                // Consume the immediate interval tick so the next refresh is one full interval away.
+                let _ = banserver_ticker.tick().await;
+            }
             loop {
                 if self.shutdown_signal.trigger.is_triggered() {
                     break;
@@ -86,6 +115,7 @@ impl ConnectionManager {
                 select! {
                     _ = rx.recv() => self.clone().handle_event().await,
                     _ = ticker.tick() => self.clone().handle_event().await,
+                    _ = banserver_ticker.tick(), if self.banserver_enabled => self.clone().refresh_banserver_bans().await,
                     _ = self.shutdown_signal.listener.clone() => break,
                 }
             }
@@ -126,6 +156,19 @@ impl ConnectionManager {
             }
 
             if !is_connected && request.next_attempt <= SystemTime::now() {
+                if self.is_banserver_banned_ip(address.ip()) {
+                    debug!("Skipping connection request {} because it is blocked by banserver list", address);
+                    new_requests.insert(
+                        address,
+                        ConnectionRequest {
+                            next_attempt: SystemTime::now() + BANSERVER_BANNED_CONNECTION_RETRY_DELAY,
+                            is_permanent: request.is_permanent,
+                            attempts: request.attempts,
+                        },
+                    );
+                    continue;
+                }
+
                 debug!("Connecting to peer request {}", address);
                 match self.p2p_adaptor.connect_peer(address.to_string()).await {
                     Err(err) => {
@@ -182,6 +225,10 @@ impl ConnectionManager {
                     connecting = false;
                     break;
                 };
+                if self.is_banserver_banned_ip(net_addr.ip.into()) {
+                    debug!("Skipping outbound candidate {} due to banserver list", net_addr);
+                    continue;
+                }
                 let socket_addr = SocketAddr::new(net_addr.ip.into(), net_addr.port).to_string();
                 debug!("Connecting to {}", &socket_addr);
                 addrs_to_connect.push(net_addr);
@@ -325,7 +372,8 @@ impl ConnectionManager {
 
     /// Returns whether the given address is banned.
     pub async fn is_banned(&self, address: &SocketAddr) -> bool {
-        !self.is_permanent(address).await && self.address_manager.lock().is_banned(address.ip().into())
+        self.is_banserver_banned_ip(address.ip())
+            || (!self.is_permanent(address).await && self.address_manager.lock().is_banned(address.ip().into()))
     }
 
     /// Returns whether the given address is a permanent request.
@@ -336,5 +384,228 @@ impl ConnectionManager {
     /// Returns whether the given IP has some permanent request.
     pub async fn ip_has_permanent_connection(&self, ip: IpAddr) -> bool {
         self.connection_requests.lock().await.iter().any(|(address, request)| request.is_permanent && address.ip() == ip)
+    }
+
+    fn is_banserver_banned_ip(&self, ip: IpAddr) -> bool {
+        self.banserver_enabled && self.banserver_banned_ips.lock().contains(&ip)
+    }
+
+    async fn refresh_banserver_bans(self: Arc<Self>) {
+        let fetched = match self.fetch_banserver_payload().await {
+            Ok(ips) => ips,
+            Err(err) => {
+                warn!("Banserver refresh failed (URL: {}): {}. Continuing without remote list update.", self.banserver_url, err);
+                return;
+            }
+        };
+
+        let (newly_banned, removed_count, total_count) = {
+            let mut state = self.banserver_banned_ips.lock();
+            let newly_banned = fetched.difference(&*state).copied().collect_vec();
+            let removed_count = state.difference(&fetched).count();
+            *state = fetched;
+            (newly_banned, removed_count, state.len())
+        };
+
+        if newly_banned.is_empty() && removed_count == 0 {
+            debug!("Banserver refresh completed with no changes ({} active IPs)", total_count);
+            return;
+        }
+
+        info!(
+            "Banserver refresh applied: {} newly banned, {} removed, {} total entries",
+            newly_banned.len(),
+            removed_count,
+            total_count
+        );
+
+        if !newly_banned.is_empty() {
+            self.disconnect_peers_by_ip_list(newly_banned).await;
+        }
+
+        // Ensure the connection loop reacts quickly to newly updated server bans.
+        let _ = self.force_next_iteration.send(());
+    }
+
+    async fn fetch_banserver_payload(&self) -> Result<HashSet<IpAddr>, String> {
+        let primary_url = self.banserver_url.trim();
+        match self.fetch_banserver_json(primary_url).await {
+            Ok(payload) => Self::parse_banserver_ips(payload),
+            Err(primary_err) => {
+                if let Some(fallback_url) = Self::http_fallback_url(primary_url) {
+                    match self.fetch_banserver_json(&fallback_url).await {
+                        Ok(payload) => {
+                            warn!(
+                                "Banserver HTTPS fetch failed for {} ({}), HTTP fallback {} succeeded",
+                                primary_url, primary_err, fallback_url
+                            );
+                            Self::parse_banserver_ips(payload)
+                        }
+                        Err(fallback_err) => {
+                            Err(format!("primary fetch failed: {}; http fallback failed: {}", primary_err, fallback_err))
+                        }
+                    }
+                } else {
+                    Err(primary_err)
+                }
+            }
+        }
+    }
+
+    async fn fetch_banserver_json(&self, url: &str) -> Result<JsonValue, String> {
+        let parsed_url = ParsedUrl::parse(url).map_err(|err| format!("invalid URL `{url}`: {err}"))?;
+        match parsed_url.scheme() {
+            "https" | "http" => {}
+            scheme => return Err(format!("unsupported URL scheme `{scheme}` (only http/https allowed)")),
+        }
+
+        let client = HttpClient::builder()
+            // Explicitly allow self-signed/invalid TLS chains to maximize compatibility.
+            .danger_accept_invalid_certs(true)
+            // Keep hostname verification enabled (default), only cert chain/date checks are relaxed.
+            .danger_accept_invalid_hostnames(false)
+            .redirect(RedirectPolicy::limited(2))
+            .timeout(BANSERVER_FETCH_TIMEOUT)
+            .build()
+            .map_err(|err| format!("failed building HTTP client: {err}"))?;
+
+        let response = client.get(parsed_url).send().await.map_err(|err| format!("request error: {err}"))?;
+
+        if !response.status().is_success() {
+            return Err(format!("http status {}", response.status()));
+        }
+
+        if let Some(content_length) = response.content_length() {
+            if content_length > BANSERVER_MAX_PAYLOAD_BYTES as u64 {
+                return Err(format!(
+                    "payload too large by content-length: {} bytes (max {})",
+                    content_length, BANSERVER_MAX_PAYLOAD_BYTES
+                ));
+            }
+        }
+
+        let body = response.bytes().await.map_err(|err| format!("failed reading response body: {err}"))?;
+        if body.len() > BANSERVER_MAX_PAYLOAD_BYTES {
+            return Err(format!("payload too large after download: {} bytes (max {})", body.len(), BANSERVER_MAX_PAYLOAD_BYTES));
+        }
+
+        serde_json::from_slice::<JsonValue>(&body).map_err(|err| format!("invalid json payload: {err}"))
+    }
+
+    fn http_fallback_url(url: &str) -> Option<String> {
+        let mut parsed = ParsedUrl::parse(url).ok()?;
+        if parsed.scheme() != "https" {
+            return None;
+        }
+
+        if parsed.port() == Some(443) {
+            let _ = parsed.set_port(Some(80));
+        }
+        parsed.set_scheme("http").ok()?;
+        Some(parsed.to_string())
+    }
+
+    fn parse_banserver_ips(payload: JsonValue) -> Result<HashSet<IpAddr>, String> {
+        let ips_values = Self::extract_ip_array(&payload).ok_or_else(|| "missing `ips` array in banserver payload".to_owned())?;
+
+        let mut parsed_ips = HashSet::new();
+        for raw in ips_values.iter().take(BANSERVER_MAX_IPS) {
+            let Some(raw_ip) = raw.as_str() else {
+                continue;
+            };
+            let candidate = raw_ip.trim();
+            if candidate.is_empty() || candidate.len() > BANSERVER_MAX_IP_ENTRY_LEN {
+                continue;
+            }
+            if let Ok(ip) = candidate.parse::<IpAddr>() {
+                parsed_ips.insert(ip);
+            }
+        }
+        Ok(parsed_ips)
+    }
+
+    fn extract_ip_array(payload: &JsonValue) -> Option<&Vec<JsonValue>> {
+        payload
+            .get("ips")
+            .and_then(JsonValue::as_array)
+            .or_else(|| payload.get("data").and_then(|data| data.get("ips")).and_then(JsonValue::as_array))
+            .or_else(|| payload.as_array())
+    }
+
+    async fn disconnect_peers_by_ip_list(&self, ips: Vec<IpAddr>) {
+        let ip_set = ips.into_iter().collect::<HashSet<_>>();
+        if ip_set.is_empty() {
+            return;
+        }
+
+        let peers_to_disconnect =
+            self.p2p_adaptor.active_peers().into_iter().filter(|peer| ip_set.contains(&peer.net_address().ip())).collect_vec();
+        if peers_to_disconnect.is_empty() {
+            return;
+        }
+
+        info!("Banserver enforcement: disconnecting {} active peer(s) due to newly banned IP entries", peers_to_disconnect.len());
+        let disconnect_jobs = peers_to_disconnect.iter().map(|peer| self.p2p_adaptor.terminate(peer.key())).collect_vec();
+        join_all(disconnect_jobs).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_banserver_ips_accepts_standard_ips_array() {
+        let payload = json!({
+            "status": "success",
+            "count": 2,
+            "ips": ["1.2.3.4", "2001:db8::1"]
+        });
+        let parsed = ConnectionManager::parse_banserver_ips(payload).expect("payload should parse");
+        assert!(parsed.contains(&"1.2.3.4".parse::<IpAddr>().unwrap()));
+        assert!(parsed.contains(&"2001:db8::1".parse::<IpAddr>().unwrap()));
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn parse_banserver_ips_filters_invalid_entries() {
+        let payload = json!({
+            "ips": ["1.2.3.4", "not-an-ip", "", "  ", null, "999.1.1.1", "2001:db8::1"]
+        });
+        let parsed = ConnectionManager::parse_banserver_ips(payload).expect("payload should parse");
+        assert!(parsed.contains(&"1.2.3.4".parse::<IpAddr>().unwrap()));
+        assert!(parsed.contains(&"2001:db8::1".parse::<IpAddr>().unwrap()));
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn parse_banserver_ips_respects_max_entries_cap() {
+        let mut ips = Vec::with_capacity(BANSERVER_MAX_IPS + 10);
+        for i in 0..(BANSERVER_MAX_IPS + 10) {
+            let octet = (i % 250) as u8;
+            ips.push(format!("10.0.{}.{}", octet, (octet + 1) % 250));
+        }
+        let payload = json!({ "ips": ips });
+        let parsed = ConnectionManager::parse_banserver_ips(payload).expect("payload should parse");
+        assert!(parsed.len() <= BANSERVER_MAX_IPS);
+    }
+
+    #[test]
+    fn http_fallback_url_converts_https_to_http() {
+        let fallback = ConnectionManager::http_fallback_url("https://example.org/api/confirmed-cases/iplist").unwrap();
+        assert_eq!(fallback, "http://example.org/api/confirmed-cases/iplist");
+    }
+
+    #[test]
+    fn http_fallback_url_converts_https_443_to_http_80() {
+        let fallback = ConnectionManager::http_fallback_url("https://example.org:443/path").unwrap();
+        assert_eq!(fallback, "http://example.org/path");
+    }
+
+    #[test]
+    fn http_fallback_url_ignores_non_https() {
+        assert!(ConnectionManager::http_fallback_url("http://example.org/path").is_none());
+        assert!(ConnectionManager::http_fallback_url("ftp://example.org/path").is_none());
     }
 }

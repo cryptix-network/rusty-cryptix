@@ -7,3 +7,4 @@ NC='\033[0m' # No Color
 echo -e "${RED}WARNING: do not use resulting WASM binaries in production!${NC}"
 # wasm-pack build --weak-refs --dev --target nodejs --out-name cryptix --out-dir nodejs/cryptix-dev --features wasm32-sdk $@
 wasm-pack build --weak-refs --dev --target nodejs --out-name cryptix --out-dir nodejs/cryptix-dev --features wasm32-sdk $@
+node build/patch-init-warnings.js nodejs/cryptix-dev

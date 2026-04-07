@@ -34,7 +34,7 @@ Feedback and contributions are always welcome.
 | `--utxoindex` | switch | `false` | Enable UTXO index. |
 | `--max-tracked-addresses=<N>` | integer | `0` | Preallocated max addresses for UTXO change tracking. |
 | `--testnet` | switch | `false` | Use testnet. |
-| `--netsuffix=<N>` | integer | `10` | Testnet suffix. |
+| `--netsuffix=<N>` | integer | none | Optional testnet suffix (for dedicated parallel testnet variants). |
 | `--devnet` | switch | `false` | Use devnet. |
 | `--simnet` | switch | `false` | Use simnet. |
 | `--archival` | switch | `false` | Run in archival mode (increased disk usage). |
@@ -50,6 +50,11 @@ Feedback and contributions are always welcome.
 | `--hfa-drift-ms=<MS>` | integer | `5000` | HFA clock drift window in milliseconds for fast-intent admission. |
 | `--hfa-microblock-interval-ms-normal=<MS>` | integer | `50` | HFA microblock interval in milliseconds while in normal mode. |
 | `--no-hfa` | switch | `false` | Force-disable HFA (overrides config). |
+| `--autoban` | switch | `true` | Enable automatic banning of repeatedly misbehaving peers. |
+| `--no-autoban` | switch | `false` | Disable automatic banning of repeatedly misbehaving peers (overrides config). |
+| `--banserver` | switch | `true` | Enable remote ban list synchronization from the antifraud banserver. |
+| `--no-banserver` | switch | `false` | Disable remote ban list synchronization from the antifraud banserver (overrides config). |
+| `--banserver-url=<URL>` | string | `https://antifraud.cryptix-network.org/api/confirmed-cases/iplist` | Override the banserver endpoint for remote IP blocklist sync. |
 | `--disable-upnp` | switch | `false` | Disable UPnP. |
 | `--nodnsseed` | switch | `false` | Disable DNS peer seeding. |
 | `--nogrpc` | switch | `false` | Disable gRPC server. |
@@ -283,9 +288,7 @@ The framework is compatible with all major desktop and mobile browsers.
 cargo run --release --bin cryptixd -- --testnet
   ```
 
-  **Testnet 11**
-
-  For participation in the 10BPS test network (TN11), see the following detailed [guide](docs/testnet11.md).
+  Optionally, `--netsuffix=<N>` can be used to run an isolated suffixed testnet id when needed.
 
 <details>
 
@@ -310,15 +313,30 @@ utxoindex = false
 disable-upnp = true
 perf-metrics = true
 appdir = "some-dir"
-netsuffix = 11
 hfa-microblock-interval-ms-normal = 50
+autoban = true
+banserver = true
+banserver-url = "https://antifraud.cryptix-network.org/api/confirmed-cases/iplist"
 addpeer = ["10.0.0.1", "1.2.3.4"]
   ```
- Pass the `--help` flag to view all possible arguments
+Pass the `--help` flag to view all possible arguments
 
   ```bash
 cargo run --release --bin cryptixd -- --help
   ```
+
+  Auto-ban defaults:
+  - enabled by default (`autoban = true`)
+  - ban threshold: 5 strikes
+  - ban duration: 3 hours
+  - inbound connection rate-limiter
+  - rate-limit penalties are strike-cooldown limited to 1 per 60s per IP
+
+  Banserver sync defaults:
+  - enabled by default (`banserver = true`)
+  - startup fetch + periodic refresh every 1 hour
+  - endpoint default: `https://antifraud.cryptix-network.org/api/confirmed-cases/iplist`
+  - fail-open: server/network/payload errors are ignored safely and do not crash node operation
 </details>
 
 <details>

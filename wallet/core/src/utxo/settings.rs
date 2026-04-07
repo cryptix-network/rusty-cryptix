@@ -58,19 +58,11 @@ static MAINNET_NETWORK_PARAMS: LazyLock<NetworkParams> = LazyLock::new(|| Networ
     additional_compound_transaction_mass: 100,
 });
 
-static TESTNET10_NETWORK_PARAMS: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
+static TESTNET_NETWORK_PARAMS: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
     coinbase_transaction_maturity_period_daa: AtomicU64::new(100),
     coinbase_transaction_stasis_period_daa: 50,
     user_transaction_maturity_period_daa: AtomicU64::new(10),
     kip9_version: Kip9Version::Beta,
-    additional_compound_transaction_mass: 100,
-});
-
-static TESTNET11_NETWORK_PARAMS: LazyLock<NetworkParams> = LazyLock::new(|| NetworkParams {
-    coinbase_transaction_maturity_period_daa: AtomicU64::new(1_000),
-    coinbase_transaction_stasis_period_daa: 500,
-    user_transaction_maturity_period_daa: AtomicU64::new(100),
-    kip9_version: Kip9Version::Alpha,
     additional_compound_transaction_mass: 100,
 });
 
@@ -94,12 +86,7 @@ impl NetworkParams {
     pub fn from(value: NetworkId) -> &'static NetworkParams {
         match value.network_type {
             NetworkType::Mainnet => &MAINNET_NETWORK_PARAMS,
-            NetworkType::Testnet => match value.suffix {
-                Some(10) => &TESTNET10_NETWORK_PARAMS,
-                Some(11) => &TESTNET11_NETWORK_PARAMS,
-                Some(x) => panic!("Testnet suffix {} is not supported", x),
-                None => panic!("Testnet suffix not provided"),
-            },
+            NetworkType::Testnet => &TESTNET_NETWORK_PARAMS,
             NetworkType::Devnet => &DEVNET_NETWORK_PARAMS,
             NetworkType::Simnet => &SIMNET_NETWORK_PARAMS,
         }

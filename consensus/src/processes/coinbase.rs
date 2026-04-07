@@ -71,7 +71,8 @@ impl CoinbaseManager {
 
         // Precomputed subsidy by month table for the actual block per second rate
         // Here values are rounded up so that we keep the same number of rewarding months as in the original 1 BPS table.
-        // In a 10 BPS network, the induced increase in total rewards is 51 CPAY (see tests::calc_high_bps_total_rewards_delta())
+        // In a high-BPS network, rounding can induce a small increase in total rewards
+        // (see tests::calc_high_bps_total_rewards_delta()).
         let subsidy_by_month_table: SubsidyByMonthTable = core::array::from_fn(|i| (SUBSIDY_BY_MONTH_TABLE[i] + bps - 1) / bps);
         Self {
             coinbase_payload_script_public_key_max_len,
@@ -272,28 +273,25 @@ const SUBSIDY_BY_MONTH_TABLE: [u64; 426] = [
 mod tests {
     use super::*;
     use crate::params::MAINNET_PARAMS;
-    use cryptix_consensus_core::{
-        config::params::{Params, TESTNET11_PARAMS},
-        constants::SOMPI_PER_CRYPTIX,
-        network::NetworkId,
-        tx::scriptvec,
-    };
+    use cryptix_consensus_core::{config::params::Params, constants::SOMPI_PER_CRYPTIX, network::NetworkId, tx::scriptvec};
 
     #[test]
     fn calc_high_bps_total_rewards_delta() {
         const SECONDS_PER_MONTH: u64 = 2629800;
+        const HIGH_BPS: u64 = 10;
 
         let legacy_cbm = create_legacy_manager();
         let pre_deflationary_rewards = legacy_cbm.pre_deflationary_phase_base_subsidy * legacy_cbm.deflationary_phase_daa_score;
         let total_rewards: u64 = pre_deflationary_rewards + SUBSIDY_BY_MONTH_TABLE.iter().map(|x| x * SECONDS_PER_MONTH).sum::<u64>();
-        let testnet_11_bps = TESTNET11_PARAMS.bps();
+        let mut high_bps_params = MAINNET_PARAMS;
+        high_bps_params.target_time_per_block = 1000 / HIGH_BPS;
+        high_bps_params.deflationary_phase_daa_score *= HIGH_BPS;
+        high_bps_params.pre_deflationary_phase_base_subsidy /= HIGH_BPS;
+        let high_bps = high_bps_params.bps();
         let total_high_bps_rewards_rounded_up: u64 = pre_deflationary_rewards
-            + SUBSIDY_BY_MONTH_TABLE
-                .iter()
-                .map(|x| ((x + testnet_11_bps - 1) / testnet_11_bps * testnet_11_bps) * SECONDS_PER_MONTH)
-                .sum::<u64>();
+            + SUBSIDY_BY_MONTH_TABLE.iter().map(|x| ((x + high_bps - 1) / high_bps * high_bps) * SECONDS_PER_MONTH).sum::<u64>();
 
-        let cbm = create_manager(&TESTNET11_PARAMS);
+        let cbm = create_manager(&high_bps_params);
         let total_high_bps_rewards: u64 =
             pre_deflationary_rewards + cbm.subsidy_by_month_table.iter().map(|x| x * cbm.blocks_per_month).sum::<u64>();
         assert_eq!(total_high_bps_rewards_rounded_up, total_high_bps_rewards, "subsidy adjusted to bps must be rounded up");
@@ -327,8 +325,6 @@ mod tests {
 
     #[test]
     fn subsidy_test() {
-        const PRE_DEFLATIONARY_PHASE_BASE_SUBSIDY: u64 = 167300000000;
-        const DEFLATIONARY_PHASE_INITIAL_SUBSIDY: u64 = 1000000000;
         const SECONDS_PER_MONTH: u64 = 2629800;
         const SECONDS_PER_HALVING: u64 = SECONDS_PER_MONTH * 12;
 
@@ -336,9 +332,13 @@ mod tests {
             let params = &network_id.into();
             let cbm = create_manager(params);
 
-            let pre_deflationary_phase_base_subsidy = PRE_DEFLATIONARY_PHASE_BASE_SUBSIDY / params.bps();
-            let deflationary_phase_initial_subsidy = DEFLATIONARY_PHASE_INITIAL_SUBSIDY / params.bps();
+            let pre_deflationary_phase_base_subsidy = cbm.pre_deflationary_phase_base_subsidy;
+            let deflationary_phase_initial_subsidy = cbm.subsidy_by_month_table[0];
             let blocks_per_halving = SECONDS_PER_HALVING * params.bps();
+            let subsidy_after_halvings = |halvings: usize| {
+                let month_index = halvings * 12;
+                cbm.subsidy_by_month_table.get(month_index).copied().unwrap_or_else(|| *cbm.subsidy_by_month_table.last().unwrap())
+            };
 
             struct Test {
                 name: &'static str,
@@ -362,32 +362,32 @@ mod tests {
                 Test {
                     name: "after one halving",
                     daa_score: params.deflationary_phase_daa_score + blocks_per_halving,
-                    expected: deflationary_phase_initial_subsidy / 2,
+                    expected: subsidy_after_halvings(1),
                 },
                 Test {
                     name: "after 2 halvings",
                     daa_score: params.deflationary_phase_daa_score + 2 * blocks_per_halving,
-                    expected: deflationary_phase_initial_subsidy / 4,
+                    expected: subsidy_after_halvings(2),
                 },
                 Test {
                     name: "after 5 halvings",
                     daa_score: params.deflationary_phase_daa_score + 5 * blocks_per_halving,
-                    expected: deflationary_phase_initial_subsidy / 32,
+                    expected: subsidy_after_halvings(5),
                 },
                 Test {
                     name: "after 32 halvings",
                     daa_score: params.deflationary_phase_daa_score + 32 * blocks_per_halving,
-                    expected: ((DEFLATIONARY_PHASE_INITIAL_SUBSIDY / 2_u64.pow(32)) + cbm.bps() - 1) / cbm.bps(),
+                    expected: subsidy_after_halvings(32),
                 },
                 Test {
                     name: "just before subsidy depleted",
                     daa_score: params.deflationary_phase_daa_score + 35 * blocks_per_halving,
-                    expected: 1,
+                    expected: subsidy_after_halvings(35),
                 },
                 Test {
                     name: "after subsidy depleted",
                     daa_score: params.deflationary_phase_daa_score + 36 * blocks_per_halving,
-                    expected: 0,
+                    expected: subsidy_after_halvings(36),
                 },
             ];
 

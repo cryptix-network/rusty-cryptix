@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use clap::{Arg, ArgAction, Command};
 use cryptix_addresses::{Address, Prefix, Version};
 use cryptix_consensus_core::{
-    config::params::{TESTNET11_PARAMS, TESTNET_PARAMS},
+    config::params::TESTNET_PARAMS,
     constants::{SOMPI_PER_CRYPTIX, TX_VERSION},
     sign::sign,
     subnets::SUBNETWORK_ID_NATIVE,
@@ -154,10 +154,7 @@ async fn main() {
 
     info!("Using Rothschild with private key {} and address {}", schnorr_key.display_secret(), String::from(&cryptix_addr));
     let info = rpc_client.get_block_dag_info().await.unwrap();
-    let coinbase_maturity = match info.network.suffix {
-        Some(11) => TESTNET11_PARAMS.coinbase_maturity,
-        None | Some(_) => TESTNET_PARAMS.coinbase_maturity,
-    };
+    let coinbase_maturity = TESTNET_PARAMS.coinbase_maturity;
     info!(
         "Node block-DAG info: \n\tNetwork: {}, \n\tBlock count: {}, \n\tHeader count: {}, \n\tDifficulty: {}, 
 \tMedian time: {}, \n\tDAA score: {}, \n\tPruning point: {}, \n\tTips: {}, \n\t{} virtual parents: ...{}, \n\tCoinbase maturity: {}",

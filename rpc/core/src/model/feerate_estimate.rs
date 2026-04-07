@@ -73,30 +73,39 @@ pub struct RpcFeeEstimateVerboseExperimentalData {
     pub next_block_template_feerate_min: f64,
     pub next_block_template_feerate_median: f64,
     pub next_block_template_feerate_max: f64,
+    pub minimum_relay_feerate: Option<f64>,
+    pub payload_overcap_feerate_floor: Option<f64>,
+    pub effective_hfa_feerate_floor: Option<f64>,
 }
 
 impl Serializer for RpcFeeEstimateVerboseExperimentalData {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
         store!(u64, &self.mempool_ready_transactions_count, writer)?;
         store!(u64, &self.mempool_ready_transactions_total_mass, writer)?;
         store!(u64, &self.network_mass_per_second, writer)?;
         store!(f64, &self.next_block_template_feerate_min, writer)?;
         store!(f64, &self.next_block_template_feerate_median, writer)?;
         store!(f64, &self.next_block_template_feerate_max, writer)?;
+        store!(Option<f64>, &self.minimum_relay_feerate, writer)?;
+        store!(Option<f64>, &self.payload_overcap_feerate_floor, writer)?;
+        store!(Option<f64>, &self.effective_hfa_feerate_floor, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for RpcFeeEstimateVerboseExperimentalData {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let mempool_ready_transactions_count = load!(u64, reader)?;
         let mempool_ready_transactions_total_mass = load!(u64, reader)?;
         let network_mass_per_second = load!(u64, reader)?;
         let next_block_template_feerate_min = load!(f64, reader)?;
         let next_block_template_feerate_median = load!(f64, reader)?;
         let next_block_template_feerate_max = load!(f64, reader)?;
+        let minimum_relay_feerate = if version >= 2 { load!(Option<f64>, reader)? } else { None };
+        let payload_overcap_feerate_floor = if version >= 2 { load!(Option<f64>, reader)? } else { None };
+        let effective_hfa_feerate_floor = if version >= 2 { load!(Option<f64>, reader)? } else { None };
         Ok(Self {
             mempool_ready_transactions_count,
             mempool_ready_transactions_total_mass,
@@ -104,6 +113,9 @@ impl Deserializer for RpcFeeEstimateVerboseExperimentalData {
             next_block_template_feerate_min,
             next_block_template_feerate_median,
             next_block_template_feerate_max,
+            minimum_relay_feerate,
+            payload_overcap_feerate_floor,
+            effective_hfa_feerate_floor,
         })
     }
 }

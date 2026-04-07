@@ -482,6 +482,15 @@ impl WalletApi for super::Wallet {
         let store = self.store().as_transaction_record_store()?;
         let TransactionRangeResult { transactions, total } =
             store.load_range(&binding, &network_id, filter, start as usize..end as usize).await?;
+        let current_daa_score = self.current_daa_score();
+        let transactions = transactions
+            .into_iter()
+            .map(|record| {
+                let mut record = (*record).clone();
+                record.refresh_payload_availability(current_daa_score);
+                Arc::new(record)
+            })
+            .collect::<Vec<_>>();
 
         Ok(TransactionsDataGetResponse { transactions, total, account_id, start })
     }

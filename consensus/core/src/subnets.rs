@@ -65,6 +65,12 @@ impl SubnetworkId {
         *self == SUBNETWORK_ID_NATIVE
     }
 
+    /// Returns true if the subnetwork is the payload subnetwork
+    #[inline]
+    pub fn is_payload(&self) -> bool {
+        *self == SUBNETWORK_ID_PAYLOAD
+    }
+
     /// Returns true if the subnetwork is the native or a built-in subnetwork
     #[inline]
     pub fn is_builtin_or_native(&self) -> bool {
@@ -135,3 +141,6 @@ pub const SUBNETWORK_ID_COINBASE: SubnetworkId = SubnetworkId::from_byte(1);
 
 /// The subnetwork ID which is used for adding new sub networks to the registry
 pub const SUBNETWORK_ID_REGISTRY: SubnetworkId = SubnetworkId::from_byte(2);
+
+/// The subnetwork ID which is used for user payload transactions
+pub const SUBNETWORK_ID_PAYLOAD: SubnetworkId = SubnetworkId::from_byte(3);

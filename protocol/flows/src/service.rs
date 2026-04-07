@@ -23,6 +23,8 @@ pub struct P2pService {
     inbound_limit: usize,
     dns_seeders: &'static [&'static str],
     default_port: u16,
+    banserver_enabled: bool,
+    banserver_url: Option<String>,
     shutdown: SingleTrigger,
     counters: Arc<TowerConnectionCounters>,
 }
@@ -37,6 +39,8 @@ impl P2pService {
         inbound_limit: usize,
         dns_seeders: &'static [&'static str],
         default_port: u16,
+        banserver_enabled: bool,
+        banserver_url: Option<String>,
         counters: Arc<TowerConnectionCounters>,
     ) -> Self {
         Self {
@@ -49,6 +53,8 @@ impl P2pService {
             inbound_limit,
             dns_seeders,
             default_port,
+            banserver_enabled,
+            banserver_url,
             counters,
         }
     }
@@ -75,6 +81,8 @@ impl AsyncService for P2pService {
             self.dns_seeders,
             self.default_port,
             self.flow_context.address_manager.clone(),
+            self.banserver_enabled,
+            self.banserver_url.clone(),
         );
 
         self.flow_context.set_connection_manager(connection_manager.clone());

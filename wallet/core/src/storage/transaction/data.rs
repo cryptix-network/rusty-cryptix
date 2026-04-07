@@ -19,24 +19,36 @@ pub enum TransactionData {
         utxo_entries: Vec<UtxoRecord>,
         #[serde(rename = "value")]
         aggregate_input_value: u64,
+        #[serde(rename = "transaction", skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        transaction: Option<Transaction>,
     },
     Incoming {
         #[serde(rename = "utxoEntries")]
         utxo_entries: Vec<UtxoRecord>,
         #[serde(rename = "value")]
         aggregate_input_value: u64,
+        #[serde(rename = "transaction", skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        transaction: Option<Transaction>,
     },
     Stasis {
         #[serde(rename = "utxoEntries")]
         utxo_entries: Vec<UtxoRecord>,
         #[serde(rename = "value")]
         aggregate_input_value: u64,
+        #[serde(rename = "transaction", skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        transaction: Option<Transaction>,
     },
     External {
         #[serde(rename = "utxoEntries")]
         utxo_entries: Vec<UtxoRecord>,
         #[serde(rename = "value")]
         aggregate_input_value: u64,
+        #[serde(rename = "transaction", skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        transaction: Option<Transaction>,
     },
     Batch {
         fees: u64,
@@ -123,7 +135,7 @@ pub enum TransactionData {
 
 impl TransactionData {
     const STORAGE_MAGIC: u32 = 0x54445854;
-    const STORAGE_VERSION: u32 = 0;
+    const STORAGE_VERSION: u32 = 1;
 
     pub fn kind(&self) -> TransactionKind {
         match self {
@@ -156,6 +168,37 @@ impl TransactionData {
             TransactionData::Change { utxo_entries, .. } => utxo_entries.iter().any(|utxo| utxo.address.as_ref() == Some(address)),
         }
     }
+
+    pub fn transaction(&self) -> Option<&Transaction> {
+        match self {
+            TransactionData::Reorg { transaction, .. }
+            | TransactionData::Incoming { transaction, .. }
+            | TransactionData::Stasis { transaction, .. }
+            | TransactionData::External { transaction, .. } => transaction.as_ref(),
+            TransactionData::Batch { transaction, .. }
+            | TransactionData::Outgoing { transaction, .. }
+            | TransactionData::TransferIncoming { transaction, .. }
+            | TransactionData::TransferOutgoing { transaction, .. }
+            | TransactionData::Change { transaction, .. } => Some(transaction),
+        }
+    }
+
+    pub fn attach_transaction_if_supported(&mut self, transaction: Transaction) -> bool {
+        match self {
+            TransactionData::Reorg { transaction: tx, .. }
+            | TransactionData::Incoming { transaction: tx, .. }
+            | TransactionData::Stasis { transaction: tx, .. }
+            | TransactionData::External { transaction: tx, .. } => {
+                *tx = Some(transaction);
+                true
+            }
+            TransactionData::Batch { .. }
+            | TransactionData::Outgoing { .. }
+            | TransactionData::TransferIncoming { .. }
+            | TransactionData::TransferOutgoing { .. }
+            | TransactionData::Change { .. } => false,
+        }
+    }
 }
 
 impl BorshSerialize for TransactionData {
@@ -166,21 +209,25 @@ impl BorshSerialize for TransactionData {
         BorshSerialize::serialize(&kind, writer)?;
 
         match self {
-            TransactionData::Reorg { utxo_entries, aggregate_input_value } => {
+            TransactionData::Reorg { utxo_entries, aggregate_input_value, transaction } => {
                 BorshSerialize::serialize(utxo_entries, writer)?;
                 BorshSerialize::serialize(aggregate_input_value, writer)?;
+                BorshSerialize::serialize(transaction, writer)?;
             }
-            TransactionData::Incoming { utxo_entries, aggregate_input_value } => {
+            TransactionData::Incoming { utxo_entries, aggregate_input_value, transaction } => {
                 BorshSerialize::serialize(utxo_entries, writer)?;
                 BorshSerialize::serialize(aggregate_input_value, writer)?;
+                BorshSerialize::serialize(transaction, writer)?;
             }
-            TransactionData::Stasis { utxo_entries, aggregate_input_value } => {
+            TransactionData::Stasis { utxo_entries, aggregate_input_value, transaction } => {
                 BorshSerialize::serialize(utxo_entries, writer)?;
                 BorshSerialize::serialize(aggregate_input_value, writer)?;
+                BorshSerialize::serialize(transaction, writer)?;
             }
-            TransactionData::External { utxo_entries, aggregate_input_value } => {
+            TransactionData::External { utxo_entries, aggregate_input_value, transaction } => {
                 BorshSerialize::serialize(utxo_entries, writer)?;
                 BorshSerialize::serialize(aggregate_input_value, writer)?;
+                BorshSerialize::serialize(transaction, writer)?;
             }
             TransactionData::Batch {
                 fees,
@@ -283,7 +330,7 @@ impl BorshSerialize for TransactionData {
 
 impl BorshDeserialize for TransactionData {
     fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> IoResult<Self> {
-        let StorageHeader { version: _, .. } =
+        let StorageHeader { version, .. } =
             StorageHeader::deserialize_reader(reader)?.try_magic(Self::STORAGE_MAGIC)?.try_version(Self::STORAGE_VERSION)?;
 
         let kind: TransactionKind = BorshDeserialize::deserialize_reader(reader)?;
@@ -292,22 +339,26 @@ impl BorshDeserialize for TransactionData {
             TransactionKind::Reorg => {
                 let utxo_entries: Vec<UtxoRecord> = BorshDeserialize::deserialize_reader(reader)?;
                 let aggregate_input_value: u64 = BorshDeserialize::deserialize_reader(reader)?;
-                Ok(TransactionData::Reorg { utxo_entries, aggregate_input_value })
+                let transaction = if version >= 1 { BorshDeserialize::deserialize_reader(reader)? } else { None };
+                Ok(TransactionData::Reorg { utxo_entries, aggregate_input_value, transaction })
             }
             TransactionKind::Incoming => {
                 let utxo_entries: Vec<UtxoRecord> = BorshDeserialize::deserialize_reader(reader)?;
                 let aggregate_input_value: u64 = BorshDeserialize::deserialize_reader(reader)?;
-                Ok(TransactionData::Incoming { utxo_entries, aggregate_input_value })
+                let transaction = if version >= 1 { BorshDeserialize::deserialize_reader(reader)? } else { None };
+                Ok(TransactionData::Incoming { utxo_entries, aggregate_input_value, transaction })
             }
             TransactionKind::Stasis => {
                 let utxo_entries: Vec<UtxoRecord> = BorshDeserialize::deserialize_reader(reader)?;
                 let aggregate_input_value: u64 = BorshDeserialize::deserialize_reader(reader)?;
-                Ok(TransactionData::Stasis { utxo_entries, aggregate_input_value })
+                let transaction = if version >= 1 { BorshDeserialize::deserialize_reader(reader)? } else { None };
+                Ok(TransactionData::Stasis { utxo_entries, aggregate_input_value, transaction })
             }
             TransactionKind::External => {
                 let utxo_entries: Vec<UtxoRecord> = BorshDeserialize::deserialize_reader(reader)?;
                 let aggregate_input_value: u64 = BorshDeserialize::deserialize_reader(reader)?;
-                Ok(TransactionData::External { utxo_entries, aggregate_input_value })
+                let transaction = if version >= 1 { BorshDeserialize::deserialize_reader(reader)? } else { None };
+                Ok(TransactionData::External { utxo_entries, aggregate_input_value, transaction })
             }
             TransactionKind::Batch => {
                 let fees: u64 = BorshDeserialize::deserialize_reader(reader)?;
@@ -408,5 +459,38 @@ impl BorshDeserialize for TransactionData {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cryptix_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+
+    #[test]
+    fn deserialize_v0_incoming_without_transaction() {
+        let mut bytes = Vec::new();
+        BorshSerialize::serialize(&StorageHeader::new(TransactionData::STORAGE_MAGIC, 0), &mut bytes).unwrap();
+        BorshSerialize::serialize(&TransactionKind::Incoming, &mut bytes).unwrap();
+        let utxo_entries: Vec<UtxoRecord> = vec![];
+        BorshSerialize::serialize(&utxo_entries, &mut bytes).unwrap();
+        BorshSerialize::serialize(&42u64, &mut bytes).unwrap();
+
+        let decoded = TransactionData::deserialize_reader(&mut bytes.as_slice()).unwrap();
+        match decoded {
+            TransactionData::Incoming { aggregate_input_value, transaction, .. } => {
+                assert_eq!(aggregate_input_value, 42);
+                assert!(transaction.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_transaction_to_incoming_record() {
+        let mut data = TransactionData::Incoming { utxo_entries: vec![], aggregate_input_value: 0, transaction: None };
+        let tx = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![1, 2, 3]);
+        assert!(data.attach_transaction_if_supported(tx.clone()));
+        assert_eq!(data.transaction().unwrap().payload, tx.payload);
     }
 }

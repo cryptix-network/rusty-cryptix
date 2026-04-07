@@ -1,6 +1,6 @@
 use crate::{
     config::params::Params,
-    subnets::SUBNETWORK_ID_SIZE,
+    subnets::{SUBNETWORK_ID_PAYLOAD, SUBNETWORK_ID_SIZE},
     tx::{Transaction, TransactionInput, TransactionOutput, VerifiableTransaction},
 };
 use cryptix_hashes::HASH_SIZE;
@@ -77,11 +77,18 @@ pub struct MassCalculator {
     mass_per_script_pub_key_byte: u64,
     mass_per_sig_op: u64,
     storage_mass_parameter: u64,
+    payload_weight_multiplier: u64,
 }
 
 impl MassCalculator {
-    pub fn new(mass_per_tx_byte: u64, mass_per_script_pub_key_byte: u64, mass_per_sig_op: u64, storage_mass_parameter: u64) -> Self {
-        Self { mass_per_tx_byte, mass_per_script_pub_key_byte, mass_per_sig_op, storage_mass_parameter }
+    pub fn new(
+        mass_per_tx_byte: u64,
+        mass_per_script_pub_key_byte: u64,
+        mass_per_sig_op: u64,
+        storage_mass_parameter: u64,
+        payload_weight_multiplier: u64,
+    ) -> Self {
+        Self { mass_per_tx_byte, mass_per_script_pub_key_byte, mass_per_sig_op, storage_mass_parameter, payload_weight_multiplier }
     }
 
     pub fn new_with_consensus_params(consensus_params: &Params) -> Self {
@@ -90,6 +97,7 @@ impl MassCalculator {
             mass_per_script_pub_key_byte: consensus_params.mass_per_script_pub_key_byte,
             mass_per_sig_op: consensus_params.mass_per_sig_op,
             storage_mass_parameter: consensus_params.storage_mass_parameter,
+            payload_weight_multiplier: consensus_params.payload_weight_multiplier,
         }
     }
 
@@ -112,7 +120,18 @@ impl MassCalculator {
         let total_sigops: u64 = tx.inputs.iter().map(|input| input.sig_op_count as u64).sum();
         let total_sigops_mass = total_sigops * self.mass_per_sig_op;
 
-        mass_for_size + total_script_public_key_mass + total_sigops_mass
+        mass_for_size + total_script_public_key_mass + total_sigops_mass + self.calc_payload_mass_delta(tx)
+    }
+
+    fn calc_payload_mass_delta(&self, tx: &Transaction) -> u64 {
+        if tx.subnetwork_id != SUBNETWORK_ID_PAYLOAD || self.payload_weight_multiplier <= 1 {
+            return 0;
+        }
+
+        let payload_len = tx.payload.len() as u64;
+        let payload_base_mass = payload_len.saturating_mul(self.mass_per_tx_byte);
+        let multiplier_delta = self.payload_weight_multiplier - 1;
+        payload_base_mass.saturating_mul(multiplier_delta)
     }
 
     /// Calculates the storage mass for this populated transaction.
@@ -221,7 +240,7 @@ mod tests {
     use super::*;
     use crate::{
         constants::{SOMPI_PER_CRYPTIX, STORAGE_MASS_PARAMETER},
-        subnets::SubnetworkId,
+        subnets::{SubnetworkId, SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PAYLOAD},
         tx::*,
     };
     use std::str::FromStr;
@@ -235,7 +254,7 @@ mod tests {
         // Assert the formula: max( 0 , C·( |O|/H(O) - |I|/A(I) ) )
 
         let storage_mass =
-            MassCalculator::new(0, 0, 0, 10u64.pow(12)).calc_tx_storage_mass(&tx.as_verifiable(), test_version).unwrap();
+            MassCalculator::new(0, 0, 0, 10u64.pow(12), 1).calc_tx_storage_mass(&tx.as_verifiable(), test_version).unwrap();
         assert_eq!(storage_mass, 0); // Compounds from 3 to 2, with symmetric outputs and no fee, should be zero
 
         // Create asymmetry
@@ -243,7 +262,7 @@ mod tests {
         tx.tx.outputs[1].value = 550;
         let storage_mass_parameter = 10u64.pow(12);
         let storage_mass =
-            MassCalculator::new(0, 0, 0, storage_mass_parameter).calc_tx_storage_mass(&tx.as_verifiable(), test_version).unwrap();
+            MassCalculator::new(0, 0, 0, storage_mass_parameter, 1).calc_tx_storage_mass(&tx.as_verifiable(), test_version).unwrap();
         assert_eq!(storage_mass, storage_mass_parameter / 50 + storage_mass_parameter / 550 - 3 * (storage_mass_parameter / 200));
 
         // Create a tx with more outs than ins
@@ -251,13 +270,13 @@ mod tests {
         let mut tx = generate_tx_from_amounts(&[base_value, base_value, base_value * 2], &[base_value; 4]);
         let storage_mass_parameter = STORAGE_MASS_PARAMETER;
         let storage_mass =
-            MassCalculator::new(0, 0, 0, storage_mass_parameter).calc_tx_storage_mass(&tx.as_verifiable(), test_version).unwrap();
+            MassCalculator::new(0, 0, 0, storage_mass_parameter, 1).calc_tx_storage_mass(&tx.as_verifiable(), test_version).unwrap();
         assert_eq!(storage_mass, 4); // Inputs are above C so they don't contribute negative mass, 4 outputs exactly equal C each charge 1
 
         let mut tx2 = tx.clone();
         tx2.tx.outputs[0].value = 10 * SOMPI_PER_CRYPTIX;
         let storage_mass =
-            MassCalculator::new(0, 0, 0, storage_mass_parameter).calc_tx_storage_mass(&tx2.as_verifiable(), test_version).unwrap();
+            MassCalculator::new(0, 0, 0, storage_mass_parameter, 1).calc_tx_storage_mass(&tx2.as_verifiable(), test_version).unwrap();
         assert_eq!(storage_mass, 1003);
 
         // Increase values over the lim
@@ -266,7 +285,7 @@ mod tests {
         }
         tx.entries[0].as_mut().unwrap().amount += tx.tx.outputs.len() as u64;
         let storage_mass =
-            MassCalculator::new(0, 0, 0, storage_mass_parameter).calc_tx_storage_mass(&tx.as_verifiable(), test_version).unwrap();
+            MassCalculator::new(0, 0, 0, storage_mass_parameter, 1).calc_tx_storage_mass(&tx.as_verifiable(), test_version).unwrap();
         assert_eq!(storage_mass, 0);
     }
 
@@ -279,22 +298,63 @@ mod tests {
         // Assert the formula: max( 0 , C·( |O|/H(O) - |I|/O(I) ) )
 
         let storage_mass =
-            MassCalculator::new(0, 0, 0, storage_mass_parameter).calc_tx_storage_mass(&tx.as_verifiable(), test_version).unwrap();
+            MassCalculator::new(0, 0, 0, storage_mass_parameter, 1).calc_tx_storage_mass(&tx.as_verifiable(), test_version).unwrap();
         assert_eq!(storage_mass, 9000000000);
 
         // Set outputs to be equal to inputs
         tx.tx.outputs[0].value = 100;
         tx.tx.outputs[1].value = 200;
         let storage_mass =
-            MassCalculator::new(0, 0, 0, storage_mass_parameter).calc_tx_storage_mass(&tx.as_verifiable(), test_version).unwrap();
+            MassCalculator::new(0, 0, 0, storage_mass_parameter, 1).calc_tx_storage_mass(&tx.as_verifiable(), test_version).unwrap();
         assert_eq!(storage_mass, 0);
 
         // Remove an output and make sure the other is small enough to make storage mass greater than zero
         tx.tx.outputs.pop();
         tx.tx.outputs[0].value = 50;
         let storage_mass =
-            MassCalculator::new(0, 0, 0, storage_mass_parameter).calc_tx_storage_mass(&tx.as_verifiable(), test_version).unwrap();
+            MassCalculator::new(0, 0, 0, storage_mass_parameter, 1).calc_tx_storage_mass(&tx.as_verifiable(), test_version).unwrap();
         assert_eq!(storage_mass, 5000000000);
+    }
+
+    #[test]
+    fn test_payload_mass_delta_multiplier() {
+        let payload_len = 256usize;
+        let mut payload_tx = generate_tx_from_amounts(&[1_000_000], &[999_000]);
+        payload_tx.tx.subnetwork_id = SUBNETWORK_ID_PAYLOAD;
+        payload_tx.tx.payload = vec![7u8; payload_len];
+
+        let mut native_tx = payload_tx.clone();
+        native_tx.tx.subnetwork_id = SUBNETWORK_ID_NATIVE;
+
+        let calc = MassCalculator::new(1, 0, 0, 0, 4);
+        let payload_mass = calc.calc_tx_compute_mass(&payload_tx.tx);
+        let native_mass = calc.calc_tx_compute_mass(&native_tx.tx);
+        assert_eq!(payload_mass, native_mass + (payload_len as u64 * 3));
+    }
+
+    #[test]
+    fn test_payload_mass_golden_vectors_boundaries() {
+        let calc = MassCalculator::new(1, 0, 0, 0, 4);
+        let vectors: &[(usize, u64, u64)] = &[
+            // (payload_len, expected_native_compute_mass, expected_payload_compute_mass)
+            (0, 164, 164),
+            (1, 165, 168),
+            (2048, 2212, 8356),
+            (2049, 2213, 8360),
+            (8192, 8356, 32932),
+            (8193, 8357, 32936),
+        ];
+
+        for (payload_len, expected_native, expected_payload) in vectors {
+            let mut tx = generate_tx_from_amounts(&[1_000_000], &[999_000]);
+            tx.tx.payload = vec![9u8; *payload_len];
+
+            tx.tx.subnetwork_id = SUBNETWORK_ID_NATIVE;
+            assert_eq!(calc.calc_tx_compute_mass(&tx.tx), *expected_native, "native mismatch for payload length {}", payload_len);
+
+            tx.tx.subnetwork_id = SUBNETWORK_ID_PAYLOAD;
+            assert_eq!(calc.calc_tx_compute_mass(&tx.tx), *expected_payload, "payload mismatch for payload length {}", payload_len);
+        }
     }
 
     fn generate_tx_from_amounts(ins: &[u64], outs: &[u64]) -> MutableTransaction<Transaction> {

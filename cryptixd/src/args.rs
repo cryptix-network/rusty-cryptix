@@ -12,6 +12,8 @@ use serde_with::{serde_as, DisplayFromStr};
 use std::{ffi::OsString, fs};
 use toml::from_str;
 
+const DEFAULT_BANSERVER_URL: &str = "https://antifraud.cryptix-network.org/api/confirmed-cases/iplist";
+
 #[cfg(feature = "devnet-prealloc")]
 use cryptix_addresses::Address;
 #[cfg(feature = "devnet-prealloc")]
@@ -65,7 +67,7 @@ pub struct Args {
     pub enable_mainnet_mining: bool,
     pub testnet: bool,
     #[serde(rename = "netsuffix")]
-    pub testnet_suffix: u32,
+    pub testnet_suffix: Option<u32>,
     pub devnet: bool,
     pub simnet: bool,
     pub archival: bool,
@@ -81,6 +83,9 @@ pub struct Args {
     pub hfa_cpu: f64,
     pub hfa_drift_ms: u64,
     pub hfa_microblock_interval_ms_normal: u64,
+    pub autoban: bool,
+    pub banserver: bool,
+    pub banserver_url: Option<String>,
 
     #[cfg(feature = "devnet-prealloc")]
     pub num_prealloc_utxos: Option<u64>,
@@ -115,7 +120,7 @@ impl Default for Args {
             enable_unsynced_mining: false,
             enable_mainnet_mining: true,
             testnet: false,
-            testnet_suffix: 10,
+            testnet_suffix: None,
             devnet: false,
             simnet: false,
             archival: false,
@@ -138,6 +143,9 @@ impl Default for Args {
             hfa_cpu: 0.7,
             hfa_drift_ms: 5_000,
             hfa_microblock_interval_ms_normal: 50,
+            autoban: true,
+            banserver: true,
+            banserver_url: Some(DEFAULT_BANSERVER_URL.to_owned()),
 
             #[cfg(feature = "devnet-prealloc")]
             num_prealloc_utxos: None,
@@ -193,7 +201,10 @@ impl Args {
     pub fn network(&self) -> NetworkId {
         match (self.testnet, self.devnet, self.simnet) {
             (false, false, false) => NetworkId::new(NetworkType::Mainnet),
-            (true, false, false) => NetworkId::with_suffix(NetworkType::Testnet, self.testnet_suffix),
+            (true, false, false) => self
+                .testnet_suffix
+                .map(|suffix| NetworkId::with_suffix(NetworkType::Testnet, suffix))
+                .unwrap_or_else(|| NetworkId::new(NetworkType::Testnet)),
             (false, true, false) => NetworkId::new(NetworkType::Devnet),
             (false, false, true) => NetworkId::new(NetworkType::Simnet),
             _ => panic!("only a single net should be activated"),
@@ -337,7 +348,7 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
                 .value_name("netsuffix")
                 .require_equals(true)
                 .value_parser(clap::value_parser!(u32))
-                .help("Testnet network suffix number"),
+                .help("Optional testnet network suffix number (for dedicated parallel testnet variants)."),
         )
         .arg(arg!(--devnet "Use the development test network"))
         .arg(arg!(--simnet "Use the simulation test network"))
@@ -409,6 +420,41 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
                 .conflicts_with("hfa")
                 .help("Disable HFA fast rail for this process (overrides config)."),
         )
+        .arg(
+            Arg::new("autoban")
+                .long("autoban")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("no-autoban")
+                .help("Enable automatic banning of repeatedly misbehaving peers (default: enabled)."),
+        )
+        .arg(
+            Arg::new("no-autoban")
+                .long("no-autoban")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("autoban")
+                .help("Disable automatic banning of repeatedly misbehaving peers (overrides config)."),
+        )
+        .arg(
+            Arg::new("banserver")
+                .long("banserver")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("no-banserver")
+                .help("Enable remote ban list synchronization from the antifraud banserver (default: enabled)."),
+        )
+        .arg(
+            Arg::new("no-banserver")
+                .long("no-banserver")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("banserver")
+                .help("Disable remote ban list synchronization from the antifraud banserver (overrides config)."),
+        )
+        .arg(
+            Arg::new("banserver-url")
+                .long("banserver-url")
+                .value_name("URL")
+                .require_equals(true)
+                .help("Override the remote banserver URL used for fetching IP blocklist entries."),
+        )
         .arg(arg!(--"disable-upnp" "Disable upnp"))
         .arg(arg!(--"nodnsseed" "Disable DNS seeding for peers"))
         .arg(arg!(--"nogrpc" "Disable gRPC server"))
@@ -467,6 +513,20 @@ impl Args {
         } else {
             defaults.hfa
         };
+        let autoban_enabled = if arg_match_unwrap_or::<bool>(&m, "autoban", false) {
+            true
+        } else if arg_match_unwrap_or::<bool>(&m, "no-autoban", false) {
+            false
+        } else {
+            defaults.autoban
+        };
+        let banserver_enabled = if arg_match_unwrap_or::<bool>(&m, "banserver", false) {
+            true
+        } else if arg_match_unwrap_or::<bool>(&m, "no-banserver", false) {
+            false
+        } else {
+            defaults.banserver
+        };
 
         let args = Args {
             appdir: m.get_one::<String>("appdir").cloned().or(defaults.appdir),
@@ -491,7 +551,7 @@ impl Args {
             enable_mainnet_mining: arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", defaults.enable_mainnet_mining),
             utxoindex: arg_match_unwrap_or::<bool>(&m, "utxoindex", defaults.utxoindex),
             testnet: arg_match_unwrap_or::<bool>(&m, "testnet", defaults.testnet),
-            testnet_suffix: arg_match_unwrap_or::<u32>(&m, "netsuffix", defaults.testnet_suffix),
+            testnet_suffix: m.get_one::<u32>("netsuffix").copied().or(defaults.testnet_suffix),
             devnet: arg_match_unwrap_or::<bool>(&m, "devnet", defaults.devnet),
             simnet: arg_match_unwrap_or::<bool>(&m, "simnet", defaults.simnet),
             archival: arg_match_unwrap_or::<bool>(&m, "archival", defaults.archival),
@@ -512,6 +572,9 @@ impl Args {
                 "hfa-microblock-interval-ms-normal",
                 defaults.hfa_microblock_interval_ms_normal,
             ),
+            autoban: autoban_enabled,
+            banserver: banserver_enabled,
+            banserver_url: m.get_one::<String>("banserver-url").cloned().or(defaults.banserver_url),
             disable_upnp: arg_match_unwrap_or::<bool>(&m, "disable-upnp", defaults.disable_upnp),
             disable_dns_seeding: arg_match_unwrap_or::<bool>(&m, "nodnsseed", defaults.disable_dns_seeding),
             disable_grpc: arg_match_unwrap_or::<bool>(&m, "nogrpc", defaults.disable_grpc),

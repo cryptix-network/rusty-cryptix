@@ -9,7 +9,7 @@ use cryptix_core::trace;
 use feerate_key::FeerateTransactionKey;
 use rand::{distributions::Uniform, prelude::Distribution, Rng};
 use search_tree::SearchTree;
-use selectors::{SequenceSelector, SequenceSelectorInput, TakeAllSelector};
+use selectors::{SequenceSelector, SequenceSelectorInput, SequenceSelectorTransaction, TakeAllSelector};
 use std::{collections::HashSet, iter::FusedIterator, sync::Arc};
 
 pub(crate) mod feerate_key;
@@ -152,7 +152,7 @@ impl Frontier {
                 }
                 item
             };
-            sequence.push(item.tx.clone(), item.mass);
+            sequence.push(item.tx.clone(), item.fee, item.mass);
             total_selected_mass += item.mass; // Max standard mass + Mempool capacity bound imply this will not overflow
         }
         trace!("[mempool frontier sample inplace] collisions: {collisions}, cache: {}", cache.len());
@@ -176,7 +176,10 @@ impl Frontier {
     /// for more details.  
     pub fn build_selector(&self, policy: &Policy) -> Box<dyn TemplateTransactionSelector> {
         if self.total_mass <= policy.max_block_mass {
-            Box::new(TakeAllSelector::new(self.search_tree.ascending_iter().map(|k| k.tx.clone()).collect()))
+            Box::new(TakeAllSelector::new(
+                self.search_tree.ascending_iter().map(|k| SequenceSelectorTransaction::new(k.tx.clone(), k.fee, k.mass)).collect(),
+                policy.clone(),
+            ))
         } else if self.total_mass > policy.max_block_mass * COLLISION_FACTOR {
             let mut rng = rand::thread_rng();
             Box::new(SequenceSelector::new(self.sample_inplace(&mut rng, policy, &mut 0), policy.clone()))
@@ -197,7 +200,10 @@ impl Frontier {
 
     /// Exposed for benchmarking purposes
     pub fn build_selector_take_all(&self) -> Box<dyn TemplateTransactionSelector> {
-        Box::new(TakeAllSelector::new(self.search_tree.ascending_iter().map(|k| k.tx.clone()).collect()))
+        Box::new(TakeAllSelector::new(
+            self.search_tree.ascending_iter().map(|k| SequenceSelectorTransaction::new(k.tx.clone(), k.fee, k.mass)).collect(),
+            Policy::new(500_000),
+        ))
     }
 
     /// Exposed for benchmarking purposes

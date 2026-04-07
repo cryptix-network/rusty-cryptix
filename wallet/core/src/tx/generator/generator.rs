@@ -67,7 +67,7 @@ use crate::utxo::{NetworkParams, UtxoContext, UtxoEntryReference};
 use cryptix_consensus_client::UtxoEntry;
 use cryptix_consensus_core::constants::UNACCEPTED_DAA_SCORE;
 use cryptix_consensus_core::mass::Kip9Version;
-use cryptix_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+use cryptix_consensus_core::subnets::{SubnetworkId, SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PAYLOAD};
 use cryptix_consensus_core::tx::{Transaction, TransactionInput, TransactionOutpoint, TransactionOutput};
 use cryptix_txscript::pay_to_address_script;
 use std::collections::VecDeque;
@@ -298,6 +298,8 @@ struct Inner {
     final_transaction_outputs_compute_mass: u64,
     // final transaction payload
     final_transaction_payload: Vec<u8>,
+    // final transaction subnetwork (payload txs are routed to payload subnetwork)
+    final_transaction_subnetwork_id: SubnetworkId,
     // final transaction payload mass
     final_transaction_payload_mass: u64,
     // execution context
@@ -323,6 +325,7 @@ impl std::fmt::Debug for Inner {
             .field("final_transaction_outputs_harmonic", &self.final_transaction_outputs_harmonic)
             .field("final_transaction_outputs_compute_mass", &self.final_transaction_outputs_compute_mass)
             .field("final_transaction_payload", &self.final_transaction_payload)
+            .field("final_transaction_subnetwork_id", &self.final_transaction_subnetwork_id)
             .field("final_transaction_payload_mass", &self.final_transaction_payload_mass)
             // .field("context", &self.context)
             .finish()
@@ -407,7 +410,10 @@ impl Generator {
         let final_transaction_outputs_compute_mass =
             mass_calculator.calc_compute_mass_for_client_transaction_outputs(&final_transaction_outputs);
         let final_transaction_payload = final_transaction_payload.unwrap_or_default();
-        let final_transaction_payload_mass = mass_calculator.calc_compute_mass_for_payload(final_transaction_payload.len());
+        let final_transaction_subnetwork_id =
+            if final_transaction_payload.is_empty() { SUBNETWORK_ID_NATIVE } else { SUBNETWORK_ID_PAYLOAD };
+        let final_transaction_payload_mass =
+            mass_calculator.calc_compute_mass_for_payload(final_transaction_payload.len(), &final_transaction_subnetwork_id);
         let final_transaction_outputs_harmonic =
             mass_calculator.calc_storage_mass_output_harmonic(&final_transaction_outputs).ok_or(Error::MassCalculationError)?;
 
@@ -459,6 +465,7 @@ impl Generator {
             final_transaction_outputs_harmonic,
             final_transaction_outputs_compute_mass,
             final_transaction_payload,
+            final_transaction_subnetwork_id,
             final_transaction_payload_mass,
             destination_utxo_context,
         };
@@ -1016,7 +1023,7 @@ impl Generator {
                     inputs,
                     final_outputs,
                     0,
-                    SUBNETWORK_ID_NATIVE,
+                    self.inner.final_transaction_subnetwork_id.clone(),
                     0,
                     self.inner.final_transaction_payload.clone(),
                 );

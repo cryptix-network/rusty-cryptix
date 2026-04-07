@@ -9,7 +9,11 @@ use cryptix_consensus_client as kcc;
 use cryptix_consensus_client::UtxoEntryReference;
 use cryptix_consensus_core::mass::{calc_storage_mass as consensus_calc_storage_mass, Kip9Version};
 use cryptix_consensus_core::tx::{Transaction, TransactionInput, TransactionOutput, SCRIPT_VECTOR_SIZE};
-use cryptix_consensus_core::{config::params::Params, constants::*, subnets::SUBNETWORK_ID_SIZE};
+use cryptix_consensus_core::{
+    config::params::Params,
+    constants::*,
+    subnets::{SubnetworkId, SUBNETWORK_ID_PAYLOAD, SUBNETWORK_ID_SIZE},
+};
 use cryptix_hashes::HASH_SIZE;
 
 // pub const ECDSA_SIGNATURE_SIZE: u64 = 64;
@@ -218,6 +222,7 @@ pub struct MassCalculator {
     mass_per_script_pub_key_byte: u64,
     mass_per_sig_op: u64,
     storage_mass_parameter: u64,
+    payload_weight_multiplier: u64,
     kip9_version: Kip9Version,
 }
 
@@ -228,6 +233,7 @@ impl MassCalculator {
             mass_per_script_pub_key_byte: consensus_params.mass_per_script_pub_key_byte,
             mass_per_sig_op: consensus_params.mass_per_sig_op,
             storage_mass_parameter: consensus_params.storage_mass_parameter,
+            payload_weight_multiplier: consensus_params.payload_weight_multiplier,
             kip9_version: network_params.kip9_version(),
         }
     }
@@ -242,7 +248,7 @@ impl MassCalculator {
     pub fn calc_compute_mass_for_signed_consensus_transaction(&self, tx: &Transaction) -> u64 {
         let payload_len = tx.payload.len();
         self.blank_transaction_compute_mass()
-            + self.calc_compute_mass_for_payload(payload_len)
+            + self.calc_compute_mass_for_payload(payload_len, &tx.subnetwork_id)
             + self.calc_compute_mass_for_client_transaction_outputs(&tx.outputs)
             + self.calc_compute_mass_for_client_transaction_inputs(&tx.inputs)
     }
@@ -251,8 +257,14 @@ impl MassCalculator {
         blank_transaction_serialized_byte_size() * self.mass_per_tx_byte
     }
 
-    pub(crate) fn calc_compute_mass_for_payload(&self, payload_byte_size: usize) -> u64 {
-        payload_byte_size as u64 * self.mass_per_tx_byte
+    pub(crate) fn calc_compute_mass_for_payload(&self, payload_byte_size: usize, subnetwork_id: &SubnetworkId) -> u64 {
+        let payload_mass = payload_byte_size as u64 * self.mass_per_tx_byte;
+        if *subnetwork_id != SUBNETWORK_ID_PAYLOAD || self.payload_weight_multiplier <= 1 {
+            return payload_mass;
+        }
+
+        let multiplier_delta = self.payload_weight_multiplier - 1;
+        payload_mass.saturating_add(payload_mass.saturating_mul(multiplier_delta))
     }
 
     pub(crate) fn calc_compute_mass_for_client_transaction_outputs(&self, outputs: &[TransactionOutput]) -> u64 {
@@ -361,5 +373,137 @@ impl MassCalculator {
     pub fn calc_storage_mass(&self, output_harmonic: u64, total_input_value: u64, number_of_inputs: u64) -> u64 {
         let input_arithmetic = self.calc_storage_mass_input_mean_arithmetic(total_input_value, number_of_inputs);
         output_harmonic.saturating_sub(input_arithmetic)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cryptix_consensus_core::{
+        config::params::MAINNET_PARAMS,
+        mass::MassCalculator as ConsensusMassCalculator,
+        network::{NetworkId, NetworkType},
+        subnets::{SubnetworkId, SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PAYLOAD},
+        tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionId, TransactionInput, TransactionOutpoint, TransactionOutput},
+    };
+
+    fn build_test_tx(payload_len: usize, subnetwork_id: SubnetworkId) -> Transaction {
+        let payload = vec![0x2a; payload_len];
+        let input = TransactionInput {
+            previous_outpoint: TransactionOutpoint { transaction_id: TransactionId::from_u64_word(1), index: 0 },
+            signature_script: vec![0x51],
+            sequence: MAX_TX_IN_SEQUENCE_NUM,
+            sig_op_count: 1,
+        };
+        let output =
+            TransactionOutput { value: 1_000_000, script_public_key: ScriptPublicKey::new(0, ScriptVec::from_slice(&[0x51])) };
+        Transaction::new(TX_VERSION, vec![input], vec![output], 0, subnetwork_id, 0, payload)
+    }
+
+    #[test]
+    fn payload_mass_parity_matches_consensus_for_boundaries() {
+        let params = MAINNET_PARAMS.clone();
+        let network_params = NetworkParams::from(NetworkId::new(NetworkType::Mainnet));
+        let wallet_calc = MassCalculator::new(&params, network_params);
+        let consensus_calc = ConsensusMassCalculator::new_with_consensus_params(&params);
+
+        for payload_len in [0usize, 1, 2048, 2049, 8192, 8193] {
+            let tx_payload = build_test_tx(payload_len, SUBNETWORK_ID_PAYLOAD);
+            let tx_native = build_test_tx(payload_len, SUBNETWORK_ID_NATIVE);
+
+            assert_eq!(
+                wallet_calc.calc_compute_mass_for_signed_consensus_transaction(&tx_payload),
+                consensus_calc.calc_tx_compute_mass(&tx_payload),
+                "payload subnetwork mismatch at payload length {payload_len}"
+            );
+
+            assert_eq!(
+                wallet_calc.calc_compute_mass_for_signed_consensus_transaction(&tx_native),
+                consensus_calc.calc_tx_compute_mass(&tx_native),
+                "native subnetwork mismatch at payload length {payload_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_multiplier_applies_only_on_payload_subnetwork() {
+        let params = MAINNET_PARAMS.clone();
+        let network_params = NetworkParams::from(NetworkId::new(NetworkType::Mainnet));
+        let wallet_calc = MassCalculator::new(&params, network_params);
+
+        let payload_len = 128usize;
+        let payload_tx = build_test_tx(payload_len, SUBNETWORK_ID_PAYLOAD);
+        let native_tx = build_test_tx(payload_len, SUBNETWORK_ID_NATIVE);
+        let payload_mass = wallet_calc.calc_compute_mass_for_signed_consensus_transaction(&payload_tx);
+        let native_mass = wallet_calc.calc_compute_mass_for_signed_consensus_transaction(&native_tx);
+
+        assert!(payload_mass > native_mass, "payload tx mass must exceed native tx mass for non-zero payload");
+    }
+
+    #[test]
+    fn payload_mass_golden_vectors_expected_values() {
+        let mut params = MAINNET_PARAMS.clone();
+        params.mass_per_tx_byte = 1;
+        params.mass_per_script_pub_key_byte = 0;
+        params.mass_per_sig_op = 0;
+        params.payload_weight_multiplier = 4;
+
+        let network_params = NetworkParams::from(NetworkId::new(NetworkType::Mainnet));
+        let wallet_calc = MassCalculator::new(&params, network_params);
+
+        let vectors: &[(usize, u64, u64)] = &[
+            // (payload_len, expected_native_compute_mass, expected_payload_compute_mass)
+            (0, 164, 164),
+            (1, 165, 168),
+            (2048, 2212, 8356),
+            (2049, 2213, 8360),
+            (8192, 8356, 32932),
+            (8193, 8357, 32936),
+        ];
+
+        for (payload_len, expected_native, expected_payload) in vectors {
+            let tx_native = Transaction::new(
+                TX_VERSION,
+                vec![TransactionInput {
+                    previous_outpoint: TransactionOutpoint { transaction_id: TransactionId::from_u64_word(11), index: 0 },
+                    signature_script: vec![],
+                    sequence: MAX_TX_IN_SEQUENCE_NUM,
+                    sig_op_count: 0,
+                }],
+                vec![TransactionOutput { value: 1_000_000, script_public_key: ScriptPublicKey::new(0, ScriptVec::from_slice(&[])) }],
+                0,
+                SUBNETWORK_ID_NATIVE,
+                0,
+                vec![0x22; *payload_len],
+            );
+
+            let tx_payload = Transaction::new(
+                TX_VERSION,
+                vec![TransactionInput {
+                    previous_outpoint: TransactionOutpoint { transaction_id: TransactionId::from_u64_word(12), index: 0 },
+                    signature_script: vec![],
+                    sequence: MAX_TX_IN_SEQUENCE_NUM,
+                    sig_op_count: 0,
+                }],
+                vec![TransactionOutput { value: 1_000_000, script_public_key: ScriptPublicKey::new(0, ScriptVec::from_slice(&[])) }],
+                0,
+                SUBNETWORK_ID_PAYLOAD,
+                0,
+                vec![0x22; *payload_len],
+            );
+
+            assert_eq!(
+                wallet_calc.calc_compute_mass_for_signed_consensus_transaction(&tx_native),
+                *expected_native,
+                "wallet native vector mismatch at payload length {}",
+                payload_len
+            );
+            assert_eq!(
+                wallet_calc.calc_compute_mass_for_signed_consensus_transaction(&tx_payload),
+                *expected_payload,
+                "wallet payload vector mismatch at payload length {}",
+                payload_len
+            );
+        }
     }
 }

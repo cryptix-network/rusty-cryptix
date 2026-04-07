@@ -8,7 +8,8 @@ use super::{
 };
 
 impl TransactionValidator {
-    pub fn validate_tx_in_isolation(&self, tx: &Transaction) -> TxResult<()> {
+    pub fn validate_tx_in_isolation(&self, tx: &Transaction, pov_daa_score: u64) -> TxResult<()> {
+        let payload_hf_activated = pov_daa_score >= self.payload_hf_activation_daa_score;
         self.check_transaction_inputs_in_isolation(tx)?;
         self.check_transaction_outputs_in_isolation(tx)?;
         self.check_coinbase_in_isolation(tx)?;
@@ -16,8 +17,8 @@ impl TransactionValidator {
         check_transaction_output_value_ranges(tx)?;
         check_duplicate_transaction_inputs(tx)?;
         check_gas(tx)?;
-        check_transaction_payload(tx)?;
-        check_transaction_subnetwork(tx)?;
+        check_transaction_subnetwork(tx, payload_hf_activated)?;
+        check_transaction_payload(tx, payload_hf_activated, self.payload_max_len_consensus)?;
         check_transaction_version(tx)
     }
 
@@ -107,10 +108,31 @@ fn check_gas(tx: &Transaction) -> TxResult<()> {
     Ok(())
 }
 
-fn check_transaction_payload(tx: &Transaction) -> TxResult<()> {
-    // This should be revised if subnetworks are activated (along with other validations that weren't copied from cryptixd)
-    if !tx.is_coinbase() && !tx.payload.is_empty() {
-        return Err(TxRuleError::NonCoinbaseTxHasPayload);
+fn check_transaction_payload(tx: &Transaction, payload_hf_activated: bool, payload_max_len_consensus: usize) -> TxResult<()> {
+    if tx.is_coinbase() {
+        return Ok(());
+    }
+
+    if !payload_hf_activated {
+        if !tx.payload.is_empty() {
+            return Err(TxRuleError::NonCoinbaseTxHasPayload);
+        }
+        return Ok(());
+    }
+
+    if tx.subnetwork_id.is_payload() {
+        let payload_len = tx.payload.len();
+        if payload_len == 0 {
+            return Err(TxRuleError::PayloadSubnetworkHasNoPayload);
+        }
+        if payload_len > payload_max_len_consensus {
+            return Err(TxRuleError::PayloadLengthAboveMax(payload_len, payload_max_len_consensus));
+        }
+        return Ok(());
+    }
+
+    if !tx.payload.is_empty() {
+        return Err(TxRuleError::PayloadInInvalidSubnetwork(tx.subnetwork_id.clone()));
     }
     Ok(())
 }
@@ -147,8 +169,18 @@ fn check_transaction_output_value_ranges(tx: &Transaction) -> TxResult<()> {
     Ok(())
 }
 
-fn check_transaction_subnetwork(tx: &Transaction) -> TxResult<()> {
-    if tx.is_coinbase() || tx.subnetwork_id.is_native() {
+fn check_transaction_subnetwork(tx: &Transaction, payload_hf_activated: bool) -> TxResult<()> {
+    if !payload_hf_activated {
+        if tx.is_coinbase() || tx.subnetwork_id.is_native() {
+            return Ok(());
+        }
+        return Err(TxRuleError::SubnetworksDisabled(tx.subnetwork_id.clone()));
+    }
+
+    if tx.subnetwork_id == cryptix_consensus_core::subnets::SUBNETWORK_ID_COINBASE
+        || tx.subnetwork_id == cryptix_consensus_core::subnets::SUBNETWORK_ID_NATIVE
+        || tx.subnetwork_id == cryptix_consensus_core::subnets::SUBNETWORK_ID_PAYLOAD
+    {
         Ok(())
     } else {
         Err(TxRuleError::SubnetworksDisabled(tx.subnetwork_id.clone()))
@@ -158,7 +190,7 @@ fn check_transaction_subnetwork(tx: &Transaction) -> TxResult<()> {
 #[cfg(test)]
 mod tests {
     use cryptix_consensus_core::{
-        subnets::{SubnetworkId, SUBNETWORK_ID_COINBASE, SUBNETWORK_ID_NATIVE},
+        subnets::{SubnetworkId, SUBNETWORK_ID_COINBASE, SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PAYLOAD},
         tx::{scriptvec, ScriptPublicKey, Transaction, TransactionId, TransactionInput, TransactionOutpoint, TransactionOutput},
     };
     use cryptix_core::assert_match;
@@ -204,7 +236,7 @@ mod tests {
             vec![9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         );
 
-        tv.validate_tx_in_isolation(&valid_cb).unwrap();
+        tv.validate_tx_in_isolation(&valid_cb, 0).unwrap();
 
         let valid_tx = Transaction::new(
             0,
@@ -268,46 +300,80 @@ mod tests {
             vec![],
         );
 
-        tv.validate_tx_in_isolation(&valid_tx).unwrap();
+        tv.validate_tx_in_isolation(&valid_tx, 0).unwrap();
 
         let mut tx: Transaction = valid_tx.clone();
         tx.subnetwork_id = SubnetworkId::from_byte(3);
-        assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::SubnetworksDisabled(_)));
+        assert_match!(tv.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::SubnetworksDisabled(_)));
 
         let mut tx = valid_tx.clone();
         tx.inputs = vec![];
-        assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::NoTxInputs));
+        assert_match!(tv.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::NoTxInputs));
 
         let mut tx = valid_tx.clone();
         tx.inputs = (0..params.max_tx_inputs + 1).map(|_| valid_tx.inputs[0].clone()).collect();
-        assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::TooManyInputs(_, _)));
+        assert_match!(tv.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::TooManyInputs(_, _)));
 
         let mut tx = valid_tx.clone();
         tx.inputs[0].signature_script = vec![0; params.max_signature_script_len + 1];
-        assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::TooBigSignatureScript(_, _)));
+        assert_match!(tv.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::TooBigSignatureScript(_, _)));
 
         let mut tx = valid_tx.clone();
         tx.outputs = (0..params.max_tx_outputs + 1).map(|_| valid_tx.outputs[0].clone()).collect();
-        assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::TooManyOutputs(_, _)));
+        assert_match!(tv.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::TooManyOutputs(_, _)));
 
         let mut tx = valid_tx.clone();
         tx.outputs[0].script_public_key = ScriptPublicKey::new(0, scriptvec![0u8; params.max_script_public_key_len + 1]);
-        assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::TooBigScriptPublicKey(_, _)));
+        assert_match!(tv.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::TooBigScriptPublicKey(_, _)));
 
         let mut tx = valid_tx.clone();
         tx.inputs.push(tx.inputs[0].clone());
-        assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::TxDuplicateInputs));
+        assert_match!(tv.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::TxDuplicateInputs));
 
         let mut tx = valid_tx.clone();
         tx.gas = 1;
-        assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::TxHasGas));
+        assert_match!(tv.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::TxHasGas));
 
         let mut tx = valid_tx.clone();
         tx.payload = vec![0];
-        assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::NonCoinbaseTxHasPayload));
+        assert_match!(tv.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::NonCoinbaseTxHasPayload));
+
+        let mut tx = valid_tx.clone();
+        tx.version = TX_VERSION + 1;
+        assert_match!(tv.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::UnknownTxVersion(_)));
+
+        let tv_post_hf = TransactionValidator::new(
+            params.max_tx_inputs,
+            params.max_tx_outputs,
+            params.max_signature_script_len,
+            params.max_script_public_key_len,
+            params.ghostdag_k,
+            params.coinbase_payload_script_public_key_max_len,
+            params.coinbase_maturity,
+            Default::default(),
+            cryptix_consensus_core::mass::MassCalculator::new(0, 0, 0, 0, 1),
+            params.storage_mass_activation_daa_score,
+            0,
+            8192,
+        );
+
+        let mut tx = valid_tx.clone();
+        tx.subnetwork_id = SUBNETWORK_ID_PAYLOAD;
+        tx.payload = vec![1];
+        tv_post_hf.validate_tx_in_isolation(&tx, 0).unwrap();
+
+        tx.payload = vec![];
+        assert_match!(tv_post_hf.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::PayloadSubnetworkHasNoPayload));
+
+        tx.payload = vec![7; 8193];
+        assert_match!(tv_post_hf.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::PayloadLengthAboveMax(8193, 8192)));
+
+        let mut tx = valid_tx.clone();
+        tx.payload = vec![2];
+        assert_match!(tv_post_hf.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::PayloadInInvalidSubnetwork(_)));
 
         let mut tx = valid_tx;
-        tx.version = TX_VERSION + 1;
-        assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::UnknownTxVersion(_)));
+        tx.subnetwork_id = SubnetworkId::from_byte(10);
+        assert_match!(tv_post_hf.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::SubnetworksDisabled(_)));
     }
 }

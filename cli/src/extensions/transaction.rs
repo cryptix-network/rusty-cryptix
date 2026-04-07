@@ -126,10 +126,10 @@ impl TransactionExtension for TransactionRecord {
         let suffix = cryptix_suffix(&self.network_id.network_type);
 
         match transaction_data {
-            TransactionData::Reorg { utxo_entries, aggregate_input_value }
-            | TransactionData::Stasis { utxo_entries, aggregate_input_value }
-            | TransactionData::Incoming { utxo_entries, aggregate_input_value }
-            | TransactionData::External { utxo_entries, aggregate_input_value }
+            TransactionData::Reorg { utxo_entries, aggregate_input_value, .. }
+            | TransactionData::Stasis { utxo_entries, aggregate_input_value, .. }
+            | TransactionData::Incoming { utxo_entries, aggregate_input_value, .. }
+            | TransactionData::External { utxo_entries, aggregate_input_value, .. }
             | TransactionData::Change { utxo_entries, aggregate_input_value, .. } => {
                 let aggregate_input_value =
                     transaction_type.style_with_sign(sompi_to_cryptix_string(*aggregate_input_value).as_str(), history);

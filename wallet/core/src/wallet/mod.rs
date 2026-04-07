@@ -90,8 +90,10 @@ pub struct Inner {
     store: Arc<dyn Interface>,
     settings: SettingsStore<WalletSettings>,
     utxo_processor: Arc<UtxoProcessor>,
+    ingress_multiplexer: Multiplexer<Box<Events>>,
     multiplexer: Multiplexer<Box<Events>>,
     wallet_bus: Channel<WalletBusMessage>,
+    messenger_dedup_indexes: AsyncMutex<HashMap<String, crate::tx::MessengerDedupIndex>>,
     estimation_abortables: Mutex<HashMap<AccountId, Abortable>>,
     retained_contexts: Mutex<HashMap<String, Arc<Vec<u8>>>>,
     // Mutex used to protect concurrent access to accounts at the wallet api level
@@ -147,13 +149,15 @@ impl Wallet {
     }
 
     pub fn try_with_rpc(rpc: Option<Rpc>, store: Arc<dyn Interface>, network_id: Option<NetworkId>) -> Result<Wallet> {
+        let ingress_multiplexer = Multiplexer::<Box<Events>>::new();
         let multiplexer = Multiplexer::<Box<Events>>::new();
         let wallet_bus = Channel::unbounded();
         let utxo_processor =
-            Arc::new(UtxoProcessor::new(rpc.clone(), network_id, Some(multiplexer.clone()), Some(wallet_bus.clone())));
+            Arc::new(UtxoProcessor::new(rpc.clone(), network_id, Some(ingress_multiplexer.clone()), Some(wallet_bus.clone())));
 
         let wallet = Wallet {
             inner: Arc::new(Inner {
+                ingress_multiplexer,
                 multiplexer,
                 store,
                 active_accounts: ActiveAccountMap::default(),
@@ -164,6 +168,7 @@ impl Wallet {
                 settings: SettingsStore::new_with_storage(Storage::default_settings_store()),
                 utxo_processor: utxo_processor.clone(),
                 wallet_bus,
+                messenger_dedup_indexes: AsyncMutex::new(HashMap::new()),
                 estimation_abortables: Mutex::new(HashMap::new()),
                 retained_contexts: Mutex::new(HashMap::new()),
                 guard: Arc::new(AsyncMutex::new(())),
@@ -560,6 +565,10 @@ impl Wallet {
 
     pub fn multiplexer(&self) -> &Multiplexer<Box<Events>> {
         &self.inner.multiplexer
+    }
+
+    fn ingress_multiplexer(&self) -> &Multiplexer<Box<Events>> {
+        &self.inner.ingress_multiplexer
     }
 
     pub(crate) fn wallet_bus(&self) -> &Channel<WalletBusMessage> {
@@ -999,6 +1008,10 @@ impl Wallet {
     }
 
     pub(crate) async fn handle_discovery(&self, record: TransactionRecord) -> Result<()> {
+        let record = self.enrich_record_transaction(&record).await?;
+        if !self.should_persist_record_after_messenger_dedup(&record).await {
+            return Ok(());
+        }
         let transaction_store = self.store().as_transaction_record_store()?;
 
         if let Err(_err) = transaction_store.load_single(record.binding(), &self.network_id()?, record.id()).await {
@@ -1030,6 +1043,78 @@ impl Wallet {
         Ok(())
     }
 
+    fn needs_transaction_enrichment(record: &TransactionRecord) -> bool {
+        if record.has_embedded_transaction() {
+            return false;
+        }
+
+        matches!(
+            record.transaction_data(),
+            TransactionData::Incoming { .. }
+                | TransactionData::External { .. }
+                | TransactionData::Reorg { .. }
+                | TransactionData::Stasis { .. }
+        )
+    }
+
+    async fn resolve_record_transaction(&self, record: &TransactionRecord) -> Option<cryptix_consensus_core::tx::Transaction> {
+        if let Some(transaction) = self.utxo_processor().confirmed_transaction(record.id()) {
+            return Some(transaction);
+        }
+
+        let mempool_entry = self.rpc_api().get_mempool_entry(*record.id(), true, false).await.ok()?;
+        cryptix_consensus_core::tx::Transaction::try_from(mempool_entry.transaction).ok()
+    }
+
+    async fn enrich_record_transaction(&self, record: &TransactionRecord) -> Result<TransactionRecord> {
+        let mut enriched = record.clone();
+        if !Self::needs_transaction_enrichment(&enriched) {
+            enriched.refresh_payload_availability(self.current_daa_score());
+            return Ok(enriched);
+        }
+
+        if let Some(transaction) = self.resolve_record_transaction(&enriched).await {
+            let _ = enriched.try_attach_transaction(transaction);
+        }
+
+        enriched.refresh_payload_availability(self.current_daa_score());
+
+        Ok(enriched)
+    }
+
+    fn messenger_scope_key(record: &TransactionRecord) -> String {
+        format!("{}:{}", record.binding().to_hex(), record.network_id())
+    }
+
+    fn messenger_secondary_key(record: &TransactionRecord) -> Option<cryptix_hashes::Hash> {
+        let transaction = record.transaction()?;
+        let classified = crate::tx::classify_messenger_payload(transaction.payload.as_slice()).ok()?;
+        match classified {
+            crate::tx::MessengerPayloadClass::MessengerV1(envelope) => envelope.secondary_dedup_key().ok(),
+            _ => None,
+        }
+    }
+
+    async fn mark_messenger_detached(&self, record: &TransactionRecord) {
+        let key = Self::messenger_scope_key(record);
+        let mut indexes = self.inner.messenger_dedup_indexes.lock().await;
+        if let Some(index) = indexes.get_mut(&key) {
+            index.mark_detached(*record.id());
+        }
+    }
+
+    async fn should_persist_record_after_messenger_dedup(&self, record: &TransactionRecord) -> bool {
+        let Some(secondary_key) = Self::messenger_secondary_key(record) else {
+            return true;
+        };
+
+        let key = Self::messenger_scope_key(record);
+        let mut indexes = self.inner.messenger_dedup_indexes.lock().await;
+        let index = indexes.entry(key).or_default();
+        index.observe_chain_message(*record.id(), secondary_key);
+        index.canonical_txid(&secondary_key) == Some(*record.id())
+    }
+
     async fn handle_wallet_bus(self: &Arc<Self>, message: WalletBusMessage) -> Result<()> {
         match message {
             WalletBusMessage::Discovery { record } => {
@@ -1039,25 +1124,47 @@ impl Wallet {
         Ok(())
     }
 
-    async fn handle_event(self: &Arc<Self>, event: Box<Events>) -> Result<()> {
+    async fn handle_event(self: &Arc<Self>, event: Box<Events>) -> Result<Option<Events>> {
         match &*event {
-            Events::Pending { record } | Events::Maturity { record } | Events::Reorg { record } => {
-                if !record.is_change() {
-                    self.store().as_transaction_record_store()?.store(&[record]).await?;
+            Events::Pending { record } | Events::Maturity { record } => {
+                let enriched_record = self.enrich_record_transaction(record).await?;
+                if enriched_record.is_change() {
+                    return Ok(None);
                 }
+
+                if !self.should_persist_record_after_messenger_dedup(&enriched_record).await {
+                    return Ok(None);
+                }
+
+                self.store().as_transaction_record_store()?.store(&[&enriched_record]).await?;
+
+                let normalized = match &*event {
+                    Events::Pending { .. } => Events::Pending { record: enriched_record },
+                    Events::Maturity { .. } => Events::Maturity { record: enriched_record },
+                    _ => unreachable!(),
+                };
+                Ok(Some(normalized))
+            }
+            Events::Reorg { record } => {
+                let enriched_record = self.enrich_record_transaction(record).await?;
+                self.mark_messenger_detached(&enriched_record).await;
+                if enriched_record.is_change() {
+                    return Ok(None);
+                }
+
+                self.store().as_transaction_record_store()?.store(&[&enriched_record]).await?;
+                Ok(Some(Events::Reorg { record: enriched_record }))
             }
 
-            _ => {}
+            _ => Ok(Some((*event).clone())),
         }
-
-        Ok(())
     }
 
     async fn start_task(self: &Arc<Self>) -> Result<()> {
         let this = self.clone();
         let task_ctl_receiver = self.inner.task_ctl.request.receiver.clone();
         let task_ctl_sender = self.inner.task_ctl.response.sender.clone();
-        let events = self.multiplexer().channel();
+        let events = self.ingress_multiplexer().channel();
         let wallet_bus_receiver = self.wallet_bus().receiver.clone();
 
         // let this_clone = self.clone();
@@ -1079,7 +1186,13 @@ impl Wallet {
                     msg = events.receiver.recv().fuse() => {
                         match msg {
                             Ok(event) => {
-                                this.handle_event(event).await.unwrap_or_else(|e| log_error!("Wallet::handle_event() error: {}", e));
+                                match this.handle_event(event).await {
+                                    Ok(Some(event)) => {
+                                        this.notify(event).await.unwrap_or_else(|e| log_error!("Wallet::notify() error: {}", e));
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => log_error!("Wallet::handle_event() error: {}", e),
+                                }
                             },
                             Err(err) => {
                                 log_error!("Wallet: error while receiving multiplexer message: {err}");

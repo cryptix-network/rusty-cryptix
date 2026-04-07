@@ -20,9 +20,6 @@ pub fn calculate_ghostdag_k(x: f64, delta: f64) -> u64 {
     }
 }
 
-/// Bps-related constants generator for testnet 11
-pub type Testnet11Bps = Bps<10>;
-
 /// Struct representing network blocks-per-second. Provides a bunch of const functions
 /// computing various constants which are functions of the BPS value
 pub struct Bps<const BPS: u64>;
@@ -108,7 +105,7 @@ impl<const BPS: u64> Bps<BPS> {
             + 2 * Self::ghostdag_k() as u64
             + 2
 
-        // TODO (HF or restart of TN11):
+        // TODO (HF or testnet restart):
         // Return `Self::finality_depth() * 3` and assert that this value is equal or larger than the above expression.
         // This will give us a round easy number to track which is not sensitive to minor changes in other related params.
     }

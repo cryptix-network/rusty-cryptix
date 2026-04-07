@@ -1,12 +1,115 @@
 use crate::imports::*;
 use crate::result::Result;
-use crate::tx::{IPaymentOutputArray, PaymentOutputs};
+use crate::tx::{default_fast_max_fee_cap, validate_wallet_payload, IPaymentOutputArray, PaymentOutputs};
 use crate::wasm::tx::generator::*;
 use cryptix_consensus_client::*;
-use cryptix_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+use cryptix_consensus_core::subnets::{SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PAYLOAD};
 use cryptix_wallet_macros::declare_typescript_wasm_interface as declare;
 use cryptix_wasm_core::types::BinaryT;
 use workflow_core::runtime::is_web;
+
+declare! {
+    IFastFeeRecommendation,
+    r#"
+    /**
+     * Recommended fee values for fast-path submission.
+     *
+     * @category Wallet SDK
+     */
+    export interface IFastFeeRecommendation {
+        txMass: bigint;
+        isPayload: boolean;
+        estimateFeerate: number;
+        requiredFeerate: number;
+        requiredFeeSompi: bigint;
+        recommendedMaxFeeSompi: bigint;
+        minimumRelayFeerate?: number;
+        payloadOvercapFeerateFloor?: number;
+        effectiveHfaFeerateFloor?: number;
+    }
+    "#,
+}
+
+fn validate_optional_feerate(label: &str, value: Option<f64>) -> Result<Option<f64>> {
+    match value {
+        Some(v) if !v.is_finite() || v < 0.0 => Err(Error::custom(format!("{label} must be a finite non-negative number"))),
+        Some(v) => Ok(Some(v)),
+        None => Ok(None),
+    }
+}
+
+fn ceil_fee_from_feerate(feerate: f64, tx_mass: u64) -> Result<u64> {
+    if tx_mass == 0 || feerate <= 0.0 {
+        return Ok(0);
+    }
+
+    let fee = (feerate * tx_mass as f64).ceil();
+    if !fee.is_finite() || fee < 0.0 || fee > u64::MAX as f64 {
+        return Err(Error::custom("unable to compute fee from feerate and tx mass"));
+    }
+
+    Ok(fee as u64)
+}
+
+/// Build a conservative fast-path fee recommendation from tx mass, a base estimate and optional node-provided floors.
+/// @category Wallet SDK
+#[wasm_bindgen(js_name = recommendFastFees)]
+pub fn recommend_fast_fees_js(
+    tx_mass: BigInt,
+    estimate_feerate: f64,
+    is_payload: Option<bool>,
+    minimum_relay_feerate: Option<f64>,
+    payload_overcap_feerate_floor: Option<f64>,
+    effective_hfa_feerate_floor: Option<f64>,
+) -> Result<IFastFeeRecommendation> {
+    if !estimate_feerate.is_finite() || estimate_feerate < 0.0 {
+        return Err(Error::custom("estimateFeerate must be a finite non-negative number"));
+    }
+
+    let tx_mass: u64 = tx_mass.try_into().map_err(|err| Error::custom(format!("invalid txMass value: {err}")))?;
+    let is_payload = is_payload.unwrap_or(false);
+    let minimum_relay_feerate = validate_optional_feerate("minimumRelayFeerate", minimum_relay_feerate)?;
+    let payload_overcap_feerate_floor = validate_optional_feerate("payloadOvercapFeerateFloor", payload_overcap_feerate_floor)?;
+    let effective_hfa_feerate_floor = validate_optional_feerate("effectiveHfaFeerateFloor", effective_hfa_feerate_floor)?;
+
+    let mut required_feerate = estimate_feerate;
+    if let Some(v) = minimum_relay_feerate {
+        required_feerate = required_feerate.max(v);
+    }
+    if let Some(v) = effective_hfa_feerate_floor {
+        required_feerate = required_feerate.max(v);
+    }
+    if is_payload {
+        let payload_floor = payload_overcap_feerate_floor.or_else(|| minimum_relay_feerate.map(|min| min * 2.0)).unwrap_or(0.0);
+        required_feerate = required_feerate.max(payload_floor);
+    }
+
+    let required_fee_sompi = ceil_fee_from_feerate(required_feerate, tx_mass)?;
+    let recommended_max_fee_sompi = default_fast_max_fee_cap(required_fee_sompi);
+
+    let object = IFastFeeRecommendation::default();
+    object.set("txMass", &js_sys::BigInt::from(tx_mass).into())?;
+    object.set("isPayload", &is_payload.into())?;
+    object.set("estimateFeerate", &estimate_feerate.into())?;
+    object.set("requiredFeerate", &required_feerate.into())?;
+    object.set("requiredFeeSompi", &js_sys::BigInt::from(required_fee_sompi).into())?;
+    object.set("recommendedMaxFeeSompi", &js_sys::BigInt::from(recommended_max_fee_sompi).into())?;
+    if let Some(v) = minimum_relay_feerate {
+        object.set("minimumRelayFeerate", &v.into())?;
+    }
+    if let Some(v) = payload_overcap_feerate_floor {
+        object.set("payloadOvercapFeerateFloor", &v.into())?;
+    } else if is_payload {
+        if let Some(v) = minimum_relay_feerate.map(|min| min * 2.0) {
+            object.set("payloadOvercapFeerateFloor", &v.into())?;
+        }
+    }
+    if let Some(v) = effective_hfa_feerate_floor {
+        object.set("effectiveHfaFeerateFloor", &v.into())?;
+    }
+
+    Ok(object)
+}
 
 /// Create a basic transaction without any mass limit checks.
 /// @category Wallet SDK
@@ -25,6 +128,7 @@ pub fn create_transaction_js(
     };
     let priority_fee: u64 = priority_fee.try_into().map_err(|err| Error::custom(format!("invalid fee value: {err}")))?;
     let payload = payload.and_then(|payload| payload.try_as_vec_u8().ok()).unwrap_or_default();
+    validate_wallet_payload(Some(&payload))?;
     let outputs = PaymentOutputs::try_owned_from(outputs)?;
     let sig_op_count = sig_op_count.unwrap_or(1);
 
@@ -49,7 +153,8 @@ pub fn create_transaction_js(
     }
 
     let outputs: Vec<TransactionOutput> = outputs.into();
-    let transaction = Transaction::new(None, 0, inputs, outputs, 0, SUBNETWORK_ID_NATIVE, 0, payload, 0)?;
+    let subnetwork_id = if payload.is_empty() { SUBNETWORK_ID_NATIVE } else { SUBNETWORK_ID_PAYLOAD };
+    let transaction = Transaction::new(None, 0, inputs, outputs, 0, subnetwork_id, 0, payload, 0)?;
 
     Ok(transaction)
 }

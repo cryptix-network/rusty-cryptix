@@ -17,6 +17,9 @@ pub(crate) const DEFAULT_MAXIMUM_ORPHAN_TRANSACTION_COUNT: u64 = 500;
 /// DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE specifies the minimum transaction fee for a transaction to be accepted to
 /// the mempool and relayed. It is specified in sompi per 1kg (or 1000 grams) of transaction mass.
 pub(crate) const DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE: u64 = 1000;
+pub(crate) const DEFAULT_PAYLOAD_MAX_STANDARD_LEN: usize = 2048;
+pub(crate) const DEFAULT_PAYLOAD_SOFT_CAP_PER_BLOCK_BYTES: u64 = 32_768;
+pub(crate) const DEFAULT_PAYLOAD_OVERCAP_FEERATE_MULTIPLIER: f64 = 2.0;
 
 /// Standard transaction version range might be different from what consensus accepts, therefore
 /// we define separate values in mempool.
@@ -43,6 +46,9 @@ pub struct Config {
     pub accept_non_standard: bool,
     pub maximum_mass_per_block: u64,
     pub minimum_relay_transaction_fee: u64,
+    pub payload_max_len_standard: usize,
+    pub payload_soft_cap_per_block_bytes: u64,
+    pub payload_overcap_feerate_multiplier: f64,
     pub minimum_standard_transaction_version: u16,
     pub maximum_standard_transaction_version: u16,
     pub network_blocks_per_second: u64,
@@ -67,6 +73,9 @@ impl Config {
         accept_non_standard: bool,
         maximum_mass_per_block: u64,
         minimum_relay_transaction_fee: u64,
+        payload_max_len_standard: usize,
+        payload_soft_cap_per_block_bytes: u64,
+        payload_overcap_feerate_multiplier: f64,
         minimum_standard_transaction_version: u16,
         maximum_standard_transaction_version: u16,
         network_blocks_per_second: u64,
@@ -88,6 +97,9 @@ impl Config {
             accept_non_standard,
             maximum_mass_per_block,
             minimum_relay_transaction_fee,
+            payload_max_len_standard,
+            payload_soft_cap_per_block_bytes,
+            payload_overcap_feerate_multiplier,
             minimum_standard_transaction_version,
             maximum_standard_transaction_version,
             network_blocks_per_second,
@@ -117,6 +129,9 @@ impl Config {
             accept_non_standard: relay_non_std_transactions,
             maximum_mass_per_block: max_block_mass,
             minimum_relay_transaction_fee: DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            payload_max_len_standard: DEFAULT_PAYLOAD_MAX_STANDARD_LEN,
+            payload_soft_cap_per_block_bytes: DEFAULT_PAYLOAD_SOFT_CAP_PER_BLOCK_BYTES,
+            payload_overcap_feerate_multiplier: DEFAULT_PAYLOAD_OVERCAP_FEERATE_MULTIPLIER,
             minimum_standard_transaction_version: DEFAULT_MINIMUM_STANDARD_TRANSACTION_VERSION,
             maximum_standard_transaction_version: DEFAULT_MAXIMUM_STANDARD_TRANSACTION_VERSION,
             network_blocks_per_second: 1000 / target_milliseconds_per_block,

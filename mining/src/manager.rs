@@ -214,6 +214,11 @@ impl MiningManager {
         self.config.minimum_feerate()
     }
 
+    /// Returns the payload over-cap feerate floor in sompi/gram units.
+    pub(crate) fn payload_overcap_feerate_floor(&self) -> f64 {
+        self.config.minimum_feerate().max(0.0) * self.config.payload_overcap_feerate_multiplier
+    }
+
     /// Returns realtime feerate estimations based on internal mempool state with additional verbose data
     pub(crate) fn get_realtime_feerate_estimations_verbose(
         &self,
@@ -866,6 +871,11 @@ impl MiningManagerProxy {
     /// Returns the current minimum relay feerate in sompi/gram units.
     pub async fn minimum_relay_feerate(self) -> f64 {
         spawn_blocking(move || self.inner.minimum_relay_feerate()).await.unwrap()
+    }
+
+    /// Returns the payload over-cap feerate floor in sompi/gram units.
+    pub async fn payload_overcap_feerate_floor(self) -> f64 {
+        spawn_blocking(move || self.inner.payload_overcap_feerate_floor()).await.unwrap()
     }
 
     /// Returns realtime feerate estimations based on internal mempool state with additional verbose data

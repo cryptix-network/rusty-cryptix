@@ -6,7 +6,7 @@
 use crate::events::Events;
 use crate::imports::*;
 use crate::result::Result;
-use crate::tx::{Fees, PaymentDestination};
+use crate::tx::{validate_wallet_payload, Fees, PaymentDestination};
 use crate::utxo::{UtxoContext, UtxoEntryReference, UtxoIterator};
 use cryptix_addresses::Address;
 use workflow_core::channel::Multiplexer;
@@ -63,6 +63,8 @@ impl GeneratorSettings {
         final_priority_fee: Fees,
         final_transaction_payload: Option<Vec<u8>>,
     ) -> Result<Self> {
+        validate_wallet_payload(final_transaction_payload.as_deref())?;
+
         let network_id = account.utxo_context().processor().network_id()?;
         let change_address = account.change_address()?;
         let multiplexer = account.wallet().multiplexer().clone();
@@ -101,6 +103,8 @@ impl GeneratorSettings {
         final_transaction_payload: Option<Vec<u8>>,
         multiplexer: Option<Multiplexer<Box<Events>>>,
     ) -> Result<Self> {
+        validate_wallet_payload(final_transaction_payload.as_deref())?;
+
         let network_id = utxo_context.processor().network_id()?;
         let utxo_iterator = UtxoIterator::new(&utxo_context);
 
@@ -135,6 +139,8 @@ impl GeneratorSettings {
         final_transaction_payload: Option<Vec<u8>>,
         multiplexer: Option<Multiplexer<Box<Events>>>,
     ) -> Result<Self> {
+        validate_wallet_payload(final_transaction_payload.as_deref())?;
+
         let settings = GeneratorSettings {
             network_id,
             multiplexer,

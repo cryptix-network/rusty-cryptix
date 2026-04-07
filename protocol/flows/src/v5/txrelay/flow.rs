@@ -70,6 +70,17 @@ impl Flow for RelayTransactionsFlow {
     async fn start(&mut self) -> Result<(), ProtocolError> {
         self.start_impl().await
     }
+
+    async fn on_error(&self, err: &ProtocolError) {
+        let reason = match err {
+            ProtocolError::MisbehavingPeer(reason) => Some(reason.to_owned()),
+            ProtocolError::UnexpectedMessage(_, _) | ProtocolError::ConversionError(_) => Some(err.to_string()),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            self.ctx.report_misbehaving_peer(&self.router, &reason).await;
+        }
+    }
 }
 
 impl RelayTransactionsFlow {
@@ -110,7 +121,11 @@ impl RelayTransactionsFlow {
             // trace!("Receive an inv message from {} with {} transaction ids", self.router.identity(), inv.len());
 
             if inv.len() > MAX_INV_PER_TX_INV_MSG {
-                return Err(ProtocolError::Other("Number of invs in tx inv message is over the limit"));
+                return Err(ProtocolError::MisbehavingPeer(format!(
+                    "number of invs in tx inv message is over the limit: {} > {}",
+                    inv.len(),
+                    MAX_INV_PER_TX_INV_MSG
+                )));
             }
 
             let session = self.ctx.consensus().unguarded_session();
@@ -206,7 +221,7 @@ impl RelayTransactionsFlow {
             let response = self.read_response().await?;
             let transaction_id = response.transaction_id();
             if transaction_id != request.req {
-                return Err(ProtocolError::OtherOwned(format!(
+                return Err(ProtocolError::MisbehavingPeer(format!(
                     "requested transaction id {} but got transaction {}",
                     request.req, transaction_id
                 )));

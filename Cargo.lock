@@ -1238,6 +1238,8 @@ dependencies = [
  "log",
  "parking_lot",
  "rand 0.8.5",
+ "reqwest",
+ "serde_json",
  "tokio",
 ]
 

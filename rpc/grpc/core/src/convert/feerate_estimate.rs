@@ -29,6 +29,9 @@ from!(item: &cryptix_rpc_core::RpcFeeEstimateVerboseExperimentalData, protowire:
         next_block_template_feerate_min: item.next_block_template_feerate_min,
         next_block_template_feerate_median: item.next_block_template_feerate_median,
         next_block_template_feerate_max: item.next_block_template_feerate_max,
+        minimum_relay_feerate: item.minimum_relay_feerate,
+        payload_overcap_feerate_floor: item.payload_overcap_feerate_floor,
+        effective_hfa_feerate_floor: item.effective_hfa_feerate_floor,
     }
 });
 
@@ -62,5 +65,8 @@ try_from!(item: &protowire::RpcFeeEstimateVerboseExperimentalData, cryptix_rpc_c
         next_block_template_feerate_min: item.next_block_template_feerate_min,
         next_block_template_feerate_median: item.next_block_template_feerate_median,
         next_block_template_feerate_max: item.next_block_template_feerate_max,
+        minimum_relay_feerate: item.minimum_relay_feerate,
+        payload_overcap_feerate_floor: item.payload_overcap_feerate_floor,
+        effective_hfa_feerate_floor: item.effective_hfa_feerate_floor,
     }
 });

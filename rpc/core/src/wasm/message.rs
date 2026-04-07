@@ -1661,6 +1661,9 @@ declare! {
         nextBlockTemplateFeerateMin : number;
         nextBlockTemplateFeerateMedian : number;
         nextBlockTemplateFeerateMax : number;
+        minimumRelayFeerate? : number;
+        payloadOvercapFeerateFloor? : number;
+        effectiveHfaFeerateFloor? : number;
     }
     "#,
 }
@@ -1674,6 +1677,15 @@ try_from!( data: RpcFeeEstimateVerboseExperimentalData, IFeeEstimateVerboseExper
     target.set("nextBlockTemplateFeerateMin", &data.next_block_template_feerate_min.into())?;
     target.set("nextBlockTemplateFeerateMedian", &data.next_block_template_feerate_median.into())?;
     target.set("nextBlockTemplateFeerateMax", &data.next_block_template_feerate_max.into())?;
+    if let Some(minimum_relay_feerate) = data.minimum_relay_feerate {
+        target.set("minimumRelayFeerate", &minimum_relay_feerate.into())?;
+    }
+    if let Some(payload_overcap_feerate_floor) = data.payload_overcap_feerate_floor {
+        target.set("payloadOvercapFeerateFloor", &payload_overcap_feerate_floor.into())?;
+    }
+    if let Some(effective_hfa_feerate_floor) = data.effective_hfa_feerate_floor {
+        target.set("effectiveHfaFeerateFloor", &effective_hfa_feerate_floor.into())?;
+    }
 
     Ok(target)
 });

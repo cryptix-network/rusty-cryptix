@@ -11,7 +11,7 @@ use cryptix_consensus::{
         headers::HeaderStoreReader,
         relations::RelationsStoreReader,
     },
-    params::{Params, Testnet11Bps, DEVNET_PARAMS, NETWORK_DELAY_BOUND, TESTNET11_PARAMS},
+    params::{Params, DEVNET_PARAMS, NETWORK_DELAY_BOUND},
 };
 use cryptix_consensus_core::{
     api::ConsensusApi, block::Block, blockstatus::BlockStatus, config::bps::calculate_ghostdag_k, errors::block::BlockProcessResult,
@@ -104,9 +104,6 @@ struct Args {
     #[arg(long, default_value_t = false)]
     daa_legacy: bool,
 
-    /// Use testnet-11 consensus params
-    #[arg(long, default_value_t = false)]
-    testnet11: bool,
     /// Enable performance metrics: cpu, memory, disk io usage
     #[arg(long, default_value_t = false)]
     perf_metrics: bool,
@@ -156,7 +153,7 @@ fn main() {
     main_impl(args);
 }
 
-fn main_impl(mut args: Args) {
+fn main_impl(args: Args) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     let stop_perf_monitor = args.perf_metrics.then(|| {
@@ -187,8 +184,7 @@ fn main_impl(mut args: Args) {
             args.miners
         );
     }
-    args.bps = if args.testnet11 { Testnet11Bps::bps() as f64 } else { args.bps };
-    let mut params = if args.testnet11 { TESTNET11_PARAMS } else { DEVNET_PARAMS };
+    let mut params = DEVNET_PARAMS;
     params.storage_mass_activation_daa_score = 400;
     params.storage_mass_parameter = 10_000;
     let mut builder = ConfigBuilder::new(params)
@@ -286,39 +282,30 @@ fn apply_args_to_consensus_params(args: &Args, params: &mut Params) {
     // however we avoid the actual max since it is reserved for the DB prefix scheme
     params.max_block_level = BlockLevel::MAX - 1;
     params.genesis.timestamp = 0;
-    if args.testnet11 {
-        info!(
-            "Using cryptix-testnet-11 configuration (GHOSTDAG K={}, DAA window size={}, Median time window size={})",
-            params.ghostdag_k,
-            params.difficulty_window_size(0),
-            params.past_median_time_window_size(0),
-        );
+    let max_delay = args.delay.max(NETWORK_DELAY_BOUND as f64);
+    let k = u64::max(calculate_ghostdag_k(2.0 * max_delay * args.bps, 0.05), params.ghostdag_k as u64);
+    let k = u64::min(k, KType::MAX as u64) as KType; // Clamp to KType::MAX
+    params.ghostdag_k = k;
+    params.mergeset_size_limit = k as u64 * 10;
+    params.max_block_parents = u8::max((0.66 * k as f64) as u8, 10);
+    params.target_time_per_block = (1000.0 / args.bps) as u64;
+    params.merge_depth = (params.merge_depth as f64 * args.bps) as u64;
+    params.coinbase_maturity = (params.coinbase_maturity as f64 * f64::max(1.0, args.bps * args.delay * 0.25)) as u64;
+
+    if args.daa_legacy {
+        // Scale DAA and median-time windows linearly with BPS
+        params.sampling_activation_daa_score = u64::MAX;
+        params.legacy_timestamp_deviation_tolerance = (params.legacy_timestamp_deviation_tolerance as f64 * args.bps) as u64;
+        params.legacy_difficulty_window_size = (params.legacy_difficulty_window_size as f64 * args.bps) as usize;
     } else {
-        let max_delay = args.delay.max(NETWORK_DELAY_BOUND as f64);
-        let k = u64::max(calculate_ghostdag_k(2.0 * max_delay * args.bps, 0.05), params.ghostdag_k as u64);
-        let k = u64::min(k, KType::MAX as u64) as KType; // Clamp to KType::MAX
-        params.ghostdag_k = k;
-        params.mergeset_size_limit = k as u64 * 10;
-        params.max_block_parents = u8::max((0.66 * k as f64) as u8, 10);
-        params.target_time_per_block = (1000.0 / args.bps) as u64;
-        params.merge_depth = (params.merge_depth as f64 * args.bps) as u64;
-        params.coinbase_maturity = (params.coinbase_maturity as f64 * f64::max(1.0, args.bps * args.delay * 0.25)) as u64;
-
-        if args.daa_legacy {
-            // Scale DAA and median-time windows linearly with BPS
-            params.sampling_activation_daa_score = u64::MAX;
-            params.legacy_timestamp_deviation_tolerance = (params.legacy_timestamp_deviation_tolerance as f64 * args.bps) as u64;
-            params.legacy_difficulty_window_size = (params.legacy_difficulty_window_size as f64 * args.bps) as usize;
-        } else {
-            // Use the new sampling algorithms
-            params.sampling_activation_daa_score = 0;
-            params.past_median_time_sample_rate = (10.0 * args.bps) as u64;
-            params.new_timestamp_deviation_tolerance = (600.0 * args.bps) as u64;
-            params.difficulty_sample_rate = (2.0 * args.bps) as u64;
-        }
-
-        info!("2Dλ={}, GHOSTDAG K={}, DAA window size={}", 2.0 * args.delay * args.bps, k, params.difficulty_window_size(0));
+        // Use the new sampling algorithms
+        params.sampling_activation_daa_score = 0;
+        params.past_median_time_sample_rate = (10.0 * args.bps) as u64;
+        params.new_timestamp_deviation_tolerance = (600.0 * args.bps) as u64;
+        params.difficulty_sample_rate = (2.0 * args.bps) as u64;
     }
+
+    info!("2Dλ={}, GHOSTDAG K={}, DAA window size={}", 2.0 * args.delay * args.bps, k, params.difficulty_window_size(0));
     if args.test_pruning {
         params.pruning_proof_m = 16;
         params.legacy_difficulty_window_size = 64;

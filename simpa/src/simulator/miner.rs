@@ -113,6 +113,7 @@ impl Miner {
                 params.mass_per_script_pub_key_byte,
                 params.mass_per_sig_op,
                 params.storage_mass_parameter,
+                params.payload_weight_multiplier,
             ),
         }
     }

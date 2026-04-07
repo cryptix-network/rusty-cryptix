@@ -1,18 +1,26 @@
 #!/bin/bash
 set -e
 
+patch_generated_glue() {
+    node build/patch-init-warnings.js "$@"
+}
+
 if [ "$1" == "--keygen" ]; then
     echo "building wasm32-keygen"
     wasm-pack build --weak-refs --target web --out-name cryptix --out-dir web/cryptix-keygen --features wasm32-keygen
+    patch_generated_glue web/cryptix-keygen
 elif [ "$1" == "--rpc" ]; then
     echo "building wasm32-rpc"
     wasm-pack build --weak-refs --target web --out-name cryptix --out-dir web/cryptix-rpc --features wasm32-rpc
+    patch_generated_glue web/cryptix-rpc
 elif [ "$1" == "--core" ]; then
     echo "building wasm32-core"
     wasm-pack build --weak-refs --target web --out-name cryptix --out-dir web/cryptix-core --features wasm32-core
+    patch_generated_glue web/cryptix-core
 elif [ "$1" == "--sdk" ]; then
     echo "building wasm32-sdk"
     wasm-pack build --weak-refs --target web --out-name cryptix --out-dir web/cryptix --features wasm32-sdk
+    patch_generated_glue web/cryptix
 
 else
 
@@ -24,5 +32,6 @@ else
     wasm-pack build --weak-refs --target web --out-name cryptix --out-dir web/cryptix-core --features wasm32-core
     echo "building wasm32-sdk"
     wasm-pack build --weak-refs --target web --out-name cryptix --out-dir web/cryptix --features wasm32-sdk
+    patch_generated_glue web/cryptix-keygen web/cryptix-rpc web/cryptix-core web/cryptix
 
 fi

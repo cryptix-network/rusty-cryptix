@@ -10,3 +10,4 @@ wasm-pack build --weak-refs -dev --target web --out-name cryptix --out-dir web/c
 wasm-pack build --weak-refs -dev --target web --out-name cryptix --out-dir web/cryptix-dev-rpc --features wasm32-rpc $@
 wasm-pack build --weak-refs -dev --target web --out-name cryptix --out-dir web/cryptix-dev-core --features wasm32-core $@
 wasm-pack build --weak-refs -dev --target web --out-name cryptix --out-dir web/cryptix-dev --features wasm32-sdk $@
+node build/patch-init-warnings.js web/cryptix-dev-keygen web/cryptix-dev-rpc web/cryptix-dev-core web/cryptix-dev

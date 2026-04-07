@@ -257,6 +257,12 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     if args.datacenter {
         info!("Datacenter mode: ENABLED (private/unroutable peer addresses are filtered by address manager)");
     }
+    info!("Auto-ban: {} (default strike threshold: 5, ban duration: 3h)", if args.autoban { "ENABLED" } else { "DISABLED" });
+    info!(
+        "Banserver sync: {} ({})",
+        if args.banserver { "ENABLED" } else { "DISABLED" },
+        args.banserver_url.as_deref().unwrap_or("default URL")
+    );
 
     assert!(!db_dir.to_str().unwrap().is_empty());
     info!("Application directory: {}", app_dir.display());
@@ -448,7 +454,8 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         None
     };
 
-    let (address_manager, port_mapping_extender_svc) = AddressManager::new(config.clone(), meta_db, tick_service.clone(), args.datacenter);
+    let (address_manager, port_mapping_extender_svc) =
+        AddressManager::new(config.clone(), meta_db, tick_service.clone(), args.datacenter);
 
     let mining_manager = MiningManagerProxy::new(Arc::new(MiningManager::new_with_extended_config(
         config.target_time_per_block,
@@ -468,6 +475,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         mining_manager.clone(),
         tick_service.clone(),
         notification_root,
+        args.autoban,
     ));
     let p2p_service = Arc::new(P2pService::new(
         flow_context.clone(),
@@ -478,6 +486,8 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         args.inbound_limit,
         dns_seeders,
         config.default_p2p_port(),
+        args.banserver,
+        args.banserver_url.clone(),
         p2p_tower_counters.clone(),
     ));
 

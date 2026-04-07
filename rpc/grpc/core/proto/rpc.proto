@@ -955,6 +955,9 @@ message RpcFeeEstimateVerboseExperimentalData {
   double nextBlockTemplateFeerateMin = 11;
   double nextBlockTemplateFeerateMedian = 12;
   double nextBlockTemplateFeerateMax = 13;
+  optional double minimumRelayFeerate = 14;
+  optional double payloadOvercapFeerateFloor = 15;
+  optional double effectiveHfaFeerateFloor = 16;
 }
 
 message GetFeeEstimateRequestMessage {

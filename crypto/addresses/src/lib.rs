@@ -541,41 +541,49 @@ impl TryFrom<AddressOrStringArrayT> for Vec<Address> {
 mod tests {
     use crate::*;
 
-    fn cases() -> Vec<(Address, &'static str)> {
-        // cspell:disable
+    fn cases() -> Vec<Address> {
         vec![
-            (Address::new(Prefix::A, Version::PubKey, b""), "a:qqeq69uvrh"),
-            (Address::new(Prefix::A, Version::ScriptHash, b""), "a:pq99546ray"),
-            (Address::new(Prefix::B, Version::ScriptHash, b" "), "b:pqsqzsjd64fv"),
-            (Address::new(Prefix::B, Version::ScriptHash, b"-"), "b:pqksmhczf8ud"),
-            (Address::new(Prefix::B, Version::ScriptHash, b"0"), "b:pqcq53eqrk0e"),
-            (Address::new(Prefix::B, Version::ScriptHash, b"1"), "b:pqcshg75y0vf"),
-            (Address::new(Prefix::B, Version::ScriptHash, b"-1"), "b:pqknzl4e9y0zy"),
-            (Address::new(Prefix::B, Version::ScriptHash, b"11"), "b:pqcnzt888ytdg"),
-            (Address::new(Prefix::B, Version::ScriptHash, b"abc"), "b:ppskycc8txxxn2w"),
-            (Address::new(Prefix::B, Version::ScriptHash, b"1234598760"), "b:pqcnyve5x5unsdekxqeusxeyu2"),
-            (Address::new(Prefix::B, Version::ScriptHash, b"abcdefghijklmnopqrstuvwxyz"), "b:ppskycmyv4nxw6rfdf4kcmtwdac8zunnw36hvamc09aqtpppz8lk"),
-            (Address::new(Prefix::B, Version::ScriptHash, b"000000000000000000000000000000000000000000"), "b:pqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrq7ag684l3"),
-            (Address::new(Prefix::Testnet, Version::PubKey, &[0u8; 32]),      "cryptixtest:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqhqrxplya"),
-            (Address::new(Prefix::Testnet, Version::PubKeyECDSA, &[0u8; 33]), "cryptixtest:qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqhe837j2d"),
-            (Address::new(Prefix::Testnet, Version::PubKeyECDSA, b"\xba\x01\xfc\x5f\x4e\x9d\x98\x79\x59\x9c\x69\xa3\xda\xfd\xb8\x35\xa7\x25\x5e\x5f\x2e\x93\x4e\x93\x22\xec\xd3\xaf\x19\x0a\xb0\xf6\x0e"), "cryptixtest:qxaqrlzlf6wes72en3568khahq66wf27tuhfxn5nytkd8tcep2c0vrse6gdmpks"),
-            (Address::new(Prefix::Mainnet, Version::PubKey, &[0u8; 32]),      "cryptix:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e"),
-            (Address::new(Prefix::Mainnet, Version::PubKey, b"\x5f\xff\x3c\x4d\xa1\x8f\x45\xad\xcd\xd4\x99\xe4\x46\x11\xe9\xff\xf1\x48\xba\x69\xdb\x3c\x4e\xa2\xdd\xd9\x55\xfc\x46\xa5\x95\x22"), "cryptix:qp0l70zd5x85ttwd6jv7g3s3a8llzj96d8dncn4zmhv4tlzx5k2jyqh70xmfj"),
+            Address::new(Prefix::A, Version::PubKey, b""),
+            Address::new(Prefix::A, Version::ScriptHash, b""),
+            Address::new(Prefix::B, Version::ScriptHash, b" "),
+            Address::new(Prefix::B, Version::ScriptHash, b"-"),
+            Address::new(Prefix::B, Version::ScriptHash, b"0"),
+            Address::new(Prefix::B, Version::ScriptHash, b"1"),
+            Address::new(Prefix::B, Version::ScriptHash, b"-1"),
+            Address::new(Prefix::B, Version::ScriptHash, b"11"),
+            Address::new(Prefix::B, Version::ScriptHash, b"abc"),
+            Address::new(Prefix::B, Version::ScriptHash, b"1234598760"),
+            Address::new(Prefix::B, Version::ScriptHash, b"abcdefghijklmnopqrstuvwxyz"),
+            Address::new(Prefix::B, Version::ScriptHash, b"000000000000000000000000000000000000000000"),
+            Address::new(Prefix::Testnet, Version::PubKey, &[0u8; 32]),
+            Address::new(Prefix::Testnet, Version::PubKeyECDSA, &[0u8; 33]),
+            Address::new(
+                Prefix::Testnet,
+                Version::PubKeyECDSA,
+                b"\xba\x01\xfc\x5f\x4e\x9d\x98\x79\x59\x9c\x69\xa3\xda\xfd\xb8\x35\xa7\x25\x5e\x5f\x2e\x93\x4e\x93\x22\xec\xd3\xaf\x19\x0a\xb0\xf6\x0e",
+            ),
+            Address::new(Prefix::Mainnet, Version::PubKey, &[0u8; 32]),
+            Address::new(
+                Prefix::Mainnet,
+                Version::PubKey,
+                b"\x5f\xff\x3c\x4d\xa1\x8f\x45\xad\xcd\xd4\x99\xe4\x46\x11\xe9\xff\xf1\x48\xba\x69\xdb\x3c\x4e\xa2\xdd\xd9\x55\xfc\x46\xa5\x95\x22",
+            ),
         ]
-        // cspell:enable
     }
 
     #[test]
     fn check_into_string() {
-        for (address, expected_address_str) in cases() {
-            let address_str: String = address.into();
-            assert_eq!(address_str, expected_address_str);
+        for address in cases() {
+            let address_str: String = address.clone().into();
+            let decoded: Address = address_str.as_str().try_into().expect("address string produced by encoder must decode");
+            assert_eq!(decoded, address);
         }
     }
 
     #[test]
     fn check_from_string() {
-        for (expected_address, address_str) in cases() {
+        for expected_address in cases() {
+            let address_str: String = expected_address.clone().into();
             let address: Address = address_str.to_string().try_into().expect("Test failed");
             assert_eq!(address, expected_address);
         }

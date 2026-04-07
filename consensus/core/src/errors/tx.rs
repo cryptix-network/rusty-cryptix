@@ -18,6 +18,15 @@ pub enum TxRuleError {
     #[error("a non coinbase transaction has a payload")]
     NonCoinbaseTxHasPayload,
 
+    #[error("transaction in subnetwork {0} carries payload; payload is only allowed in payload subnetwork")]
+    PayloadInInvalidSubnetwork(SubnetworkId),
+
+    #[error("payload subnetwork transaction must have a non-empty payload")]
+    PayloadSubnetworkHasNoPayload,
+
+    #[error("payload length {0} exceeds max allowed {1}")]
+    PayloadLengthAboveMax(usize, usize),
+
     #[error("transaction version {0} is unknown")]
     UnknownTxVersion(u16),
 
@@ -93,7 +102,7 @@ pub enum TxRuleError {
     #[error("calculated contextual mass (including storage mass) {0} is not equal to the committed mass field {1}")]
     WrongMass(u64, u64),
 
-    #[error("transaction subnetwork id {0} is neither native nor coinbase")]
+    #[error("transaction subnetwork id {0} is not enabled")]
     SubnetworksDisabled(SubnetworkId),
 
     /// [`TxRuleError::FeerateTooLow`] is not a consensus error but a mempool error triggered by the

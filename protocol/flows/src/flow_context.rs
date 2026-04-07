@@ -39,7 +39,8 @@ use cryptix_utils::iter::IterExtensions;
 use cryptix_utils::networking::PeerId;
 use futures::future::join_all;
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::net::IpAddr;
 use std::time::Instant;
 use std::{collections::hash_map::Entry, fmt::Display};
 use std::{
@@ -69,6 +70,28 @@ const MAX_ORPHANS_UPPER_BOUND: usize = 1024;
 
 /// The min time to wait before allowing another parallel request
 const REQUEST_SCOPE_WAIT_TIME: Duration = Duration::from_secs(1);
+
+/// How many misbehavior strikes are required before banning a peer.
+const MISBEHAVIOR_BAN_SCORE: u32 = 5;
+
+/// Every full interval without additional misbehavior reduces the strike score by one.
+const MISBEHAVIOR_DECAY_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Forget stale peer scores to keep the tracker bounded over time.
+const MISBEHAVIOR_FORGET_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// Soft memory cap for tracked peers in the misbehavior map.
+const MISBEHAVIOR_MAX_TRACKED_PEERS: usize = 4096;
+
+/// Soft inbound connection rate-limit window and threshold per IP.
+const INBOUND_CONNECTION_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const INBOUND_CONNECTION_RATE_LIMIT_MAX_ATTEMPTS: usize = 20;
+
+/// Maximum frequency in which rate-limit breaches can add strikes.
+const INBOUND_CONNECTION_RATE_LIMIT_STRIKE_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Soft memory cap for tracked peer IPs in the inbound connection limiter map.
+const INBOUND_CONNECTION_RATE_LIMIT_MAX_TRACKED_IPS: usize = 4096;
 
 /// Represents a block event to be logged
 #[derive(Debug, PartialEq)]
@@ -222,6 +245,9 @@ pub struct FlowContextInner {
     ibd_metadata: Arc<RwLock<Option<IbdMetadata>>>,
     pub address_manager: Arc<Mutex<AddressManager>>,
     connection_manager: RwLock<Option<Arc<ConnectionManager>>>,
+    autoban_enabled: bool,
+    misbehaving_peer_scores: Mutex<HashMap<IpAddr, MisbehaviorRecord>>,
+    inbound_connection_rate_limit: Mutex<HashMap<IpAddr, InboundConnectionRateLimitRecord>>,
     hfa_bridge: RwLock<Option<Arc<dyn HfaP2pBridge>>>,
     mining_manager: MiningManagerProxy,
     pub(crate) tick_service: Arc<TickService>,
@@ -257,6 +283,26 @@ struct IbdMetadata {
     peer: PeerKey,
     /// The DAA score of the relay block which triggered the current IBD
     daa_score: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MisbehaviorRecord {
+    score: u32,
+    last_seen: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct InboundConnectionRateLimitRecord {
+    attempts: VecDeque<Instant>,
+    last_penalty: Option<Instant>,
+    last_seen: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InboundConnectionRateLimitVerdict {
+    allowed: bool,
+    attempts_in_window: usize,
+    should_penalize: bool,
 }
 
 pub struct RequestScopeMetadata {
@@ -305,6 +351,7 @@ impl FlowContext {
         mining_manager: MiningManagerProxy,
         tick_service: Arc<TickService>,
         notification_root: Arc<ConsensusNotificationRoot>,
+        autoban_enabled: bool,
     ) -> Self {
         let hub = Hub::new();
 
@@ -326,6 +373,9 @@ impl FlowContext {
                 hub,
                 address_manager,
                 connection_manager: Default::default(),
+                autoban_enabled,
+                misbehaving_peer_scores: Default::default(),
+                inbound_connection_rate_limit: Default::default(),
                 hfa_bridge: Default::default(),
                 mining_manager,
                 tick_service,
@@ -366,6 +416,140 @@ impl FlowContext {
 
     pub fn connection_manager(&self) -> Option<Arc<ConnectionManager>> {
         self.connection_manager.read().clone()
+    }
+
+    fn register_inbound_connection_attempt(&self, ip: IpAddr) -> InboundConnectionRateLimitVerdict {
+        let now = Instant::now();
+        let mut rate_limit = self.inbound_connection_rate_limit.lock();
+
+        // Keep this table bounded over time and by size.
+        rate_limit.retain(|_, record| now.saturating_duration_since(record.last_seen) <= MISBEHAVIOR_FORGET_AFTER);
+
+        let record = rate_limit.entry(ip).or_insert_with(|| InboundConnectionRateLimitRecord {
+            attempts: VecDeque::new(),
+            last_penalty: None,
+            last_seen: now,
+        });
+
+        while let Some(front) = record.attempts.front().copied() {
+            if now.saturating_duration_since(front) > INBOUND_CONNECTION_RATE_LIMIT_WINDOW {
+                record.attempts.pop_front();
+            } else {
+                break;
+            }
+        }
+        record.attempts.push_back(now);
+        record.last_seen = now;
+
+        let attempts_in_window = record.attempts.len();
+        let allowed = attempts_in_window <= INBOUND_CONNECTION_RATE_LIMIT_MAX_ATTEMPTS;
+        let should_penalize = if allowed {
+            false
+        } else {
+            let can_penalize = record
+                .last_penalty
+                .is_none_or(|last| now.saturating_duration_since(last) >= INBOUND_CONNECTION_RATE_LIMIT_STRIKE_COOLDOWN);
+            if can_penalize {
+                record.last_penalty = Some(now);
+            }
+            can_penalize
+        };
+
+        if rate_limit.len() > INBOUND_CONNECTION_RATE_LIMIT_MAX_TRACKED_IPS {
+            let overflow = rate_limit.len() - INBOUND_CONNECTION_RATE_LIMIT_MAX_TRACKED_IPS;
+            let mut by_age = rate_limit.iter().map(|(tracked_ip, rec)| (*tracked_ip, rec.last_seen)).collect::<Vec<_>>();
+            by_age.sort_by_key(|(_, last_seen)| *last_seen);
+            for (old_ip, _) in by_age.into_iter().take(overflow) {
+                rate_limit.remove(&old_ip);
+            }
+        }
+
+        InboundConnectionRateLimitVerdict { allowed, attempts_in_window, should_penalize }
+    }
+
+    async fn enforce_inbound_connection_rate_limit(&self, router: &Arc<Router>) -> Result<(), ProtocolError> {
+        if !self.autoban_enabled || router.is_outbound() {
+            return Ok(());
+        }
+
+        let ip = router.net_address().ip();
+        let verdict = self.register_inbound_connection_attempt(ip);
+        if verdict.allowed {
+            return Ok(());
+        }
+
+        let reason = format!(
+            "inbound connection rate limit exceeded for {} ({} attempts in {}s, max {})",
+            ip,
+            verdict.attempts_in_window,
+            INBOUND_CONNECTION_RATE_LIMIT_WINDOW.as_secs(),
+            INBOUND_CONNECTION_RATE_LIMIT_MAX_ATTEMPTS
+        );
+        if verdict.should_penalize {
+            self.report_misbehaving_peer(router, &reason).await;
+        }
+
+        Err(ProtocolError::OtherOwned(reason))
+    }
+
+    pub async fn report_misbehaving_peer(&self, router: &Arc<Router>, reason: &str) {
+        if !self.autoban_enabled {
+            warn!("Auto-ban disabled: misbehaving peer {} ({})", router.net_address(), reason);
+            return;
+        }
+
+        let ip = router.net_address().ip();
+        let now = Instant::now();
+
+        let (score, should_ban) = {
+            let mut scores = self.misbehaving_peer_scores.lock();
+            scores.retain(|_, record| now.saturating_duration_since(record.last_seen) <= MISBEHAVIOR_FORGET_AFTER);
+
+            let record = scores.entry(ip).or_insert(MisbehaviorRecord { score: 0, last_seen: now });
+            let elapsed = now.saturating_duration_since(record.last_seen);
+            let decay_steps = (elapsed.as_secs() / MISBEHAVIOR_DECAY_INTERVAL.as_secs()) as u32;
+            record.score = record.score.saturating_sub(decay_steps).saturating_add(1);
+            record.last_seen = now;
+
+            let score = record.score;
+            let should_ban = score >= MISBEHAVIOR_BAN_SCORE;
+
+            if should_ban {
+                scores.remove(&ip);
+            } else if scores.len() > MISBEHAVIOR_MAX_TRACKED_PEERS {
+                let overflow = scores.len() - MISBEHAVIOR_MAX_TRACKED_PEERS;
+                let mut by_age = scores.iter().map(|(ip, record)| (*ip, record.last_seen)).collect::<Vec<_>>();
+                by_age.sort_by_key(|(_, last_seen)| *last_seen);
+                for (old_ip, _) in by_age.into_iter().take(overflow) {
+                    scores.remove(&old_ip);
+                }
+            }
+
+            (score, should_ban)
+        };
+
+        if should_ban {
+            if let Some(connection_manager) = self.connection_manager() {
+                warn!(
+                    "Auto-ban: banning peer {} after {}/{} strikes ({})",
+                    router.net_address(),
+                    score,
+                    MISBEHAVIOR_BAN_SCORE,
+                    reason
+                );
+                connection_manager.ban(ip).await;
+            } else {
+                warn!(
+                    "Auto-ban: peer {} reached {}/{} strikes ({}), but no connection manager is available",
+                    router.net_address(),
+                    score,
+                    MISBEHAVIOR_BAN_SCORE,
+                    reason
+                );
+            }
+        } else {
+            warn!("Auto-ban: peer {} strike {}/{} ({})", router.net_address(), score, MISBEHAVIOR_BAN_SCORE, reason);
+        }
     }
 
     pub fn set_hfa_bridge(&self, bridge: Arc<dyn HfaP2pBridge>) {
@@ -761,6 +945,13 @@ impl FlowContext {
 #[async_trait]
 impl ConnectionInitializer for FlowContext {
     async fn initialize_connection(&self, router: Arc<Router>) -> Result<(), ProtocolError> {
+        if let Some(connection_manager) = self.connection_manager() {
+            if connection_manager.is_banned(&router.net_address()).await {
+                return Err(ProtocolError::OtherOwned(format!("peer {} is banned", router.net_address().ip())));
+            }
+        }
+        self.enforce_inbound_connection_rate_limit(&router).await?;
+
         // Build the handshake object and subscribe to handshake messages
         let mut handshake = CryptixdHandshake::new(&router);
 

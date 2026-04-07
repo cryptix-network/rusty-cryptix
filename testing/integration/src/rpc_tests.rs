@@ -668,6 +668,7 @@ async fn sanity_test() {
                         gas: 0,
                         payload: Vec::new(),
                         mass: 0,
+                        fast_path: None,
                         verbose_data: None,
                     };
                     let result = rpc_client

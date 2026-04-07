@@ -7,12 +7,12 @@ mod tests {
         mempool::{
             config::{Config, DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE},
             errors::RuleError,
-            model::frontier::selectors::TakeAllSelector,
+            model::frontier::selectors::{SequenceSelectorTransaction, TakeAllSelector},
             tx::{Orphan, Priority, RbfPolicy},
         },
         model::{tx_insert::TransactionInsertion, tx_query::TransactionQuery},
         testutils::consensus_mock::ConsensusMock,
-        MiningCounters,
+        MiningCounters, Policy,
     };
     use cryptix_addresses::{Address, Prefix, Version};
     use cryptix_consensus_core::{
@@ -1264,10 +1264,20 @@ mod tests {
 
         // Build a fresh template for coinbase2 as a reference
         let builder = mining_manager.block_template_builder();
+        let take_all_sequence = transactions
+            .iter()
+            .map(|tx| {
+                SequenceSelectorTransaction::new(
+                    tx.clone(),
+                    DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+                    transaction_estimated_serialized_size(tx.as_ref()),
+                )
+            })
+            .collect();
         let result = builder.build_block_template(
             consensus,
             &miner_data_2,
-            Box::new(TakeAllSelector::new(transactions)),
+            Box::new(TakeAllSelector::new(take_all_sequence, Policy::new(500_000))),
             TemplateBuildMode::Standard,
         );
         assert!(result.is_ok(), "build block template failed for miner data 2");

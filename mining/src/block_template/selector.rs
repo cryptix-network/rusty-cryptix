@@ -10,7 +10,7 @@ use super::{
 };
 use cryptix_consensus_core::{
     block::TemplateTransactionSelector,
-    subnets::SubnetworkId,
+    subnets::{SubnetworkId, SUBNETWORK_ID_PAYLOAD},
     tx::{Transaction, TransactionId},
 };
 
@@ -49,6 +49,7 @@ pub struct RebalancingWeightedTransactionSelector {
     used_p: f64,
     total_mass: u64,
     total_fees: u64,
+    total_payload_bytes: u64,
     gas_usage_map: HashMap<SubnetworkId, u64>,
 }
 
@@ -71,6 +72,7 @@ impl RebalancingWeightedTransactionSelector {
             used_p: 0.0,
             total_mass: 0,
             total_fees: 0,
+            total_payload_bytes: 0,
             gas_usage_map: Default::default(),
         };
 
@@ -125,14 +127,15 @@ impl RebalancingWeightedTransactionSelector {
             // Select a candidate tx at random
             let r = rng.gen::<f64>() * self.candidate_list.total_p;
             let selected_candidate_idx = self.candidate_list.find(r);
-            let selected_candidate = self.candidate_list.candidates.get_mut(selected_candidate_idx).unwrap();
 
             // If is_marked_for_deletion is set, it means we got a collision.
             // Ignore and select another Tx.
-            if selected_candidate.is_marked_for_deletion {
+            if self.candidate_list.candidates[selected_candidate_idx].is_marked_for_deletion {
                 continue;
             }
-            let selected_tx = &self.transactions[selected_candidate.index];
+            let selected_tx_index = self.candidate_list.candidates[selected_candidate_idx].index;
+            let selected_tx = &self.transactions[selected_tx_index];
+            let payload_len = payload_bytes(selected_tx.tx.as_ref());
 
             // Enforce maximum transaction mass per block.
             // Also check for overflow.
@@ -142,6 +145,14 @@ impl RebalancingWeightedTransactionSelector {
                 break;
             }
 
+            if !self.payload_policy_allows_selection(selected_tx, payload_len) {
+                let selected_candidate = self.candidate_list.candidates.get_mut(selected_candidate_idx).unwrap();
+                selected_candidate.is_marked_for_deletion = true;
+                self.used_count += 1;
+                self.used_p += self.selectable_txs[selected_tx_index].p;
+                continue;
+            }
+
             // Enforce maximum gas per subnetwork per block.
             // Also check for overflow.
             if !selected_tx.tx.subnetwork_id.is_builtin_or_native() {
@@ -149,7 +160,7 @@ impl RebalancingWeightedTransactionSelector {
                 let gas_usage = self.gas_usage_map.entry(subnetwork_id.clone()).or_insert(0);
                 let tx_gas = selected_tx.tx.gas;
                 let next_gas_usage = (*gas_usage).checked_add(tx_gas);
-                if next_gas_usage.is_none() || next_gas_usage.unwrap() > self.selectable_txs[selected_candidate.index].gas_limit {
+                if next_gas_usage.is_none() || next_gas_usage.unwrap() > self.selectable_txs[selected_tx_index].gas_limit {
                     trace!(
                         "Tx {0} would exceed the gas limit in subnetwork {1}. Removing all remaining txs from this subnetwork.",
                         selected_tx.tx.id(),
@@ -178,16 +189,18 @@ impl RebalancingWeightedTransactionSelector {
             // Add the transaction to the result, increment counters, and
             // save the masses, fees, and signature operation counts to the
             // result.
-            self.selected_txs.push(selected_candidate.index);
+            self.selected_txs.push(selected_tx_index);
             self.total_mass += selected_tx.calculated_mass;
             self.total_fees += selected_tx.calculated_fee;
+            self.total_payload_bytes += payload_len;
 
             trace!("Adding tx {0} (fee per gram: {1})", selected_tx.tx.id(), selected_tx.calculated_fee / selected_tx.calculated_mass);
 
             // Mark for deletion
+            let selected_candidate = self.candidate_list.candidates.get_mut(selected_candidate_idx).unwrap();
             selected_candidate.is_marked_for_deletion = true;
             self.used_count += 1;
-            self.used_p += self.selectable_txs[selected_candidate.index].p;
+            self.used_p += self.selectable_txs[selected_tx_index].p;
         }
 
         self.selected_txs.sort();
@@ -223,6 +236,24 @@ impl RebalancingWeightedTransactionSelector {
             fee / mass / mass_limit + transaction.tx.gas as f64 / gas_limit
         }
     }
+
+    fn payload_policy_allows_selection(&self, transaction: &CandidateTransaction, payload_len: u64) -> bool {
+        if payload_len == 0 {
+            return true;
+        }
+
+        let next_payload_bytes = self.total_payload_bytes.saturating_add(payload_len);
+        if next_payload_bytes <= self.policy.payload_soft_cap_per_block_bytes {
+            return true;
+        }
+
+        let mass = transaction.calculated_mass;
+        if mass == 0 {
+            return false;
+        }
+        let feerate = transaction.calculated_fee as f64 / mass as f64;
+        feerate >= self.policy.overcap_feerate_floor()
+    }
 }
 
 impl TemplateTransactionSelector for RebalancingWeightedTransactionSelector {
@@ -239,6 +270,7 @@ impl TemplateTransactionSelector for RebalancingWeightedTransactionSelector {
         let tx = &self.transactions[tx_index];
         self.total_mass -= tx.calculated_mass;
         self.total_fees -= tx.calculated_fee;
+        self.total_payload_bytes -= payload_bytes(tx.tx.as_ref());
         if !tx.tx.subnetwork_id.is_builtin_or_native() {
             *self.gas_usage_map.get_mut(&tx.tx.subnetwork_id).expect("previously selected txs have an entry") -= tx.tx.gas;
         }
@@ -256,13 +288,21 @@ impl TemplateTransactionSelector for RebalancingWeightedTransactionSelector {
     }
 }
 
+fn payload_bytes(tx: &Transaction) -> u64 {
+    if tx.subnetwork_id == SUBNETWORK_ID_PAYLOAD {
+        tx.payload.len() as u64
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cryptix_consensus_core::{
         constants::{MAX_TX_IN_SEQUENCE_NUM, SOMPI_PER_CRYPTIX, TX_VERSION},
         mass::transaction_estimated_serialized_size,
-        subnets::SUBNETWORK_ID_NATIVE,
+        subnets::{SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PAYLOAD},
         tx::{Transaction, TransactionId, TransactionInput, TransactionOutpoint, TransactionOutput},
     };
     use cryptix_txscript::{pay_to_script_hash_signature_script, test_helpers::op_true_script};
@@ -284,8 +324,10 @@ mod tests {
         // Create a vector of transactions differing by output value so they have unique ids
         let transactions = (0..TX_INITIAL_COUNT).map(|i| create_transaction(SOMPI_PER_CRYPTIX * (i + 1) as u64)).collect_vec();
         let masses: HashMap<_, _> = transactions.iter().map(|tx| (tx.tx.id(), tx.calculated_mass)).collect();
-        let sequence: SequenceSelectorInput =
-            transactions.iter().map(|tx| SequenceSelectorTransaction::new(tx.tx.clone(), tx.calculated_mass)).collect();
+        let sequence: SequenceSelectorInput = transactions
+            .iter()
+            .map(|tx| SequenceSelectorTransaction::new(tx.tx.clone(), tx.calculated_fee, tx.calculated_mass))
+            .collect();
 
         let policy = Policy::new(100_000);
         let selectors: [Box<dyn TemplateTransactionSelector>; 2] = [
@@ -323,6 +365,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_payload_overcap_policy() {
+        let policy = Policy::new_with_payload_policy(100_000, 100, 2.0, 1.0);
+        let seed = vec![create_payload_transaction(90, 300, 120)];
+        let mut selector = RebalancingWeightedTransactionSelector::new(policy, seed);
+        selector.total_payload_bytes = 90;
+
+        let low_feerate = create_payload_transaction(20, 20, 20);
+        let high_feerate = create_payload_transaction(20, 60, 20);
+
+        assert!(
+            !selector.payload_policy_allows_selection(&low_feerate, 20),
+            "over-cap payload tx below feerate floor should be rejected"
+        );
+        assert!(
+            selector.payload_policy_allows_selection(&high_feerate, 20),
+            "over-cap payload tx above feerate floor should be accepted"
+        );
+    }
+
     fn create_transaction(value: u64) -> CandidateTransaction {
         let previous_outpoint = TransactionOutpoint::new(TransactionId::default(), 0);
         let (script_public_key, redeem_script) = op_true_script();
@@ -335,5 +397,16 @@ mod tests {
         let calculated_fee = DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE;
 
         CandidateTransaction { tx, calculated_fee, calculated_mass }
+    }
+
+    fn create_payload_transaction(payload_len: usize, fee: u64, mass: u64) -> CandidateTransaction {
+        let previous_outpoint = TransactionOutpoint::new(TransactionId::from_u64_word(payload_len as u64 + fee + mass), 0);
+        let (script_public_key, redeem_script) = op_true_script();
+        let signature_script = pay_to_script_hash_signature_script(redeem_script, vec![]).expect("the redeem script is canonical");
+        let input = TransactionInput::new(previous_outpoint, signature_script, MAX_TX_IN_SEQUENCE_NUM, 1);
+        let output = TransactionOutput::new(SOMPI_PER_CRYPTIX, script_public_key);
+        let payload = vec![9u8; payload_len];
+        let tx = Arc::new(Transaction::new(TX_VERSION, vec![input], vec![output], 0, SUBNETWORK_ID_PAYLOAD, 0, payload));
+        CandidateTransaction { tx, calculated_fee: fee, calculated_mass: mass.max(1) }
     }
 }

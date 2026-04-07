@@ -1,6 +1,7 @@
 use crate::Policy;
 use cryptix_consensus_core::{
     block::TemplateTransactionSelector,
+    subnets::SUBNETWORK_ID_PAYLOAD,
     tx::{Transaction, TransactionId},
 };
 use std::{
@@ -10,12 +11,13 @@ use std::{
 
 pub struct SequenceSelectorTransaction {
     pub tx: Arc<Transaction>,
+    pub fee: u64,
     pub mass: u64,
 }
 
 impl SequenceSelectorTransaction {
-    pub fn new(tx: Arc<Transaction>, mass: u64) -> Self {
-        Self { tx, mass }
+    pub fn new(tx: Arc<Transaction>, fee: u64, mass: u64) -> Self {
+        Self { tx, fee, mass }
     }
 }
 
@@ -36,9 +38,9 @@ impl FromIterator<SequenceSelectorTransaction> for SequenceSelectorInput {
 }
 
 impl SequenceSelectorInput {
-    pub fn push(&mut self, tx: Arc<Transaction>, mass: u64) {
+    pub fn push(&mut self, tx: Arc<Transaction>, fee: u64, mass: u64) {
         let idx = self.inner.len() as SequencePriorityIndex;
-        self.inner.insert(idx, SequenceSelectorTransaction::new(tx, mass));
+        self.inner.insert(idx, SequenceSelectorTransaction::new(tx, fee, mass));
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &SequenceSelectorTransaction> {
@@ -50,6 +52,7 @@ impl SequenceSelectorInput {
 struct SequenceSelectorSelection {
     tx_id: TransactionId,
     mass: u64,
+    payload_bytes: u64,
     priority_index: SequencePriorityIndex,
 }
 
@@ -59,9 +62,10 @@ struct SequenceSelectorSelection {
 pub struct SequenceSelector {
     input_sequence: SequenceSelectorInput,
     selected_vec: Vec<SequenceSelectorSelection>,
-    /// Maps from selected tx ids to tx mass so that the total used mass can be subtracted on tx reject
-    selected_map: Option<HashMap<TransactionId, u64>>,
+    /// Maps from selected tx ids to tx mass and payload bytes so that used counters can be subtracted on tx reject
+    selected_map: Option<HashMap<TransactionId, (u64, u64)>>,
     total_selected_mass: u64,
+    total_selected_payload_bytes: u64,
     overall_candidates: usize,
     overall_rejections: usize,
     policy: Policy,
@@ -75,6 +79,7 @@ impl SequenceSelector {
             input_sequence,
             selected_map: Default::default(),
             total_selected_mass: Default::default(),
+            total_selected_payload_bytes: Default::default(),
             overall_rejections: Default::default(),
             policy,
         }
@@ -104,8 +109,18 @@ impl TemplateTransactionSelector for SequenceSelector {
                 // for transactions with lower mass which might fit into the remaining gap
                 continue;
             }
+            let payload_len = payload_bytes(tx.tx.as_ref());
+            if !payload_policy_allows_selection(&self.policy, self.total_selected_payload_bytes, payload_len, tx.fee, tx.mass) {
+                continue;
+            }
             self.total_selected_mass += tx.mass;
-            self.selected_vec.push(SequenceSelectorSelection { tx_id: tx.tx.id(), mass: tx.mass, priority_index });
+            self.total_selected_payload_bytes += payload_len;
+            self.selected_vec.push(SequenceSelectorSelection {
+                tx_id: tx.tx.id(),
+                mass: tx.mass,
+                payload_bytes: payload_len,
+                priority_index,
+            });
             transactions.push(tx.tx.as_ref().clone())
         }
         transactions
@@ -113,10 +128,13 @@ impl TemplateTransactionSelector for SequenceSelector {
 
     fn reject_selection(&mut self, tx_id: TransactionId) {
         // Lazy-create the map only when there are actual rejections
-        let selected_map = self.selected_map.get_or_insert_with(|| self.selected_vec.iter().map(|tx| (tx.tx_id, tx.mass)).collect());
-        let mass = selected_map.remove(&tx_id).expect("only previously selected txs can be rejected (and only once)");
+        let selected_map = self
+            .selected_map
+            .get_or_insert_with(|| self.selected_vec.iter().map(|tx| (tx.tx_id, (tx.mass, tx.payload_bytes))).collect());
+        let (mass, payload_bytes) = selected_map.remove(&tx_id).expect("only previously selected txs can be rejected (and only once)");
         // Selections must be counted in total selected mass, so this subtraction cannot underflow
         self.total_selected_mass -= mass;
+        self.total_selected_payload_bytes -= payload_bytes;
         self.overall_rejections += 1;
     }
 
@@ -135,19 +153,31 @@ impl TemplateTransactionSelector for SequenceSelector {
 /// If all mempool transactions have combined mass which is <= block mass limit, this selector
 /// should be called and provided with all the transactions.
 pub struct TakeAllSelector {
-    txs: Vec<Arc<Transaction>>,
+    txs: Vec<SequenceSelectorTransaction>,
+    policy: Policy,
 }
 
 impl TakeAllSelector {
-    pub fn new(txs: Vec<Arc<Transaction>>) -> Self {
-        Self { txs }
+    pub fn new(txs: Vec<SequenceSelectorTransaction>, policy: Policy) -> Self {
+        Self { txs, policy }
     }
 }
 
 impl TemplateTransactionSelector for TakeAllSelector {
     fn select_transactions(&mut self) -> Vec<Transaction> {
+        let mut total_payload_bytes = 0u64;
         // Drain on the first call so that subsequent calls return nothing
-        self.txs.drain(..).map(|tx| tx.as_ref().clone()).collect()
+        self.txs
+            .drain(..)
+            .filter_map(|tx| {
+                let payload_len = payload_bytes(tx.tx.as_ref());
+                if !payload_policy_allows_selection(&self.policy, total_payload_bytes, payload_len, tx.fee, tx.mass) {
+                    return None;
+                }
+                total_payload_bytes = total_payload_bytes.saturating_add(payload_len);
+                Some(tx.tx.as_ref().clone())
+            })
+            .collect()
     }
 
     fn reject_selection(&mut self, _tx_id: TransactionId) {
@@ -158,5 +188,85 @@ impl TemplateTransactionSelector for TakeAllSelector {
         // Considered successful because we provided all mempool transactions to this
         // selector, so there's no point in retries
         true
+    }
+}
+
+fn payload_bytes(tx: &Transaction) -> u64 {
+    if tx.subnetwork_id == SUBNETWORK_ID_PAYLOAD {
+        tx.payload.len() as u64
+    } else {
+        0
+    }
+}
+
+fn payload_policy_allows_selection(policy: &Policy, total_payload_bytes: u64, payload_len: u64, fee: u64, mass: u64) -> bool {
+    if payload_len == 0 {
+        return true;
+    }
+
+    let next_payload = total_payload_bytes.saturating_add(payload_len);
+    if next_payload <= policy.payload_soft_cap_per_block_bytes {
+        return true;
+    }
+
+    if mass == 0 {
+        return false;
+    }
+
+    fee as f64 / mass as f64 >= policy.overcap_feerate_floor()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cryptix_consensus_core::{
+        constants::{MAX_TX_IN_SEQUENCE_NUM, TX_VERSION},
+        subnets::{SubnetworkId, SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PAYLOAD},
+        tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionId, TransactionInput, TransactionOutpoint, TransactionOutput},
+    };
+
+    fn build_tx(payload_len: usize, subnetwork_id: SubnetworkId, output_value: u64) -> Arc<Transaction> {
+        let input = TransactionInput::new(
+            TransactionOutpoint::new(TransactionId::from_u64_word(output_value), 0),
+            vec![0x51],
+            MAX_TX_IN_SEQUENCE_NUM,
+            1,
+        );
+        let output = TransactionOutput::new(output_value.saturating_sub(1), ScriptPublicKey::new(0, ScriptVec::from_slice(&[0x51])));
+        let payload = if subnetwork_id == SUBNETWORK_ID_PAYLOAD { vec![0xaa; payload_len] } else { vec![] };
+        Arc::new(Transaction::new(TX_VERSION, vec![input], vec![output], 0, subnetwork_id, 0, payload))
+    }
+
+    #[test]
+    fn overcap_requires_minimum_feerate_floor() {
+        let policy = Policy::new_with_payload_policy(1_000_000, 100, 2.0, 1.0);
+        assert!(!payload_policy_allows_selection(&policy, 90, 20, 30, 20));
+        assert!(payload_policy_allows_selection(&policy, 90, 20, 40, 20));
+    }
+
+    #[test]
+    fn take_all_selector_enforces_soft_cap_and_overcap_feerate() {
+        let policy = Policy::new_with_payload_policy(1_000_000, 100, 2.0, 1.0);
+        let tx1 = build_tx(90, SUBNETWORK_ID_PAYLOAD, 10_000);
+        let tx2 = build_tx(20, SUBNETWORK_ID_PAYLOAD, 20_000);
+        let tx3 = build_tx(20, SUBNETWORK_ID_PAYLOAD, 30_000);
+        let tx4 = build_tx(0, SUBNETWORK_ID_NATIVE, 40_000);
+
+        let mut selector = TakeAllSelector::new(
+            vec![
+                SequenceSelectorTransaction::new(tx1.clone(), 180, 90),
+                SequenceSelectorTransaction::new(tx2.clone(), 20, 20),
+                SequenceSelectorTransaction::new(tx3.clone(), 60, 20),
+                SequenceSelectorTransaction::new(tx4.clone(), 10, 10),
+            ],
+            policy,
+        );
+
+        let selected = selector.select_transactions();
+        let selected_ids: Vec<_> = selected.iter().map(|tx| tx.id()).collect();
+        assert!(selected_ids.contains(&tx1.id()), "first payload tx within cap should be selected");
+        assert!(!selected_ids.contains(&tx2.id()), "over-cap payload tx below feerate floor should be skipped");
+        assert!(selected_ids.contains(&tx3.id()), "over-cap payload tx meeting feerate floor should be selected");
+        assert!(selected_ids.contains(&tx4.id()), "non-payload txs must remain unaffected by payload soft cap");
     }
 }

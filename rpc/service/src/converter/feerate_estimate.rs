@@ -43,6 +43,9 @@ impl FeeEstimateVerboseConverter for FeeEstimateVerbose {
                 next_block_template_feerate_min: self.next_block_template_feerate_min,
                 next_block_template_feerate_median: self.next_block_template_feerate_median,
                 next_block_template_feerate_max: self.next_block_template_feerate_max,
+                minimum_relay_feerate: None,
+                payload_overcap_feerate_floor: None,
+                effective_hfa_feerate_floor: None,
             }),
         }
     }

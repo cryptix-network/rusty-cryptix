@@ -74,6 +74,19 @@ impl Flow for HandleRelayInvsFlow {
     async fn start(&mut self) -> Result<(), ProtocolError> {
         self.start_impl().await
     }
+
+    async fn on_error(&self, err: &ProtocolError) {
+        let reason = match err {
+            ProtocolError::MisbehavingPeer(reason) => Some(reason.to_owned()),
+            ProtocolError::UnexpectedMessage(_, _) | ProtocolError::ConversionError(_) | ProtocolError::RuleError(_) => {
+                Some(err.to_string())
+            }
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            self.ctx.report_misbehaving_peer(&self.router, &reason).await;
+        }
+    }
 }
 
 impl HandleRelayInvsFlow {
@@ -97,7 +110,7 @@ impl HandleRelayInvsFlow {
                 None | Some(BlockStatus::StatusHeaderOnly) => {} // Continue processing this missing inv
                 Some(BlockStatus::StatusInvalid) => {
                     // Report a protocol error
-                    return Err(ProtocolError::OtherOwned(format!("sent inv of an invalid block {}", inv.hash)));
+                    return Err(ProtocolError::MisbehavingPeer(format!("sent inv of an invalid block {}", inv.hash)));
                 }
                 _ => {
                     // Block is already known, skip to next inv
@@ -131,7 +144,7 @@ impl HandleRelayInvsFlow {
             request_scope.report_obtained();
 
             if block.is_header_only() {
-                return Err(ProtocolError::OtherOwned(format!("sent header of {} where expected block with body", block.hash())));
+                return Err(ProtocolError::MisbehavingPeer(format!("sent header of {} where expected block with body", block.hash())));
             }
 
             let blue_work_threshold = session.async_get_virtual_merge_depth_blue_work_threshold().await;
@@ -238,7 +251,7 @@ impl HandleRelayInvsFlow {
         let msg = dequeue_with_timeout!(self.msg_route, Payload::Block)?;
         let block: Block = msg.try_into()?;
         if block.hash() != requested_hash {
-            Err(ProtocolError::OtherOwned(format!("requested block hash {} but got block {}", requested_hash, block.hash())))
+            Err(ProtocolError::MisbehavingPeer(format!("requested block hash {} but got block {}", requested_hash, block.hash())))
         } else {
             Ok(Some((block, request_scope)))
         }

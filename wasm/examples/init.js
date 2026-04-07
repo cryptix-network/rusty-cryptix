@@ -25,11 +25,11 @@ const {
 });
 
 if (values.help) {
-    console.log(`Usage: node init [--reset] [--network=(mainnet|testnet-<number>)]`);
+    console.log(`Usage: node init [--reset] [--network=(mainnet|testnet|devnet|simnet|testnet-<number>)]`);
     process.exit(0);
 }
 
-const network = values.network ?? positionals.find((positional) => positional.match(/^(testnet|mainnet|simnet|devnet)-\d+$/)) ?? null;
+const network = values.network ?? positionals.find((positional) => positional.match(/^(mainnet|testnet|simnet|devnet)(-\d+)?$/)) ?? null;
 
 const configFileName = path.join(__dirname, "data", "config.json");
 const exists = fs.existsSync(configFileName);
@@ -66,9 +66,9 @@ if (fs.existsSync(configFileName)) {
 function createConfigFile() {
     
     if (!network) {
-        console.log("... '--network=' argument is not specified ...defaulting to 'testnet-11'");
+        console.log("... '--network=' argument is not specified ...defaulting to 'testnet'");
     }
-    let networkId = network ?? "testnet-11";
+    let networkId = network ?? "testnet";
 
     let wallet = basicWallet(networkId, Mnemonic.random());
 

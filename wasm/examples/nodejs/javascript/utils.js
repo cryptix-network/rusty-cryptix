@@ -46,7 +46,7 @@ function parseArgs(options = {
         }, tokens: true, allowPositionals: true
     });
     if (values.help) {
-        console.log(`Usage: node ${script} [address] [mainnet|testnet-10|testnet-11] [--address <address>] [--network <mainnet|testnet-10|testnet-11>] [--encoding <borsh|json>] ${options.additionalHelpOutput}`);
+        console.log(`Usage: node ${script} [address] [mainnet|testnet|devnet|simnet] [--address <address>] [--network <mainnet|testnet|devnet|simnet|testnet-<number>>] [--encoding <borsh|json>] ${options.additionalHelpOutput}`);
         process.exit(0);
     }
 
@@ -64,9 +64,9 @@ function parseArgs(options = {
     const addressArg = values.address ?? positionals.find((positional) => addressRegex.test(positional)) ?? null;
     const address = addressArg === null ? null : new Address(addressArg);
 
-    const networkArg = values.network ?? positionals.find((positional) => positional.match(/^(testnet|mainnet|simnet|devnet)-\d+$/)) ?? config.networkId ?? null;
+    const networkArg = values.network ?? positionals.find((positional) => positional.match(/^(mainnet|testnet|simnet|devnet)(-\d+)?$/)) ?? config.networkId ?? null;
     if (!networkArg) {
-        console.error('Network id must be specified: --network=(mainnet|testnet-<number>)');
+        console.error('Network id must be specified: --network=(mainnet|testnet|devnet|simnet)');
         process.exit(1);
     }
     const networkId = new NetworkId(networkArg);

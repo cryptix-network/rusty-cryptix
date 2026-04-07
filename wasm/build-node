@@ -2,3 +2,4 @@
 set -e
 
 wasm-pack build --weak-refs --target nodejs --out-name cryptix --out-dir nodejs/cryptix --features wasm32-sdk
+node build/patch-init-warnings.js nodejs/cryptix

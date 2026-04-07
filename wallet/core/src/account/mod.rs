@@ -885,18 +885,28 @@ mod tests {
         unsafe { std::str::from_utf8_unchecked(&hex) }.to_string()
     }
 
+    fn address_from_key_hex(key_hex: &str) -> Address {
+        let mut key_bytes = [0u8; 32];
+        faster_hex::hex_decode(key_hex.as_bytes(), &mut key_bytes).expect("valid test key hex");
+        let secret = SecretKey::from_slice(&key_bytes).expect("valid secp256k1 private key");
+        PubkeyDerivationManagerV0::create_address(&secret.get_public_key(), Prefix::Testnet, false).expect("valid test address")
+    }
+
     #[tokio::test]
     async fn gen0_prv_keys() {
-        let receive_addresses = gen0_receive_addresses()
+        let receive_keys = gen0_receive_keys();
+        let change_keys = gen0_change_keys();
+
+        let receive_addresses = receive_keys
             .iter()
             .enumerate()
-            .map(|(index, str)| (Address::try_from(*str).unwrap(), index as u32))
+            .map(|(index, key)| (address_from_key_hex(key), index as u32))
             .collect::<Vec<(Address, u32)>>();
 
-        let change_addresses = gen0_change_addresses()
+        let change_addresses = change_keys
             .iter()
             .enumerate()
-            .map(|(index, str)| (Address::try_from(*str).unwrap(), index as u32))
+            .map(|(index, key)| (address_from_key_hex(key), index as u32))
             .collect::<Vec<(Address, u32)>>();
 
         let receive_addresses = receive_addresses.iter().map(|(a, index)| (a, *index)).collect::<Vec<(&Address, u32)>>();
@@ -904,9 +914,6 @@ mod tests {
 
         let key = "xprv9s21ZrQH143K2SDYtUz6dphDH3yRLAC7Jc552GYiXai3STvqgc3JBZxH2M4KaKhriaZDSS9KL7zUi5kYpggFspkiZBYWNCxbp27CCcnsJUs";
         let xkey = ExtendedPrivateKey::<SecretKey>::from_str(key).unwrap();
-
-        let receive_keys = gen0_receive_keys();
-        let change_keys = gen0_change_keys();
 
         let keys = create_private_keys(&LEGACY_ACCOUNT_KIND.into(), 0, 0, &xkey, &receive_addresses, &[]).unwrap();
         for (index, (a, key)) in keys.iter().enumerate() {

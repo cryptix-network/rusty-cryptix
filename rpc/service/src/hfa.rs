@@ -817,11 +817,7 @@ impl HfaEngine {
         let mut state = self.lock_state();
         self.sweep(&mut state, now_ms);
 
-        let mut pairs = state
-            .fast_tx_routes
-            .iter()
-            .map(|(tx_id, until_ms)| (tx_id.clone(), *until_ms))
-            .collect::<Vec<_>>();
+        let mut pairs = state.fast_tx_routes.iter().map(|(tx_id, until_ms)| (tx_id.clone(), *until_ms)).collect::<Vec<_>>();
 
         pairs.sort_by(|a, b| b.1.cmp(&a.1));
         pairs.into_iter().take(limit).map(|(tx_id, _)| tx_id).collect()
@@ -1698,6 +1694,9 @@ fn map_tx_error_to_reason(err: TxRuleError) -> &'static str {
         | TxRuleError::UnknownTxVersion(_)
         | TxRuleError::SubnetworksDisabled(_)
         | TxRuleError::NonCoinbaseTxHasPayload
+        | TxRuleError::PayloadInInvalidSubnetwork(_)
+        | TxRuleError::PayloadSubnetworkHasNoPayload
+        | TxRuleError::PayloadLengthAboveMax(_, _)
         | TxRuleError::TxHasGas => REASON_NONSTANDARD_BASE_TX,
         TxRuleError::FeerateTooLow => REASON_FEE_RATE_BELOW_FLOOR,
         _ => REASON_INVALID_BASE_TX,
@@ -1838,7 +1837,10 @@ impl HfaP2pBridge for HfaEngine {
         }
 
         if let Some(cancel_token) = response.cancel_token {
-            warn!("Fastchain receive rejected: intent {} tx {} failed mempool insertion, cancelling local fast context", response.intent_id, tx_id);
+            warn!(
+                "Fastchain receive rejected: intent {} tx {} failed mempool insertion, cancelling local fast context",
+                response.intent_id, tx_id
+            );
             let _ = self.cancel_fast_intent(CancelFastIntentRequest {
                 intent_id: response.intent_id,
                 cancel_token,
@@ -1859,7 +1861,6 @@ impl HfaP2pBridge for HfaEngine {
         HfaEngine::take_outbound_fast_microblocks(self)
     }
 }
-
 
 // @all - leave the tests in place until the next hard fork in case we still need them or problems arise.
 

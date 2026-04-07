@@ -452,7 +452,7 @@ pub struct AccountsGetResponse {
 /// @category Wallet API
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize, CastFromJs)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "wasm32-sdk", wasm_bindgen)]
+#[wasm_bindgen]
 pub enum NewAddressKind {
     Receive,
     Change,
