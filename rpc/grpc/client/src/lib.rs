@@ -280,6 +280,7 @@ impl RpcApi for GrpcClient {
     route!(submit_fast_intent_call, SubmitFastIntent);
     route!(get_fast_intent_status_call, GetFastIntentStatus);
     route!(cancel_fast_intent_call, CancelFastIntent);
+    route!(get_strong_nodes_call, GetStrongNodes);
 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Notification API

@@ -1049,6 +1049,57 @@ mod mockery {
 
     test!(GetSyncStatusResponse);
 
+    impl Mock for GetStrongNodesRequest {
+        fn mock() -> Self {
+            GetStrongNodesRequest {}
+        }
+    }
+
+    test!(GetStrongNodesRequest);
+
+    impl Mock for RpcStrongNodeEntry {
+        fn mock() -> Self {
+            RpcStrongNodeEntry {
+                static_id: "00".repeat(32),
+                public_key_xonly: "11".repeat(32),
+                source: "direct".to_string(),
+                signature_valid: true,
+                performance_verified: false,
+                claimed_ip: Some("127.0.0.1".to_string()),
+                last_sender_ip: Some("::1".to_string()),
+                seq_no: mock(),
+                found_blocks_10m: mock(),
+                total_blocks_10m: mock(),
+                share_bps: mock(),
+                window_start_ms: mock(),
+                window_end_ms: mock(),
+                sent_at_ms: mock(),
+                first_seen_ms: mock(),
+                last_seen_ms: mock(),
+                last_announce_sent_at_ms: mock(),
+                is_stale: false,
+            }
+        }
+    }
+
+    test!(RpcStrongNodeEntry);
+
+    impl Mock for GetStrongNodesResponse {
+        fn mock() -> Self {
+            GetStrongNodesResponse {
+                enabled_by_config: true,
+                hardfork_active: true,
+                runtime_available: true,
+                disabled_reason_code: None,
+                disabled_reason_message: None,
+                seq_conflict_total: mock(),
+                entries: vec![mock()],
+            }
+        }
+    }
+
+    test!(GetStrongNodesResponse);
+
     impl Mock for GetDaaScoreTimestampEstimateRequest {
         fn mock() -> Self {
             GetDaaScoreTimestampEstimateRequest { daa_scores: mock() }

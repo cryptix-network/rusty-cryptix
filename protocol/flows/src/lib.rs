@@ -3,5 +3,6 @@ pub mod flow_trait;
 pub mod flowcontext;
 pub mod hfa;
 pub mod service;
+pub mod strong_nodes;
 pub mod v5;
 pub mod v6;

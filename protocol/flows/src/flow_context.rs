@@ -4,6 +4,7 @@ use crate::flowcontext::{
     transactions::TransactionsSpread,
 };
 use crate::hfa::{FastIntentP2pData, FastMicroblockP2pData, HfaP2pBridge, HFA_P2P_SERVICE_BIT};
+use crate::strong_nodes::{StrongNodesEngine, StrongNodesEngineConfig, StrongNodesRuntimeSnapshot, STRONG_NODES_P2P_SERVICE_BIT};
 use crate::{v5, v6};
 use async_trait::async_trait;
 use cryptix_addressmanager::AddressManager;
@@ -32,7 +33,7 @@ use cryptix_p2p_lib::{
     common::ProtocolError,
     convert::model::version::Version,
     make_message,
-    pb::{cryptixd_message::Payload, FastIntentMessage, FastMicroblockMessage, InvRelayBlockMessage},
+    pb::{cryptixd_message::Payload, FastIntentMessage, FastMicroblockMessage, InvRelayBlockMessage, StrongNodeAnnouncementMessage},
     ConnectionInitializer, CryptixdHandshake, Hub, PeerKey, PeerProperties, Router,
 };
 use cryptix_utils::iter::IterExtensions;
@@ -41,6 +42,7 @@ use futures::future::join_all;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::time::Instant;
 use std::{collections::hash_map::Entry, fmt::Display};
 use std::{
@@ -86,6 +88,7 @@ const MISBEHAVIOR_MAX_TRACKED_PEERS: usize = 4096;
 /// Soft inbound connection rate-limit window and threshold per IP.
 const INBOUND_CONNECTION_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const INBOUND_CONNECTION_RATE_LIMIT_MAX_ATTEMPTS: usize = 20;
+const STRONG_NODES_GOSSIP_FANOUT: usize = 4;
 
 /// Maximum frequency in which rate-limit breaches can add strikes.
 const INBOUND_CONNECTION_RATE_LIMIT_STRIKE_COOLDOWN: Duration = Duration::from_secs(60);
@@ -249,6 +252,7 @@ pub struct FlowContextInner {
     misbehaving_peer_scores: Mutex<HashMap<IpAddr, MisbehaviorRecord>>,
     inbound_connection_rate_limit: Mutex<HashMap<IpAddr, InboundConnectionRateLimitRecord>>,
     hfa_bridge: RwLock<Option<Arc<dyn HfaP2pBridge>>>,
+    strong_nodes_engine: Arc<StrongNodesEngine>,
     mining_manager: MiningManagerProxy,
     pub(crate) tick_service: Arc<TickService>,
     notification_root: Arc<ConsensusNotificationRoot>,
@@ -352,8 +356,15 @@ impl FlowContext {
         tick_service: Arc<TickService>,
         notification_root: Arc<ConsensusNotificationRoot>,
         autoban_enabled: bool,
+        strong_nodes_enabled: bool,
+        app_data_dir: PathBuf,
     ) -> Self {
         let hub = Hub::new();
+        let strong_nodes_engine = Arc::new(StrongNodesEngine::new(StrongNodesEngineConfig {
+            enabled: strong_nodes_enabled,
+            network: config.network_name(),
+            app_data_dir,
+        }));
 
         let orphan_resolution_range = BASELINE_ORPHAN_RESOLUTION_RANGE + (config.bps() as f64).log2().ceil() as u32;
 
@@ -377,6 +388,7 @@ impl FlowContext {
                 misbehaving_peer_scores: Default::default(),
                 inbound_connection_rate_limit: Default::default(),
                 hfa_bridge: Default::default(),
+                strong_nodes_engine,
                 mining_manager,
                 tick_service,
                 notification_root,
@@ -404,6 +416,16 @@ impl FlowContext {
         if let Some(logger) = self.block_event_logger.as_ref() {
             logger.start();
         }
+        let ctx = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match ctx.tick_service.tick(Duration::from_secs(5)).await {
+                    cryptix_core::task::tick::TickReason::Wakeup => ctx.run_strong_nodes_tick_once().await,
+                    cryptix_core::task::tick::TickReason::Shutdown => break,
+                }
+            }
+            ctx.strong_nodes_engine.best_effort_flush();
+        });
     }
 
     pub fn set_connection_manager(&self, connection_manager: Arc<ConnectionManager>) {
@@ -411,6 +433,7 @@ impl FlowContext {
     }
 
     pub fn drop_connection_manager(&self) {
+        self.strong_nodes_engine.best_effort_flush();
         self.connection_manager.write().take();
     }
 
@@ -564,6 +587,19 @@ impl FlowContext {
         self.hfa_bridge().map(|bridge| bridge.hfa_enabled()).unwrap_or(false)
     }
 
+    pub fn strong_nodes_snapshot(&self) -> StrongNodesRuntimeSnapshot {
+        self.strong_nodes_engine.snapshot(self.is_payload_hf_active())
+    }
+
+    pub fn is_payload_hf_active(&self) -> bool {
+        let virtual_daa_score = self.consensus().unguarded_session().get_virtual_daa_score();
+        virtual_daa_score >= self.config.params.payload_hf_activation_daa_score
+    }
+
+    pub fn is_strong_nodes_p2p_enabled(&self) -> bool {
+        self.strong_nodes_engine.should_advertise_service_bit(self.is_payload_hf_active())
+    }
+
     pub fn consensus(&self) -> ConsensusInstance {
         self.consensus_manager.consensus()
     }
@@ -701,6 +737,12 @@ impl FlowContext {
     }
 
     pub fn log_block_event(&self, event: BlockLogEvent) {
+        match &event {
+            BlockLogEvent::Relay(_) => self.strong_nodes_engine.on_block_event(false),
+            BlockLogEvent::Submit(_) => self.strong_nodes_engine.on_block_event(true),
+            _ => {}
+        }
+
         if let Some(logger) = self.block_event_logger.as_ref() {
             logger.log(event)
         } else {
@@ -940,6 +982,62 @@ impl FlowContext {
             self.broadcast_fast_microblock(microblock).await;
         }
     }
+
+    pub async fn handle_strong_node_announcement(&self, router: &Arc<Router>, message: StrongNodeAnnouncementMessage) {
+        let sender_ip = router.net_address().ip();
+        let outcome = self.strong_nodes_engine.ingest_announcement(&message, sender_ip, self.is_payload_hf_active());
+        match outcome {
+            crate::strong_nodes::IngestOutcome::Accepted => {
+                self.broadcast_strong_node_announcement(message, Some(router.key())).await;
+            }
+            crate::strong_nodes::IngestOutcome::Strike { reason } => {
+                self.report_misbehaving_peer(router, &reason).await;
+            }
+            crate::strong_nodes::IngestOutcome::Ignored | crate::strong_nodes::IngestOutcome::Dropped => {}
+        }
+    }
+
+    pub async fn broadcast_strong_node_announcement(&self, message: StrongNodeAnnouncementMessage, exclude_peer: Option<PeerKey>) {
+        if !self.is_strong_nodes_p2p_enabled() {
+            return;
+        }
+
+        let mut targets = self
+            .hub
+            .active_peers()
+            .into_iter()
+            .filter_map(|peer| {
+                if (peer.properties().services & STRONG_NODES_P2P_SERVICE_BIT) == 0 {
+                    return None;
+                }
+                if exclude_peer.is_some_and(|excluded| excluded == peer.key()) {
+                    return None;
+                }
+                Some(peer.key())
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return;
+        }
+        let target_len = targets.len();
+        if target_len > STRONG_NODES_GOSSIP_FANOUT {
+            let base = (unix_now() as usize) % target_len;
+            targets = (0..STRONG_NODES_GOSSIP_FANOUT).map(|offset| targets[(base + offset) % target_len]).collect();
+        }
+
+        let msg = make_message!(Payload::StrongNodeAnnouncement, message);
+        for target in targets {
+            let _ = self.hub.send(target, msg.clone()).await;
+        }
+    }
+
+    async fn run_strong_nodes_tick_once(&self) {
+        let claimed_ip = self.address_manager.lock().best_local_address().map(|addr| addr.ip.0);
+        let output = self.strong_nodes_engine.on_tick(self.is_payload_hf_active(), claimed_ip);
+        if let Some(message) = output.outbound_announcement {
+            self.broadcast_strong_node_announcement(message, None).await;
+        }
+    }
 }
 
 #[async_trait]
@@ -968,6 +1066,9 @@ impl ConnectionInitializer for FlowContext {
         self_version_message.add_user_agent(name(), version(), &self.config.user_agent_comments);
         if self.is_hfa_p2p_enabled() {
             self_version_message.services |= HFA_P2P_SERVICE_BIT;
+        }
+        if self.is_strong_nodes_p2p_enabled() {
+            self_version_message.services |= STRONG_NODES_P2P_SERVICE_BIT;
         }
         // TODO: get number of live services
         // TODO: disable_relay_tx from config/cmd
@@ -998,14 +1099,23 @@ impl ConnectionInitializer for FlowContext {
         let local_hfa_enabled = self.is_hfa_p2p_enabled();
         let peer_hfa_enabled = (peer_version.services & HFA_P2P_SERVICE_BIT) != 0;
         let hfa_capable = local_hfa_enabled && peer_hfa_enabled;
+        let local_strong_nodes_enabled = self.is_strong_nodes_p2p_enabled();
+        let peer_strong_nodes_enabled = (peer_version.services & STRONG_NODES_P2P_SERVICE_BIT) != 0;
+        let strong_nodes_capable = local_strong_nodes_enabled && peer_strong_nodes_enabled;
         debug!(
             "HFA P2P capability for peer {}: local_enabled={} peer_enabled={} peer_services=0x{:x} capable={}",
             router, local_hfa_enabled, peer_hfa_enabled, peer_version.services, hfa_capable
         );
+        debug!(
+            "Strong-Nodes P2P capability for peer {}: local_enabled={} peer_enabled={} peer_services=0x{:x} capable={}",
+            router, local_strong_nodes_enabled, peer_strong_nodes_enabled, peer_version.services, strong_nodes_capable
+        );
 
         let (flows, applied_protocol_version) = match peer_version.protocol_version {
-            v if v >= PROTOCOL_VERSION => (v6::register(self.clone(), router.clone(), hfa_capable), PROTOCOL_VERSION),
-            5 => (v5::register(self.clone(), router.clone(), hfa_capable), 5),
+            v if v >= PROTOCOL_VERSION => {
+                (v6::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), PROTOCOL_VERSION)
+            }
+            5 => (v5::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), 5),
             v => return Err(ProtocolError::VersionMismatch(PROTOCOL_VERSION, v)),
         };
 

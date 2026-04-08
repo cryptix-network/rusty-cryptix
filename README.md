@@ -50,6 +50,8 @@ Feedback and contributions are always welcome.
 | `--hfa-drift-ms=<MS>` | integer | `5000` | HFA clock drift window in milliseconds for fast-intent admission. |
 | `--hfa-microblock-interval-ms-normal=<MS>` | integer | `50` | HFA microblock interval in milliseconds while in normal mode. |
 | `--no-hfa` | switch | `false` | Force-disable HFA (overrides config). |
+| `--strong-nodes` | switch | `true` | Enable optional Strong-Nodes overlay (Discovery/Hint, non-consensus). |
+| `--no-strong-nodes` | switch | `false` | Disable Strong-Nodes overlay locally (overrides config). |
 | `--autoban` | switch | `true` | Enable automatic banning of repeatedly misbehaving peers. |
 | `--no-autoban` | switch | `false` | Disable automatic banning of repeatedly misbehaving peers (overrides config). |
 | `--banserver` | switch | `true` | Enable remote ban list synchronization from the antifraud banserver. |

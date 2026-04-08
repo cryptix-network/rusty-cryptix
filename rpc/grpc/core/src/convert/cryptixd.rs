@@ -66,6 +66,7 @@ pub mod cryptixd_request_convert {
     impl_into_cryptixd_request!(SubmitFastIntent);
     impl_into_cryptixd_request!(GetFastIntentStatus);
     impl_into_cryptixd_request!(CancelFastIntent);
+    impl_into_cryptixd_request!(GetStrongNodes);
 
     impl_into_cryptixd_request!(NotifyBlockAdded);
     impl_into_cryptixd_request!(NotifyNewBlockTemplate);
@@ -206,6 +207,7 @@ pub mod cryptixd_response_convert {
     impl_into_cryptixd_response!(SubmitFastIntent);
     impl_into_cryptixd_response!(GetFastIntentStatus);
     impl_into_cryptixd_response!(CancelFastIntent);
+    impl_into_cryptixd_response!(GetStrongNodes);
 
     impl_into_cryptixd_notify_response!(NotifyBlockAdded);
     impl_into_cryptixd_notify_response!(NotifyNewBlockTemplate);

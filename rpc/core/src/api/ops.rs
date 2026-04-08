@@ -138,6 +138,8 @@ pub enum RpcApiOps {
     GetFastIntentStatus = 151,
     /// Cancel a local fast rail intent context.
     CancelFastIntent = 152,
+    /// Get announced strong nodes overlay state and entries.
+    GetStrongNodes = 153,
 }
 
 impl RpcApiOps {

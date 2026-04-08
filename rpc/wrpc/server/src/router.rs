@@ -64,6 +64,7 @@ impl Router {
                 GetSink,
                 GetSinkBlueScore,
                 GetSubnetwork,
+                GetStrongNodes,
                 GetSyncStatus,
                 GetSystemInfo,
                 GetUtxosByAddresses,

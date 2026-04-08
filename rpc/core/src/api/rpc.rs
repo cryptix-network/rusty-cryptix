@@ -100,6 +100,18 @@ pub trait RpcApi: Sync + Send + AnySync {
         request: GetSyncStatusRequest,
     ) -> RpcResult<GetSyncStatusResponse>;
 
+    // Get strong-nodes overlay state and announced entries.
+    async fn get_strong_nodes(&self) -> RpcResult<GetStrongNodesResponse> {
+        self.get_strong_nodes_call(None, GetStrongNodesRequest {}).await
+    }
+    async fn get_strong_nodes_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetStrongNodesRequest,
+    ) -> RpcResult<GetStrongNodesResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
     // ---
 
     /// Requests the network the node is currently running against.

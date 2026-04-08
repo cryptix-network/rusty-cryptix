@@ -257,6 +257,7 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     if args.datacenter {
         info!("Datacenter mode: ENABLED (private/unroutable peer addresses are filtered by address manager)");
     }
+    info!("Strong-Nodes overlay: {}", if args.strong_nodes { "ENABLED" } else { "DISABLED" });
     info!("Auto-ban: {} (default strike threshold: 5, ban duration: 3h)", if args.autoban { "ENABLED" } else { "DISABLED" });
     info!(
         "Banserver sync: {} ({})",
@@ -476,6 +477,8 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         tick_service.clone(),
         notification_root,
         args.autoban,
+        args.strong_nodes,
+        db_dir.clone(),
     ));
     let p2p_service = Arc::new(P2pService::new(
         flow_context.clone(),

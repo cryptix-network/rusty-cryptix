@@ -1390,6 +1390,48 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         Ok(GetSyncStatusResponse { is_synced })
     }
 
+    async fn get_strong_nodes_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetStrongNodesRequest,
+    ) -> RpcResult<GetStrongNodesResponse> {
+        let snapshot = self.flow_context.strong_nodes_snapshot();
+        let entries = snapshot
+            .nodes
+            .into_iter()
+            .map(|entry| RpcStrongNodeEntry {
+                static_id: entry.static_id,
+                public_key_xonly: entry.public_key_xonly,
+                source: entry.source,
+                signature_valid: entry.signature_valid,
+                performance_verified: entry.performance_verified,
+                claimed_ip: entry.claimed_ip,
+                last_sender_ip: entry.last_sender_ip,
+                seq_no: entry.seq_no,
+                found_blocks_10m: entry.found_blocks_10m,
+                total_blocks_10m: entry.total_blocks_10m,
+                share_bps: entry.share_bps,
+                window_start_ms: entry.window_start_ms,
+                window_end_ms: entry.window_end_ms,
+                sent_at_ms: entry.sent_at_ms,
+                first_seen_ms: entry.first_seen_ms,
+                last_seen_ms: entry.last_seen_ms,
+                last_announce_sent_at_ms: entry.last_announce_sent_at_ms,
+                is_stale: entry.is_stale,
+            })
+            .collect();
+
+        Ok(GetStrongNodesResponse {
+            enabled_by_config: snapshot.enabled_by_config,
+            hardfork_active: snapshot.hardfork_active,
+            runtime_available: snapshot.runtime_available,
+            disabled_reason_code: snapshot.disabled_reason_code.map(|code| code.as_str().to_string()),
+            disabled_reason_message: snapshot.disabled_reason_message,
+            seq_conflict_total: snapshot.seq_conflict_total,
+            entries,
+        })
+    }
+
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Notification API
 

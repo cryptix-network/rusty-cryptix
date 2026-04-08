@@ -637,6 +637,7 @@ impl RpcApi for CryptixRpcClient {
             GetSink,
             GetSinkBlueScore,
             GetSubnetwork,
+            GetStrongNodes,
             GetSyncStatus,
             GetSystemInfo,
             GetUtxosByAddresses,

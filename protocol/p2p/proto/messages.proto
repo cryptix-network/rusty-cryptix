@@ -55,6 +55,7 @@ message CryptixdMessage {
     RequestFastIntentsMessage requestFastIntents = 57;
     FastIntentMessage fastIntent = 58;
     FastMicroblockMessage fastMicroblock = 59;
+    StrongNodeAnnouncementMessage strongNodeAnnouncement = 60;
   }
 }
 

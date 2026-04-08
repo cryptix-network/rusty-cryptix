@@ -90,6 +90,7 @@ pub enum CryptixdPayloadOps {
     SubmitFastIntent,
     GetFastIntentStatus,
     CancelFastIntent,
+    GetStrongNodes,
 
     // Subscription commands for starting/stopping notifications
     NotifyBlockAdded,

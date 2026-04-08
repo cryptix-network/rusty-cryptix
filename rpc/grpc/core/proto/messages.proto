@@ -68,6 +68,7 @@ message CryptixdRequest {
     SubmitFastIntentRequestMessage submitFastIntentRequest = 1112;
     GetFastIntentStatusRequestMessage getFastIntentStatusRequest = 1114;
     CancelFastIntentRequestMessage cancelFastIntentRequest = 1116;
+    GetStrongNodesRequestMessage getStrongNodesRequest = 1118;
   }
 }
 
@@ -136,6 +137,7 @@ message CryptixdResponse {
     SubmitFastIntentResponseMessage submitFastIntentResponse = 1113;
     GetFastIntentStatusResponseMessage getFastIntentStatusResponse = 1115;
     CancelFastIntentResponseMessage cancelFastIntentResponse = 1117;
+    GetStrongNodesResponseMessage getStrongNodesResponse = 1119;
   }
 }
 

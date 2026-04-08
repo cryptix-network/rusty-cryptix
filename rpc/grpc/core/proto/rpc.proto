@@ -911,6 +911,41 @@ message GetSyncStatusResponseMessage{
   RPCError error = 1000;
 }
 
+message GetStrongNodesRequestMessage{
+}
+
+message RpcStrongNodeEntry {
+  string staticId = 1;
+  string source = 2;
+  bool signatureValid = 3;
+  bool performanceVerified = 4;
+  optional string claimedIp = 5;
+  optional string lastSenderIp = 6;
+  uint64 seqNo = 7;
+  uint32 foundBlocks10m = 8;
+  uint32 totalBlocks10m = 9;
+  uint32 shareBps = 10;
+  uint64 windowStartMs = 11;
+  uint64 windowEndMs = 12;
+  uint64 sentAtMs = 13;
+  uint64 lastSeenMs = 14;
+  bool isStale = 15;
+  string publicKeyXonly = 16;
+  uint64 firstSeenMs = 17;
+  uint64 lastAnnounceSentAtMs = 18;
+}
+
+message GetStrongNodesResponseMessage{
+  bool enabledByConfig = 1;
+  bool hardforkActive = 2;
+  bool runtimeAvailable = 3;
+  optional string disabledReasonCode = 4;
+  optional string disabledReasonMessage = 5;
+  uint64 seqConflictTotal = 6;
+  repeated RpcStrongNodeEntry entries = 7;
+  RPCError error = 1000;
+}
+
 message GetDaaScoreTimestampEstimateRequestMessage {
   repeated uint64 daaScores = 1;
 }

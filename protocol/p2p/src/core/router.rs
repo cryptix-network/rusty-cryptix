@@ -83,9 +83,9 @@ impl From<CryptixdMessagePayloadType> for IncomingRouteOverflowPolicy {
     fn from(msg_type: CryptixdMessagePayloadType) -> Self {
         match msg_type {
             // Inv messages are unique in the sense that no harm is done if some of them are dropped
-            CryptixdMessagePayloadType::InvTransactions | CryptixdMessagePayloadType::InvRelayBlock => {
-                IncomingRouteOverflowPolicy::Drop
-            }
+            CryptixdMessagePayloadType::InvTransactions
+            | CryptixdMessagePayloadType::InvRelayBlock
+            | CryptixdMessagePayloadType::StrongNodeAnnouncement => IncomingRouteOverflowPolicy::Drop,
             _ => IncomingRouteOverflowPolicy::Disconnect,
         }
     }

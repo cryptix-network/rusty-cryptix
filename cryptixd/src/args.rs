@@ -83,6 +83,7 @@ pub struct Args {
     pub hfa_cpu: f64,
     pub hfa_drift_ms: u64,
     pub hfa_microblock_interval_ms_normal: u64,
+    pub strong_nodes: bool,
     pub autoban: bool,
     pub banserver: bool,
     pub banserver_url: Option<String>,
@@ -143,6 +144,7 @@ impl Default for Args {
             hfa_cpu: 0.7,
             hfa_drift_ms: 5_000,
             hfa_microblock_interval_ms_normal: 50,
+            strong_nodes: true,
             autoban: true,
             banserver: true,
             banserver_url: Some(DEFAULT_BANSERVER_URL.to_owned()),
@@ -421,6 +423,20 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
                 .help("Disable HFA fast rail for this process (overrides config)."),
         )
         .arg(
+            Arg::new("strong-nodes")
+                .long("strong-nodes")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("no-strong-nodes")
+                .help("Enable optional Strong-Nodes overlay feature (default: enabled)."),
+        )
+        .arg(
+            Arg::new("no-strong-nodes")
+                .long("no-strong-nodes")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("strong-nodes")
+                .help("Disable optional Strong-Nodes overlay feature (overrides config)."),
+        )
+        .arg(
             Arg::new("autoban")
                 .long("autoban")
                 .action(ArgAction::SetTrue)
@@ -513,6 +529,13 @@ impl Args {
         } else {
             defaults.hfa
         };
+        let strong_nodes_enabled = if arg_match_unwrap_or::<bool>(&m, "strong-nodes", false) {
+            true
+        } else if arg_match_unwrap_or::<bool>(&m, "no-strong-nodes", false) {
+            false
+        } else {
+            defaults.strong_nodes
+        };
         let autoban_enabled = if arg_match_unwrap_or::<bool>(&m, "autoban", false) {
             true
         } else if arg_match_unwrap_or::<bool>(&m, "no-autoban", false) {
@@ -572,6 +595,7 @@ impl Args {
                 "hfa-microblock-interval-ms-normal",
                 defaults.hfa_microblock_interval_ms_normal,
             ),
+            strong_nodes: strong_nodes_enabled,
             autoban: autoban_enabled,
             banserver: banserver_enabled,
             banserver_url: m.get_one::<String>("banserver-url").cloned().or(defaults.banserver_url),
