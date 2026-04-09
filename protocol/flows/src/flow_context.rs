@@ -40,7 +40,7 @@ use cryptix_utils::iter::IterExtensions;
 use cryptix_utils::networking::PeerId;
 use futures::future::join_all;
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -89,12 +89,17 @@ const MISBEHAVIOR_MAX_TRACKED_PEERS: usize = 4096;
 const INBOUND_CONNECTION_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const INBOUND_CONNECTION_RATE_LIMIT_MAX_ATTEMPTS: usize = 20;
 const STRONG_NODES_GOSSIP_FANOUT: usize = 4;
+const STRONG_NODES_TICK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Maximum frequency in which rate-limit breaches can add strikes.
 const INBOUND_CONNECTION_RATE_LIMIT_STRIKE_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Soft memory cap for tracked peer IPs in the inbound connection limiter map.
 const INBOUND_CONNECTION_RATE_LIMIT_MAX_TRACKED_IPS: usize = 4096;
+
+fn strong_node_static_id_raw(message: &StrongNodeAnnouncementMessage) -> Option<[u8; 32]> {
+    message.static_id_raw.as_slice().try_into().ok()
+}
 
 /// Represents a block event to be logged
 #[derive(Debug, PartialEq)]
@@ -253,6 +258,7 @@ pub struct FlowContextInner {
     inbound_connection_rate_limit: Mutex<HashMap<IpAddr, InboundConnectionRateLimitRecord>>,
     hfa_bridge: RwLock<Option<Arc<dyn HfaP2pBridge>>>,
     strong_nodes_engine: Arc<StrongNodesEngine>,
+    peer_announced_strong_node_ids: Mutex<HashMap<PeerKey, [u8; 32]>>,
     mining_manager: MiningManagerProxy,
     pub(crate) tick_service: Arc<TickService>,
     notification_root: Arc<ConsensusNotificationRoot>,
@@ -389,6 +395,7 @@ impl FlowContext {
                 inbound_connection_rate_limit: Default::default(),
                 hfa_bridge: Default::default(),
                 strong_nodes_engine,
+                peer_announced_strong_node_ids: Default::default(),
                 mining_manager,
                 tick_service,
                 notification_root,
@@ -419,7 +426,7 @@ impl FlowContext {
         let ctx = self.clone();
         tokio::spawn(async move {
             loop {
-                match ctx.tick_service.tick(Duration::from_secs(5)).await {
+                match ctx.tick_service.tick(STRONG_NODES_TICK_INTERVAL).await {
                     cryptix_core::task::tick::TickReason::Wakeup => ctx.run_strong_nodes_tick_once().await,
                     cryptix_core::task::tick::TickReason::Shutdown => break,
                 }
@@ -985,9 +992,20 @@ impl FlowContext {
 
     pub async fn handle_strong_node_announcement(&self, router: &Arc<Router>, message: StrongNodeAnnouncementMessage) {
         let sender_ip = router.net_address().ip();
+        let static_id_raw = strong_node_static_id_raw(&message);
+        if let (Some(connection_manager), Some(static_id_raw)) = (self.connection_manager(), static_id_raw.as_ref()) {
+            if connection_manager.is_banserver_banned_strong_node_id(static_id_raw) {
+                warn!("Dropping strong-node announcement from {} because static_id is listed in remote antifraud bans", sender_ip);
+                connection_manager.ban(sender_ip).await;
+                return;
+            }
+        }
         let outcome = self.strong_nodes_engine.ingest_announcement(&message, sender_ip, self.is_payload_hf_active());
         match outcome {
             crate::strong_nodes::IngestOutcome::Accepted => {
+                if let Some(static_id_raw) = static_id_raw {
+                    self.peer_announced_strong_node_ids.lock().insert(router.key(), static_id_raw);
+                }
                 self.broadcast_strong_node_announcement(message, Some(router.key())).await;
             }
             crate::strong_nodes::IngestOutcome::Strike { reason } => {
@@ -1032,10 +1050,46 @@ impl FlowContext {
     }
 
     async fn run_strong_nodes_tick_once(&self) {
+        self.enforce_banned_announced_strong_nodes().await;
         let claimed_ip = self.address_manager.lock().best_local_address().map(|addr| addr.ip.0);
         let output = self.strong_nodes_engine.on_tick(self.is_payload_hf_active(), claimed_ip);
         if let Some(message) = output.outbound_announcement {
             self.broadcast_strong_node_announcement(message, None).await;
+        }
+    }
+
+    async fn enforce_banned_announced_strong_nodes(&self) {
+        let Some(connection_manager) = self.connection_manager() else {
+            return;
+        };
+
+        let active_peers = self.hub.active_peers();
+        if active_peers.is_empty() {
+            self.peer_announced_strong_node_ids.lock().clear();
+            return;
+        }
+
+        let active_by_key =
+            active_peers.into_iter().map(|peer| (peer.key(), peer.net_address().ip())).collect::<HashMap<PeerKey, IpAddr>>();
+
+        let ips_to_ban = {
+            let mut announced = self.peer_announced_strong_node_ids.lock();
+            announced.retain(|peer_key, _| active_by_key.contains_key(peer_key));
+
+            let mut ips_to_ban = HashSet::new();
+            for (peer_key, static_id_raw) in announced.iter() {
+                if connection_manager.is_banserver_banned_strong_node_id(static_id_raw) {
+                    if let Some(ip) = active_by_key.get(peer_key) {
+                        ips_to_ban.insert(*ip);
+                    }
+                }
+            }
+            ips_to_ban
+        };
+
+        for ip in ips_to_ban {
+            warn!("Disconnecting peer {} because its announced strong-node static_id is listed in remote antifraud bans", ip);
+            connection_manager.ban(ip).await;
         }
     }
 }

@@ -31,6 +31,8 @@ const BANSERVER_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const BANSERVER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const BANSERVER_MAX_IPS: usize = 10_000;
 const BANSERVER_MAX_IP_ENTRY_LEN: usize = 64;
+const BANSERVER_MAX_NODE_IDS: usize = 10_000;
+const BANSERVER_NODE_ID_HEX_LEN: usize = 64;
 const BANSERVER_MAX_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 const BANSERVER_BANNED_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
 
@@ -47,6 +49,7 @@ pub struct ConnectionManager {
     banserver_enabled: bool,
     banserver_url: String,
     banserver_banned_ips: ParkingLotMutex<HashSet<IpAddr>>,
+    banserver_banned_strong_node_ids: ParkingLotMutex<HashSet<[u8; 32]>>,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +57,12 @@ struct ConnectionRequest {
     next_attempt: SystemTime,
     is_permanent: bool,
     attempts: u32,
+}
+
+#[derive(Debug, Default)]
+struct BanserverPayload {
+    ips: HashSet<IpAddr>,
+    strong_node_ids: HashSet<[u8; 32]>,
 }
 
 impl ConnectionRequest {
@@ -91,6 +100,7 @@ impl ConnectionManager {
             banserver_enabled,
             banserver_url,
             banserver_banned_ips: ParkingLotMutex::new(HashSet::new()),
+            banserver_banned_strong_node_ids: ParkingLotMutex::new(HashSet::new()),
         });
         manager.clone().start_event_loop(rx);
         manager.force_next_iteration.send(()).unwrap();
@@ -390,47 +400,78 @@ impl ConnectionManager {
         self.banserver_enabled && self.banserver_banned_ips.lock().contains(&ip)
     }
 
+    pub fn is_banserver_banned_strong_node_id(&self, static_id_raw: &[u8; 32]) -> bool {
+        self.banserver_enabled && self.banserver_banned_strong_node_ids.lock().contains(static_id_raw)
+    }
+
     async fn refresh_banserver_bans(self: Arc<Self>) {
         let fetched = match self.fetch_banserver_payload().await {
-            Ok(ips) => ips,
+            Ok(payload) => payload,
             Err(err) => {
                 warn!("Banserver refresh failed (URL: {}): {}. Continuing without remote list update.", self.banserver_url, err);
                 return;
             }
         };
 
-        let (newly_banned, removed_count, total_count) = {
-            let mut state = self.banserver_banned_ips.lock();
-            let newly_banned = fetched.difference(&*state).copied().collect_vec();
-            let removed_count = state.difference(&fetched).count();
-            *state = fetched;
-            (newly_banned, removed_count, state.len())
+        let (
+            newly_banned_ips,
+            removed_ip_count,
+            total_ip_count,
+            newly_banned_node_id_count,
+            removed_node_id_count,
+            total_node_id_count,
+        ) = {
+            let mut ip_state = self.banserver_banned_ips.lock();
+            let mut node_id_state = self.banserver_banned_strong_node_ids.lock();
+
+            let newly_banned_ips = fetched.ips.difference(&*ip_state).copied().collect_vec();
+            let removed_ip_count = ip_state.difference(&fetched.ips).count();
+            let newly_banned_node_id_count = fetched.strong_node_ids.difference(&*node_id_state).count();
+            let removed_node_id_count = node_id_state.difference(&fetched.strong_node_ids).count();
+
+            *ip_state = fetched.ips;
+            *node_id_state = fetched.strong_node_ids;
+
+            (
+                newly_banned_ips,
+                removed_ip_count,
+                ip_state.len(),
+                newly_banned_node_id_count,
+                removed_node_id_count,
+                node_id_state.len(),
+            )
         };
 
-        if newly_banned.is_empty() && removed_count == 0 {
-            debug!("Banserver refresh completed with no changes ({} active IPs)", total_count);
+        if newly_banned_ips.is_empty() && removed_ip_count == 0 && newly_banned_node_id_count == 0 && removed_node_id_count == 0 {
+            debug!(
+                "Banserver refresh completed with no changes ({} active IPs, {} active strong-node IDs)",
+                total_ip_count, total_node_id_count
+            );
             return;
         }
 
         info!(
-            "Banserver refresh applied: {} newly banned, {} removed, {} total entries",
-            newly_banned.len(),
-            removed_count,
-            total_count
+            "Banserver refresh applied: {} newly banned IPs, {} removed IPs, {} total IPs, {} newly banned strong-node IDs, {} removed strong-node IDs, {} total strong-node IDs",
+            newly_banned_ips.len(),
+            removed_ip_count,
+            total_ip_count,
+            newly_banned_node_id_count,
+            removed_node_id_count,
+            total_node_id_count
         );
 
-        if !newly_banned.is_empty() {
-            self.disconnect_peers_by_ip_list(newly_banned).await;
+        if !newly_banned_ips.is_empty() {
+            self.disconnect_peers_by_ip_list(newly_banned_ips).await;
         }
 
         // Ensure the connection loop reacts quickly to newly updated server bans.
         let _ = self.force_next_iteration.send(());
     }
 
-    async fn fetch_banserver_payload(&self) -> Result<HashSet<IpAddr>, String> {
+    async fn fetch_banserver_payload(&self) -> Result<BanserverPayload, String> {
         let primary_url = self.banserver_url.trim();
         match self.fetch_banserver_json(primary_url).await {
-            Ok(payload) => Self::parse_banserver_ips(payload),
+            Ok(payload) => Self::parse_banserver_payload(payload),
             Err(primary_err) => {
                 if let Some(fallback_url) = Self::http_fallback_url(primary_url) {
                     match self.fetch_banserver_json(&fallback_url).await {
@@ -439,7 +480,7 @@ impl ConnectionManager {
                                 "Banserver HTTPS fetch failed for {} ({}), HTTP fallback {} succeeded",
                                 primary_url, primary_err, fallback_url
                             );
-                            Self::parse_banserver_ips(payload)
+                            Self::parse_banserver_payload(payload)
                         }
                         Err(fallback_err) => {
                             Err(format!("primary fetch failed: {}; http fallback failed: {}", primary_err, fallback_err))
@@ -505,23 +546,42 @@ impl ConnectionManager {
         Some(parsed.to_string())
     }
 
-    fn parse_banserver_ips(payload: JsonValue) -> Result<HashSet<IpAddr>, String> {
-        let ips_values = Self::extract_ip_array(&payload).ok_or_else(|| "missing `ips` array in banserver payload".to_owned())?;
+    fn parse_banserver_payload(payload: JsonValue) -> Result<BanserverPayload, String> {
+        let ips_values = Self::extract_ip_array(&payload);
+        let node_id_values = Self::extract_node_id_array(&payload);
+        if ips_values.is_none() && node_id_values.is_none() {
+            return Err("missing `ips` or `node_ids` array in banserver payload".to_owned());
+        }
 
         let mut parsed_ips = HashSet::new();
-        for raw in ips_values.iter().take(BANSERVER_MAX_IPS) {
-            let Some(raw_ip) = raw.as_str() else {
-                continue;
-            };
-            let candidate = raw_ip.trim();
-            if candidate.is_empty() || candidate.len() > BANSERVER_MAX_IP_ENTRY_LEN {
-                continue;
-            }
-            if let Ok(ip) = candidate.parse::<IpAddr>() {
-                parsed_ips.insert(ip);
+        if let Some(ips_values) = ips_values {
+            for raw in ips_values.iter().take(BANSERVER_MAX_IPS) {
+                let Some(raw_ip) = raw.as_str() else {
+                    continue;
+                };
+                let candidate = raw_ip.trim();
+                if candidate.is_empty() || candidate.len() > BANSERVER_MAX_IP_ENTRY_LEN {
+                    continue;
+                }
+                if let Ok(ip) = candidate.parse::<IpAddr>() {
+                    parsed_ips.insert(ip);
+                }
             }
         }
-        Ok(parsed_ips)
+
+        let mut parsed_node_ids = HashSet::new();
+        if let Some(node_id_values) = node_id_values {
+            for raw in node_id_values.iter().take(BANSERVER_MAX_NODE_IDS) {
+                let Some(raw_node_id) = raw.as_str() else {
+                    continue;
+                };
+                if let Some(static_id_raw) = Self::parse_node_id_hex(raw_node_id) {
+                    parsed_node_ids.insert(static_id_raw);
+                }
+            }
+        }
+
+        Ok(BanserverPayload { ips: parsed_ips, strong_node_ids: parsed_node_ids })
     }
 
     fn extract_ip_array(payload: &JsonValue) -> Option<&Vec<JsonValue>> {
@@ -530,6 +590,38 @@ impl ConnectionManager {
             .and_then(JsonValue::as_array)
             .or_else(|| payload.get("data").and_then(|data| data.get("ips")).and_then(JsonValue::as_array))
             .or_else(|| payload.as_array())
+    }
+
+    fn extract_node_id_array(payload: &JsonValue) -> Option<&Vec<JsonValue>> {
+        payload
+            .get("node_ids")
+            .and_then(JsonValue::as_array)
+            .or_else(|| payload.get("data").and_then(|data| data.get("node_ids")).and_then(JsonValue::as_array))
+    }
+
+    fn parse_node_id_hex(raw: &str) -> Option<[u8; 32]> {
+        let candidate = raw.trim();
+        if candidate.len() != BANSERVER_NODE_ID_HEX_LEN {
+            return None;
+        }
+
+        let bytes = candidate.as_bytes();
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            let high = Self::hex_nibble(bytes[i * 2])?;
+            let low = Self::hex_nibble(bytes[i * 2 + 1])?;
+            out[i] = (high << 4) | low;
+        }
+        Some(out)
+    }
+
+    fn hex_nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
     }
 
     async fn disconnect_peers_by_ip_list(&self, ips: Vec<IpAddr>) {
@@ -562,7 +654,7 @@ mod tests {
             "count": 2,
             "ips": ["1.2.3.4", "2001:db8::1"]
         });
-        let parsed = ConnectionManager::parse_banserver_ips(payload).expect("payload should parse");
+        let parsed = ConnectionManager::parse_banserver_payload(payload).expect("payload should parse").ips;
         assert!(parsed.contains(&"1.2.3.4".parse::<IpAddr>().unwrap()));
         assert!(parsed.contains(&"2001:db8::1".parse::<IpAddr>().unwrap()));
         assert_eq!(parsed.len(), 2);
@@ -573,7 +665,7 @@ mod tests {
         let payload = json!({
             "ips": ["1.2.3.4", "not-an-ip", "", "  ", null, "999.1.1.1", "2001:db8::1"]
         });
-        let parsed = ConnectionManager::parse_banserver_ips(payload).expect("payload should parse");
+        let parsed = ConnectionManager::parse_banserver_payload(payload).expect("payload should parse").ips;
         assert!(parsed.contains(&"1.2.3.4".parse::<IpAddr>().unwrap()));
         assert!(parsed.contains(&"2001:db8::1".parse::<IpAddr>().unwrap()));
         assert_eq!(parsed.len(), 2);
@@ -587,8 +679,44 @@ mod tests {
             ips.push(format!("10.0.{}.{}", octet, (octet + 1) % 250));
         }
         let payload = json!({ "ips": ips });
-        let parsed = ConnectionManager::parse_banserver_ips(payload).expect("payload should parse");
+        let parsed = ConnectionManager::parse_banserver_payload(payload).expect("payload should parse").ips;
         assert!(parsed.len() <= BANSERVER_MAX_IPS);
+    }
+
+    #[test]
+    fn parse_banserver_payload_parses_node_ids() {
+        let payload = json!({
+            "ips": ["1.2.3.4"],
+            "node_ids": [
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+            ]
+        });
+        let parsed = ConnectionManager::parse_banserver_payload(payload).expect("payload should parse");
+        assert!(parsed.ips.contains(&"1.2.3.4".parse::<IpAddr>().unwrap()));
+        assert_eq!(parsed.strong_node_ids.len(), 2);
+    }
+
+    #[test]
+    fn parse_banserver_payload_filters_invalid_node_ids() {
+        let payload = json!({
+            "node_ids": [
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "xyz",
+                "",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaz",
+                123
+            ]
+        });
+        let parsed = ConnectionManager::parse_banserver_payload(payload).expect("payload should parse");
+        assert_eq!(parsed.strong_node_ids.len(), 1);
+    }
+
+    #[test]
+    fn parse_banserver_payload_rejects_payload_without_supported_arrays() {
+        let payload = json!({ "status": "ok" });
+        let err = ConnectionManager::parse_banserver_payload(payload).expect_err("payload must be rejected");
+        assert!(err.contains("missing `ips` or `node_ids` array"));
     }
 
     #[test]
