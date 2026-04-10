@@ -107,6 +107,9 @@ pub fn validate_args(args: &Args) -> ConfigResult<()> {
     if args.hfa_microblock_interval_ms_normal == 0 {
         return Err(ConfigError::HfaMicroblockIntervalMsNormalOutOfRange(args.hfa_microblock_interval_ms_normal));
     }
+    if args.tx_relay_broadcast_interval_ms == 0 {
+        return Err(ConfigError::TxRelayBroadcastIntervalMsOutOfRange(args.tx_relay_broadcast_interval_ms));
+    }
     Ok(())
 }
 
@@ -257,6 +260,7 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     if args.datacenter {
         info!("Datacenter mode: ENABLED (private/unroutable peer addresses are filtered by address manager)");
     }
+    info!("Tx relay broadcast interval: {} ms", args.tx_relay_broadcast_interval_ms);
     info!("Strong-Nodes overlay: {}", if args.strong_nodes { "ENABLED" } else { "DISABLED" });
     info!("Auto-ban: {} (default strike threshold: 5, ban duration: 3h)", if args.autoban { "ENABLED" } else { "DISABLED" });
     info!(

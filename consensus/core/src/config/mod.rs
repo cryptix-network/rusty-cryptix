@@ -61,6 +61,9 @@ pub struct Config {
 
     pub block_template_cache_lifetime: Option<u64>,
 
+    /// Interval in milliseconds for batching mempool tx INV broadcasts.
+    pub tx_relay_broadcast_interval_ms: u64,
+
     #[cfg(feature = "devnet-prealloc")]
     pub initial_utxo_set: Arc<UtxoCollection>,
 
@@ -90,6 +93,7 @@ impl Config {
             externalip: None,
             p2p_listen_address: ContextualNetAddress::unspecified(),
             block_template_cache_lifetime: None,
+            tx_relay_broadcast_interval_ms: 250,
 
             #[cfg(feature = "devnet-prealloc")]
             initial_utxo_set: Default::default(),

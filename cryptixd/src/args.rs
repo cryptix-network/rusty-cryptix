@@ -78,6 +78,7 @@ pub struct Args {
     pub perf_metrics: bool,
     pub perf_metrics_interval_sec: u64,
     pub block_template_cache_lifetime: Option<u64>,
+    pub tx_relay_broadcast_interval_ms: u64,
     pub datacenter: bool,
     pub hfa: bool,
     pub hfa_cpu: f64,
@@ -139,6 +140,7 @@ impl Default for Args {
             perf_metrics_interval_sec: 10,
             externalip: None,
             block_template_cache_lifetime: None,
+            tx_relay_broadcast_interval_ms: 250,
             datacenter: false,
             hfa: false,
             hfa_cpu: 0.7,
@@ -176,6 +178,7 @@ impl Args {
         config.enable_sanity_checks = true;
         config.user_agent_comments.clone_from(&self.user_agent_comments);
         config.block_template_cache_lifetime = self.block_template_cache_lifetime;
+        config.tx_relay_broadcast_interval_ms = self.tx_relay_broadcast_interval_ms;
         config.p2p_listen_address = self.listen.unwrap_or(ContextualNetAddress::unspecified());
         config.externalip = self.externalip.map(|v| v.normalize(config.default_p2p_port()));
         config.ram_scale = self.ram_scale;
@@ -382,6 +385,13 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
                 .help("Interval in seconds for performance metrics collection."),
         )
         .arg(
+            Arg::new("tx-relay-broadcast-interval-ms")
+                .long("tx-relay-broadcast-interval-ms")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(u64))
+                .help("Interval in milliseconds for batching mempool transaction inv broadcasts (default: 250)."),
+        )
+        .arg(
             Arg::new("datacenter")
                 .long("datacenter")
                 .action(ArgAction::SetTrue)
@@ -586,6 +596,11 @@ impl Args {
             perf_metrics_interval_sec: arg_match_unwrap_or::<u64>(&m, "perf-metrics-interval-sec", defaults.perf_metrics_interval_sec),
             // Note: currently used programmatically by benchmarks and not exposed to CLI users
             block_template_cache_lifetime: defaults.block_template_cache_lifetime,
+            tx_relay_broadcast_interval_ms: arg_match_unwrap_or::<u64>(
+                &m,
+                "tx-relay-broadcast-interval-ms",
+                defaults.tx_relay_broadcast_interval_ms,
+            ),
             datacenter: arg_match_unwrap_or::<bool>(&m, "datacenter", defaults.datacenter),
             hfa: hfa_enabled,
             hfa_cpu: arg_match_unwrap_or::<f64>(&m, "hfa-cpu", defaults.hfa_cpu),

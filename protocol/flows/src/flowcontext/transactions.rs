@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 /// Interval between mempool scanning tasks (in seconds)
 const SCANNING_TASK_INTERVAL: u64 = 10;
 const REBROADCAST_FREQUENCY: u64 = 3;
-const BROADCAST_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) const MAX_INV_PER_TX_INV_MSG: usize = 131_072;
 
 pub struct TransactionsSpread {
@@ -22,10 +21,11 @@ pub struct TransactionsSpread {
     scanning_job_count: u64,
     transaction_ids: ProcessQueue<TransactionId>,
     last_broadcast_time: Instant,
+    broadcast_interval: Duration,
 }
 
 impl TransactionsSpread {
-    pub fn new(hub: Hub) -> Self {
+    pub fn new(hub: Hub, broadcast_interval: Duration) -> Self {
         Self {
             hub,
             last_scanning_time: Instant::now(),
@@ -33,6 +33,7 @@ impl TransactionsSpread {
             scanning_job_count: 0,
             transaction_ids: ProcessQueue::new(),
             last_broadcast_time: Instant::now(),
+            broadcast_interval,
         }
     }
 
@@ -73,7 +74,7 @@ impl TransactionsSpread {
     /// within transaction Inv messages.
     ///
     /// The broadcast itself may happen only during a subsequent call to this function since it is done at most
-    /// every [`BROADCAST_INTERVAL`] milliseconds or when the queue length is larger than the Inv message
+    /// every `broadcast_interval` milliseconds or when the queue length is larger than the Inv message
     /// capacity.
     ///
     /// _GO-CRYPTIXD: EnqueueTransactionIDsForPropagation_
@@ -81,7 +82,7 @@ impl TransactionsSpread {
         self.transaction_ids.enqueue_chunk(transaction_ids);
 
         let now = Instant::now();
-        if now < self.last_broadcast_time + BROADCAST_INTERVAL && self.transaction_ids.len() < MAX_INV_PER_TX_INV_MSG {
+        if now < self.last_broadcast_time + self.broadcast_interval && self.transaction_ids.len() < MAX_INV_PER_TX_INV_MSG {
             return;
         }
 

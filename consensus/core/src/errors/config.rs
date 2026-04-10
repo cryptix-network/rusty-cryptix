@@ -26,6 +26,9 @@ pub enum ConfigError {
     #[error("Configuration: --hfa-microblock-interval-ms-normal must be greater than 0, got {0}")]
     HfaMicroblockIntervalMsNormalOutOfRange(u64),
 
+    #[error("Configuration: --tx-relay-broadcast-interval-ms must be greater than 0, got {0}")]
+    TxRelayBroadcastIntervalMsOutOfRange(u64),
+
     #[cfg(feature = "devnet-prealloc")]
     #[error("Cannot preallocate UTXOs on any network except devnet")]
     PreallocUtxosOnNonDevnet,

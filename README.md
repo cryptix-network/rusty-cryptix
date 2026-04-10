@@ -44,6 +44,7 @@ Feedback and contributions are always welcome.
 | `--externalip=<IP[:PORT]>` | address | none | Advertised external P2P address. |
 | `--perf-metrics` | switch | `false` | Enable runtime perf metrics collection. |
 | `--perf-metrics-interval-sec=<SECONDS>` | integer | `10` | Perf metrics collection interval. |
+| `--tx-relay-broadcast-interval-ms=<MS>` | integer | `250` | Interval in milliseconds for batching mempool transaction INV broadcasts. |
 | `--datacenter` | switch | `false` | Enable datacenter peer filter mode (skip private/unroutable peer addresses in address manager). |
 | `--hfa` | switch | `false` | Enable HFA fast rail for this process. |
 | `--hfa-cpu=<RATIO>` | float | `0.7` | HFA CPU low-water ratio (`0.0 < value <= 1.0`). |
@@ -314,6 +315,7 @@ testnet = true
 utxoindex = false
 disable-upnp = true
 perf-metrics = true
+tx-relay-broadcast-interval-ms = 250
 appdir = "some-dir"
 hfa-microblock-interval-ms-normal = 50
 autoban = true

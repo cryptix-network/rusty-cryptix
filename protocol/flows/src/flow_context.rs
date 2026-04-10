@@ -383,7 +383,10 @@ impl FlowContext {
                 consensus_manager,
                 orphans_pool: AsyncRwLock::new(OrphanBlocksPool::new(max_orphans)),
                 shared_block_requests: Arc::new(Mutex::new(HashMap::new())),
-                transactions_spread: AsyncRwLock::new(TransactionsSpread::new(hub.clone())),
+                transactions_spread: AsyncRwLock::new(TransactionsSpread::new(
+                    hub.clone(),
+                    Duration::from_millis(config.tx_relay_broadcast_interval_ms),
+                )),
                 shared_transaction_requests: Arc::new(Mutex::new(HashMap::new())),
                 is_ibd_running: Default::default(),
                 ibd_metadata: Default::default(),
