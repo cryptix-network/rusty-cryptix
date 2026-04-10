@@ -101,6 +101,7 @@ fn build_dummy_version_message() -> VersionMessage {
         disable_relay_tx: false,
         subnetwork_id: None,
         network: "cryptix-mainnet".to_string(),
+        anti_fraud_hashes: Vec::new(),
     }
 }
 

@@ -1228,6 +1228,7 @@ dependencies = [
 name = "cryptix-connectionmanager"
 version = "0.16.0"
 dependencies = [
+ "blake3",
  "cryptix-addressmanager",
  "cryptix-core",
  "cryptix-p2p-lib",
@@ -1239,6 +1240,8 @@ dependencies = [
  "parking_lot",
  "rand 0.8.5",
  "reqwest",
+ "secp256k1",
+ "serde",
  "serde_json",
  "tokio",
 ]

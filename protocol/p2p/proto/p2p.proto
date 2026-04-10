@@ -147,6 +147,21 @@ message VersionMessage{
   bool disableRelayTx = 8;
   SubnetworkId subnetworkId = 9;
   string network = 10;
+  repeated bytes antiFraudHashes = 11;
+}
+
+message RequestAntiFraudSnapshotV1Message{
+}
+
+message AntiFraudSnapshotV1Message{
+  uint32 schemaVersion = 1;
+  uint32 network = 2;
+  uint64 snapshotSeq = 3;
+  uint64 generatedAtMs = 4;
+  uint32 signingKeyId = 5;
+  repeated bytes bannedIps = 6;
+  repeated bytes bannedNodeIds = 7;
+  bytes signature = 8;
 }
 
 message RejectMessage{

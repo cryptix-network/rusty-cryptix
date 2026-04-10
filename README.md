@@ -57,7 +57,7 @@ Feedback and contributions are always welcome.
 | `--no-autoban` | switch | `false` | Disable automatic banning of repeatedly misbehaving peers (overrides config). |
 | `--banserver` | switch | `true` | Enable remote ban list synchronization from the antifraud banserver. |
 | `--no-banserver` | switch | `false` | Disable remote ban list synchronization from the antifraud banserver (overrides config). |
-| `--banserver-url=<URL>` | string | `https://antifraud.cryptix-network.org/api/confirmed-cases/iplist` | Override the banserver endpoint for remote IP blocklist sync. |
+| `--banserver-url=<URL>` | string | `https://antifraud.cryptix-network.org/api/v1/antifraud/snapshot` | Override the banserver endpoint for remote IP blocklist sync. |
 | `--disable-upnp` | switch | `false` | Disable UPnP. |
 | `--nodnsseed` | switch | `false` | Disable DNS peer seeding. |
 | `--nogrpc` | switch | `false` | Disable gRPC server. |
@@ -320,7 +320,7 @@ appdir = "some-dir"
 hfa-microblock-interval-ms-normal = 50
 autoban = true
 banserver = true
-banserver-url = "https://antifraud.cryptix-network.org/api/confirmed-cases/iplist"
+banserver-url = "https://antifraud.cryptix-network.org/api/v1/antifraud/snapshot"
 addpeer = ["10.0.0.1", "1.2.3.4"]
   ```
 Pass the `--help` flag to view all possible arguments
@@ -338,8 +338,8 @@ cargo run --release --bin cryptixd -- --help
 
   Banserver sync defaults:
   - enabled by default (`banserver = true`)
-  - startup fetch + periodic refresh every 1 hour
-  - endpoint default: `https://antifraud.cryptix-network.org/api/confirmed-cases/iplist`
+  - startup fetch + periodic refresh every 20 minutes
+  - endpoint default: `https://antifraud.cryptix-network.org/api/v1/antifraud/snapshot`
   - fail-open: server/network/payload errors are ignored safely and do not crash node operation
 </details>
 

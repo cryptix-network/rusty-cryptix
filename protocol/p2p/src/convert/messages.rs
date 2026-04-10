@@ -33,6 +33,7 @@ impl From<Version> for protowire::VersionMessage {
             disable_relay_tx: item.disable_relay_tx,
             subnetwork_id: item.subnetwork_id.map(|x| x.into()),
             network: item.network.clone(),
+            anti_fraud_hashes: item.anti_fraud_hashes.into_iter().map(|v| v.to_vec()).collect(),
         }
     }
 }
@@ -54,8 +55,18 @@ impl TryFrom<protowire::VersionMessage> for Version {
             disable_relay_tx: msg.disable_relay_tx,
             subnetwork_id: if msg.subnetwork_id.is_none() { None } else { Some(msg.subnetwork_id.unwrap().try_into()?) },
             network: msg.network.clone(),
+            anti_fraud_hashes: parse_anti_fraud_hashes(msg.anti_fraud_hashes)?,
         })
     }
+}
+
+fn parse_anti_fraud_hashes(raw: Vec<Vec<u8>>) -> Result<Vec<[u8; 32]>, ConversionError> {
+    if raw.len() > 3 {
+        return Err(ConversionError::General);
+    }
+    raw.into_iter()
+        .map(|entry| entry.as_slice().try_into().map_err(|_| ConversionError::General))
+        .collect()
 }
 
 impl TryFrom<protowire::RequestHeadersMessage> for (Hash, Hash) {

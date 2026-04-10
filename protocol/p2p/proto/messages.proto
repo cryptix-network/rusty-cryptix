@@ -56,6 +56,8 @@ message CryptixdMessage {
     FastIntentMessage fastIntent = 58;
     FastMicroblockMessage fastMicroblock = 59;
     StrongNodeAnnouncementMessage strongNodeAnnouncement = 60;
+    RequestAntiFraudSnapshotV1Message requestAntiFraudSnapshotV1 = 61;
+    AntiFraudSnapshotV1Message antiFraudSnapshotV1 = 62;
   }
 }
 

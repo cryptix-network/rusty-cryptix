@@ -495,6 +495,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         config.default_p2p_port(),
         args.banserver,
         args.banserver_url.clone(),
+        Some(db_dir.clone()),
         p2p_tower_counters.clone(),
     ));
 

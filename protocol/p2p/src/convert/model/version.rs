@@ -18,6 +18,7 @@ pub struct Version {
     pub user_agent: String,
     pub disable_relay_tx: bool,
     pub subnetwork_id: Option<SubnetworkId>,
+    pub anti_fraud_hashes: Vec<[u8; 32]>,
 }
 
 impl Version {
@@ -38,6 +39,7 @@ impl Version {
             user_agent: format!("/{}:{}/", name(), version()),
             disable_relay_tx: false,
             subnetwork_id,
+            anti_fraud_hashes: Vec::new(),
         }
     }
 

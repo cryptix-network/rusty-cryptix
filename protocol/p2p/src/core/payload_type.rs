@@ -50,6 +50,8 @@ pub enum CryptixdMessagePayloadType {
     FastIntent,
     FastMicroblock,
     StrongNodeAnnouncement,
+    RequestAntiFraudSnapshotV1,
+    AntiFraudSnapshotV1,
 }
 
 impl From<&CryptixdMessagePayload> for CryptixdMessagePayloadType {
@@ -110,6 +112,8 @@ impl From<&CryptixdMessagePayload> for CryptixdMessagePayloadType {
             CryptixdMessagePayload::FastIntent(_) => CryptixdMessagePayloadType::FastIntent,
             CryptixdMessagePayload::FastMicroblock(_) => CryptixdMessagePayloadType::FastMicroblock,
             CryptixdMessagePayload::StrongNodeAnnouncement(_) => CryptixdMessagePayloadType::StrongNodeAnnouncement,
+            CryptixdMessagePayload::RequestAntiFraudSnapshotV1(_) => CryptixdMessagePayloadType::RequestAntiFraudSnapshotV1,
+            CryptixdMessagePayload::AntiFraudSnapshotV1(_) => CryptixdMessagePayloadType::AntiFraudSnapshotV1,
         }
     }
 }

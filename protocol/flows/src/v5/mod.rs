@@ -15,6 +15,7 @@ use self::{
     strong_nodes::StrongNodesRelayFlow,
     txrelay::flow::{RelayTransactionsFlow, RequestTransactionsFlow},
 };
+use crate::antifraud::{AntiFraudSnapshotRequestsFlow, AntiFraudSnapshotSyncFlow};
 use crate::{flow_context::FlowContext, flow_trait::Flow};
 
 use cryptix_p2p_lib::{CryptixdMessagePayloadType, Router, SharedIncomingRoute};
@@ -79,6 +80,16 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, hfa_capable: bool, strong
         )),
         Box::new(ReceivePingsFlow::new(ctx.clone(), router.clone(), router.subscribe(vec![CryptixdMessagePayloadType::Ping]))),
         Box::new(SendPingsFlow::new(ctx.clone(), router.clone(), router.subscribe(vec![CryptixdMessagePayloadType::Pong]))),
+        Box::new(AntiFraudSnapshotRequestsFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe(vec![CryptixdMessagePayloadType::RequestAntiFraudSnapshotV1]),
+        )),
+        Box::new(AntiFraudSnapshotSyncFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe_with_capacity(vec![CryptixdMessagePayloadType::AntiFraudSnapshotV1], 64),
+        )),
         Box::new(RequestHeadersFlow::new(
             ctx.clone(),
             router.clone(),
@@ -186,4 +197,21 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, hfa_capable: bool, strong
     // CryptixdMessagePayloadType::IbdBlockLocator,
 
     flows
+}
+
+pub fn register_restricted(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
+    vec![
+        Box::new(ReceivePingsFlow::new(ctx.clone(), router.clone(), router.subscribe(vec![CryptixdMessagePayloadType::Ping]))),
+        Box::new(SendPingsFlow::new(ctx.clone(), router.clone(), router.subscribe(vec![CryptixdMessagePayloadType::Pong]))),
+        Box::new(AntiFraudSnapshotRequestsFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe(vec![CryptixdMessagePayloadType::RequestAntiFraudSnapshotV1]),
+        )),
+        Box::new(AntiFraudSnapshotSyncFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe_with_capacity(vec![CryptixdMessagePayloadType::AntiFraudSnapshotV1], 64),
+        )),
+    ]
 }

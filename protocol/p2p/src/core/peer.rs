@@ -11,6 +11,8 @@ pub struct PeerProperties {
     pub disable_relay_tx: bool,
     pub subnetwork_id: Option<SubnetworkId>,
     pub time_offset: i64,
+    pub anti_fraud_hashes: Vec<[u8; 32]>,
+    pub anti_fraud_restricted: bool,
 }
 
 #[derive(Debug)]

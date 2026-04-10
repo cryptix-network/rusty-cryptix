@@ -8,7 +8,7 @@ use crate::strong_nodes::{StrongNodesEngine, StrongNodesEngineConfig, StrongNode
 use crate::{v5, v6};
 use async_trait::async_trait;
 use cryptix_addressmanager::AddressManager;
-use cryptix_connectionmanager::ConnectionManager;
+use cryptix_connectionmanager::{AntiFraudMode, ConnectionManager};
 use cryptix_consensus_core::api::{BlockValidationFuture, BlockValidationFutures};
 use cryptix_consensus_core::block::Block;
 use cryptix_consensus_core::config::Config;
@@ -99,6 +99,13 @@ const INBOUND_CONNECTION_RATE_LIMIT_MAX_TRACKED_IPS: usize = 4096;
 
 fn strong_node_static_id_raw(message: &StrongNodeAnnouncementMessage) -> Option<[u8; 32]> {
     message.static_id_raw.as_slice().try_into().ok()
+}
+
+fn anti_fraud_hash_window_from_vec(entries: &[[u8; 32]]) -> Option<[[u8; 32]; 3]> {
+    if entries.len() != 3 {
+        return None;
+    }
+    Some([entries[0], entries[1], entries[2]])
 }
 
 /// Represents a block event to be logged
@@ -1121,6 +1128,9 @@ impl ConnectionInitializer for FlowContext {
         // Subnets are not currently supported
         let mut self_version_message = Version::new(local_address, self.node_id, network_name.clone(), None, PROTOCOL_VERSION);
         self_version_message.add_user_agent(name(), version(), &self.config.user_agent_comments);
+        let local_anti_fraud_hash_window =
+            self.connection_manager().map(|cm| cm.anti_fraud_hash_window()).unwrap_or([[0u8; 32]; 3]);
+        self_version_message.anti_fraud_hashes = local_anti_fraud_hash_window.to_vec();
         if self.is_hfa_p2p_enabled() {
             self_version_message.services |= HFA_P2P_SERVICE_BIT;
         }
@@ -1168,12 +1178,27 @@ impl ConnectionInitializer for FlowContext {
             router, local_strong_nodes_enabled, peer_strong_nodes_enabled, peer_version.services, strong_nodes_capable
         );
 
+        let anti_fraud_mode = self
+            .connection_manager()
+            .map(|cm| match anti_fraud_hash_window_from_vec(&peer_version.anti_fraud_hashes) {
+                Some(peer_hash_window) => cm.anti_fraud_mode_for_peer_hashes(&peer_hash_window),
+                None => AntiFraudMode::Restricted,
+            })
+            .unwrap_or(AntiFraudMode::Restricted);
+
         let payload_hf_active = self.is_payload_hf_active();
         let (flows, applied_protocol_version) = if payload_hf_active {
             // After payload HF activation we no longer accept legacy P2P protocol versions.
             match peer_version.protocol_version {
                 v if v >= PROTOCOL_VERSION => {
-                    (v6::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), PROTOCOL_VERSION)
+                    match anti_fraud_mode {
+                        AntiFraudMode::Full => {
+                            (v6::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), PROTOCOL_VERSION)
+                        }
+                        AntiFraudMode::Restricted => {
+                            (v6::register_restricted(self.clone(), router.clone()), PROTOCOL_VERSION)
+                        }
+                    }
                 }
                 v => return Err(ProtocolError::VersionMismatch(PROTOCOL_VERSION, v)),
             }
@@ -1196,6 +1221,8 @@ impl ConnectionInitializer for FlowContext {
             disable_relay_tx: peer_version.disable_relay_tx,
             subnetwork_id: peer_version.subnetwork_id.to_owned(),
             time_offset,
+            anti_fraud_hashes: peer_version.anti_fraud_hashes.clone(),
+            anti_fraud_restricted: payload_hf_active && anti_fraud_mode == AntiFraudMode::Restricted,
         });
         router.set_properties(peer_properties);
 

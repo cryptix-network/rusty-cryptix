@@ -14,4 +14,4 @@ For more information please refer to the GitHub repository `README.md` located a
 
 - CLI: `--banserver` (enable), `--no-banserver` (disable), `--banserver-url=<URL>` (override endpoint)
 - Config file: `banserver = true|false`, `banserver-url = "<URL>"`
-- Default: enabled, endpoint `https://antifraud.cryptix-network.org/api/confirmed-cases/iplist`
+- Default: enabled, endpoint `https://antifraud.cryptix-network.org/api/v1/antifraud/snapshot`

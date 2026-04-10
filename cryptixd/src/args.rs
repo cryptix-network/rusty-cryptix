@@ -12,7 +12,7 @@ use serde_with::{serde_as, DisplayFromStr};
 use std::{ffi::OsString, fs};
 use toml::from_str;
 
-const DEFAULT_BANSERVER_URL: &str = "https://antifraud.cryptix-network.org/api/confirmed-cases/iplist";
+const DEFAULT_BANSERVER_URL: &str = "https://antifraud.cryptix-network.org/api/v1/antifraud/snapshot";
 
 #[cfg(feature = "devnet-prealloc")]
 use cryptix_addresses::Address;

@@ -22,4 +22,7 @@ parking_lot.workspace = true
 rand.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde_json.workspace = true
+serde.workspace = true
+blake3.workspace = true
+secp256k1.workspace = true
 tokio.workspace = true
