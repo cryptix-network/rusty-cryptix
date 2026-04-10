@@ -1165,12 +1165,23 @@ impl ConnectionInitializer for FlowContext {
             router, local_strong_nodes_enabled, peer_strong_nodes_enabled, peer_version.services, strong_nodes_capable
         );
 
-        let (flows, applied_protocol_version) = match peer_version.protocol_version {
-            v if v >= PROTOCOL_VERSION => {
-                (v6::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), PROTOCOL_VERSION)
+        let payload_hf_active = self.is_payload_hf_active();
+        let (flows, applied_protocol_version) = if payload_hf_active {
+            // After payload HF activation we no longer accept legacy P2P protocol versions.
+            match peer_version.protocol_version {
+                v if v >= PROTOCOL_VERSION => {
+                    (v6::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), PROTOCOL_VERSION)
+                }
+                v => return Err(ProtocolError::VersionMismatch(PROTOCOL_VERSION, v)),
             }
-            5 => (v5::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), 5),
-            v => return Err(ProtocolError::VersionMismatch(PROTOCOL_VERSION, v)),
+        } else {
+            match peer_version.protocol_version {
+                v if v >= PROTOCOL_VERSION => {
+                    (v6::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), PROTOCOL_VERSION)
+                }
+                5 => (v5::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), 5),
+                v => return Err(ProtocolError::VersionMismatch(PROTOCOL_VERSION, v)),
+            }
         };
 
         // Build and register the peer properties
