@@ -735,6 +735,15 @@ async fn sanity_test() {
                 })
             }
 
+            CryptixdPayloadOps::GetStrongNodes => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let response = rpc_client.get_strong_nodes_call(None, GetStrongNodesRequest {}).await.unwrap();
+                    assert_eq!(response.seq_conflict_total, 0);
+                    assert!(response.entries.is_empty());
+                })
+            }
+
             CryptixdPayloadOps::NotifyBlockAdded => {
                 let rpc_client = client.clone();
                 let id = listener_id;

@@ -27,7 +27,7 @@ use tokio::{
 };
 
 pub const DEFAULT_BANSERVER_URL: &str = "https://antifraud.cryptix-network.org/api/confirmed-cases/iplist";
-const BANSERVER_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const BANSERVER_REFRESH_INTERVAL: Duration = Duration::from_secs(20 * 60);
 const BANSERVER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const BANSERVER_MAX_IPS: usize = 10_000;
 const BANSERVER_MAX_IP_ENTRY_LEN: usize = 64;
