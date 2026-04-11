@@ -304,6 +304,7 @@ mod mockery {
                 advertised_protocol_version: mock(),
                 time_connected: mock(),
                 is_ibd_peer: mock(),
+                unified_node_id: Some("00".repeat(32)),
             }
         }
     }

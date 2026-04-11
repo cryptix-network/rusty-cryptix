@@ -19,6 +19,7 @@ from!(item: &cryptix_rpc_core::RpcPeerInfo, protowire::GetConnectedPeerInfoMessa
         advertised_protocol_version: item.advertised_protocol_version,
         time_connected: item.time_connected as i64,
         is_ibd_peer: item.is_ibd_peer,
+        unified_node_id: item.unified_node_id.clone().unwrap_or_default(),
     }
 });
 
@@ -40,6 +41,7 @@ try_from!(item: &protowire::GetConnectedPeerInfoMessage, cryptix_rpc_core::RpcPe
         advertised_protocol_version: item.advertised_protocol_version,
         time_connected: item.time_connected as u64,
         is_ibd_peer: item.is_ibd_peer,
+        unified_node_id: if item.unified_node_id.is_empty() { None } else { Some(item.unified_node_id.clone()) },
     }
 });
 

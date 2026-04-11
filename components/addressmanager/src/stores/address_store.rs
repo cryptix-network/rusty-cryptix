@@ -16,6 +16,8 @@ use crate::NetAddress;
 pub struct Entry {
     pub connection_failed_count: u64,
     pub address: NetAddress,
+    #[serde(default)]
+    pub verified: bool,
 }
 
 impl MemSizeEstimator for Entry {}
@@ -115,6 +117,6 @@ impl AddressesStore for DbAddressesStore {
 
     fn set_failed_count(&mut self, key: AddressKey, connection_failed_count: u64) -> StoreResult<()> {
         let entry = self.get(key)?;
-        self.set(key, Entry { connection_failed_count, address: entry.address })
+        self.set(key, Entry { connection_failed_count, address: entry.address, verified: entry.verified })
     }
 }

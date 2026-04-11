@@ -279,6 +279,9 @@ message GetConnectedPeerInfoMessage{
 
   // Whether this peer is the IBD peer (if IBD is running)
   bool isIbdPeer = 11;
+
+  // Unified node identity advertised during handshake (hex-encoded BLAKE3-256 over x-only pubkey).
+  string unifiedNodeId = 12;
 }
 
 // AddPeerRequestMessage adds a peer to cryptixd's outgoing connection list.

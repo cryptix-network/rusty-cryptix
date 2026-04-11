@@ -1,4 +1,5 @@
 use cryptix_connectionmanager::AntiFraudNetwork;
+use cryptix_core::{info, warn};
 use hex::{decode as hex_decode, encode as hex_encode};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use secp256k1::{schnorr::Signature as SchnorrSignature, Keypair, Message as SecpMessage, SecretKey, XOnlyPublicKey};
@@ -7,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const NODE_IDENTITY_SCHEMA_VERSION: u32 = 1;
 const NODE_IDENTITY_FILE_MAX_BYTES: usize = 16 * 1024;
@@ -15,8 +16,8 @@ const STRONG_NODES_DIR: &str = "strong-nodes";
 const NODE_IDENTITY_FILE: &str = "node_identity.json";
 const NODE_POW_DOMAIN_TAG: &[u8] = b"cryptix-node-id-pow-v1";
 const NODE_AUTH_DOMAIN_TAG: &[u8] = b"cryptix-node-id-auth-v1";
-const MAINNET_NODE_POW_DIFFICULTY: u8 = 20;
-const NON_MAINNET_NODE_POW_DIFFICULTY: u8 = 18;
+const MAINNET_NODE_POW_DIFFICULTY: u8 = 24;
+const NON_MAINNET_NODE_POW_DIFFICULTY: u8 = 22;
 
 #[derive(Clone, Debug)]
 pub struct UnifiedNodeIdentity {
@@ -40,20 +41,42 @@ struct NodeIdentityDisk {
 
 pub fn load_or_create_identity(app_data_dir: &Path, network_name: &str) -> Result<UnifiedNodeIdentity, String> {
     let network_code = network_code_from_name(network_name).ok_or_else(|| format!("unsupported network name `{network_name}`"))?;
+    let difficulty = node_pow_difficulty(network_code).ok_or_else(|| format!("unsupported network code `{network_code}`"))?;
     let node_identity_dir = app_data_dir.join(STRONG_NODES_DIR);
     fs::create_dir_all(&node_identity_dir).map_err(|err| format!("failed creating node identity directory: {err}"))?;
     let node_identity_path = node_identity_dir.join(NODE_IDENTITY_FILE);
 
     if node_identity_path.exists() {
         match load_identity_file(&node_identity_path, network_code) {
-            Ok(identity) => return Ok(identity),
+            Ok(identity) => {
+                info!(
+                    "Unified node identity loaded from disk (path: {}, pubkey_xonly: {}, node_id: {}, pow_nonce: {}, difficulty: {})",
+                    node_identity_path.display(),
+                    hex_encode(identity.pubkey_xonly),
+                    hex_encode(identity.node_id),
+                    identity.pow_nonce,
+                    difficulty
+                );
+                return Ok(identity);
+            }
             Err(err) => {
+                warn!(
+                    "Unified node identity file invalid/corrupt (path: {}, reason: {}), quarantining and regenerating",
+                    node_identity_path.display(),
+                    err
+                );
                 quarantine_corrupted_identity(&node_identity_path);
-                let _ = err;
             }
         }
     }
 
+    info!(
+        "Unified node identity generation started (path: {}, network: {}, network_code: {}, difficulty: {})",
+        node_identity_path.display(),
+        network_name,
+        network_code,
+        difficulty
+    );
     create_and_persist_identity(&node_identity_path, network_code)
 }
 
@@ -170,11 +193,13 @@ pub fn leading_zero_bits(hash: &[u8; 32]) -> u8 {
 }
 
 fn create_and_persist_identity(identity_path: &Path, network_code: u8) -> Result<UnifiedNodeIdentity, String> {
+    let difficulty = node_pow_difficulty(network_code).ok_or_else(|| format!("unsupported network code `{network_code}`"))?;
     let mut rng = rand::thread_rng();
     let secret_key = SecretKey::new(&mut rng);
     let keypair = Keypair::from_secret_key(secp256k1::SECP256K1, &secret_key);
     let pubkey_xonly = keypair.x_only_public_key().0.serialize();
     let node_id = compute_node_id(&pubkey_xonly);
+    let mine_started_at = Instant::now();
     let pow_nonce = mine_pow_nonce(network_code, &pubkey_xonly);
     let disk = NodeIdentityDisk {
         schema_version: NODE_IDENTITY_SCHEMA_VERSION,
@@ -185,6 +210,15 @@ fn create_and_persist_identity(identity_path: &Path, network_code: u8) -> Result
         pow_nonce: Some(pow_nonce),
     };
     persist_identity_file(identity_path, &disk)?;
+    info!(
+        "Unified node identity generation finished (path: {}, pubkey_xonly: {}, node_id: {}, pow_nonce: {}, difficulty: {}, elapsed_ms: {})",
+        identity_path.display(),
+        hex_encode(pubkey_xonly),
+        hex_encode(node_id),
+        pow_nonce,
+        difficulty,
+        mine_started_at.elapsed().as_millis()
+    );
     Ok(UnifiedNodeIdentity { secret_key, pubkey_xonly, node_id, pow_nonce })
 }
 
@@ -215,11 +249,29 @@ fn load_identity_file(identity_path: &Path, network_code: u8) -> Result<UnifiedN
 
     let mut pow_nonce = disk.pow_nonce.unwrap_or(0);
     if !is_valid_pow_nonce(network_code, &stored_pubkey, pow_nonce) {
+        let difficulty = node_pow_difficulty(network_code).unwrap_or(0);
+        info!(
+            "Unified node identity PoW is missing/invalid; re-mining (path: {}, pubkey_xonly: {}, old_pow_nonce: {}, difficulty: {})",
+            identity_path.display(),
+            hex_encode(stored_pubkey),
+            pow_nonce,
+            difficulty
+        );
+        let mine_started_at = Instant::now();
         pow_nonce = mine_pow_nonce(network_code, &stored_pubkey);
         disk.public_key_xonly = hex_encode(stored_pubkey);
         disk.static_id_raw = hex_encode(node_id);
         disk.pow_nonce = Some(pow_nonce);
         persist_identity_file(identity_path, &disk)?;
+        info!(
+            "Unified node identity PoW re-mined (path: {}, pubkey_xonly: {}, node_id: {}, pow_nonce: {}, difficulty: {}, elapsed_ms: {})",
+            identity_path.display(),
+            hex_encode(stored_pubkey),
+            hex_encode(node_id),
+            pow_nonce,
+            difficulty,
+            mine_started_at.elapsed().as_millis()
+        );
     }
 
     Ok(UnifiedNodeIdentity { secret_key, pubkey_xonly: stored_pubkey, node_id, pow_nonce })
@@ -312,42 +364,48 @@ mod tests {
     }
 
     #[test]
+    fn pow_difficulty_constants_are_locked() {
+        assert_eq!(MAINNET_NODE_POW_DIFFICULTY, 24);
+        assert_eq!(NON_MAINNET_NODE_POW_DIFFICULTY, 22);
+    }
+
+    #[test]
     fn cross_language_vectors_match() {
         let vectors = [
             (
                 0u8,
                 "6d6caac248af96f6afa7f904f550253a0f3ef3f5aa2fe6838a95b216691468e2",
                 "1b393963bd75edc656dbc0207e35416c509d27a2bf83119c4b4f916bedbab3a2",
-                1763949u64,
-                "00000bc349b49f4e4ade68388d08c61b675702a222d254d8d4411e9c5e46e1be",
+                35392942u64,
+                "000000b2f399876eaed4de3156fe4aafa1b451e1a1ea2b3fa245e310dc9022ad",
             ),
             (
                 0u8,
                 "5f7117a78150fe2ef97db7cfc83bd57b2e2c0d0dd25eaf467a4a1c2a45ce1486",
                 "53240c1f9d4506e30994f69fbbf8feb97f3d2e0d89330cf76207b41fef73d994",
-                1297078u64,
-                "00000cc9a5a11330fa7921cab2ecde7cddf9898bc90067f833bfe67c4c8f9af0",
+                13829020u64,
+                "000000e250482b9640b31048b25776572deb49e45de48217938b2003ee4ef731",
             ),
             (
                 1u8,
                 "fc10777c57060195c83e9885c790c8a26496d305b366b8e5fbf475203c680f79",
                 "e28077604051f2d4cc5218b7d57e81164203ccfb2b503b2aa0dd8fd30c19e274",
-                345502u64,
-                "00003e411f41cc52438ec9dafca71e57ca44008506d3fe7535abd46229e17594",
+                8894582u64,
+                "000003867828f13ad967b222c180b6f75d5db14ca6e4804395113b93896cca15",
             ),
             (
                 2u8,
                 "c93b4ed533a76866a3c3ea1cc0bc3e70c0dbe32a945057b5dff95b88ce9280dd",
                 "524988b85b8b6ba0d4e24b934cc5b129c628f70609932cd4509e82eb6a22556a",
-                124967u64,
-                "000015e1c263f2bb0d143105ce860e510f83a35fb8add33543ca7336e0a98c9a",
+                1588910u64,
+                "000002136045d006fa98697640fed65804859d1d96342298c17c019243b61d97",
             ),
             (
                 3u8,
                 "01ea552a43712c4c96771ce1e9f83a877a735b31b3e200df94c661153c7dcb4b",
                 "570a7eadd0f105a27fd5530dd175a8d8d21c38b657206afdd37e6cd644b4b84f",
-                211636u64,
-                "00003cba8df2eb272709f06a05f870d71ac9f3c866f9d4ab0e2b4e1026c52aea",
+                9081845u64,
+                "0000000f4fce90bc93a2644f41cee1aa4774b367e49fce64a8d8fb49e160fe99",
             ),
         ];
 

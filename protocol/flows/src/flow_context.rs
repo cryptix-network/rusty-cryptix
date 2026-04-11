@@ -1346,11 +1346,11 @@ impl ConnectionInitializer for FlowContext {
             let mut address_manager = self.address_manager.lock();
 
             if router.is_outbound() {
-                address_manager.add_address(router.net_address().into());
+                address_manager.add_verified_address(router.net_address().into());
             }
 
             if let Some(peer_ip_address) = peer_version.address {
-                address_manager.add_address(peer_ip_address);
+                address_manager.add_verified_address(peer_ip_address);
             }
         }
 

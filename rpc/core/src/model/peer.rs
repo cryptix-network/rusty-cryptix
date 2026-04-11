@@ -20,4 +20,5 @@ pub struct RpcPeerInfo {
     pub advertised_protocol_version: u32,
     pub time_connected: u64, // NOTE: i64 in gRPC protowire
     pub is_ibd_peer: bool,
+    pub unified_node_id: Option<String>,
 }

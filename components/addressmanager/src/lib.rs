@@ -259,6 +259,14 @@ impl AddressManager {
     }
 
     pub fn add_address(&mut self, address: NetAddress) {
+        self.add_address_impl(address, false);
+    }
+
+    pub fn add_verified_address(&mut self, address: NetAddress) {
+        self.add_address_impl(address, true);
+    }
+
+    fn add_address_impl(&mut self, address: NetAddress, verified: bool) {
         if address.ip.is_loopback() || address.ip.is_unspecified() {
             debug!("[Address manager] skipping local address {}", address.ip);
             return;
@@ -269,11 +277,18 @@ impl AddressManager {
         }
 
         if self.address_store.has(address) {
+            if verified {
+                let entry = self.address_store.get(address);
+                if !entry.verified {
+                    self.address_store.set(address, entry.connection_failed_count, true);
+                }
+            }
             return;
         }
 
-        // We mark `connection_failed_count` as 0 only after first success
-        self.address_store.set(address, 1);
+        // We mark `connection_failed_count` as 0 only after first success.
+        // Addresses learned from gossip are unverified until a successful handshake.
+        self.address_store.set(address, 1, verified);
     }
 
     pub fn mark_connection_failure(&mut self, address: NetAddress) {
@@ -285,7 +300,8 @@ impl AddressManager {
         if new_count > MAX_CONNECTION_FAILED_COUNT {
             self.address_store.remove(address);
         } else {
-            self.address_store.set(address, new_count);
+            let verified = self.address_store.get(address).verified;
+            self.address_store.set(address, new_count, verified);
         }
     }
 
@@ -294,11 +310,15 @@ impl AddressManager {
             return;
         }
 
-        self.address_store.set(address, 0);
+        self.address_store.set(address, 0, true);
     }
 
     pub fn iterate_addresses(&self) -> impl Iterator<Item = NetAddress> + '_ {
         self.address_store.iterate_addresses()
+    }
+
+    pub fn iterate_verified_addresses(&self) -> impl Iterator<Item = NetAddress> + '_ {
+        self.address_store.iterate_verified_addresses()
     }
 
     pub fn iterate_prioritized_random_addresses(&self, exceptions: HashSet<NetAddress>) -> impl ExactSizeIterator<Item = NetAddress> {
@@ -384,10 +404,10 @@ mod address_store_with_cache {
             self.addresses.contains_key(&address.into())
         }
 
-        pub fn set(&mut self, address: NetAddress, connection_failed_count: u64) {
+        pub fn set(&mut self, address: NetAddress, connection_failed_count: u64, verified: bool) {
             let entry = match self.addresses.get(&address.into()) {
-                Some(entry) => Entry { connection_failed_count, address: entry.address },
-                None => Entry { connection_failed_count, address },
+                Some(entry) => Entry { connection_failed_count, address: entry.address, verified: entry.verified || verified },
+                None => Entry { connection_failed_count, address, verified },
             };
             self.db_store.set(address.into(), entry).unwrap();
             self.addresses.insert(address.into(), entry);
@@ -417,6 +437,10 @@ mod address_store_with_cache {
 
         pub fn iterate_addresses(&self) -> impl Iterator<Item = NetAddress> + '_ {
             self.addresses.values().map(|entry| entry.address)
+        }
+
+        pub fn iterate_verified_addresses(&self) -> impl Iterator<Item = NetAddress> + '_ {
+            self.addresses.values().filter(|entry| entry.verified).map(|entry| entry.address)
         }
 
         /// This iterator functions as the node's ip routing selection algo.

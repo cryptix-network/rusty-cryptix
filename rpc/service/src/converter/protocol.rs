@@ -3,6 +3,7 @@ use std::sync::Arc;
 use cryptix_p2p_flows::flow_context::FlowContext;
 use cryptix_p2p_lib::{Peer, PeerKey};
 use cryptix_rpc_core::RpcPeerInfo;
+use cryptix_utils::hex::ToHex;
 
 pub struct ProtocolConverter {
     flow_context: Arc<FlowContext>,
@@ -25,6 +26,7 @@ impl ProtocolConverter {
             user_agent: properties.user_agent.clone(),
             advertised_protocol_version: properties.advertised_protocol_version,
             time_connected: peer.time_connected(),
+            unified_node_id: properties.unified_node_id.map(|id| id.as_slice().to_hex()),
         }
     }
 
