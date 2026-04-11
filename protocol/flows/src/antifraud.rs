@@ -1,6 +1,6 @@
 use crate::{flow_context::FlowContext, flow_trait::Flow};
 use async_trait::async_trait;
-use cryptix_connectionmanager::{AntiFraudMode, AntiFraudSnapshotEnvelope};
+use cryptix_connectionmanager::{AntiFraudMode, AntiFraudSnapshotEnvelope, ConnectionManager, ANTI_FRAUD_HASH_WINDOW_LEN, ANTI_FRAUD_ZERO_HASH};
 use cryptix_core::{debug, warn};
 use cryptix_p2p_lib::{
     common::ProtocolError,
@@ -23,6 +23,15 @@ fn anti_fraud_hash_window_from_vec(entries: &[[u8; 32]]) -> Option<[[u8; 32]; 3]
         return None;
     }
     Some([entries[0], entries[1], entries[2]])
+}
+
+fn normalized_peer_hash_window(entries: &[[u8; 32]]) -> [[u8; 32]; ANTI_FRAUD_HASH_WINDOW_LEN] {
+    let candidate = anti_fraud_hash_window_from_vec(entries).unwrap_or([ANTI_FRAUD_ZERO_HASH; ANTI_FRAUD_HASH_WINDOW_LEN]);
+    if ConnectionManager::validate_hash_window(&candidate) {
+        candidate
+    } else {
+        [ANTI_FRAUD_ZERO_HASH; ANTI_FRAUD_HASH_WINDOW_LEN]
+    }
 }
 
 pub struct AntiFraudSnapshotRequestsFlow {
@@ -159,8 +168,19 @@ impl Flow for AntiFraudSnapshotSyncFlow {
                         signature: payload.signature,
                     };
                     match connection_manager.ingest_peer_snapshot(self.router.key(), envelope) {
-                        Ok(applied) => {
-                            if applied {
+                        Ok(result) => {
+                            // Keep peer hash view fresh based on verified snapshot messages so
+                            // mode rechecks are not stuck on stale handshake hashes.
+                            let props = self.router.properties();
+                            let current_window = normalized_peer_hash_window(&props.anti_fraud_hashes);
+                            let updated_window = ConnectionManager::advance_peer_hash_window(current_window, result.root_hash);
+                            if updated_window != current_window {
+                                let mut updated_props = (*props).clone();
+                                updated_props.anti_fraud_hashes = updated_window.to_vec();
+                                self.router.set_properties(Arc::new(updated_props));
+                            }
+
+                            if result.applied {
                                 debug!("Applied peer anti-fraud snapshot from {}", self.router);
                             }
                         }

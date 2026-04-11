@@ -170,6 +170,12 @@ struct PeerSnapshotVote {
     snapshot: AntiFraudSnapshot,
 }
 
+#[derive(Clone, Debug)]
+pub struct IngestPeerSnapshotResult {
+    pub applied: bool,
+    pub root_hash: [u8; 32],
+}
+
 #[derive(Debug)]
 struct AntiFraudState {
     current_snapshot: Option<AntiFraudSnapshot>,
@@ -591,8 +597,13 @@ impl ConnectionManager {
             .any(|local_hash| remote.iter().any(|remote_hash| *remote_hash == *local_hash && *remote_hash != ANTI_FRAUD_ZERO_HASH))
     }
 
-    pub fn ingest_peer_snapshot(&self, peer_key: PeerKey, envelope: AntiFraudSnapshotEnvelope) -> Result<bool, String> {
+    pub fn ingest_peer_snapshot(
+        &self,
+        peer_key: PeerKey,
+        envelope: AntiFraudSnapshotEnvelope,
+    ) -> Result<IngestPeerSnapshotResult, String> {
         let snapshot = self.normalize_snapshot_envelope(envelope)?;
+        let peer_root_hash = snapshot.root_hash;
         let peer_label = peer_key.to_string();
         let now = Instant::now();
 
@@ -601,7 +612,7 @@ impl ConnectionManager {
         state.peer_votes.retain(|_, vote| vote.received_at.elapsed() <= PEER_CANDIDATE_MAX_AGE);
 
         let Some(max_seq) = state.peer_votes.values().map(|vote| vote.snapshot.snapshot_seq).max() else {
-            return Ok(false);
+            return Ok(IngestPeerSnapshotResult { applied: false, root_hash: peer_root_hash });
         };
         let candidates = state
             .peer_votes
@@ -610,7 +621,7 @@ impl ConnectionManager {
             .map(|vote| vote.snapshot.clone())
             .collect_vec();
         if candidates.is_empty() {
-            return Ok(false);
+            return Ok(IngestPeerSnapshotResult { applied: false, root_hash: peer_root_hash });
         }
 
         let mut counts = HashMap::<[u8; 32], usize>::new();
@@ -620,12 +631,13 @@ impl ConnectionManager {
         let (winner_hash, winner_votes) = counts.into_iter().max_by_key(|(_, count)| *count).expect("counts is non-empty");
         let strict_majority = winner_votes > (candidates.len() / 2);
         if !strict_majority {
-            return Ok(false);
+            return Ok(IngestPeerSnapshotResult { applied: false, root_hash: peer_root_hash });
         }
 
         let winner = candidates.into_iter().find(|candidate| candidate.root_hash == winner_hash).expect("winner hash exists");
         drop(state);
-        self.try_apply_snapshot(winner, "peer-majority")
+        let applied = self.try_apply_snapshot(winner, "peer-majority")?;
+        Ok(IngestPeerSnapshotResult { applied, root_hash: peer_root_hash })
     }
 
     async fn request_peer_snapshots_tick(self: Arc<Self>) {
@@ -1164,6 +1176,13 @@ impl ConnectionManager {
             ordered.push(ANTI_FRAUD_ZERO_HASH);
         }
         [ordered[0], ordered[1], ordered[2]]
+    }
+
+    pub fn advance_peer_hash_window(
+        current: [[u8; 32]; ANTI_FRAUD_HASH_WINDOW_LEN],
+        new_hash: [u8; 32],
+    ) -> [[u8; 32]; ANTI_FRAUD_HASH_WINDOW_LEN] {
+        Self::advance_hash_window(current, new_hash)
     }
 
     fn anti_fraud_current_path(&self) -> Option<PathBuf> {
