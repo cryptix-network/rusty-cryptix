@@ -2541,7 +2541,7 @@ pub struct RpcStrongNodeEntry {
 
 impl Serializer for RpcStrongNodeEntry {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &2, writer)?;
+        store!(u16, &1, writer)?;
         store!(String, &self.node_id, writer)?;
         store!(String, &self.public_key_xonly, writer)?;
         store!(String, &self.source, writer)?;
@@ -2555,51 +2555,15 @@ impl Serializer for RpcStrongNodeEntry {
 
 impl Deserializer for RpcStrongNodeEntry {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let version = load!(u16, reader)?;
-        match version {
-            1 => {
-                let static_id = load!(String, reader)?;
-                let public_key_xonly = load!(String, reader)?;
-                let source = load!(String, reader)?;
-                let _signature_valid = load!(bool, reader)?;
-                let _performance_verified = load!(bool, reader)?;
-                let _claimed_ip = load!(Option<String>, reader)?;
-                let _last_sender_ip = load!(Option<String>, reader)?;
-                let _seq_no = load!(u64, reader)?;
-                let found_blocks_10m = load!(u32, reader)?;
-                let _total_blocks_10m = load!(u32, reader)?;
-                let share_bps = load!(u32, reader)?;
-                let _window_start_ms = load!(u64, reader)?;
-                let _window_end_ms = load!(u64, reader)?;
-                let sent_at_ms = load!(u64, reader)?;
-                let _first_seen_ms = load!(u64, reader)?;
-                let _last_seen_ms = load!(u64, reader)?;
-                let _last_announce_sent_at_ms = load!(u64, reader)?;
-                let _is_stale = load!(bool, reader)?;
-                Ok(Self {
-                    node_id: static_id,
-                    public_key_xonly,
-                    source,
-                    claimed_blocks: found_blocks_10m,
-                    share_bps,
-                    last_claim_block_hash: None,
-                    last_claim_time_ms: sent_at_ms,
-                })
-            }
-            2 => {
-                let node_id = load!(String, reader)?;
-                let public_key_xonly = load!(String, reader)?;
-                let source = load!(String, reader)?;
-                let claimed_blocks = load!(u32, reader)?;
-                let share_bps = load!(u32, reader)?;
-                let last_claim_block_hash = load!(Option<String>, reader)?;
-                let last_claim_time_ms = load!(u64, reader)?;
-                Ok(Self { node_id, public_key_xonly, source, claimed_blocks, share_bps, last_claim_block_hash, last_claim_time_ms })
-            }
-            _ => {
-                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("unsupported RpcStrongNodeEntry version: {version}")))
-            }
-        }
+        let _version = load!(u16, reader)?;
+        let node_id = load!(String, reader)?;
+        let public_key_xonly = load!(String, reader)?;
+        let source = load!(String, reader)?;
+        let claimed_blocks = load!(u32, reader)?;
+        let share_bps = load!(u32, reader)?;
+        let last_claim_block_hash = load!(Option<String>, reader)?;
+        let last_claim_time_ms = load!(u64, reader)?;
+        Ok(Self { node_id, public_key_xonly, source, claimed_blocks, share_bps, last_claim_block_hash, last_claim_time_ms })
     }
 }
 
@@ -2618,7 +2582,7 @@ pub struct GetStrongNodesResponse {
 
 impl Serializer for GetStrongNodesResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &2, writer)?;
+        store!(u16, &1, writer)?;
         store!(bool, &self.enabled_by_config, writer)?;
         store!(bool, &self.hardfork_active, writer)?;
         store!(bool, &self.runtime_available, writer)?;
@@ -2633,52 +2597,25 @@ impl Serializer for GetStrongNodesResponse {
 
 impl Deserializer for GetStrongNodesResponse {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let version = load!(u16, reader)?;
-        match version {
-            1 => {
-                let enabled_by_config = load!(bool, reader)?;
-                let hardfork_active = load!(bool, reader)?;
-                let runtime_available = load!(bool, reader)?;
-                let disabled_reason_code = load!(Option<String>, reader)?;
-                let disabled_reason_message = load!(Option<String>, reader)?;
-                let conflict_total = load!(u64, reader)?;
-                let entries = load!(Vec<RpcStrongNodeEntry>, reader)?;
-                Ok(Self {
-                    enabled_by_config,
-                    hardfork_active,
-                    runtime_available,
-                    disabled_reason_code,
-                    disabled_reason_message,
-                    conflict_total,
-                    window_size: 0,
-                    entries,
-                })
-            }
-            2 => {
-                let enabled_by_config = load!(bool, reader)?;
-                let hardfork_active = load!(bool, reader)?;
-                let runtime_available = load!(bool, reader)?;
-                let disabled_reason_code = load!(Option<String>, reader)?;
-                let disabled_reason_message = load!(Option<String>, reader)?;
-                let conflict_total = load!(u64, reader)?;
-                let window_size = load!(u32, reader)?;
-                let entries = load!(Vec<RpcStrongNodeEntry>, reader)?;
-                Ok(Self {
-                    enabled_by_config,
-                    hardfork_active,
-                    runtime_available,
-                    disabled_reason_code,
-                    disabled_reason_message,
-                    conflict_total,
-                    window_size,
-                    entries,
-                })
-            }
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unsupported GetStrongNodesResponse version: {version}"),
-            )),
-        }
+        let _version = load!(u16, reader)?;
+        let enabled_by_config = load!(bool, reader)?;
+        let hardfork_active = load!(bool, reader)?;
+        let runtime_available = load!(bool, reader)?;
+        let disabled_reason_code = load!(Option<String>, reader)?;
+        let disabled_reason_message = load!(Option<String>, reader)?;
+        let conflict_total = load!(u64, reader)?;
+        let window_size = load!(u32, reader)?;
+        let entries = load!(Vec<RpcStrongNodeEntry>, reader)?;
+        Ok(Self {
+            enabled_by_config,
+            hardfork_active,
+            runtime_available,
+            disabled_reason_code,
+            disabled_reason_message,
+            conflict_total,
+            window_size,
+            entries,
+        })
     }
 }
 
