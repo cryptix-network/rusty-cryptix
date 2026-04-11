@@ -104,6 +104,7 @@ fn build_dummy_version_message() -> VersionMessage {
         anti_fraud_hashes: Vec::new(),
         node_pubkey_xonly: Vec::new(),
         node_pow_nonce: None,
+        node_challenge_nonce: None,
     }
 }
 
@@ -137,7 +138,7 @@ impl ConnectionInitializer for EchoFlowInitializer {
         EchoFlow::register(router.clone()).await;
 
         // Send a ready signal
-        handshake.exchange_ready_messages().await?;
+        handshake.exchange_ready_messages(pb::ReadyMessage { node_auth_signature: Vec::new() }).await?;
 
         // Note: at this point receivers for handshake subscriptions
         // are dropped, thus effectively unsubscribing

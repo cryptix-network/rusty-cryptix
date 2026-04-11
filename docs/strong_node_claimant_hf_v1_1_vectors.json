@@ -1,0 +1,52 @@
+[
+  {
+    "name": "v1-mainnet-a",
+    "network_u8": 0,
+    "private_key_hex": "9e335f14f1a549c374a273b014e4e6658c666b9be6bb7478085510abcba7fae2",
+    "block_hash_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+    "pubkey_xonly_hex": "c93b4ed533a76866a3c3ea1cc0bc3e70c0dbe32a945057b5dff95b88ce9280dd",
+    "node_id_hex": "524988b85b8b6ba0d4e24b934cc5b129c628f70609932cd4509e82eb6a22556a",
+    "claim_digest_hex": "75d237a8084b859aecb3d0d301cf2d3cd4432ce7e1dbc6406d6b5d2df29d36f0",
+    "signature_hex": "e7470143eb3b21b178064070b70cd9fd0e76c65b9530035b1e7457fffce58f8c118fb511ffc7a50bbfaf78615f4bf8daaaa58847b1b8f867bd2bbc3fe9fc8ca3"
+  },
+  {
+    "name": "v2-mainnet-b",
+    "network_u8": 0,
+    "private_key_hex": "09bd7f60bd8bebf178d23abe7744da54cb0d6803b16bb498f0b443fe768c31ee",
+    "block_hash_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "pubkey_xonly_hex": "fc10777c57060195c83e9885c790c8a26496d305b366b8e5fbf475203c680f79",
+    "node_id_hex": "e28077604051f2d4cc5218b7d57e81164203ccfb2b503b2aa0dd8fd30c19e274",
+    "claim_digest_hex": "ca24240141f292ace353928d6a04de2eca2350fbf53943241472c00bde3e73dc",
+    "signature_hex": "63efb9137f5352aba7cdaa4d2b71e9ddb3e5e3a84e087040553136e0f69c2ccfc50135f469ccfa06e9ca94b40ea1a58b3572d1a1acdb8614b8d782799d736563"
+  },
+  {
+    "name": "v3-testnet-a",
+    "network_u8": 1,
+    "private_key_hex": "1f1e1d1c1b1a191817161514131211101f1e1d1c1b1a19181716151413121110",
+    "block_hash_hex": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+    "pubkey_xonly_hex": "ba009b5a635794425a7aeb795a26632b4976e3bee84e125f907754e6a4248e2b",
+    "node_id_hex": "c551112122efad5f65e893f1f5bab0badcd4041f52a68257c8e78e40320bf820",
+    "claim_digest_hex": "ce920465aadcad67dbbdc2a030c7f9b1fb84178066bd603dd960ce0285c3af9f",
+    "signature_hex": "6016661e7e8caec8be53c2948f0e1dcc89f7df17735944e7e55ecab5c52d8c1b21244f7ea0137dfb6294628f66522973f843bae0c8a3dcfa6f9b38097f5c565d"
+  },
+  {
+    "name": "v4-devnet-a",
+    "network_u8": 2,
+    "private_key_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "block_hash_hex": "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+    "pubkey_xonly_hex": "6a04ab98d9e4774ad806e302dddeb63bea16b5cb5f223ee77478e861bb583eb3",
+    "node_id_hex": "44d836556b2c1a8300565721051e120997bb51e381b6cd62e8e4d7cbd9f3b063",
+    "claim_digest_hex": "3ad808edb301b1a95d8849b809e8a6695c6e752b9ca7fb763a199ef355336669",
+    "signature_hex": "fe308ae82df20423366d6420e9f60a30edf720324e87b722955d5160c5b0f49b2dddf71082799c38c87d2dd7b91aadc1ab029924ba0d3e20bdd21d97393bb6c4"
+  },
+  {
+    "name": "v5-simnet-a",
+    "network_u8": 3,
+    "private_key_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "block_hash_hex": "0000000000000000000000000000000000000000000000000000000000000001",
+    "pubkey_xonly_hex": "68680737c76dabb801cb2204f57dbe4e4579e4f710cd67dc1b4227592c81e9b5",
+    "node_id_hex": "a4bbc69361c22a9ad8c939a392e7cff14dd3122daf845b31ede472ac30ac2995",
+    "claim_digest_hex": "7ca7a60b9002f374826657c63a8c741030b4f99c8f04733d12dd9cbe18afe6c2",
+    "signature_hex": "71ec14dba32e3bae6dcde0c0b5d5af384e3d72b8806375f89caa4503f466320c7ec81f57deac4e9baf21816280687a15a1305ab516dd47cc93a2f5e8cbd5c47e"
+  }
+]

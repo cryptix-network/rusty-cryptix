@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use cryptix_addressmanager::NetAddress;
 use cryptix_connectionmanager::ConnectionManager;

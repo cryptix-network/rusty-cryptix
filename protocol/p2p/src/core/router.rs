@@ -85,7 +85,8 @@ impl From<CryptixdMessagePayloadType> for IncomingRouteOverflowPolicy {
             // Inv messages are unique in the sense that no harm is done if some of them are dropped
             CryptixdMessagePayloadType::InvTransactions
             | CryptixdMessagePayloadType::InvRelayBlock
-            | CryptixdMessagePayloadType::StrongNodeAnnouncement => IncomingRouteOverflowPolicy::Drop,
+            | CryptixdMessagePayloadType::StrongNodeAnnouncement
+            | CryptixdMessagePayloadType::BlockProducerClaimV1 => IncomingRouteOverflowPolicy::Drop,
             _ => IncomingRouteOverflowPolicy::Disconnect,
         }
     }

@@ -150,6 +150,7 @@ message VersionMessage{
   repeated bytes antiFraudHashes = 11;
   bytes nodePubkeyXonly = 12;
   optional uint64 nodePowNonce = 13;
+  optional uint64 nodeChallengeNonce = 14;
 }
 
 message RequestAntiFraudSnapshotV1Message{
@@ -299,6 +300,7 @@ message PruningPointProofHeaderArray {
 }
 
 message ReadyMessage {
+  bytes nodeAuthSignature = 1;
 }
 
 message BlockWithTrustedDataV4Message {
@@ -342,4 +344,12 @@ message StrongNodeAnnouncementMessage {
   uint64 sentAtMs = 10;
   bytes claimedIp = 11;
   bytes signature = 12;
+}
+
+message BlockProducerClaimV1Message {
+  uint32 schemaVersion = 1;
+  uint32 network = 2;
+  bytes blockHash = 3;
+  bytes nodePubkeyXonly = 4;
+  bytes signature = 5;
 }

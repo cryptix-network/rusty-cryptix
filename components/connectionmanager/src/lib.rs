@@ -70,6 +70,7 @@ pub struct ConnectionManager {
     anti_fraud_state: ParkingLotMutex<AntiFraudState>,
     banserver_banned_ips: ParkingLotMutex<HashSet<IpAddr>>,
     banserver_banned_strong_node_ids: ParkingLotMutex<HashSet<[u8; 32]>>,
+    locally_banned_unified_node_ids: ParkingLotMutex<HashSet<[u8; 32]>>,
 }
 
 #[derive(Clone, Debug)]
@@ -238,6 +239,7 @@ impl ConnectionManager {
             anti_fraud_state: ParkingLotMutex::new(AntiFraudState::default()),
             banserver_banned_ips: ParkingLotMutex::new(HashSet::new()),
             banserver_banned_strong_node_ids: ParkingLotMutex::new(HashSet::new()),
+            locally_banned_unified_node_ids: ParkingLotMutex::new(HashSet::new()),
         });
         manager.try_load_persisted_snapshot();
         manager.clone().start_event_loop(rx);
@@ -520,6 +522,12 @@ impl ConnectionManager {
         self.address_manager.lock().ban(ip.into());
     }
 
+    /// Bans the given unified node ID and disconnects all active peers advertising this identity.
+    pub async fn ban_unified_node_id(&self, node_id: [u8; 32]) {
+        self.locally_banned_unified_node_ids.lock().insert(node_id);
+        self.disconnect_peers_by_node_id_list(vec![node_id]).await;
+    }
+
     /// Returns whether the given address is banned.
     pub async fn is_banned(&self, address: &SocketAddr) -> bool {
         self.is_banserver_banned_ip(address.ip())
@@ -542,6 +550,10 @@ impl ConnectionManager {
 
     pub fn is_banserver_banned_node_id(&self, node_id_raw: &[u8; 32]) -> bool {
         self.banserver_banned_strong_node_ids.lock().contains(node_id_raw)
+    }
+
+    pub fn is_unified_node_id_banned(&self, node_id_raw: &[u8; 32]) -> bool {
+        self.is_banserver_banned_node_id(node_id_raw) || self.locally_banned_unified_node_ids.lock().contains(node_id_raw)
     }
 
     pub fn is_banserver_banned_strong_node_id(&self, static_id_raw: &[u8; 32]) -> bool {
@@ -1090,6 +1102,10 @@ impl ConnectionManager {
             out.push(HEX[(byte & 0x0f) as usize] as char);
         }
         out
+    }
+
+    pub fn encode_node_id_hex(node_id: &[u8; 32]) -> String {
+        Self::encode_hex(node_id)
     }
 
     fn hex_nibble(byte: u8) -> Option<u8> {

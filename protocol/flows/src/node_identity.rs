@@ -1,7 +1,7 @@
 use cryptix_connectionmanager::AntiFraudNetwork;
 use hex::{decode as hex_decode, encode as hex_encode};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
-use secp256k1::{Keypair, SecretKey};
+use secp256k1::{schnorr::Signature as SchnorrSignature, Keypair, Message as SecpMessage, SecretKey, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -14,11 +14,13 @@ const NODE_IDENTITY_FILE_MAX_BYTES: usize = 16 * 1024;
 const STRONG_NODES_DIR: &str = "strong-nodes";
 const NODE_IDENTITY_FILE: &str = "node_identity.json";
 const NODE_POW_DOMAIN_TAG: &[u8] = b"cryptix-node-id-pow-v1";
+const NODE_AUTH_DOMAIN_TAG: &[u8] = b"cryptix-node-id-auth-v1";
 const MAINNET_NODE_POW_DIFFICULTY: u8 = 20;
 const NON_MAINNET_NODE_POW_DIFFICULTY: u8 = 18;
 
 #[derive(Clone, Debug)]
 pub struct UnifiedNodeIdentity {
+    pub secret_key: SecretKey,
     pub pubkey_xonly: [u8; 32],
     pub node_id: [u8; 32],
     pub pow_nonce: u64,
@@ -63,7 +65,7 @@ pub fn create_ephemeral_identity(network_name: &str) -> Result<UnifiedNodeIdenti
     let pubkey_xonly = keypair.x_only_public_key().0.serialize();
     let node_id = compute_node_id(&pubkey_xonly);
     let pow_nonce = mine_pow_nonce(network_code, &pubkey_xonly);
-    Ok(UnifiedNodeIdentity { pubkey_xonly, node_id, pow_nonce })
+    Ok(UnifiedNodeIdentity { secret_key, pubkey_xonly, node_id, pow_nonce })
 }
 
 pub fn network_code_from_name(network_name: &str) -> Option<u8> {
@@ -91,6 +93,60 @@ pub fn compute_pow_hash(network_code: u8, pubkey_xonly: &[u8; 32], pow_nonce: u6
     let mut out = [0u8; 32];
     out.copy_from_slice(hasher.finalize().as_slice());
     out
+}
+
+pub fn build_node_auth_digest(
+    network_code: u8,
+    signer_node_id: &[u8; 32],
+    verifier_node_id: &[u8; 32],
+    signer_challenge_nonce: u64,
+    verifier_challenge_nonce: u64,
+) -> [u8; 32] {
+    let mut payload = Vec::with_capacity(NODE_AUTH_DOMAIN_TAG.len() + 1 + 32 + 32 + 8 + 8);
+    payload.extend_from_slice(NODE_AUTH_DOMAIN_TAG);
+    payload.push(network_code);
+    payload.extend_from_slice(signer_node_id);
+    payload.extend_from_slice(verifier_node_id);
+    payload.extend_from_slice(&signer_challenge_nonce.to_be_bytes());
+    payload.extend_from_slice(&verifier_challenge_nonce.to_be_bytes());
+    *blake3::hash(&payload).as_bytes()
+}
+
+pub fn sign_node_auth_proof(
+    identity: &UnifiedNodeIdentity,
+    network_code: u8,
+    verifier_node_id: &[u8; 32],
+    signer_challenge_nonce: u64,
+    verifier_challenge_nonce: u64,
+) -> Result<[u8; 64], String> {
+    let digest =
+        build_node_auth_digest(network_code, &identity.node_id, verifier_node_id, signer_challenge_nonce, verifier_challenge_nonce);
+    let message = SecpMessage::from_digest_slice(&digest).map_err(|err| format!("invalid auth digest: {err}"))?;
+    let keypair = Keypair::from_secret_key(secp256k1::SECP256K1, &identity.secret_key);
+    Ok(*keypair.sign_schnorr(message).as_ref())
+}
+
+pub fn verify_node_auth_proof(
+    network_code: u8,
+    signer_pubkey_xonly: &[u8; 32],
+    signer_node_id: &[u8; 32],
+    verifier_node_id: &[u8; 32],
+    signer_challenge_nonce: u64,
+    verifier_challenge_nonce: u64,
+    signature: &[u8; 64],
+) -> bool {
+    let digest =
+        build_node_auth_digest(network_code, signer_node_id, verifier_node_id, signer_challenge_nonce, verifier_challenge_nonce);
+    let Ok(message) = SecpMessage::from_digest_slice(&digest) else {
+        return false;
+    };
+    let Ok(pubkey) = XOnlyPublicKey::from_slice(signer_pubkey_xonly) else {
+        return false;
+    };
+    let Ok(signature) = SchnorrSignature::from_slice(signature) else {
+        return false;
+    };
+    signature.verify(&message, &pubkey).is_ok()
 }
 
 pub fn is_valid_pow_nonce(network_code: u8, pubkey_xonly: &[u8; 32], pow_nonce: u64) -> bool {
@@ -129,7 +185,7 @@ fn create_and_persist_identity(identity_path: &Path, network_code: u8) -> Result
         pow_nonce: Some(pow_nonce),
     };
     persist_identity_file(identity_path, &disk)?;
-    Ok(UnifiedNodeIdentity { pubkey_xonly, node_id, pow_nonce })
+    Ok(UnifiedNodeIdentity { secret_key, pubkey_xonly, node_id, pow_nonce })
 }
 
 fn load_identity_file(identity_path: &Path, network_code: u8) -> Result<UnifiedNodeIdentity, String> {
@@ -166,7 +222,7 @@ fn load_identity_file(identity_path: &Path, network_code: u8) -> Result<UnifiedN
         persist_identity_file(identity_path, &disk)?;
     }
 
-    Ok(UnifiedNodeIdentity { pubkey_xonly: stored_pubkey, node_id, pow_nonce })
+    Ok(UnifiedNodeIdentity { secret_key, pubkey_xonly: stored_pubkey, node_id, pow_nonce })
 }
 
 fn mine_pow_nonce(network_code: u8, pubkey_xonly: &[u8; 32]) -> u64 {

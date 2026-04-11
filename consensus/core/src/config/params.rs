@@ -321,7 +321,6 @@ pub const MAINNET_PARAMS: Params = Params {
     dns_seeders: &[
         "seed1.cryptix-network.org",
         "seed2.cryptix-network.org",
-        "seed3.cryptix-network.org",
         "dyn1.cryptix-network.org",
         "dyn2.cryptix-network.org",
         "dyn3.cryptix-network.org",
@@ -387,7 +386,6 @@ pub const TESTNET_PARAMS: Params = Params {
     dns_seeders: &[
         "t.seed1.cryptix-network.org",
         "t.seed2.cryptix-network.org",
-        "t.seed3.cryptix-network.org",
         "t.dyn1.cryptix-network.org",
         "t.dyn2.cryptix-network.org",
         "t.dyn3.cryptix-network.org",

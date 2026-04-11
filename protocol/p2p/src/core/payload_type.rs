@@ -52,6 +52,7 @@ pub enum CryptixdMessagePayloadType {
     StrongNodeAnnouncement,
     RequestAntiFraudSnapshotV1,
     AntiFraudSnapshotV1,
+    BlockProducerClaimV1,
 }
 
 impl From<&CryptixdMessagePayload> for CryptixdMessagePayloadType {
@@ -114,6 +115,7 @@ impl From<&CryptixdMessagePayload> for CryptixdMessagePayloadType {
             CryptixdMessagePayload::StrongNodeAnnouncement(_) => CryptixdMessagePayloadType::StrongNodeAnnouncement,
             CryptixdMessagePayload::RequestAntiFraudSnapshotV1(_) => CryptixdMessagePayloadType::RequestAntiFraudSnapshotV1,
             CryptixdMessagePayload::AntiFraudSnapshotV1(_) => CryptixdMessagePayloadType::AntiFraudSnapshotV1,
+            CryptixdMessagePayload::BlockProducerClaimV1(_) => CryptixdMessagePayloadType::BlockProducerClaimV1,
         }
     }
 }

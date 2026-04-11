@@ -36,6 +36,7 @@ impl From<Version> for protowire::VersionMessage {
             anti_fraud_hashes: item.anti_fraud_hashes.into_iter().map(|v| v.to_vec()).collect(),
             node_pubkey_xonly: item.node_pubkey_xonly.map(|value| value.to_vec()).unwrap_or_default(),
             node_pow_nonce: item.node_pow_nonce,
+            node_challenge_nonce: item.node_challenge_nonce,
         }
     }
 }
@@ -60,6 +61,7 @@ impl TryFrom<protowire::VersionMessage> for Version {
             anti_fraud_hashes: parse_anti_fraud_hashes(msg.anti_fraud_hashes)?,
             node_pubkey_xonly: parse_optional_32_bytes(msg.node_pubkey_xonly)?,
             node_pow_nonce: msg.node_pow_nonce,
+            node_challenge_nonce: msg.node_challenge_nonce,
         })
     }
 }

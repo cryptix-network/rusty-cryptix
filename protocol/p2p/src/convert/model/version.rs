@@ -21,6 +21,7 @@ pub struct Version {
     pub anti_fraud_hashes: Vec<[u8; 32]>,
     pub node_pubkey_xonly: Option<[u8; 32]>,
     pub node_pow_nonce: Option<u64>,
+    pub node_challenge_nonce: Option<u64>,
 }
 
 impl Version {
@@ -44,6 +45,7 @@ impl Version {
             anti_fraud_hashes: Vec::new(),
             node_pubkey_xonly: None,
             node_pow_nonce: None,
+            node_challenge_nonce: None,
         }
     }
 

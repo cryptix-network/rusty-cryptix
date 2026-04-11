@@ -12,7 +12,7 @@ use crate::v5::{
     request_ibd_chain_block_locator::RequestIbdChainBlockLocatorFlow,
     request_pp_proof::RequestPruningPointProofFlow,
     request_pruning_point_utxo_set::RequestPruningPointUtxoSetFlow,
-    strong_nodes::StrongNodesRelayFlow,
+    strong_node_claims::StrongNodeClaimsRelayFlow,
     txrelay::flow::{RelayTransactionsFlow, RequestTransactionsFlow},
 };
 use crate::{flow_context::FlowContext, flow_trait::Flow};
@@ -25,7 +25,12 @@ use crate::v6::request_pruning_point_and_anticone::PruningPointAndItsAnticoneReq
 
 pub(crate) mod request_pruning_point_and_anticone;
 
-pub fn register(ctx: FlowContext, router: Arc<Router>, hfa_capable: bool, strong_nodes_capable: bool) -> Vec<Box<dyn Flow>> {
+pub fn register(
+    ctx: FlowContext,
+    router: Arc<Router>,
+    hfa_capable: bool,
+    strong_node_claims_capable: bool,
+) -> Vec<Box<dyn Flow>> {
     // IBD flow <-> invs flow communication uses a job channel in order to always
     // maintain at most a single pending job which can be updated
     let (ibd_sender, relay_receiver) = channel::job();
@@ -174,11 +179,11 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, hfa_capable: bool, strong
         )));
     }
 
-    if strong_nodes_capable {
-        flows.push(Box::new(StrongNodesRelayFlow::new(
+    if strong_node_claims_capable {
+        flows.push(Box::new(StrongNodeClaimsRelayFlow::new(
             ctx.clone(),
             router.clone(),
-            router.subscribe_with_capacity(vec![CryptixdMessagePayloadType::StrongNodeAnnouncement], 1024),
+            router.subscribe_with_capacity(vec![CryptixdMessagePayloadType::BlockProducerClaimV1], 2048),
         )));
     }
 

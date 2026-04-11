@@ -6,9 +6,11 @@ use crate::flowcontext::{
 use crate::hfa::{FastIntentP2pData, FastMicroblockP2pData, HfaP2pBridge, HFA_P2P_SERVICE_BIT};
 use crate::node_identity::{
     compute_node_id, create_ephemeral_identity, is_valid_pow_nonce, load_or_create_identity, network_code_from_name,
-    UnifiedNodeIdentity,
+    sign_node_auth_proof, verify_node_auth_proof, UnifiedNodeIdentity,
 };
-use crate::strong_nodes::{StrongNodesEngine, StrongNodesEngineConfig, StrongNodesRuntimeSnapshot, STRONG_NODES_P2P_SERVICE_BIT};
+use crate::strong_node_claims::{
+    ClaimIngestOutcome, StrongNodeClaimsEngine, StrongNodeClaimsRuntimeSnapshot, STRONG_NODE_CLAIMS_P2P_SERVICE_BIT,
+};
 use crate::{v5, v6};
 use async_trait::async_trait;
 use cryptix_addressmanager::AddressManager;
@@ -18,6 +20,7 @@ use cryptix_consensus_core::block::Block;
 use cryptix_consensus_core::config::Config;
 use cryptix_consensus_core::errors::block::RuleError;
 use cryptix_consensus_core::tx::{Transaction, TransactionId};
+use cryptix_consensus_core::ChainPath;
 use cryptix_consensus_notify::{
     notification::{Notification, PruningPointUtxoSetOverrideNotification},
     root::ConsensusNotificationRoot,
@@ -37,14 +40,16 @@ use cryptix_p2p_lib::{
     common::ProtocolError,
     convert::model::version::Version,
     make_message,
-    pb::{cryptixd_message::Payload, FastIntentMessage, FastMicroblockMessage, InvRelayBlockMessage, StrongNodeAnnouncementMessage},
+    pb::{
+        cryptixd_message::Payload, BlockProducerClaimV1Message, FastIntentMessage, FastMicroblockMessage, InvRelayBlockMessage,
+    },
     ConnectionInitializer, CryptixdHandshake, Hub, PeerKey, PeerProperties, Router,
 };
 use cryptix_utils::iter::IterExtensions;
 use cryptix_utils::networking::PeerId;
 use futures::future::join_all;
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -93,18 +98,14 @@ const MISBEHAVIOR_MAX_TRACKED_PEERS: usize = 4096;
 /// Soft inbound connection rate-limit window and threshold per IP.
 const INBOUND_CONNECTION_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const INBOUND_CONNECTION_RATE_LIMIT_MAX_ATTEMPTS: usize = 20;
-const STRONG_NODES_GOSSIP_FANOUT: usize = 4;
 const STRONG_NODES_TICK_INTERVAL: Duration = Duration::from_secs(30);
+const STRONG_NODE_CLAIMS_GOSSIP_FANOUT: usize = 8;
 
 /// Maximum frequency in which rate-limit breaches can add strikes.
 const INBOUND_CONNECTION_RATE_LIMIT_STRIKE_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Soft memory cap for tracked peer IPs in the inbound connection limiter map.
 const INBOUND_CONNECTION_RATE_LIMIT_MAX_TRACKED_IPS: usize = 4096;
-
-fn strong_node_static_id_raw(message: &StrongNodeAnnouncementMessage) -> Option<[u8; 32]> {
-    message.static_id_raw.as_slice().try_into().ok()
-}
 
 fn anti_fraud_hash_window_from_vec(entries: &[[u8; 32]]) -> Option<[[u8; 32]; 3]> {
     if entries.len() != 3 {
@@ -267,11 +268,10 @@ pub struct FlowContextInner {
     pub address_manager: Arc<Mutex<AddressManager>>,
     connection_manager: RwLock<Option<Arc<ConnectionManager>>>,
     autoban_enabled: bool,
-    misbehaving_peer_scores: Mutex<HashMap<IpAddr, MisbehaviorRecord>>,
+    misbehaving_peer_scores: Mutex<HashMap<MisbehaviorIdentity, MisbehaviorRecord>>,
     inbound_connection_rate_limit: Mutex<HashMap<IpAddr, InboundConnectionRateLimitRecord>>,
     hfa_bridge: RwLock<Option<Arc<dyn HfaP2pBridge>>>,
-    strong_nodes_engine: Arc<StrongNodesEngine>,
-    peer_announced_strong_node_ids: Mutex<HashMap<PeerKey, [u8; 32]>>,
+    strong_node_claims_engine: Arc<StrongNodeClaimsEngine>,
     mining_manager: MiningManagerProxy,
     pub(crate) tick_service: Arc<TickService>,
     notification_root: Arc<ConsensusNotificationRoot>,
@@ -312,6 +312,12 @@ struct IbdMetadata {
 struct MisbehaviorRecord {
     score: u32,
     last_seen: Instant,
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+enum MisbehaviorIdentity {
+    Ip(IpAddr),
+    UnifiedNodeId([u8; 32]),
 }
 
 #[derive(Debug, Clone)]
@@ -375,16 +381,10 @@ impl FlowContext {
         tick_service: Arc<TickService>,
         notification_root: Arc<ConsensusNotificationRoot>,
         autoban_enabled: bool,
-        strong_nodes_enabled: bool,
         app_data_dir: PathBuf,
     ) -> Self {
         let hub = Hub::new();
-        let strong_nodes_app_data_dir = app_data_dir.clone();
-        let strong_nodes_engine = Arc::new(StrongNodesEngine::new(StrongNodesEngineConfig {
-            enabled: strong_nodes_enabled,
-            network: config.network_name(),
-            app_data_dir: strong_nodes_app_data_dir,
-        }));
+        let strong_node_claims_engine = Arc::new(StrongNodeClaimsEngine::new(true, &config.network_name(), &app_data_dir));
         let unified_node_identity = match load_or_create_identity(&app_data_dir, &config.network_name()) {
             Ok(identity) => identity,
             Err(err) => {
@@ -419,8 +419,7 @@ impl FlowContext {
                 misbehaving_peer_scores: Default::default(),
                 inbound_connection_rate_limit: Default::default(),
                 hfa_bridge: Default::default(),
-                strong_nodes_engine,
-                peer_announced_strong_node_ids: Default::default(),
+                strong_node_claims_engine,
                 mining_manager,
                 tick_service,
                 notification_root,
@@ -452,11 +451,11 @@ impl FlowContext {
         tokio::spawn(async move {
             loop {
                 match ctx.tick_service.tick(STRONG_NODES_TICK_INTERVAL).await {
-                    cryptix_core::task::tick::TickReason::Wakeup => ctx.run_strong_nodes_tick_once().await,
+                    cryptix_core::task::tick::TickReason::Wakeup => ctx.run_strong_node_claims_tick_once().await,
                     cryptix_core::task::tick::TickReason::Shutdown => break,
                 }
             }
-            ctx.strong_nodes_engine.best_effort_flush();
+            ctx.strong_node_claims_engine.best_effort_flush();
         });
     }
 
@@ -465,7 +464,7 @@ impl FlowContext {
     }
 
     pub fn drop_connection_manager(&self) {
-        self.strong_nodes_engine.best_effort_flush();
+        self.strong_node_claims_engine.best_effort_flush();
         self.connection_manager.write().take();
     }
 
@@ -554,13 +553,14 @@ impl FlowContext {
         }
 
         let ip = router.net_address().ip();
+        let identity = self.misbehavior_identity_for_router(router);
         let now = Instant::now();
 
         let (score, should_ban) = {
             let mut scores = self.misbehaving_peer_scores.lock();
             scores.retain(|_, record| now.saturating_duration_since(record.last_seen) <= MISBEHAVIOR_FORGET_AFTER);
 
-            let record = scores.entry(ip).or_insert(MisbehaviorRecord { score: 0, last_seen: now });
+            let record = scores.entry(identity).or_insert(MisbehaviorRecord { score: 0, last_seen: now });
             let elapsed = now.saturating_duration_since(record.last_seen);
             let decay_steps = (elapsed.as_secs() / MISBEHAVIOR_DECAY_INTERVAL.as_secs()) as u32;
             record.score = record.score.saturating_sub(decay_steps).saturating_add(1);
@@ -570,13 +570,13 @@ impl FlowContext {
             let should_ban = score >= MISBEHAVIOR_BAN_SCORE;
 
             if should_ban {
-                scores.remove(&ip);
+                scores.remove(&identity);
             } else if scores.len() > MISBEHAVIOR_MAX_TRACKED_PEERS {
                 let overflow = scores.len() - MISBEHAVIOR_MAX_TRACKED_PEERS;
-                let mut by_age = scores.iter().map(|(ip, record)| (*ip, record.last_seen)).collect::<Vec<_>>();
+                let mut by_age = scores.iter().map(|(identity, record)| (*identity, record.last_seen)).collect::<Vec<_>>();
                 by_age.sort_by_key(|(_, last_seen)| *last_seen);
-                for (old_ip, _) in by_age.into_iter().take(overflow) {
-                    scores.remove(&old_ip);
+                for (old_identity, _) in by_age.into_iter().take(overflow) {
+                    scores.remove(&old_identity);
                 }
             }
 
@@ -585,14 +585,28 @@ impl FlowContext {
 
         if should_ban {
             if let Some(connection_manager) = self.connection_manager() {
-                warn!(
-                    "Auto-ban: banning peer {} after {}/{} strikes ({})",
-                    router.net_address(),
-                    score,
-                    MISBEHAVIOR_BAN_SCORE,
-                    reason
-                );
-                connection_manager.ban(ip).await;
+                match identity {
+                    MisbehaviorIdentity::UnifiedNodeId(node_id) => {
+                        warn!(
+                            "Auto-ban: banning unified node ID {} after {}/{} strikes ({})",
+                            ConnectionManager::encode_node_id_hex(&node_id),
+                            score,
+                            MISBEHAVIOR_BAN_SCORE,
+                            reason
+                        );
+                        connection_manager.ban_unified_node_id(node_id).await;
+                    }
+                    MisbehaviorIdentity::Ip(_) => {
+                        warn!(
+                            "Auto-ban: banning peer {} after {}/{} strikes ({})",
+                            router.net_address(),
+                            score,
+                            MISBEHAVIOR_BAN_SCORE,
+                            reason
+                        );
+                        connection_manager.ban(ip).await;
+                    }
+                }
             } else {
                 warn!(
                     "Auto-ban: peer {} reached {}/{} strikes ({}), but no connection manager is available",
@@ -607,6 +621,13 @@ impl FlowContext {
         }
     }
 
+    fn misbehavior_identity_for_router(&self, router: &Router) -> MisbehaviorIdentity {
+        if let Some(node_id) = router.properties().unified_node_id {
+            return MisbehaviorIdentity::UnifiedNodeId(node_id);
+        }
+        MisbehaviorIdentity::Ip(router.net_address().ip())
+    }
+
     pub fn set_hfa_bridge(&self, bridge: Arc<dyn HfaP2pBridge>) {
         self.hfa_bridge.write().replace(bridge);
     }
@@ -619,8 +640,8 @@ impl FlowContext {
         self.hfa_bridge().map(|bridge| bridge.hfa_enabled()).unwrap_or(false)
     }
 
-    pub fn strong_nodes_snapshot(&self) -> StrongNodesRuntimeSnapshot {
-        self.strong_nodes_engine.snapshot(self.is_payload_hf_active())
+    pub fn strong_node_claims_snapshot(&self) -> StrongNodeClaimsRuntimeSnapshot {
+        self.strong_node_claims_engine.snapshot(self.is_payload_hf_active())
     }
 
     pub fn is_payload_hf_active(&self) -> bool {
@@ -628,8 +649,8 @@ impl FlowContext {
         virtual_daa_score >= self.config.params.payload_hf_activation_daa_score
     }
 
-    pub fn is_strong_nodes_p2p_enabled(&self) -> bool {
-        self.strong_nodes_engine.should_advertise_service_bit(self.is_payload_hf_active())
+    pub fn is_strong_node_claims_p2p_enabled(&self) -> bool {
+        self.strong_node_claims_engine.should_advertise_service_bit(self.is_payload_hf_active())
     }
 
     pub fn consensus(&self) -> ConsensusInstance {
@@ -764,17 +785,12 @@ impl FlowContext {
 
         self.on_new_block(consensus, Default::default(), block, virtual_state_task).await;
         self.log_block_event(BlockLogEvent::Submit(hash));
+        self.broadcast_local_block_producer_claim(hash).await;
 
         Ok(())
     }
 
     pub fn log_block_event(&self, event: BlockLogEvent) {
-        match &event {
-            BlockLogEvent::Relay(_) => self.strong_nodes_engine.on_block_event(false),
-            BlockLogEvent::Submit(_) => self.strong_nodes_engine.on_block_event(true),
-            _ => {}
-        }
-
         if let Some(logger) = self.block_event_logger.as_ref() {
             logger.log(event)
         } else {
@@ -830,6 +846,7 @@ impl FlowContext {
 
         // Transaction relay is disabled if the node is out of sync and thus not mining
         if !consensus.async_is_nearly_synced().await {
+            self.refresh_strong_node_claims_window(consensus).await;
             return;
         }
 
@@ -866,6 +883,7 @@ impl FlowContext {
                 debug!("<> Mempool scanning task is done");
             });
         }
+        self.refresh_strong_node_claims_window(consensus).await;
     }
 
     /// Notifies that the UTXO set was reset due to pruning point change via IBD.
@@ -1015,33 +1033,33 @@ impl FlowContext {
         }
     }
 
-    pub async fn handle_strong_node_announcement(&self, router: &Arc<Router>, message: StrongNodeAnnouncementMessage) {
-        let sender_ip = router.net_address().ip();
-        let static_id_raw = strong_node_static_id_raw(&message);
-        if let (Some(connection_manager), Some(static_id_raw)) = (self.connection_manager(), static_id_raw.as_ref()) {
-            if connection_manager.is_banserver_banned_strong_node_id(static_id_raw) {
-                warn!("Dropping strong-node announcement from {} because static_id is listed in remote antifraud bans", sender_ip);
-                connection_manager.ban(sender_ip).await;
-                return;
-            }
-        }
-        let outcome = self.strong_nodes_engine.ingest_announcement(&message, sender_ip, self.is_payload_hf_active());
+    async fn run_strong_node_claims_tick_once(&self) {
+        self.strong_node_claims_engine.maybe_flush();
+    }
+
+    pub async fn handle_block_producer_claim(&self, router: &Arc<Router>, message: BlockProducerClaimV1Message) {
+        let outcome = self.strong_node_claims_engine.ingest_claim(&message, self.is_payload_hf_active());
         match outcome {
-            crate::strong_nodes::IngestOutcome::Accepted => {
-                if let Some(static_id_raw) = static_id_raw {
-                    self.peer_announced_strong_node_ids.lock().insert(router.key(), static_id_raw);
-                }
-                self.broadcast_strong_node_announcement(message, Some(router.key())).await;
+            ClaimIngestOutcome::Accepted { pending: _ } => {
+                self.broadcast_block_producer_claim(message, Some(router.key())).await;
             }
-            crate::strong_nodes::IngestOutcome::Strike { reason } => {
+            ClaimIngestOutcome::Strike { reason, node_id } => {
+                if let Some(node_id) = node_id {
+                    if let Some(connection_manager) = self.connection_manager() {
+                        if connection_manager.is_unified_node_id_banned(&node_id) {
+                            connection_manager.ban(router.net_address().ip()).await;
+                            return;
+                        }
+                    }
+                }
                 self.report_misbehaving_peer(router, &reason).await;
             }
-            crate::strong_nodes::IngestOutcome::Ignored | crate::strong_nodes::IngestOutcome::Dropped => {}
+            ClaimIngestOutcome::Ignored | ClaimIngestOutcome::Dropped => {}
         }
     }
 
-    pub async fn broadcast_strong_node_announcement(&self, message: StrongNodeAnnouncementMessage, exclude_peer: Option<PeerKey>) {
-        if !self.is_strong_nodes_p2p_enabled() {
+    pub async fn broadcast_block_producer_claim(&self, message: BlockProducerClaimV1Message, exclude_peer: Option<PeerKey>) {
+        if !self.is_strong_node_claims_p2p_enabled() {
             return;
         }
 
@@ -1050,7 +1068,7 @@ impl FlowContext {
             .active_peers()
             .into_iter()
             .filter_map(|peer| {
-                if (peer.properties().services & STRONG_NODES_P2P_SERVICE_BIT) == 0 {
+                if (peer.properties().services & STRONG_NODE_CLAIMS_P2P_SERVICE_BIT) == 0 {
                     return None;
                 }
                 if exclude_peer.is_some_and(|excluded| excluded == peer.key()) {
@@ -1063,58 +1081,50 @@ impl FlowContext {
             return;
         }
         let target_len = targets.len();
-        if target_len > STRONG_NODES_GOSSIP_FANOUT {
+        if target_len > STRONG_NODE_CLAIMS_GOSSIP_FANOUT {
             let base = (unix_now() as usize) % target_len;
-            targets = (0..STRONG_NODES_GOSSIP_FANOUT).map(|offset| targets[(base + offset) % target_len]).collect();
+            targets = (0..STRONG_NODE_CLAIMS_GOSSIP_FANOUT).map(|offset| targets[(base + offset) % target_len]).collect();
         }
-
-        let msg = make_message!(Payload::StrongNodeAnnouncement, message);
+        let msg = make_message!(Payload::BlockProducerClaimV1, message);
         for target in targets {
             let _ = self.hub.send(target, msg.clone()).await;
         }
     }
 
-    async fn run_strong_nodes_tick_once(&self) {
-        self.enforce_banned_announced_strong_nodes().await;
-        let claimed_ip = self.address_manager.lock().best_local_address().map(|addr| addr.ip.0);
-        let output = self.strong_nodes_engine.on_tick(self.is_payload_hf_active(), claimed_ip);
-        if let Some(message) = output.outbound_announcement {
-            self.broadcast_strong_node_announcement(message, None).await;
+    async fn broadcast_local_block_producer_claim(&self, block_hash: Hash) {
+        if !self.is_strong_node_claims_p2p_enabled() {
+            return;
+        }
+        match self.strong_node_claims_engine.build_local_claim(block_hash, self.unified_node_identity.as_ref()) {
+            Ok(message) => {
+                let _ = self.strong_node_claims_engine.ingest_claim(&message, true);
+                self.broadcast_block_producer_claim(message, None).await;
+            }
+            Err(err) => warn!("failed building local block producer claim for {}: {}", block_hash, err),
         }
     }
 
-    async fn enforce_banned_announced_strong_nodes(&self) {
-        let Some(connection_manager) = self.connection_manager() else {
-            return;
-        };
-
-        let active_peers = self.hub.active_peers();
-        if active_peers.is_empty() {
-            self.peer_announced_strong_node_ids.lock().clear();
+    async fn refresh_strong_node_claims_window(&self, consensus: &ConsensusProxy) {
+        if !self.is_strong_node_claims_p2p_enabled() {
             return;
         }
-
-        let active_by_key =
-            active_peers.into_iter().map(|peer| (peer.key(), peer.net_address().ip())).collect::<HashMap<PeerKey, IpAddr>>();
-
-        let ips_to_ban = {
-            let mut announced = self.peer_announced_strong_node_ids.lock();
-            announced.retain(|peer_key, _| active_by_key.contains_key(peer_key));
-
-            let mut ips_to_ban = HashSet::new();
-            for (peer_key, static_id_raw) in announced.iter() {
-                if connection_manager.is_banserver_banned_strong_node_id(static_id_raw) {
-                    if let Some(ip) = active_by_key.get(peer_key) {
-                        ips_to_ban.insert(*ip);
-                    }
+        let session = consensus.clone();
+        let sink = session.async_get_sink().await;
+        let previous = self.strong_node_claims_engine.last_sink();
+        match previous {
+            Some(prev) if prev != sink => {
+                if let Ok(chain_path) = session.async_get_virtual_chain_from_block(prev, None).await {
+                    self.strong_node_claims_engine.apply_chain_path_update(chain_path, sink, self.is_payload_hf_active());
+                    self.strong_node_claims_engine.maybe_flush();
                 }
             }
-            ips_to_ban
-        };
-
-        for ip in ips_to_ban {
-            warn!("Disconnecting peer {} because its announced strong-node static_id is listed in remote antifraud bans", ip);
-            connection_manager.ban(ip).await;
+            None => {
+                let mut path = ChainPath::default();
+                path.added.push(sink);
+                self.strong_node_claims_engine.apply_chain_path_update(path, sink, self.is_payload_hf_active());
+                self.strong_node_claims_engine.maybe_flush();
+            }
+            _ => {}
         }
     }
 }
@@ -1147,11 +1157,13 @@ impl ConnectionInitializer for FlowContext {
         self_version_message.anti_fraud_hashes = local_anti_fraud_hash_window.to_vec();
         self_version_message.node_pubkey_xonly = Some(self.unified_node_identity.pubkey_xonly);
         self_version_message.node_pow_nonce = Some(self.unified_node_identity.pow_nonce);
+        let local_node_challenge_nonce = rand::random::<u64>();
+        self_version_message.node_challenge_nonce = Some(local_node_challenge_nonce);
         if self.is_hfa_p2p_enabled() {
             self_version_message.services |= HFA_P2P_SERVICE_BIT;
         }
-        if self.is_strong_nodes_p2p_enabled() {
-            self_version_message.services |= STRONG_NODES_P2P_SERVICE_BIT;
+        if self.is_strong_node_claims_p2p_enabled() {
+            self_version_message.services |= STRONG_NODE_CLAIMS_P2P_SERVICE_BIT;
         }
         // TODO: get number of live services
         // TODO: disable_relay_tx from config/cmd
@@ -1164,16 +1176,20 @@ impl ConnectionInitializer for FlowContext {
         let peer_version: Version = peer_version_message.try_into()?;
         let network_code = network_code_from_name(&network_name)
             .ok_or_else(|| ProtocolError::OtherOwned(format!("unsupported network for node identity `{network_name}`")))?;
-        let peer_unified_node_id = match (peer_version.node_pubkey_xonly, peer_version.node_pow_nonce) {
+        let (peer_unified_node_id, peer_pubkey_xonly) = match (peer_version.node_pubkey_xonly, peer_version.node_pow_nonce) {
             (Some(pubkey), Some(pow_nonce)) => {
                 if !is_valid_pow_nonce(network_code, &pubkey, pow_nonce) {
                     return Err(ProtocolError::OtherOwned("peer sent invalid node identity proof-of-work".to_string()));
                 }
-                Some(compute_node_id(&pubkey))
+                (Some(compute_node_id(&pubkey)), Some(pubkey))
             }
-            (None, None) => None,
+            (None, None) => (None, None),
             _ => return Err(ProtocolError::OtherOwned("peer sent incomplete node identity handshake fields".to_string())),
         };
+        let peer_node_challenge_nonce = peer_version.node_challenge_nonce;
+        if peer_unified_node_id.is_none() && peer_node_challenge_nonce.is_some() {
+            return Err(ProtocolError::OtherOwned("peer sent node challenge nonce without node identity fields".to_string()));
+        }
         router.set_identity(peer_version.id);
         // Avoid duplicate connections
         if self.hub.has_peer(router.key()) {
@@ -1187,12 +1203,15 @@ impl ConnectionInitializer for FlowContext {
         if payload_hf_active && peer_unified_node_id.is_none() {
             return Err(ProtocolError::OtherOwned("peer missing mandatory unified node identity after hardfork".to_string()));
         }
+        if payload_hf_active && peer_node_challenge_nonce.is_none() {
+            return Err(ProtocolError::OtherOwned("peer missing mandatory node challenge nonce after hardfork".to_string()));
+        }
         if let Some(peer_node_id) = peer_unified_node_id {
             if peer_node_id == self.unified_node_identity.node_id {
                 return Err(ProtocolError::LoopbackConnection(router.key()));
             }
             if let Some(connection_manager) = self.connection_manager() {
-                if connection_manager.is_banserver_banned_node_id(&peer_node_id) {
+                if connection_manager.is_unified_node_id_banned(&peer_node_id) {
                     return Err(ProtocolError::OtherOwned("peer unified node identity is externally banned".to_string()));
                 }
             }
@@ -1207,16 +1226,20 @@ impl ConnectionInitializer for FlowContext {
         let local_hfa_enabled = self.is_hfa_p2p_enabled();
         let peer_hfa_enabled = (peer_version.services & HFA_P2P_SERVICE_BIT) != 0;
         let hfa_capable = local_hfa_enabled && peer_hfa_enabled;
-        let local_strong_nodes_enabled = self.is_strong_nodes_p2p_enabled();
-        let peer_strong_nodes_enabled = (peer_version.services & STRONG_NODES_P2P_SERVICE_BIT) != 0;
-        let strong_nodes_capable = local_strong_nodes_enabled && peer_strong_nodes_enabled;
+        let local_strong_node_claims_enabled = self.is_strong_node_claims_p2p_enabled();
+        let peer_strong_node_claims_enabled = (peer_version.services & STRONG_NODE_CLAIMS_P2P_SERVICE_BIT) != 0;
+        let strong_node_claims_capable = local_strong_node_claims_enabled && peer_strong_node_claims_enabled;
         debug!(
             "HFA P2P capability for peer {}: local_enabled={} peer_enabled={} peer_services=0x{:x} capable={}",
             router, local_hfa_enabled, peer_hfa_enabled, peer_version.services, hfa_capable
         );
         debug!(
-            "Strong-Nodes P2P capability for peer {}: local_enabled={} peer_enabled={} peer_services=0x{:x} capable={}",
-            router, local_strong_nodes_enabled, peer_strong_nodes_enabled, peer_version.services, strong_nodes_capable
+            "Strong-Node-Claims P2P capability for peer {}: local_enabled={} peer_enabled={} peer_services=0x{:x} capable={}",
+            router,
+            local_strong_node_claims_enabled,
+            peer_strong_node_claims_enabled,
+            peer_version.services,
+            strong_node_claims_capable
         );
 
         let anti_fraud_mode = self
@@ -1231,22 +1254,25 @@ impl ConnectionInitializer for FlowContext {
             // After payload HF activation we no longer accept legacy P2P protocol versions.
             match peer_version.protocol_version {
                 v if v >= PROTOCOL_VERSION => match anti_fraud_mode {
-                    AntiFraudMode::Full => {
-                        (v6::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), PROTOCOL_VERSION)
-                    }
+                    AntiFraudMode::Full => (
+                        v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                        PROTOCOL_VERSION,
+                    ),
                     AntiFraudMode::Restricted => (v6::register_restricted(self.clone(), router.clone()), PROTOCOL_VERSION),
                 },
                 v => return Err(ProtocolError::VersionMismatch(PROTOCOL_VERSION, v)),
             }
         } else {
             match peer_version.protocol_version {
-                v if v >= PROTOCOL_VERSION => {
-                    (v6::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), PROTOCOL_VERSION)
-                }
-                LEGACY_PROTOCOL_VERSION => {
-                    (v6::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), LEGACY_PROTOCOL_VERSION)
-                }
-                5 => (v5::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), 5),
+                v if v >= PROTOCOL_VERSION => (
+                    v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                    PROTOCOL_VERSION,
+                ),
+                LEGACY_PROTOCOL_VERSION => (
+                    v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                    LEGACY_PROTOCOL_VERSION,
+                ),
+                5 => (v5::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), 5),
                 v => return Err(ProtocolError::VersionMismatch(PROTOCOL_VERSION, v)),
             }
         };
@@ -1266,8 +1292,53 @@ impl ConnectionInitializer for FlowContext {
         });
         router.set_properties(peer_properties);
 
+        let local_ready_signature = match (peer_unified_node_id, peer_node_challenge_nonce) {
+            (Some(peer_node_id), Some(peer_nonce)) => Some(
+                sign_node_auth_proof(
+                    self.unified_node_identity.as_ref(),
+                    network_code,
+                    &peer_node_id,
+                    local_node_challenge_nonce,
+                    peer_nonce,
+                )
+                .map_err(|err| ProtocolError::OtherOwned(format!("failed creating ready auth signature: {err}")))?,
+            ),
+            _ => None,
+        };
+
         // Send and receive the ready signal
-        handshake.exchange_ready_messages().await?;
+        let received_ready_message = handshake
+            .exchange_ready_messages(cryptix_p2p_lib::pb::ReadyMessage {
+                node_auth_signature: local_ready_signature.map(|value| value.to_vec()).unwrap_or_default(),
+            })
+            .await?;
+
+        if let (Some(peer_node_id), Some(peer_pubkey), Some(peer_nonce)) =
+            (peer_unified_node_id, peer_pubkey_xonly, peer_node_challenge_nonce)
+        {
+            if received_ready_message.node_auth_signature.is_empty() {
+                if payload_hf_active {
+                    return Err(ProtocolError::OtherOwned("peer missing mandatory ready auth signature after hardfork".to_string()));
+                }
+            } else {
+                let peer_signature: [u8; 64] = received_ready_message
+                    .node_auth_signature
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| ProtocolError::OtherOwned("peer ready auth signature must be exactly 64 bytes".to_string()))?;
+                if !verify_node_auth_proof(
+                    network_code,
+                    &peer_pubkey,
+                    &peer_node_id,
+                    &self.unified_node_identity.node_id,
+                    peer_nonce,
+                    local_node_challenge_nonce,
+                    &peer_signature,
+                ) {
+                    return Err(ProtocolError::OtherOwned("peer ready auth signature verification failed".to_string()));
+                }
+            }
+        }
 
         info!("Registering p2p flows for peer {} for protocol version {}", router, applied_protocol_version);
 
