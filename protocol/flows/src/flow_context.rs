@@ -4,6 +4,10 @@ use crate::flowcontext::{
     transactions::TransactionsSpread,
 };
 use crate::hfa::{FastIntentP2pData, FastMicroblockP2pData, HfaP2pBridge, HFA_P2P_SERVICE_BIT};
+use crate::node_identity::{
+    compute_node_id, create_ephemeral_identity, is_valid_pow_nonce, load_or_create_identity, network_code_from_name,
+    UnifiedNodeIdentity,
+};
 use crate::strong_nodes::{StrongNodesEngine, StrongNodesEngineConfig, StrongNodesRuntimeSnapshot, STRONG_NODES_P2P_SERVICE_BIT};
 use crate::{v5, v6};
 use async_trait::async_trait;
@@ -62,7 +66,8 @@ use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use uuid::Uuid;
 
 /// The P2P protocol version. Currently the only one supported.
-const PROTOCOL_VERSION: u32 = 6;
+const PROTOCOL_VERSION: u32 = 7;
+const LEGACY_PROTOCOL_VERSION: u32 = 6;
 
 /// See `check_orphan_resolution_range`
 const BASELINE_ORPHAN_RESOLUTION_RANGE: u32 = 5;
@@ -249,6 +254,7 @@ impl BlockEventLogger {
 
 pub struct FlowContextInner {
     pub node_id: PeerId,
+    pub unified_node_identity: Arc<UnifiedNodeIdentity>,
     pub consensus_manager: Arc<ConsensusManager>,
     pub config: Arc<Config>,
     hub: Hub,
@@ -373,11 +379,19 @@ impl FlowContext {
         app_data_dir: PathBuf,
     ) -> Self {
         let hub = Hub::new();
+        let strong_nodes_app_data_dir = app_data_dir.clone();
         let strong_nodes_engine = Arc::new(StrongNodesEngine::new(StrongNodesEngineConfig {
             enabled: strong_nodes_enabled,
             network: config.network_name(),
-            app_data_dir,
+            app_data_dir: strong_nodes_app_data_dir,
         }));
+        let unified_node_identity = match load_or_create_identity(&app_data_dir, &config.network_name()) {
+            Ok(identity) => identity,
+            Err(err) => {
+                warn!("failed loading persistent unified node identity: {err}; falling back to ephemeral identity");
+                create_ephemeral_identity(&config.network_name()).expect("failed creating ephemeral unified node identity")
+            }
+        };
 
         let orphan_resolution_range = BASELINE_ORPHAN_RESOLUTION_RANGE + (config.bps() as f64).log2().ceil() as u32;
 
@@ -387,6 +401,7 @@ impl FlowContext {
         Self {
             inner: Arc::new(FlowContextInner {
                 node_id: Uuid::new_v4().into(),
+                unified_node_identity: Arc::new(unified_node_identity),
                 consensus_manager,
                 orphans_pool: AsyncRwLock::new(OrphanBlocksPool::new(max_orphans)),
                 shared_block_requests: Arc::new(Mutex::new(HashMap::new())),
@@ -1128,9 +1143,10 @@ impl ConnectionInitializer for FlowContext {
         // Subnets are not currently supported
         let mut self_version_message = Version::new(local_address, self.node_id, network_name.clone(), None, PROTOCOL_VERSION);
         self_version_message.add_user_agent(name(), version(), &self.config.user_agent_comments);
-        let local_anti_fraud_hash_window =
-            self.connection_manager().map(|cm| cm.anti_fraud_hash_window()).unwrap_or([[0u8; 32]; 3]);
+        let local_anti_fraud_hash_window = self.connection_manager().map(|cm| cm.anti_fraud_hash_window()).unwrap_or([[0u8; 32]; 3]);
         self_version_message.anti_fraud_hashes = local_anti_fraud_hash_window.to_vec();
+        self_version_message.node_pubkey_xonly = Some(self.unified_node_identity.pubkey_xonly);
+        self_version_message.node_pow_nonce = Some(self.unified_node_identity.pow_nonce);
         if self.is_hfa_p2p_enabled() {
             self_version_message.services |= HFA_P2P_SERVICE_BIT;
         }
@@ -1146,18 +1162,43 @@ impl ConnectionInitializer for FlowContext {
         let time_offset = unix_now() as i64 - peer_version_message.timestamp;
 
         let peer_version: Version = peer_version_message.try_into()?;
+        let network_code = network_code_from_name(&network_name)
+            .ok_or_else(|| ProtocolError::OtherOwned(format!("unsupported network for node identity `{network_name}`")))?;
+        let peer_unified_node_id = match (peer_version.node_pubkey_xonly, peer_version.node_pow_nonce) {
+            (Some(pubkey), Some(pow_nonce)) => {
+                if !is_valid_pow_nonce(network_code, &pubkey, pow_nonce) {
+                    return Err(ProtocolError::OtherOwned("peer sent invalid node identity proof-of-work".to_string()));
+                }
+                Some(compute_node_id(&pubkey))
+            }
+            (None, None) => None,
+            _ => return Err(ProtocolError::OtherOwned("peer sent incomplete node identity handshake fields".to_string())),
+        };
         router.set_identity(peer_version.id);
         // Avoid duplicate connections
         if self.hub.has_peer(router.key()) {
             return Err(ProtocolError::PeerAlreadyExists(router.key()));
         }
-        // And loopback connections...
-        if self.node_id == router.identity() {
-            return Err(ProtocolError::LoopbackConnection(router.key()));
-        }
-
         if peer_version.network != network_name {
             return Err(ProtocolError::WrongNetwork(network_name, peer_version.network));
+        }
+
+        let payload_hf_active = self.is_payload_hf_active();
+        if payload_hf_active && peer_unified_node_id.is_none() {
+            return Err(ProtocolError::OtherOwned("peer missing mandatory unified node identity after hardfork".to_string()));
+        }
+        if let Some(peer_node_id) = peer_unified_node_id {
+            if peer_node_id == self.unified_node_identity.node_id {
+                return Err(ProtocolError::LoopbackConnection(router.key()));
+            }
+            if let Some(connection_manager) = self.connection_manager() {
+                if connection_manager.is_banserver_banned_node_id(&peer_node_id) {
+                    return Err(ProtocolError::OtherOwned("peer unified node identity is externally banned".to_string()));
+                }
+            }
+        } else if self.node_id == router.identity() {
+            // Legacy pre-HF fallback.
+            return Err(ProtocolError::LoopbackConnection(router.key()));
         }
 
         debug!("protocol versions - self: {}, peer: {}", PROTOCOL_VERSION, peer_version.protocol_version);
@@ -1186,26 +1227,24 @@ impl ConnectionInitializer for FlowContext {
             })
             .unwrap_or(AntiFraudMode::Restricted);
 
-        let payload_hf_active = self.is_payload_hf_active();
         let (flows, applied_protocol_version) = if payload_hf_active {
             // After payload HF activation we no longer accept legacy P2P protocol versions.
             match peer_version.protocol_version {
-                v if v >= PROTOCOL_VERSION => {
-                    match anti_fraud_mode {
-                        AntiFraudMode::Full => {
-                            (v6::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), PROTOCOL_VERSION)
-                        }
-                        AntiFraudMode::Restricted => {
-                            (v6::register_restricted(self.clone(), router.clone()), PROTOCOL_VERSION)
-                        }
+                v if v >= PROTOCOL_VERSION => match anti_fraud_mode {
+                    AntiFraudMode::Full => {
+                        (v6::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), PROTOCOL_VERSION)
                     }
-                }
+                    AntiFraudMode::Restricted => (v6::register_restricted(self.clone(), router.clone()), PROTOCOL_VERSION),
+                },
                 v => return Err(ProtocolError::VersionMismatch(PROTOCOL_VERSION, v)),
             }
         } else {
             match peer_version.protocol_version {
                 v if v >= PROTOCOL_VERSION => {
                     (v6::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), PROTOCOL_VERSION)
+                }
+                LEGACY_PROTOCOL_VERSION => {
+                    (v6::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), LEGACY_PROTOCOL_VERSION)
                 }
                 5 => (v5::register(self.clone(), router.clone(), hfa_capable, strong_nodes_capable), 5),
                 v => return Err(ProtocolError::VersionMismatch(PROTOCOL_VERSION, v)),
@@ -1223,6 +1262,7 @@ impl ConnectionInitializer for FlowContext {
             time_offset,
             anti_fraud_hashes: peer_version.anti_fraud_hashes.clone(),
             anti_fraud_restricted: payload_hf_active && anti_fraud_mode == AntiFraudMode::Restricted,
+            unified_node_id: peer_unified_node_id,
         });
         router.set_properties(peer_properties);
 

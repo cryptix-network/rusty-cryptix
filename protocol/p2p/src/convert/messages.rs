@@ -34,6 +34,8 @@ impl From<Version> for protowire::VersionMessage {
             subnetwork_id: item.subnetwork_id.map(|x| x.into()),
             network: item.network.clone(),
             anti_fraud_hashes: item.anti_fraud_hashes.into_iter().map(|v| v.to_vec()).collect(),
+            node_pubkey_xonly: item.node_pubkey_xonly.map(|value| value.to_vec()).unwrap_or_default(),
+            node_pow_nonce: item.node_pow_nonce,
         }
     }
 }
@@ -56,6 +58,8 @@ impl TryFrom<protowire::VersionMessage> for Version {
             subnetwork_id: if msg.subnetwork_id.is_none() { None } else { Some(msg.subnetwork_id.unwrap().try_into()?) },
             network: msg.network.clone(),
             anti_fraud_hashes: parse_anti_fraud_hashes(msg.anti_fraud_hashes)?,
+            node_pubkey_xonly: parse_optional_32_bytes(msg.node_pubkey_xonly)?,
+            node_pow_nonce: msg.node_pow_nonce,
         })
     }
 }
@@ -64,9 +68,15 @@ fn parse_anti_fraud_hashes(raw: Vec<Vec<u8>>) -> Result<Vec<[u8; 32]>, Conversio
     if raw.len() > 3 {
         return Err(ConversionError::General);
     }
-    raw.into_iter()
-        .map(|entry| entry.as_slice().try_into().map_err(|_| ConversionError::General))
-        .collect()
+    raw.into_iter().map(|entry| entry.as_slice().try_into().map_err(|_| ConversionError::General)).collect()
+}
+
+fn parse_optional_32_bytes(raw: Vec<u8>) -> Result<Option<[u8; 32]>, ConversionError> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let value: [u8; 32] = raw.as_slice().try_into().map_err(|_| ConversionError::General)?;
+    Ok(Some(value))
 }
 
 impl TryFrom<protowire::RequestHeadersMessage> for (Hash, Hash) {

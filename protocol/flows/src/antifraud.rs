@@ -1,14 +1,13 @@
 use crate::{flow_context::FlowContext, flow_trait::Flow};
 use async_trait::async_trait;
-use cryptix_connectionmanager::{AntiFraudMode, AntiFraudSnapshotEnvelope, ConnectionManager, ANTI_FRAUD_HASH_WINDOW_LEN, ANTI_FRAUD_ZERO_HASH};
+use cryptix_connectionmanager::{
+    AntiFraudMode, AntiFraudSnapshotEnvelope, ConnectionManager, ANTI_FRAUD_HASH_WINDOW_LEN, ANTI_FRAUD_ZERO_HASH,
+};
 use cryptix_core::{debug, warn};
 use cryptix_p2p_lib::{
     common::ProtocolError,
-    dequeue_with_request_id,
-    make_request, make_response,
-    pb::{
-        cryptixd_message::Payload, AntiFraudSnapshotV1Message, RequestAntiFraudSnapshotV1Message,
-    },
+    dequeue_with_request_id, make_request, make_response,
+    pb::{cryptixd_message::Payload, AntiFraudSnapshotV1Message, RequestAntiFraudSnapshotV1Message},
     IncomingRoute, Router,
 };
 use std::sync::Arc;
@@ -17,6 +16,7 @@ use tokio::{select, time::interval};
 
 const ANTI_FRAUD_REQUEST_INTERVAL: Duration = Duration::from_secs(20);
 const ANTI_FRAUD_MODE_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+const HARD_FORK_PROTOCOL_VERSION: u32 = 7;
 
 fn anti_fraud_hash_window_from_vec(entries: &[[u8; 32]]) -> Option<[[u8; 32]; 3]> {
     if entries.len() != 3 {
@@ -102,10 +102,20 @@ impl Flow for AntiFraudSnapshotSyncFlow {
             select! {
                 _ = mode_ticker.tick() => {
                     if self.ctx.is_payload_hf_active() {
+                        let properties = self.router.properties();
+                        if properties.protocol_version < HARD_FORK_PROTOCOL_VERSION {
+                            warn!(
+                                "Peer {} still uses pre-HF protocol version {}; reconnecting to enforce v{}+",
+                                self.router,
+                                properties.protocol_version,
+                                HARD_FORK_PROTOCOL_VERSION
+                            );
+                            self.ctx.hub().terminate(self.router.key()).await;
+                            return Ok(());
+                        }
                         let Some(connection_manager) = self.ctx.connection_manager() else {
                             continue;
                         };
-                        let properties = self.router.properties();
                         let current_mode = anti_fraud_hash_window_from_vec(&properties.anti_fraud_hashes)
                             .map(|peer_hash_window| connection_manager.anti_fraud_mode_for_peer_hashes(&peer_hash_window))
                             .unwrap_or(AntiFraudMode::Restricted);

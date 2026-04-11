@@ -3,6 +3,7 @@ pub mod flow_context;
 pub mod flow_trait;
 pub mod flowcontext;
 pub mod hfa;
+pub mod node_identity;
 pub mod service;
 pub mod strong_nodes;
 pub mod v5;

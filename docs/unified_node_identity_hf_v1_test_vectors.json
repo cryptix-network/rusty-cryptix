@@ -1,0 +1,60 @@
+{
+  "domain": "cryptix-node-id-pow-v1",
+  "vectors": [
+    {
+      "label": "vec1-mainnet",
+      "network": 0,
+      "difficulty": 20,
+      "private_key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "pubkey_xonly_hex": "6d6caac248af96f6afa7f904f550253a0f3ef3f5aa2fe6838a95b216691468e2",
+      "node_id_hex": "1b393963bd75edc656dbc0207e35416c509d27a2bf83119c4b4f916bedbab3a2",
+      "pow_nonce": 1763949,
+      "pow_hash_hex": "00000bc349b49f4e4ade68388d08c61b675702a222d254d8d4411e9c5e46e1be",
+      "leading_zero_bits": 20
+    },
+    {
+      "label": "vec2-mainnet",
+      "network": 0,
+      "difficulty": 20,
+      "private_key_hex": "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
+      "pubkey_xonly_hex": "5f7117a78150fe2ef97db7cfc83bd57b2e2c0d0dd25eaf467a4a1c2a45ce1486",
+      "node_id_hex": "53240c1f9d4506e30994f69fbbf8feb97f3d2e0d89330cf76207b41fef73d994",
+      "pow_nonce": 1297078,
+      "pow_hash_hex": "00000cc9a5a11330fa7921cab2ecde7cddf9898bc90067f833bfe67c4c8f9af0",
+      "leading_zero_bits": 20
+    },
+    {
+      "label": "vec3-testnet",
+      "network": 1,
+      "difficulty": 18,
+      "private_key_hex": "09bd7f60bd8bebf178d23abe7744da54cb0d6803b16bb498f0b443fe768c31ee",
+      "pubkey_xonly_hex": "fc10777c57060195c83e9885c790c8a26496d305b366b8e5fbf475203c680f79",
+      "node_id_hex": "e28077604051f2d4cc5218b7d57e81164203ccfb2b503b2aa0dd8fd30c19e274",
+      "pow_nonce": 345502,
+      "pow_hash_hex": "00003e411f41cc52438ec9dafca71e57ca44008506d3fe7535abd46229e17594",
+      "leading_zero_bits": 18
+    },
+    {
+      "label": "vec4-devnet",
+      "network": 2,
+      "difficulty": 18,
+      "private_key_hex": "9e335f14f1a549c374a273b014e4e6658c666b9be6bb7478085510abcba7fae2",
+      "pubkey_xonly_hex": "c93b4ed533a76866a3c3ea1cc0bc3e70c0dbe32a945057b5dff95b88ce9280dd",
+      "node_id_hex": "524988b85b8b6ba0d4e24b934cc5b129c628f70609932cd4509e82eb6a22556a",
+      "pow_nonce": 124967,
+      "pow_hash_hex": "000015e1c263f2bb0d143105ce860e510f83a35fb8add33543ca7336e0a98c9a",
+      "leading_zero_bits": 19
+    },
+    {
+      "label": "vec5-simnet",
+      "network": 3,
+      "difficulty": 18,
+      "private_key_hex": "f6c8f31fd359cbb97007034780bc4021f6ad01c6bc10499b79849efd4cc7ca39",
+      "pubkey_xonly_hex": "01ea552a43712c4c96771ce1e9f83a877a735b31b3e200df94c661153c7dcb4b",
+      "node_id_hex": "570a7eadd0f105a27fd5530dd175a8d8d21c38b657206afdd37e6cd644b4b84f",
+      "pow_nonce": 211636,
+      "pow_hash_hex": "00003cba8df2eb272709f06a05f870d71ac9f3c866f9d4ab0e2b4e1026c52aea",
+      "leading_zero_bits": 18
+    }
+  ]
+}

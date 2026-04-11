@@ -148,6 +148,8 @@ message VersionMessage{
   SubnetworkId subnetworkId = 9;
   string network = 10;
   repeated bytes antiFraudHashes = 11;
+  bytes nodePubkeyXonly = 12;
+  optional uint64 nodePowNonce = 13;
 }
 
 message RequestAntiFraudSnapshotV1Message{

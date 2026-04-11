@@ -102,6 +102,8 @@ fn build_dummy_version_message() -> VersionMessage {
         subnetwork_id: None,
         network: "cryptix-mainnet".to_string(),
         anti_fraud_hashes: Vec::new(),
+        node_pubkey_xonly: Vec::new(),
+        node_pow_nonce: None,
     }
 }
 

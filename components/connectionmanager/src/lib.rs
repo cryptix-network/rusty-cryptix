@@ -13,14 +13,14 @@ use cryptix_addressmanager::{AddressManager, NetAddress};
 use cryptix_core::{debug, info, warn};
 use cryptix_p2p_lib::{common::ProtocolError, ConnectionError, Peer, PeerKey};
 use cryptix_utils::triggers::SingleTrigger;
-use secp256k1::{schnorr::Signature as SchnorrSignature, Message as SecpMessage, XOnlyPublicKey};
-use serde::{Deserialize, Serialize};
 use duration_string::DurationString;
 use futures_util::future::{join_all, try_join_all};
 use itertools::Itertools;
 use parking_lot::Mutex as ParkingLotMutex;
 use rand::{seq::SliceRandom, thread_rng};
 use reqwest::{redirect::Policy as RedirectPolicy, Client as HttpClient, Url as ParsedUrl};
+use secp256k1::{schnorr::Signature as SchnorrSignature, Message as SecpMessage, XOnlyPublicKey};
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tokio::{
     select,
@@ -34,7 +34,7 @@ use tokio::{
 pub const DEFAULT_BANSERVER_URL: &str = "https://antifraud.cryptix-network.org/api/v1/antifraud/snapshot";
 pub const ANTI_FRAUD_ZERO_HASH: [u8; 32] = [0u8; 32];
 pub const ANTI_FRAUD_HASH_WINDOW_LEN: usize = 3;
-const BANSERVER_REFRESH_INTERVAL: Duration = Duration::from_secs(20 * 60);
+const BANSERVER_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const BANSERVER_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const BANSERVER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const BANSERVER_MAX_IPS: usize = 4096;
@@ -540,8 +540,12 @@ impl ConnectionManager {
         self.banserver_banned_ips.lock().contains(&ip)
     }
 
+    pub fn is_banserver_banned_node_id(&self, node_id_raw: &[u8; 32]) -> bool {
+        self.banserver_banned_strong_node_ids.lock().contains(node_id_raw)
+    }
+
     pub fn is_banserver_banned_strong_node_id(&self, static_id_raw: &[u8; 32]) -> bool {
-        self.banserver_banned_strong_node_ids.lock().contains(static_id_raw)
+        self.is_banserver_banned_node_id(static_id_raw)
     }
 
     pub fn anti_fraud_hash_window(&self) -> [[u8; 32]; ANTI_FRAUD_HASH_WINDOW_LEN] {
@@ -662,10 +666,7 @@ impl ConnectionManager {
         };
 
         if fetched.snapshot.network != self.anti_fraud_network {
-            warn!(
-                "Banserver snapshot network mismatch: expected {:?}, got {:?}",
-                self.anti_fraud_network, fetched.snapshot.network
-            );
+            warn!("Banserver snapshot network mismatch: expected {:?}, got {:?}", self.anti_fraud_network, fetched.snapshot.network);
             self.anti_fraud_state.lock().peer_fallback_required = true;
             return;
         }
@@ -677,6 +678,10 @@ impl ConnectionManager {
                     let banned = self.banserver_banned_ips.lock().iter().copied().collect_vec();
                     if !banned.is_empty() {
                         self.disconnect_peers_by_ip_list(banned).await;
+                    }
+                    let banned_node_ids = self.banserver_banned_strong_node_ids.lock().iter().copied().collect_vec();
+                    if !banned_node_ids.is_empty() {
+                        self.disconnect_peers_by_node_id_list(banned_node_ids).await;
                     }
                 }
             }
@@ -782,14 +787,8 @@ impl ConnectionManager {
         }
         let signature = Self::decode_hex(signature_hex).ok_or("invalid signature hex")?;
 
-        let ip_values = root
-            .get("banned_ips")
-            .and_then(JsonValue::as_array)
-            .ok_or("missing banned_ips array")?;
-        let node_id_values = root
-            .get("banned_node_ids")
-            .and_then(JsonValue::as_array)
-            .ok_or("missing banned_node_ids array")?;
+        let ip_values = root.get("banned_ips").and_then(JsonValue::as_array).ok_or("missing banned_ips array")?;
+        let node_id_values = root.get("banned_node_ids").and_then(JsonValue::as_array).ok_or("missing banned_node_ids array")?;
         let ip_count = Self::read_u64(root, &["banned_ips_count"]).ok_or("missing banned_ips_count")?;
         if ip_count > BANSERVER_MAX_IPS as u64 {
             return Err(format!("banned_ips_count exceeds max {}", BANSERVER_MAX_IPS));
@@ -846,9 +845,9 @@ impl ConnectionManager {
     }
 
     fn read_u64(value: &JsonValue, keys: &[&str]) -> Option<u64> {
-        keys.iter().find_map(|key| value.get(*key)).and_then(|v| {
-            v.as_u64().or_else(|| v.as_str().and_then(|raw| raw.trim().parse::<u64>().ok()))
-        })
+        keys.iter()
+            .find_map(|key| value.get(*key))
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|raw| raw.trim().parse::<u64>().ok())))
     }
 
     fn read_network(value: &JsonValue) -> Option<u8> {
@@ -876,12 +875,12 @@ impl ConnectionManager {
         Self::normalize_snapshot_static(envelope, self.anti_fraud_network)
     }
 
-    fn normalize_snapshot_static(envelope: AntiFraudSnapshotEnvelope, expected_network: AntiFraudNetwork) -> Result<AntiFraudSnapshot, String> {
+    fn normalize_snapshot_static(
+        envelope: AntiFraudSnapshotEnvelope,
+        expected_network: AntiFraudNetwork,
+    ) -> Result<AntiFraudSnapshot, String> {
         if envelope.schema_version != ANTI_FRAUD_SCHEMA_VERSION {
-            return Err(format!(
-                "unsupported schema_version {} (expected {})",
-                envelope.schema_version, ANTI_FRAUD_SCHEMA_VERSION
-            ));
+            return Err(format!("unsupported schema_version {} (expected {})", envelope.schema_version, ANTI_FRAUD_SCHEMA_VERSION));
         }
         if envelope.banned_ips.len() > BANSERVER_MAX_IPS {
             return Err(format!("banned_ips_count exceeds max {}", BANSERVER_MAX_IPS));
@@ -1158,7 +1157,10 @@ impl ConnectionManager {
         Ok(true)
     }
 
-    fn advance_hash_window(current: [[u8; 32]; ANTI_FRAUD_HASH_WINDOW_LEN], new_hash: [u8; 32]) -> [[u8; 32]; ANTI_FRAUD_HASH_WINDOW_LEN] {
+    fn advance_hash_window(
+        current: [[u8; 32]; ANTI_FRAUD_HASH_WINDOW_LEN],
+        new_hash: [u8; 32],
+    ) -> [[u8; 32]; ANTI_FRAUD_HASH_WINDOW_LEN] {
         if new_hash == ANTI_FRAUD_ZERO_HASH || current[0] == new_hash {
             return current;
         }
@@ -1234,11 +1236,7 @@ impl ConnectionManager {
         self.normalize_snapshot_envelope(envelope).ok()
     }
 
-    fn persist_snapshots(
-        &self,
-        previous: Option<&AntiFraudSnapshot>,
-        current: Option<&AntiFraudSnapshot>,
-    ) -> Result<(), String> {
+    fn persist_snapshots(&self, previous: Option<&AntiFraudSnapshot>, current: Option<&AntiFraudSnapshot>) -> Result<(), String> {
         let Some(current_path) = self.anti_fraud_current_path() else { return Ok(()) };
         let Some(previous_path) = self.anti_fraud_previous_path() else { return Ok(()) };
         if let Some(parent) = current_path.parent() {
@@ -1293,6 +1291,26 @@ impl ConnectionManager {
         let disconnect_jobs = peers_to_disconnect.iter().map(|peer| self.p2p_adaptor.terminate(peer.key())).collect_vec();
         join_all(disconnect_jobs).await;
     }
+
+    async fn disconnect_peers_by_node_id_list(&self, node_ids: Vec<[u8; 32]>) {
+        let banned_set = node_ids.into_iter().collect::<HashSet<_>>();
+        let peers_to_disconnect = self
+            .p2p_adaptor
+            .active_peers()
+            .into_iter()
+            .filter(|peer| peer.properties().unified_node_id.map(|node_id| banned_set.contains(&node_id)).unwrap_or(false))
+            .collect_vec();
+        if peers_to_disconnect.is_empty() {
+            return;
+        }
+
+        info!(
+            "Banserver enforcement: disconnecting {} active peer(s) due to newly banned unified node ID entries",
+            peers_to_disconnect.len()
+        );
+        let disconnect_jobs = peers_to_disconnect.iter().map(|peer| self.p2p_adaptor.terminate(peer.key())).collect_vec();
+        join_all(disconnect_jobs).await;
+    }
 }
 
 impl From<AntiFraudSnapshot> for AntiFraudSnapshotEnvelope {
@@ -1319,11 +1337,7 @@ impl From<&AntiFraudSnapshot> for PersistedSnapshotV1 {
             generated_at_ms: value.generated_at_ms,
             signing_key_id: value.signing_key_id,
             banned_ips: value.banned_ip_entries.iter().map(|entry| ConnectionManager::encode_hex(entry)).collect(),
-            banned_node_ids: value
-                .banned_node_id_entries
-                .iter()
-                .map(|entry| ConnectionManager::encode_hex(entry))
-                .collect(),
+            banned_node_ids: value.banned_node_id_entries.iter().map(|entry| ConnectionManager::encode_hex(entry)).collect(),
             signature: ConnectionManager::encode_hex(&value.signature),
         }
     }
