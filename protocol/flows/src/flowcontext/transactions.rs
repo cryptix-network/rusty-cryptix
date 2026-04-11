@@ -7,6 +7,7 @@ use cryptix_p2p_lib::{
     Hub,
 };
 use itertools::Itertools;
+use rand::seq::SliceRandom;
 use std::time::{Duration, Instant};
 
 /// Interval between mempool scanning tasks (in seconds)
@@ -70,8 +71,8 @@ impl TransactionsSpread {
         self.scanning_task_running = false;
     }
 
-    /// Add the given transactions IDs to a set of IDs to broadcast. The IDs will be broadcasted to all peers
-    /// within transaction Inv messages.
+    /// Add the given transactions IDs to a set of IDs to broadcast. The IDs will be broadcasted to all
+    /// non-restricted peers within transaction Inv messages.
     ///
     /// The broadcast itself may happen only during a subsequent call to this function since it is done at most
     /// every `broadcast_interval` milliseconds or when the queue length is larger than the Inv message
@@ -97,11 +98,20 @@ impl TransactionsSpread {
     }
 
     async fn broadcast(&self, msg: CryptixdMessage, should_throttle: bool) {
-        if should_throttle {
+        let mut peers = self
+            .hub
+            .active_peers()
+            .into_iter()
+            .filter(|peer| !peer.properties().anti_fraud_restricted)
+            .map(|peer| peer.key())
+            .collect_vec();
+        if should_throttle && peers.len() > 8 {
             // TODO: Figure out a better number
-            self.hub.broadcast_to_some_peers(msg, 8).await
-        } else {
-            self.hub.broadcast(msg).await
+            peers.shuffle(&mut rand::thread_rng());
+            peers.truncate(8);
+        }
+        for peer_key in peers {
+            let _ = self.hub.send(peer_key, msg.clone()).await;
         }
     }
 }

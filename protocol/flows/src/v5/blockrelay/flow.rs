@@ -210,11 +210,13 @@ impl HandleRelayInvsFlow {
                     .iter()
                     .map(|b| make_message!(Payload::InvRelayBlock, InvRelayBlockMessage { hash: Some(b.hash().into()) }))
                     .collect();
-                self.ctx.hub().broadcast_many(msgs).await;
+                self.ctx.broadcast_many_to_unrestricted_peers(msgs).await;
 
                 self.ctx
-                    .hub()
-                    .broadcast(make_message!(Payload::InvRelayBlock, InvRelayBlockMessage { hash: Some(inv.hash.into()) }))
+                    .broadcast_to_unrestricted_peers(make_message!(
+                        Payload::InvRelayBlock,
+                        InvRelayBlockMessage { hash: Some(inv.hash.into()) }
+                    ))
                     .await;
             }
 
