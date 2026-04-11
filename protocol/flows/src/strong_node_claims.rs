@@ -202,6 +202,9 @@ impl StrongNodeClaimsEngine {
                 state.retention_hashes.retain(|entry| *entry != hash);
                 state.dirty = true;
             }
+            if purge_block_claim_state_locked(&mut state, hash) {
+                state.dirty = true;
+            }
         }
 
         for hash in chain_path.added {
@@ -232,9 +235,7 @@ impl StrongNodeClaimsEngine {
         while state.retention_hashes.len() > CLAIM_WINDOW_SIZE_BLOCKS + CLAIM_REORG_MARGIN_BLOCKS {
             if let Some(evicted) = state.retention_hashes.pop_front() {
                 state.retention_set.remove(&evicted);
-                state.recent_claims_by_block.remove(&evicted);
-                state.winning_claim_by_block.remove(&evicted);
-                state.pending_unknown_claims.remove(&evicted);
+                let _ = purge_block_claim_state_locked(&mut state, evicted);
                 state.dirty = true;
             }
         }
@@ -421,6 +422,20 @@ fn decrement_score(score: &mut BTreeMap<[u8; 32], u32>, node_id: [u8; 32]) {
             score.remove(&node_id);
         }
     }
+}
+
+fn purge_block_claim_state_locked(state: &mut EngineState, block_hash: Hash) -> bool {
+    let mut changed = false;
+    if state.recent_claims_by_block.remove(&block_hash).is_some() {
+        changed = true;
+    }
+    if state.winning_claim_by_block.remove(&block_hash).is_some() {
+        changed = true;
+    }
+    if state.pending_unknown_claims.remove(&block_hash).is_some() {
+        changed = true;
+    }
+    changed
 }
 
 fn recompute_scores(state: &mut EngineState) {
@@ -676,6 +691,43 @@ mod tests {
         let reloaded_snapshot = reloaded.snapshot(true);
         assert_eq!(reloaded_snapshot.entries.len(), 1, "expected one scored entry after reload");
         assert_eq!(reloaded_snapshot.entries[0].claimed_blocks, 1, "expected one claimed block after reload");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn removed_blocks_purge_claim_state() {
+        let temp_dir = std::env::temp_dir().join(format!("strong-node-claims-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("failed creating temp dir");
+        let engine = StrongNodeClaimsEngine::new(true, "mainnet", &temp_dir);
+
+        let claim = build_signed_claim_message(
+            0,
+            "9e335f14f1a549c374a273b014e4e6658c666b9be6bb7478085510abcba7fae2",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let outcome = engine.ingest_claim(&claim, true);
+        match outcome {
+            ClaimIngestOutcome::Accepted { pending } => assert!(pending, "claim should be pending before block is known"),
+            other => panic!("unexpected ingest outcome: {other:?}"),
+        }
+
+        let block_hash = Hash::from_bytes(decode_hex_32("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap());
+        let mut add_path = ChainPath::default();
+        add_path.added.push(block_hash);
+        engine.apply_chain_path_update(add_path, block_hash, true);
+
+        let mut remove_path = ChainPath::default();
+        remove_path.removed.push(block_hash);
+        engine.apply_chain_path_update(remove_path, block_hash, true);
+
+        let state = engine.state.lock();
+        assert!(!state.window_set.contains(&block_hash), "expected removed block to be absent from window set");
+        assert!(!state.retention_set.contains(&block_hash), "expected removed block to be absent from retention set");
+        assert!(!state.recent_claims_by_block.contains_key(&block_hash), "expected removed block to be absent from recent claims");
+        assert!(!state.winning_claim_by_block.contains_key(&block_hash), "expected removed block to be absent from winners");
+        assert!(!state.pending_unknown_claims.contains_key(&block_hash), "expected removed block to be absent from pending claims");
+        assert!(state.score_by_node_id.is_empty(), "expected no remaining scores after removing the only claimed block");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

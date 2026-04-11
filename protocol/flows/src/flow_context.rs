@@ -112,6 +112,17 @@ fn anti_fraud_hash_window_from_vec(entries: &[[u8; 32]]) -> Option<[[u8; 32]; 3]
     Some([entries[0], entries[1], entries[2]])
 }
 
+fn is_compatible_peer_network(local_network: &str, remote_network: &str) -> bool {
+    if local_network == remote_network {
+        return true;
+    }
+    is_testnet_network_alias(local_network) && is_testnet_network_alias(remote_network)
+}
+
+fn is_testnet_network_alias(name: &str) -> bool {
+    name == "cryptix-testnet" || name.starts_with("cryptix-testnet-")
+}
+
 /// Represents a block event to be logged
 #[derive(Debug, PartialEq)]
 pub enum BlockLogEvent {
@@ -1193,7 +1204,7 @@ impl ConnectionInitializer for FlowContext {
         if self.hub.has_peer(router.key()) {
             return Err(ProtocolError::PeerAlreadyExists(router.key()));
         }
-        if peer_version.network != network_name {
+        if !is_compatible_peer_network(&network_name, &peer_version.network) {
             return Err(ProtocolError::WrongNetwork(network_name, peer_version.network));
         }
 
@@ -1359,5 +1370,26 @@ impl ConnectionInitializer for FlowContext {
         // it is considered a protocol error and the connection will disconnect
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_compatible_peer_network, is_testnet_network_alias};
+
+    #[test]
+    fn test_testnet_alias_detection() {
+        assert!(is_testnet_network_alias("cryptix-testnet"));
+        assert!(is_testnet_network_alias("cryptix-testnet-11"));
+        assert!(!is_testnet_network_alias("cryptix-mainnet"));
+        assert!(!is_testnet_network_alias("testnet"));
+    }
+
+    #[test]
+    fn test_network_compatibility() {
+        assert!(is_compatible_peer_network("cryptix-mainnet", "cryptix-mainnet"));
+        assert!(is_compatible_peer_network("cryptix-testnet", "cryptix-testnet-11"));
+        assert!(is_compatible_peer_network("cryptix-testnet-11", "cryptix-testnet"));
+        assert!(!is_compatible_peer_network("cryptix-mainnet", "cryptix-testnet"));
     }
 }
