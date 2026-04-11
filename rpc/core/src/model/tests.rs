@@ -1060,24 +1060,13 @@ mod mockery {
     impl Mock for RpcStrongNodeEntry {
         fn mock() -> Self {
             RpcStrongNodeEntry {
-                static_id: "00".repeat(32),
+                node_id: "00".repeat(32),
                 public_key_xonly: "11".repeat(32),
-                source: "direct".to_string(),
-                signature_valid: true,
-                performance_verified: false,
-                claimed_ip: Some("127.0.0.1".to_string()),
-                last_sender_ip: Some("::1".to_string()),
-                seq_no: mock(),
-                found_blocks_10m: mock(),
-                total_blocks_10m: mock(),
+                source: "claimant-v1".to_string(),
+                claimed_blocks: mock(),
                 share_bps: mock(),
-                window_start_ms: mock(),
-                window_end_ms: mock(),
-                sent_at_ms: mock(),
-                first_seen_ms: mock(),
-                last_seen_ms: mock(),
-                last_announce_sent_at_ms: mock(),
-                is_stale: false,
+                last_claim_block_hash: Some("22".repeat(32)),
+                last_claim_time_ms: mock(),
             }
         }
     }
@@ -1092,7 +1081,8 @@ mod mockery {
                 runtime_available: true,
                 disabled_reason_code: None,
                 disabled_reason_message: None,
-                seq_conflict_total: mock(),
+                conflict_total: mock(),
+                window_size: mock(),
                 entries: vec![mock()],
             }
         }

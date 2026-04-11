@@ -1400,24 +1400,13 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             .entries
             .into_iter()
             .map(|entry| RpcStrongNodeEntry {
-                static_id: entry.node_id,
+                node_id: entry.node_id,
                 public_key_xonly: entry.public_key_xonly,
                 source: "claimant-v1".to_string(),
-                signature_valid: true,
-                performance_verified: true,
-                claimed_ip: None,
-                last_sender_ip: None,
-                seq_no: 0,
-                found_blocks_10m: entry.claimed_blocks,
-                total_blocks_10m: snapshot.window_size,
+                claimed_blocks: entry.claimed_blocks,
                 share_bps: entry.share_bps,
-                window_start_ms: 0,
-                window_end_ms: 0,
-                sent_at_ms: entry.last_claim_time_ms,
-                first_seen_ms: entry.last_claim_time_ms,
-                last_seen_ms: entry.last_claim_time_ms,
-                last_announce_sent_at_ms: entry.last_claim_time_ms,
-                is_stale: false,
+                last_claim_block_hash: entry.last_claim_block_hash,
+                last_claim_time_ms: entry.last_claim_time_ms,
             })
             .collect();
 
@@ -1427,7 +1416,8 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             runtime_available: snapshot.runtime_available,
             disabled_reason_code: None,
             disabled_reason_message: None,
-            seq_conflict_total: snapshot.conflict_total,
+            conflict_total: snapshot.conflict_total,
+            window_size: snapshot.window_size,
             entries,
         })
     }

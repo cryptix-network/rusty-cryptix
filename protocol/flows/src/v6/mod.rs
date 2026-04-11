@@ -25,12 +25,7 @@ use crate::v6::request_pruning_point_and_anticone::PruningPointAndItsAnticoneReq
 
 pub(crate) mod request_pruning_point_and_anticone;
 
-pub fn register(
-    ctx: FlowContext,
-    router: Arc<Router>,
-    hfa_capable: bool,
-    strong_node_claims_capable: bool,
-) -> Vec<Box<dyn Flow>> {
+pub fn register(ctx: FlowContext, router: Arc<Router>, hfa_capable: bool, strong_node_claims_capable: bool) -> Vec<Box<dyn Flow>> {
     // IBD flow <-> invs flow communication uses a job channel in order to always
     // maintain at most a single pending job which can be updated
     let (ibd_sender, relay_receiver) = channel::job();

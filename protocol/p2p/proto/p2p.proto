@@ -331,21 +331,6 @@ message FastMicroblockMessage {
   repeated Hash intentIds = 2;
 }
 
-message StrongNodeAnnouncementMessage {
-  uint32 schemaVersion = 1;
-  string network = 2;
-  bytes staticIdRaw = 3;
-  bytes pubkeyXonly = 4;
-  uint64 seqNo = 5;
-  uint64 windowStartMs = 6;
-  uint64 windowEndMs = 7;
-  uint32 foundBlocks10m = 8;
-  uint32 totalBlocks10m = 9;
-  uint64 sentAtMs = 10;
-  bytes claimedIp = 11;
-  bytes signature = 12;
-}
-
 message BlockProducerClaimV1Message {
   uint32 schemaVersion = 1;
   uint32 network = 2;

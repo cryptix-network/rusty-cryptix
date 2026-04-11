@@ -40,9 +40,7 @@ use cryptix_p2p_lib::{
     common::ProtocolError,
     convert::model::version::Version,
     make_message,
-    pb::{
-        cryptixd_message::Payload, BlockProducerClaimV1Message, FastIntentMessage, FastMicroblockMessage, InvRelayBlockMessage,
-    },
+    pb::{cryptixd_message::Payload, BlockProducerClaimV1Message, FastIntentMessage, FastMicroblockMessage, InvRelayBlockMessage},
     ConnectionInitializer, CryptixdHandshake, Hub, PeerKey, PeerProperties, Router,
 };
 use cryptix_utils::iter::IterExtensions;
@@ -1254,24 +1252,21 @@ impl ConnectionInitializer for FlowContext {
             // After payload HF activation we no longer accept legacy P2P protocol versions.
             match peer_version.protocol_version {
                 v if v >= PROTOCOL_VERSION => match anti_fraud_mode {
-                    AntiFraudMode::Full => (
-                        v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
-                        PROTOCOL_VERSION,
-                    ),
+                    AntiFraudMode::Full => {
+                        (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), PROTOCOL_VERSION)
+                    }
                     AntiFraudMode::Restricted => (v6::register_restricted(self.clone(), router.clone()), PROTOCOL_VERSION),
                 },
                 v => return Err(ProtocolError::VersionMismatch(PROTOCOL_VERSION, v)),
             }
         } else {
             match peer_version.protocol_version {
-                v if v >= PROTOCOL_VERSION => (
-                    v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
-                    PROTOCOL_VERSION,
-                ),
-                LEGACY_PROTOCOL_VERSION => (
-                    v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
-                    LEGACY_PROTOCOL_VERSION,
-                ),
+                v if v >= PROTOCOL_VERSION => {
+                    (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), PROTOCOL_VERSION)
+                }
+                LEGACY_PROTOCOL_VERSION => {
+                    (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), LEGACY_PROTOCOL_VERSION)
+                }
                 5 => (v5::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), 5),
                 v => return Err(ProtocolError::VersionMismatch(PROTOCOL_VERSION, v)),
             }

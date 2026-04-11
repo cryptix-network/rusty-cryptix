@@ -604,24 +604,13 @@ from!(item: RpcResult<&cryptix_rpc_core::GetSyncStatusResponse>, protowire::GetS
 from!(&cryptix_rpc_core::GetStrongNodesRequest, protowire::GetStrongNodesRequestMessage);
 from!(item: &cryptix_rpc_core::RpcStrongNodeEntry, protowire::RpcStrongNodeEntry, {
     Self {
-        static_id: item.static_id.clone(),
+        node_id: item.node_id.clone(),
         public_key_xonly: item.public_key_xonly.clone(),
         source: item.source.clone(),
-        signature_valid: item.signature_valid,
-        performance_verified: item.performance_verified,
-        claimed_ip: item.claimed_ip.clone(),
-        last_sender_ip: item.last_sender_ip.clone(),
-        seq_no: item.seq_no,
-        found_blocks10m: item.found_blocks_10m,
-        total_blocks10m: item.total_blocks_10m,
+        claimed_blocks: item.claimed_blocks,
         share_bps: item.share_bps,
-        window_start_ms: item.window_start_ms,
-        window_end_ms: item.window_end_ms,
-        sent_at_ms: item.sent_at_ms,
-        first_seen_ms: item.first_seen_ms,
-        last_seen_ms: item.last_seen_ms,
-        last_announce_sent_at_ms: item.last_announce_sent_at_ms,
-        is_stale: item.is_stale,
+        last_claim_block_hash: item.last_claim_block_hash.clone(),
+        last_claim_time_ms: item.last_claim_time_ms,
     }
 });
 from!(item: RpcResult<&cryptix_rpc_core::GetStrongNodesResponse>, protowire::GetStrongNodesResponseMessage, {
@@ -631,7 +620,8 @@ from!(item: RpcResult<&cryptix_rpc_core::GetStrongNodesResponse>, protowire::Get
         runtime_available: item.runtime_available,
         disabled_reason_code: item.disabled_reason_code.clone(),
         disabled_reason_message: item.disabled_reason_message.clone(),
-        seq_conflict_total: item.seq_conflict_total,
+        conflict_total: item.conflict_total,
+        window_size: item.window_size,
         entries: item.entries.iter().map(Into::into).collect(),
         error: None,
     }
@@ -1189,24 +1179,13 @@ try_from!(item: &protowire::GetSyncStatusResponseMessage, RpcResult<cryptix_rpc_
 try_from!(&protowire::GetStrongNodesRequestMessage, cryptix_rpc_core::GetStrongNodesRequest);
 try_from!(item: &protowire::RpcStrongNodeEntry, cryptix_rpc_core::RpcStrongNodeEntry, {
     Self {
-        static_id: item.static_id.clone(),
+        node_id: item.node_id.clone(),
         public_key_xonly: item.public_key_xonly.clone(),
         source: item.source.clone(),
-        signature_valid: item.signature_valid,
-        performance_verified: item.performance_verified,
-        claimed_ip: item.claimed_ip.clone(),
-        last_sender_ip: item.last_sender_ip.clone(),
-        seq_no: item.seq_no,
-        found_blocks_10m: item.found_blocks10m,
-        total_blocks_10m: item.total_blocks10m,
+        claimed_blocks: item.claimed_blocks,
         share_bps: item.share_bps,
-        window_start_ms: item.window_start_ms,
-        window_end_ms: item.window_end_ms,
-        sent_at_ms: item.sent_at_ms,
-        first_seen_ms: item.first_seen_ms,
-        last_seen_ms: item.last_seen_ms,
-        last_announce_sent_at_ms: item.last_announce_sent_at_ms,
-        is_stale: item.is_stale,
+        last_claim_block_hash: item.last_claim_block_hash.clone(),
+        last_claim_time_ms: item.last_claim_time_ms,
     }
 });
 try_from!(item: &protowire::GetStrongNodesResponseMessage, RpcResult<cryptix_rpc_core::GetStrongNodesResponse>, {
@@ -1216,7 +1195,8 @@ try_from!(item: &protowire::GetStrongNodesResponseMessage, RpcResult<cryptix_rpc
         runtime_available: item.runtime_available,
         disabled_reason_code: item.disabled_reason_code.clone(),
         disabled_reason_message: item.disabled_reason_message.clone(),
-        seq_conflict_total: item.seq_conflict_total,
+        conflict_total: item.conflict_total,
+        window_size: item.window_size,
         entries: item.entries.iter().map(|entry| entry.try_into()).collect::<RpcResult<Vec<_>>>()?,
     }
 });

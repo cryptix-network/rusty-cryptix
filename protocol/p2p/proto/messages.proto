@@ -55,7 +55,7 @@ message CryptixdMessage {
     RequestFastIntentsMessage requestFastIntents = 57;
     FastIntentMessage fastIntent = 58;
     FastMicroblockMessage fastMicroblock = 59;
-    StrongNodeAnnouncementMessage strongNodeAnnouncement = 60;
+    // 60 was StrongNodeAnnouncementMessage (legacy benchmark path, removed).
     RequestAntiFraudSnapshotV1Message requestAntiFraudSnapshotV1 = 61;
     AntiFraudSnapshotV1Message antiFraudSnapshotV1 = 62;
     BlockProducerClaimV1Message blockProducerClaimV1 = 63;
