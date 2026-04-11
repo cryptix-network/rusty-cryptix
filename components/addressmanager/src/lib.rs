@@ -367,6 +367,7 @@ mod address_store_with_cache {
         sync::Arc,
     };
 
+    use cryptix_core::warn;
     use cryptix_database::prelude::{CachePolicy, DB};
     use cryptix_utils::networking::PrefixBucket;
     use itertools::Itertools;
@@ -393,8 +394,27 @@ mod address_store_with_cache {
             // We manage the cache ourselves on this level, so we disable the inner builtin cache
             let db_store = DbAddressesStore::new(db, CachePolicy::Empty);
             let mut addresses = HashMap::new();
-            for (key, entry) in db_store.iterator().map(|res| res.unwrap()) {
-                addresses.insert(key, entry);
+            let mut load_error: Option<String> = None;
+            for iter_result in db_store.iterator() {
+                match iter_result {
+                    Ok((key, entry)) => {
+                        addresses.insert(key, entry);
+                    }
+                    Err(err) => {
+                        load_error = Some(err.to_string());
+                        break;
+                    }
+                }
+            }
+
+            if let Some(err) = load_error {
+                warn!(
+                    "[Address manager] failed to read persisted address list ({err}); clearing address store to recover from legacy or corrupted data"
+                );
+                if let Err(clear_err) = db_store.delete_all() {
+                    warn!("[Address manager] failed to clear address store after load failure: {clear_err}");
+                }
+                addresses.clear();
             }
 
             Self { db_store, addresses }
