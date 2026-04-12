@@ -72,8 +72,10 @@ use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use uuid::Uuid;
 
 /// The P2P protocol version. Currently the only one supported.
-const PROTOCOL_VERSION: u32 = 7;
+const PROTOCOL_VERSION: u32 = 8;
+const PRE_HARD_FORK_PROTOCOL_VERSION: u32 = 7;
 const LEGACY_PROTOCOL_VERSION: u32 = 6;
+const MIN_PRE_HARD_FORK_PROTOCOL_VERSION: u32 = 5;
 
 /// See `check_orphan_resolution_range`
 const BASELINE_ORPHAN_RESOLUTION_RANGE: u32 = 5;
@@ -116,14 +118,7 @@ fn anti_fraud_hash_window_from_vec(entries: &[[u8; 32]]) -> Option<[[u8; 32]; 3]
 }
 
 fn is_compatible_peer_network(local_network: &str, remote_network: &str) -> bool {
-    if local_network == remote_network {
-        return true;
-    }
-    is_testnet_network_alias(local_network) && is_testnet_network_alias(remote_network)
-}
-
-fn is_testnet_network_alias(name: &str) -> bool {
-    name == "cryptix-testnet" || name.starts_with("cryptix-testnet-")
+    local_network == remote_network
 }
 
 /// Represents a block event to be logged
@@ -1141,7 +1136,7 @@ impl FlowContext {
         }
         match self.strong_node_claims_engine.build_local_claim(block_hash, self.unified_node_identity.as_ref()) {
             Ok(message) => {
-                let _ = self.strong_node_claims_engine.ingest_claim(&message, true);
+                let _ = self.strong_node_claims_engine.ingest_claim(&message, self.is_payload_hf_active());
                 self.broadcast_block_producer_claim(message, None).await;
             }
             Err(err) => warn!("failed building local block producer claim for {}: {}", block_hash, err),
@@ -1294,28 +1289,28 @@ impl ConnectionInitializer for FlowContext {
             })
             .unwrap_or(AntiFraudMode::Restricted);
 
-        let (flows, applied_protocol_version) = if payload_hf_active {
-            // After payload HF activation we no longer accept legacy P2P protocol versions.
-            match peer_version.protocol_version {
-                v if v >= PROTOCOL_VERSION => match anti_fraud_mode {
-                    AntiFraudMode::Full => {
-                        (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), PROTOCOL_VERSION)
-                    }
-                    AntiFraudMode::Restricted => (v6::register_restricted(self.clone(), router.clone()), PROTOCOL_VERSION),
-                },
-                v => return Err(ProtocolError::VersionMismatch(PROTOCOL_VERSION, v)),
-            }
-        } else {
-            match peer_version.protocol_version {
-                v if v >= PROTOCOL_VERSION => {
+        let minimum_protocol_version = if payload_hf_active { PROTOCOL_VERSION } else { MIN_PRE_HARD_FORK_PROTOCOL_VERSION };
+        let (flows, applied_protocol_version) = match peer_version.protocol_version {
+            // New protocol line.
+            v if v >= PROTOCOL_VERSION => {
+                if payload_hf_active && anti_fraud_mode == AntiFraudMode::Restricted {
+                    (v6::register_restricted(self.clone(), router.clone()), PROTOCOL_VERSION)
+                } else {
                     (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), PROTOCOL_VERSION)
                 }
-                LEGACY_PROTOCOL_VERSION => {
-                    (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), LEGACY_PROTOCOL_VERSION)
-                }
-                5 => (v5::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), 5),
-                v => return Err(ProtocolError::VersionMismatch(PROTOCOL_VERSION, v)),
             }
+            // Pre-HF compatibility lines.
+            PRE_HARD_FORK_PROTOCOL_VERSION if !payload_hf_active => {
+                (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), PRE_HARD_FORK_PROTOCOL_VERSION)
+            }
+            LEGACY_PROTOCOL_VERSION if !payload_hf_active => {
+                (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), LEGACY_PROTOCOL_VERSION)
+            }
+            MIN_PRE_HARD_FORK_PROTOCOL_VERSION if !payload_hf_active => (
+                v5::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                MIN_PRE_HARD_FORK_PROTOCOL_VERSION,
+            ),
+            v => return Err(ProtocolError::VersionMismatch(minimum_protocol_version, v)),
         };
 
         // Build and register the peer properties
@@ -1388,16 +1383,16 @@ impl ConnectionInitializer for FlowContext {
             flow.launch();
         }
 
-        if router.is_outbound() || peer_version.address.is_some() {
-            let mut address_manager = self.address_manager.lock();
+        let mut address_manager = self.address_manager.lock();
 
-            if router.is_outbound() {
-                address_manager.add_verified_address(router.net_address().into());
-            }
+        if router.is_outbound() {
+            address_manager.add_verified_address(router.net_address().into());
+        }
 
-            if let Some(peer_ip_address) = peer_version.address {
-                address_manager.add_verified_address(peer_ip_address);
-            }
+        if let Some(peer_ip_address) = peer_version.address {
+            // Peer-advertised addresses are unauthenticated handshake hints and must not
+            // be promoted to verified without an actual successful connection.
+            address_manager.add_address(peer_ip_address);
         }
 
         // Note: we deliberately do not hold the handshake in memory so at this point receivers for handshake subscriptions
@@ -1410,21 +1405,14 @@ impl ConnectionInitializer for FlowContext {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_compatible_peer_network, is_testnet_network_alias};
-
-    #[test]
-    fn test_testnet_alias_detection() {
-        assert!(is_testnet_network_alias("cryptix-testnet"));
-        assert!(is_testnet_network_alias("cryptix-testnet-11"));
-        assert!(!is_testnet_network_alias("cryptix-mainnet"));
-        assert!(!is_testnet_network_alias("testnet"));
-    }
+    use super::is_compatible_peer_network;
 
     #[test]
     fn test_network_compatibility() {
         assert!(is_compatible_peer_network("cryptix-mainnet", "cryptix-mainnet"));
-        assert!(is_compatible_peer_network("cryptix-testnet", "cryptix-testnet-11"));
-        assert!(is_compatible_peer_network("cryptix-testnet-11", "cryptix-testnet"));
+        assert!(is_compatible_peer_network("cryptix-testnet", "cryptix-testnet"));
+        assert!(!is_compatible_peer_network("cryptix-testnet", "cryptix-testnet-isolated"));
+        assert!(!is_compatible_peer_network("cryptix-testnet-isolated", "cryptix-testnet"));
         assert!(!is_compatible_peer_network("cryptix-mainnet", "cryptix-testnet"));
     }
 }

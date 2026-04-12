@@ -135,8 +135,8 @@ impl StrongNodeClaimsEngine {
         self.enabled
     }
 
-    pub fn should_advertise_service_bit(&self, _hardfork_active: bool) -> bool {
-        self.enabled
+    pub fn should_advertise_service_bit(&self, hardfork_active: bool) -> bool {
+        self.enabled && hardfork_active
     }
 
     pub fn build_local_claim(&self, block_hash: Hash, identity: &UnifiedNodeIdentity) -> Result<BlockProducerClaimV1Message, String> {
@@ -154,8 +154,8 @@ impl StrongNodeClaimsEngine {
         })
     }
 
-    pub fn ingest_claim(&self, message: &BlockProducerClaimV1Message, _hardfork_active: bool) -> ClaimIngestOutcome {
-        if !self.enabled {
+    pub fn ingest_claim(&self, message: &BlockProducerClaimV1Message, hardfork_active: bool) -> ClaimIngestOutcome {
+        if !self.enabled || !hardfork_active {
             return ClaimIngestOutcome::Ignored;
         }
         let now_ms = unix_now();
@@ -184,8 +184,8 @@ impl StrongNodeClaimsEngine {
         }
     }
 
-    pub fn apply_chain_path_update(&self, chain_path: ChainPath, new_sink: Hash, _hardfork_active: bool) {
-        if !self.enabled {
+    pub fn apply_chain_path_update(&self, chain_path: ChainPath, new_sink: Hash, hardfork_active: bool) {
+        if !self.enabled || !hardfork_active {
             return;
         }
         let now_ms = unix_now();
@@ -279,7 +279,7 @@ impl StrongNodeClaimsEngine {
         StrongNodeClaimsRuntimeSnapshot {
             enabled: self.enabled,
             hardfork_active,
-            runtime_available: self.enabled,
+            runtime_available: self.enabled && hardfork_active,
             window_size: CLAIM_WINDOW_SIZE_BLOCKS as u32,
             conflict_total: state.conflict_total,
             entries,
@@ -691,6 +691,34 @@ mod tests {
         let reloaded_snapshot = reloaded.snapshot(true);
         assert_eq!(reloaded_snapshot.entries.len(), 1, "expected one scored entry after reload");
         assert_eq!(reloaded_snapshot.entries[0].claimed_blocks, 1, "expected one claimed block after reload");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn hardfork_gating_ignores_claims_and_chain_updates_pre_hf() {
+        let temp_dir = std::env::temp_dir().join(format!("strong-node-claims-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("failed creating temp dir");
+        let engine = StrongNodeClaimsEngine::new(true, "mainnet", &temp_dir);
+
+        assert!(!engine.should_advertise_service_bit(false), "service bit must remain disabled pre-HF");
+
+        let claim = build_signed_claim_message(
+            0,
+            "9e335f14f1a549c374a273b014e4e6658c666b9be6bb7478085510abcba7fae2",
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        );
+        assert!(matches!(engine.ingest_claim(&claim, false), ClaimIngestOutcome::Ignored));
+
+        let block_hash = Hash::from_bytes(decode_hex_32("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").unwrap());
+        let mut path = ChainPath::default();
+        path.added.push(block_hash);
+        engine.apply_chain_path_update(path, block_hash, false);
+
+        let snapshot = engine.snapshot(false);
+        assert!(!snapshot.runtime_available, "runtime must remain unavailable pre-HF");
+        assert!(snapshot.entries.is_empty(), "pre-HF updates must not mutate claim state");
+        assert!(engine.last_sink().is_none(), "pre-HF updates must not advance sink");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

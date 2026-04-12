@@ -88,7 +88,7 @@ impl TransactionValidator {
             sig_cache: Cache::with_counters(10_000, counters),
             mass_calculator: MassCalculator::new(0, 0, 0, 0, 1),
             storage_mass_activation_daa_score: u64::MAX,
-            payload_hf_activation_daa_score: u64::MAX,
+            payload_hf_activation_daa_score: 999_999_999_991,
             payload_max_len_consensus: usize::MAX,
         }
     }

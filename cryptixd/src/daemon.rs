@@ -6,7 +6,7 @@ use cryptix_consensus_core::{
     errors::config::{ConfigError, ConfigResult},
 };
 use cryptix_consensus_notify::{root::ConsensusNotificationRoot, service::NotifyService};
-use cryptix_core::{core::Core, debug, info};
+use cryptix_core::{core::Core, debug, info, warn};
 use cryptix_core::{cryptixd_env::version, task::tick::TickService};
 use cryptix_database::prelude::CachePolicy;
 use cryptix_grpc_server::service::GrpcService;
@@ -242,6 +242,10 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
             .build(),
     );
 
+    if args.testnet_suffix.is_some() {
+        warn!("Ignoring deprecated testnet suffix setting; using canonical testnet network id");
+    }
+
     // TODO: Validate `config` forms a valid set of properties
 
     let app_dir = get_app_dir_from_args(args);
@@ -261,6 +265,7 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
         info!("Datacenter mode: ENABLED (private/unroutable peer addresses are filtered by address manager)");
     }
     info!("Tx relay broadcast interval: {} ms", args.tx_relay_broadcast_interval_ms);
+    info!("Payload HF activation DAA score: {}", config.params.payload_hf_activation_daa_score);
     info!("Strong-Node claimant overlay: ENABLED");
     info!("Auto-ban: {} (default strike threshold: 5, ban duration: 3h)", if args.autoban { "ENABLED" } else { "DISABLED" });
     info!(
@@ -330,7 +335,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
                 if headers_store.has(config.genesis.hash).unwrap() {
                     info!("Genesis is found in active consensus DB. No action needed.");
                 } else {
-                    let msg = "Genesis not found in active consensus DB. This happens when Testnet 11 is restarted and your database needs to be fully deleted. Do you confirm the delete? (y/n)";
+                    let msg = "Genesis not found in active consensus DB. Your selected network likely changed and the database needs to be fully deleted. Do you confirm the delete? (y/n)";
                     get_user_approval_or_exit(msg, args.yes);
 
                     is_db_reset_needed = true;

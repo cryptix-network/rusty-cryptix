@@ -1,6 +1,6 @@
 //!
 //! In v6 the syncee can reconstruct trusted data from the full payload - todo: fix performance
-//! 
+//!
 //!
 
 use cryptix_consensus_core::BlockHashMap;

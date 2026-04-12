@@ -66,6 +66,7 @@ pub struct Args {
     pub enable_unsynced_mining: bool,
     pub enable_mainnet_mining: bool,
     pub testnet: bool,
+    // Deprecated and ignored: kept for config-file backwards compatibility.
     #[serde(rename = "netsuffix")]
     pub testnet_suffix: Option<u32>,
     pub devnet: bool,
@@ -87,6 +88,7 @@ pub struct Args {
     pub autoban: bool,
     pub banserver: bool,
     pub banserver_url: Option<String>,
+    pub payload_hf_activation_daa_score: Option<u64>,
 
     #[cfg(feature = "devnet-prealloc")]
     pub num_prealloc_utxos: Option<u64>,
@@ -148,6 +150,7 @@ impl Default for Args {
             autoban: true,
             banserver: true,
             banserver_url: Some(DEFAULT_BANSERVER_URL.to_owned()),
+            payload_hf_activation_daa_score: None,
 
             #[cfg(feature = "devnet-prealloc")]
             num_prealloc_utxos: None,
@@ -180,6 +183,9 @@ impl Args {
         config.p2p_listen_address = self.listen.unwrap_or(ContextualNetAddress::unspecified());
         config.externalip = self.externalip.map(|v| v.normalize(config.default_p2p_port()));
         config.ram_scale = self.ram_scale;
+        if let Some(payload_hf_activation_daa_score) = self.payload_hf_activation_daa_score {
+            config.params.payload_hf_activation_daa_score = payload_hf_activation_daa_score;
+        }
 
         #[cfg(feature = "devnet-prealloc")]
         if let Some(num_prealloc_utxos) = self.num_prealloc_utxos {
@@ -204,10 +210,7 @@ impl Args {
     pub fn network(&self) -> NetworkId {
         match (self.testnet, self.devnet, self.simnet) {
             (false, false, false) => NetworkId::new(NetworkType::Mainnet),
-            (true, false, false) => self
-                .testnet_suffix
-                .map(|suffix| NetworkId::with_suffix(NetworkType::Testnet, suffix))
-                .unwrap_or_else(|| NetworkId::new(NetworkType::Testnet)),
+            (true, false, false) => NetworkId::new(NetworkType::Testnet),
             (false, true, false) => NetworkId::new(NetworkType::Devnet),
             (false, false, true) => NetworkId::new(NetworkType::Simnet),
             _ => panic!("only a single net should be activated"),
@@ -345,16 +348,16 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
 0, Tracker::MAX_ADDRESS_UPPER_BOUND, Tracker::DEFAULT_MAX_ADDRESSES)),
         )
         .arg(arg!(--testnet "Use the test network"))
-        .arg(
-            Arg::new("netsuffix")
-                .long("netsuffix")
-                .value_name("netsuffix")
-                .require_equals(true)
-                .value_parser(clap::value_parser!(u32))
-                .help("Optional testnet network suffix number (for dedicated parallel testnet variants)."),
-        )
         .arg(arg!(--devnet "Use the development test network"))
         .arg(arg!(--simnet "Use the simulation test network"))
+        .arg(
+            Arg::new("payload-hf-activation-daa-score")
+                .long("payload-hf-activation-daa-score")
+                .value_name("DAA_SCORE")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(u64))
+                .help("Override payload hardfork activation DAA score for this node instance."),
+        )
         .arg(arg!(--archival "Run as an archival node: avoids deleting old block data when moving the pruning point (Warning: heavy disk usage)"))
         .arg(arg!(--sanity "Enable various sanity checks which might be compute-intensive (mostly performed during pruning)"))
         .arg(arg!(--yes "Answer yes to all interactive console questions"))
@@ -561,7 +564,7 @@ impl Args {
             enable_mainnet_mining: arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", defaults.enable_mainnet_mining),
             utxoindex: arg_match_unwrap_or::<bool>(&m, "utxoindex", defaults.utxoindex),
             testnet: arg_match_unwrap_or::<bool>(&m, "testnet", defaults.testnet),
-            testnet_suffix: m.get_one::<u32>("netsuffix").copied().or(defaults.testnet_suffix),
+            testnet_suffix: defaults.testnet_suffix,
             devnet: arg_match_unwrap_or::<bool>(&m, "devnet", defaults.devnet),
             simnet: arg_match_unwrap_or::<bool>(&m, "simnet", defaults.simnet),
             archival: arg_match_unwrap_or::<bool>(&m, "archival", defaults.archival),
@@ -590,6 +593,10 @@ impl Args {
             autoban: autoban_enabled,
             banserver: banserver_enabled,
             banserver_url: m.get_one::<String>("banserver-url").cloned().or(defaults.banserver_url),
+            payload_hf_activation_daa_score: m
+                .get_one::<u64>("payload-hf-activation-daa-score")
+                .copied()
+                .or(defaults.payload_hf_activation_daa_score),
             disable_upnp: arg_match_unwrap_or::<bool>(&m, "disable-upnp", defaults.disable_upnp),
             disable_dns_seeding: arg_match_unwrap_or::<bool>(&m, "nodnsseed", defaults.disable_dns_seeding),
             disable_grpc: arg_match_unwrap_or::<bool>(&m, "nogrpc", defaults.disable_grpc),

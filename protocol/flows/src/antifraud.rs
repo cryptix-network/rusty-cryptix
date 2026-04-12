@@ -16,7 +16,7 @@ use tokio::{select, time::interval};
 
 const ANTI_FRAUD_REQUEST_INTERVAL: Duration = Duration::from_secs(20);
 const ANTI_FRAUD_MODE_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
-const HARD_FORK_PROTOCOL_VERSION: u32 = 7;
+const HARD_FORK_PROTOCOL_VERSION: u32 = 8;
 
 fn anti_fraud_hash_window_from_vec(entries: &[[u8; 32]]) -> Option<[[u8; 32]; 3]> {
     if entries.len() != 3 {

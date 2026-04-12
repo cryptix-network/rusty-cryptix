@@ -296,9 +296,8 @@ impl From<NetworkId> for Params {
             NetworkType::Devnet => DEVNET_PARAMS,
             NetworkType::Simnet => SIMNET_PARAMS,
         };
-        // Preserve the exact caller-selected network id (including optional suffix) so
-        // downstream code does not silently collapse suffixed testnets.
-        params.net = value;
+        // Canonicalize optional suffixes to keep node identity/network naming stable.
+        params.net = NetworkId::new(value.network_type);
         params
     }
 }
@@ -308,10 +307,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn params_from_network_id_preserves_testnet_suffix() {
+    fn params_from_network_id_canonicalizes_testnet_suffix() {
         let requested = NetworkId::with_suffix(NetworkType::Testnet, 42);
         let params = Params::from(requested);
-        assert_eq!(params.net, requested);
+        assert_eq!(params.net, NetworkId::new(NetworkType::Testnet));
         // Suffix selection should not accidentally switch consensus constants.
         assert_eq!(params.genesis.hash, TESTNET_PARAMS.genesis.hash);
     }
@@ -366,7 +365,7 @@ pub const MAINNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     storage_mass_activation_daa_score: u64::MAX,
-    payload_hf_activation_daa_score: u64::MAX,
+    payload_hf_activation_daa_score: 999_999_999_991,
     payload_max_len_consensus: 8192,
     payload_max_len_standard: 2048,
     payload_weight_multiplier: 4,
@@ -431,7 +430,7 @@ pub const TESTNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     storage_mass_activation_daa_score: u64::MAX,
-    payload_hf_activation_daa_score: u64::MAX,
+    payload_hf_activation_daa_score: 999_999_999_991,
     payload_max_len_consensus: 8192,
     payload_max_len_standard: 2048,
     payload_weight_multiplier: 4,
@@ -495,7 +494,7 @@ pub const SIMNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     storage_mass_activation_daa_score: 0,
-    payload_hf_activation_daa_score: u64::MAX,
+    payload_hf_activation_daa_score: 999_999_999_991,
     payload_max_len_consensus: 8192,
     payload_max_len_standard: 2048,
     payload_weight_multiplier: 4,
@@ -545,7 +544,7 @@ pub const DEVNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     storage_mass_activation_daa_score: u64::MAX,
-    payload_hf_activation_daa_score: u64::MAX,
+    payload_hf_activation_daa_score: 999_999_999_991,
     payload_max_len_consensus: 8192,
     payload_max_len_standard: 2048,
     payload_weight_multiplier: 4,
