@@ -32,9 +32,11 @@ use tokio::{
 };
 
 pub const DEFAULT_BANSERVER_URL: &str = "https://antifraud.cryptix-network.org/api/v1/antifraud/snapshot";
+pub const DEFAULT_BANSERVER_SECONDARY_URL: &str = "https://guard.seed2.cryptix-network.org/api/v1/antifraud/snapshot";
 pub const ANTI_FRAUD_ZERO_HASH: [u8; 32] = [0u8; 32];
 pub const ANTI_FRAUD_HASH_WINDOW_LEN: usize = 3;
 const BANSERVER_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const BANSERVER_CONSISTENCY_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const BANSERVER_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const BANSERVER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const BANSERVER_MAX_IPS: usize = 4096;
@@ -64,7 +66,8 @@ pub struct ConnectionManager {
     force_next_iteration: UnboundedSender<()>,
     shutdown_signal: SingleTrigger,
     banserver_enabled: bool,
-    banserver_url: String,
+    banserver_primary_url: String,
+    banserver_secondary_url: String,
     anti_fraud_network: AntiFraudNetwork,
     anti_fraud_persist_dir: Option<PathBuf>,
     anti_fraud_state: ParkingLotMutex<AntiFraudState>,
@@ -83,6 +86,13 @@ struct ConnectionRequest {
 #[derive(Debug)]
 struct BanserverPayload {
     snapshot: AntiFraudSnapshot,
+}
+
+#[derive(Debug)]
+struct EndpointBanserverPayload {
+    endpoint_name: &'static str,
+    source_url: String,
+    payload: BanserverPayload,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -183,6 +193,7 @@ struct AntiFraudState {
     hash_window: [[u8; 32]; ANTI_FRAUD_HASH_WINDOW_LEN],
     peer_votes: HashMap<String, PeerSnapshotVote>,
     peer_fallback_required: bool,
+    seed_server_retry_pending: bool,
 }
 
 impl Default for AntiFraudState {
@@ -191,7 +202,8 @@ impl Default for AntiFraudState {
             current_snapshot: None,
             hash_window: [ANTI_FRAUD_ZERO_HASH; ANTI_FRAUD_HASH_WINDOW_LEN],
             peer_votes: HashMap::new(),
-            peer_fallback_required: true,
+            peer_fallback_required: false,
+            seed_server_retry_pending: false,
         }
     }
 }
@@ -216,10 +228,11 @@ impl ConnectionManager {
         anti_fraud_persist_base_dir: Option<PathBuf>,
     ) -> Arc<Self> {
         let (tx, rx) = unbounded_channel::<()>();
-        let banserver_url = banserver_url
+        let banserver_primary_url = banserver_url
             .map(|url| url.trim().to_owned())
             .filter(|url| !url.is_empty())
             .unwrap_or_else(|| DEFAULT_BANSERVER_URL.to_owned());
+        let banserver_secondary_url = DEFAULT_BANSERVER_SECONDARY_URL.to_owned();
         let anti_fraud_network = AntiFraudNetwork::from_network_name(&network_name).unwrap_or(AntiFraudNetwork::Mainnet);
         let anti_fraud_persist_dir = anti_fraud_persist_base_dir.map(|path| path.join(ANTI_FRAUD_PERSIST_DIR));
         let manager = Arc::new(Self {
@@ -233,7 +246,8 @@ impl ConnectionManager {
             dns_seeders,
             default_port,
             banserver_enabled,
-            banserver_url,
+            banserver_primary_url,
+            banserver_secondary_url,
             anti_fraud_network,
             anti_fraud_persist_dir,
             anti_fraud_state: ParkingLotMutex::new(AntiFraudState::default()),
@@ -250,14 +264,17 @@ impl ConnectionManager {
     fn start_event_loop(self: Arc<Self>, mut rx: UnboundedReceiver<()>) {
         let mut ticker = interval(Duration::from_secs(30));
         let mut banserver_ticker = interval(BANSERVER_REFRESH_INTERVAL);
+        let mut banserver_consistency_retry_ticker = interval(BANSERVER_CONSISTENCY_RETRY_INTERVAL);
         let mut banserver_retry_ticker = interval(BANSERVER_RETRY_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         banserver_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        banserver_consistency_retry_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         banserver_retry_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         tokio::spawn(async move {
             self.clone().refresh_banserver_bans().await;
             // Consume immediate interval ticks so next refresh/retry are full interval away.
             let _ = banserver_ticker.tick().await;
+            let _ = banserver_consistency_retry_ticker.tick().await;
             let _ = banserver_retry_ticker.tick().await;
             loop {
                 if self.shutdown_signal.trigger.is_triggered() {
@@ -267,6 +284,7 @@ impl ConnectionManager {
                     _ = rx.recv() => self.clone().handle_event().await,
                     _ = ticker.tick() => self.clone().handle_event().await,
                     _ = banserver_ticker.tick() => self.clone().refresh_banserver_bans().await,
+                    _ = banserver_consistency_retry_ticker.tick(), if self.should_retry_seed_server_snapshot_validation() => self.clone().refresh_banserver_bans().await,
                     _ = banserver_retry_ticker.tick(), if self.should_request_peer_snapshots() => self.clone().request_peer_snapshots_tick().await,
                     _ = self.shutdown_signal.listener.clone() => break,
                 }
@@ -573,6 +591,10 @@ impl ConnectionManager {
         !self.banserver_enabled || state.peer_fallback_required
     }
 
+    pub fn should_retry_seed_server_snapshot_validation(&self) -> bool {
+        self.anti_fraud_state.lock().seed_server_retry_pending
+    }
+
     pub fn anti_fraud_mode_for_peer_hashes(&self, peer_hashes: &[[u8; 32]]) -> AntiFraudMode {
         let local = self.anti_fraud_hash_window();
         if !Self::validate_hash_window(peer_hashes) {
@@ -664,28 +686,27 @@ impl ConnectionManager {
 
     async fn refresh_banserver_bans(self: Arc<Self>) {
         if !self.banserver_enabled {
-            self.anti_fraud_state.lock().peer_fallback_required = true;
+            let mut state = self.anti_fraud_state.lock();
+            state.peer_fallback_required = true;
+            state.seed_server_retry_pending = false;
             return;
         }
 
         let fetched = match self.fetch_banserver_payload().await {
             Ok(payload) => payload,
             Err(err) => {
-                warn!("Banserver refresh failed (URL: {}): {}. Continuing without remote list update.", self.banserver_url, err);
-                self.anti_fraud_state.lock().peer_fallback_required = true;
+                self.handle_seed_server_refresh_failure(&err);
                 return;
             }
         };
 
-        if fetched.snapshot.network != self.anti_fraud_network {
-            warn!("Banserver snapshot network mismatch: expected {:?}, got {:?}", self.anti_fraud_network, fetched.snapshot.network);
-            self.anti_fraud_state.lock().peer_fallback_required = true;
-            return;
-        }
-
         match self.try_apply_snapshot(fetched.snapshot, "seed-server") {
             Ok(applied) => {
-                self.anti_fraud_state.lock().peer_fallback_required = false;
+                {
+                    let mut state = self.anti_fraud_state.lock();
+                    state.peer_fallback_required = false;
+                    state.seed_server_retry_pending = false;
+                }
                 if applied {
                     let banned = self.banserver_banned_ips.lock().iter().copied().collect_vec();
                     if !banned.is_empty() {
@@ -698,8 +719,7 @@ impl ConnectionManager {
                 }
             }
             Err(err) => {
-                warn!("Banserver snapshot rejected: {err}");
-                self.anti_fraud_state.lock().peer_fallback_required = true;
+                self.handle_seed_server_refresh_failure(&format!("snapshot rejected: {err}"));
                 return;
             }
         }
@@ -709,28 +729,80 @@ impl ConnectionManager {
     }
 
     async fn fetch_banserver_payload(&self) -> Result<BanserverPayload, String> {
-        let primary_url = self.banserver_url.trim();
-        match self.fetch_banserver_json(primary_url).await {
-            Ok(payload) => Self::parse_banserver_payload(payload),
+        let primary = self.fetch_banserver_payload_from_endpoint("primary", self.banserver_primary_url.trim()).await?;
+        let secondary = self.fetch_banserver_payload_from_endpoint("secondary", self.banserver_secondary_url.trim()).await?;
+
+        if primary.payload.snapshot.root_hash != secondary.payload.snapshot.root_hash {
+            return Err(format!(
+                "snapshot mismatch between endpoints: {} {} (seq={}, hash={}) vs {} {} (seq={}, hash={})",
+                primary.endpoint_name,
+                primary.source_url,
+                primary.payload.snapshot.snapshot_seq,
+                Self::encode_hex(&primary.payload.snapshot.root_hash),
+                secondary.endpoint_name,
+                secondary.source_url,
+                secondary.payload.snapshot.snapshot_seq,
+                Self::encode_hex(&secondary.payload.snapshot.root_hash),
+            ));
+        }
+
+        Ok(primary.payload)
+    }
+
+    async fn fetch_banserver_payload_from_endpoint(
+        &self,
+        endpoint_name: &'static str,
+        endpoint_url: &str,
+    ) -> Result<EndpointBanserverPayload, String> {
+        let endpoint_url = endpoint_url.trim();
+        let primary_payload = match self.fetch_banserver_json(endpoint_url).await {
+            Ok(payload) => payload,
             Err(primary_err) => {
-                if let Some(fallback_url) = Self::http_fallback_url(primary_url) {
+                if let Some(fallback_url) = Self::http_fallback_url(endpoint_url) {
                     match self.fetch_banserver_json(&fallback_url).await {
                         Ok(payload) => {
                             warn!(
-                                "Banserver HTTPS fetch failed for {} ({}), HTTP fallback {} succeeded",
-                                primary_url, primary_err, fallback_url
+                                "Banserver {} HTTPS fetch failed for {} ({}), HTTP fallback {} succeeded",
+                                endpoint_name, endpoint_url, primary_err, fallback_url
                             );
-                            Self::parse_banserver_payload(payload)
+                            let parsed = Self::parse_banserver_payload(payload).map_err(|err| {
+                                format!("{} endpoint payload parse failed for {}: {}", endpoint_name, fallback_url, err)
+                            })?;
+                            return Ok(EndpointBanserverPayload { endpoint_name, source_url: fallback_url, payload: parsed });
                         }
                         Err(fallback_err) => {
-                            Err(format!("primary fetch failed: {}; http fallback failed: {}", primary_err, fallback_err))
+                            return Err(format!(
+                                "{} endpoint fetch failed: primary {} error {}; http fallback error {}",
+                                endpoint_name, endpoint_url, primary_err, fallback_err
+                            ));
                         }
                     }
-                } else {
-                    Err(primary_err)
                 }
+                return Err(format!("{} endpoint fetch failed for {}: {}", endpoint_name, endpoint_url, primary_err));
             }
+        };
+
+        let parsed = Self::parse_banserver_payload(primary_payload)
+            .map_err(|err| format!("{} endpoint payload parse failed for {}: {}", endpoint_name, endpoint_url, err))?;
+
+        Ok(EndpointBanserverPayload { endpoint_name, source_url: endpoint_url.to_owned(), payload: parsed })
+    }
+
+    fn handle_seed_server_refresh_failure(&self, reason: &str) {
+        let mut state = self.anti_fraud_state.lock();
+        if state.seed_server_retry_pending {
+            state.seed_server_retry_pending = false;
+            state.peer_fallback_required = true;
+            warn!("Banserver dual-endpoint validation failed again: {}. Activating peer snapshot fallback.", reason);
+            return;
         }
+
+        state.seed_server_retry_pending = true;
+        warn!(
+            "Banserver dual-endpoint validation failed: {}. Retrying in {}s before peer fallback.",
+            reason,
+            BANSERVER_CONSISTENCY_RETRY_INTERVAL.as_secs()
+        );
     }
 
     async fn fetch_banserver_json(&self, url: &str) -> Result<JsonValue, String> {
