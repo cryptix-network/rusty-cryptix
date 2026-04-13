@@ -25,7 +25,6 @@ pub struct P2pService {
     dns_seeders: &'static [&'static str],
     default_port: u16,
     banserver_enabled: bool,
-    banserver_url: Option<String>,
     anti_fraud_persist_base_dir: Option<PathBuf>,
     shutdown: SingleTrigger,
     counters: Arc<TowerConnectionCounters>,
@@ -42,7 +41,6 @@ impl P2pService {
         dns_seeders: &'static [&'static str],
         default_port: u16,
         banserver_enabled: bool,
-        banserver_url: Option<String>,
         anti_fraud_persist_base_dir: Option<PathBuf>,
         counters: Arc<TowerConnectionCounters>,
     ) -> Self {
@@ -57,7 +55,6 @@ impl P2pService {
             dns_seeders,
             default_port,
             banserver_enabled,
-            banserver_url,
             anti_fraud_persist_base_dir,
             counters,
         }
@@ -86,7 +83,6 @@ impl AsyncService for P2pService {
             self.default_port,
             self.flow_context.address_manager.clone(),
             self.banserver_enabled,
-            self.banserver_url.clone(),
             self.flow_context.config.network_name(),
             self.anti_fraud_persist_base_dir.clone(),
         );

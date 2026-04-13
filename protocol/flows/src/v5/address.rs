@@ -45,9 +45,7 @@ impl ReceiveAddressesFlow {
     }
 
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
-        let anti_fraud_runtime_enabled = self.ctx.connection_manager().map(|cm| cm.is_antifraud_runtime_enabled()).unwrap_or(false);
-        let enforce_anti_fraud = self.ctx.is_payload_hf_active() && anti_fraud_runtime_enabled;
-        if enforce_anti_fraud && self.router.properties().unified_node_id.is_none() {
+        if self.ctx.is_payload_hf_active() && self.router.properties().unified_node_id.is_none() {
             return Err(ProtocolError::OtherOwned(
                 "received addresses from peer without verified unified node ID after hardfork".to_string(),
             ));

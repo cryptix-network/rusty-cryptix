@@ -1311,33 +1311,32 @@ impl ConnectionInitializer for FlowContext {
 
         let payload_hf_active = self.is_payload_hf_active();
         let anti_fraud_runtime_enabled = self.connection_manager().map(|cm| cm.is_antifraud_runtime_enabled()).unwrap_or(false);
-        let enforce_anti_fraud = payload_hf_active && anti_fraud_runtime_enabled;
-        self.log_quantum_handshake_mode_transition(enforce_anti_fraud);
-        self.log_quantum_handshake_startup_once(enforce_anti_fraud);
+        let enforce_hardfork_core = payload_hf_active;
+        let enforce_anti_fraud = enforce_hardfork_core && anti_fraud_runtime_enabled;
+        self.log_quantum_handshake_mode_transition(enforce_hardfork_core);
+        self.log_quantum_handshake_startup_once(enforce_hardfork_core);
         debug!(
             "Starting handshake with peer {} in {} mode",
             router,
-            if enforce_anti_fraud { "quantum-safe (ML-KEM-1024 enforced)" } else { "legacy-compatible" }
+            if enforce_hardfork_core { "quantum-safe (ML-KEM-1024 enforced)" } else { "legacy-compatible" }
         );
 
-        if enforce_anti_fraud && peer_unified_node_id.is_none() {
+        if enforce_hardfork_core && peer_unified_node_id.is_none() {
             return Err(ProtocolError::OtherOwned("peer missing mandatory unified node identity after hardfork".to_string()));
         }
-        if enforce_anti_fraud && peer_node_challenge_nonce.is_none() {
+        if enforce_hardfork_core && peer_node_challenge_nonce.is_none() {
             return Err(ProtocolError::OtherOwned("peer missing mandatory node challenge nonce after hardfork".to_string()));
         }
-        if enforce_anti_fraud && peer_pq_ml_kem1024_public_key.is_none() {
+        if enforce_hardfork_core && peer_pq_ml_kem1024_public_key.is_none() {
             return Err(ProtocolError::OtherOwned("peer missing mandatory ML-KEM-1024 public key after hardfork".to_string()));
         }
         if let Some(peer_node_id) = peer_unified_node_id {
             if peer_node_id == self.unified_node_identity.node_id {
                 return Err(ProtocolError::LoopbackConnection(router.key()));
             }
-            if enforce_anti_fraud {
-                if let Some(connection_manager) = self.connection_manager() {
-                    if connection_manager.is_unified_node_id_banned(&peer_node_id) {
-                        return Err(ProtocolError::OtherOwned("peer unified node identity is externally banned".to_string()));
-                    }
+            if let Some(connection_manager) = self.connection_manager() {
+                if connection_manager.is_unified_node_id_banned(&peer_node_id) {
+                    return Err(ProtocolError::OtherOwned("peer unified node identity is banned".to_string()));
                 }
             }
         } else if self.node_id == router.identity() {
@@ -1353,6 +1352,9 @@ impl ConnectionInitializer for FlowContext {
         let hfa_capable = local_hfa_enabled && peer_hfa_enabled;
         let local_strong_node_claims_enabled = self.is_strong_node_claims_p2p_enabled();
         let peer_strong_node_claims_enabled = (peer_version.services & STRONG_NODE_CLAIMS_P2P_SERVICE_BIT) != 0;
+        if enforce_hardfork_core && !peer_strong_node_claims_enabled {
+            return Err(ProtocolError::OtherOwned("peer missing mandatory strong-node-claims service bit after hardfork".to_string()));
+        }
         let strong_node_claims_capable = local_strong_node_claims_enabled && peer_strong_node_claims_enabled;
         debug!(
             "HFA P2P capability for peer {}: local_enabled={} peer_enabled={} peer_services=0x{:x} capable={}",
@@ -1378,7 +1380,7 @@ impl ConnectionInitializer for FlowContext {
             AntiFraudMode::Full
         };
 
-        let minimum_protocol_version = if enforce_anti_fraud { PROTOCOL_VERSION } else { MIN_PRE_HARD_FORK_PROTOCOL_VERSION };
+        let minimum_protocol_version = if enforce_hardfork_core { PROTOCOL_VERSION } else { MIN_PRE_HARD_FORK_PROTOCOL_VERSION };
         let (flows, applied_protocol_version) = match peer_version.protocol_version {
             // New protocol line.
             v if v >= PROTOCOL_VERSION => {
@@ -1389,13 +1391,13 @@ impl ConnectionInitializer for FlowContext {
                 }
             }
             // Pre-HF compatibility lines.
-            PRE_HARD_FORK_PROTOCOL_VERSION if !enforce_anti_fraud => {
+            PRE_HARD_FORK_PROTOCOL_VERSION if !enforce_hardfork_core => {
                 (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), PRE_HARD_FORK_PROTOCOL_VERSION)
             }
-            LEGACY_PROTOCOL_VERSION if !enforce_anti_fraud => {
+            LEGACY_PROTOCOL_VERSION if !enforce_hardfork_core => {
                 (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), LEGACY_PROTOCOL_VERSION)
             }
-            MIN_PRE_HARD_FORK_PROTOCOL_VERSION if !enforce_anti_fraud => (
+            MIN_PRE_HARD_FORK_PROTOCOL_VERSION if !enforce_hardfork_core => (
                 v5::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
                 MIN_PRE_HARD_FORK_PROTOCOL_VERSION,
             ),
@@ -1445,7 +1447,7 @@ impl ConnectionInitializer for FlowContext {
                 );
                 Some((ciphertext, proof.to_vec()))
             }
-            (Some(_), Some(_), None) if enforce_anti_fraud => {
+            (Some(_), Some(_), None) if enforce_hardfork_core => {
                 return Err(ProtocolError::OtherOwned("peer missing mandatory ML-KEM-1024 public key after hardfork".to_string()))
             }
             _ => None,
@@ -1465,7 +1467,7 @@ impl ConnectionInitializer for FlowContext {
             (peer_unified_node_id, peer_pubkey_xonly, peer_node_challenge_nonce)
         {
             if received_ready_message.node_auth_signature.is_empty() {
-                if enforce_anti_fraud {
+                if enforce_hardfork_core {
                     return Err(ProtocolError::OtherOwned("peer missing mandatory ready auth signature after hardfork".to_string()));
                 }
             } else {
@@ -1490,7 +1492,7 @@ impl ConnectionInitializer for FlowContext {
             let peer_has_pq_ready_payload =
                 !received_ready_message.pq_ml_kem1024_ciphertext.is_empty() || !received_ready_message.pq_handshake_proof.is_empty();
             if !peer_has_pq_ready_payload {
-                if enforce_anti_fraud {
+                if enforce_hardfork_core {
                     return Err(ProtocolError::OtherOwned(
                         "peer missing mandatory quantum-safe ready payload after hardfork".to_string(),
                     ));

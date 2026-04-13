@@ -12,8 +12,6 @@ use serde_with::{serde_as, DisplayFromStr};
 use std::{ffi::OsString, fs};
 use toml::from_str;
 
-const DEFAULT_BANSERVER_URL: &str = "https://antifraud.cryptix-network.org/api/v1/antifraud/snapshot";
-
 #[cfg(feature = "devnet-prealloc")]
 use cryptix_addresses::Address;
 #[cfg(feature = "devnet-prealloc")]
@@ -87,6 +85,7 @@ pub struct Args {
     pub hfa_microblock_interval_ms_normal: u64,
     pub autoban: bool,
     pub banserver: bool,
+    // Deprecated and ignored: banserver endpoint is fixed in code.
     pub banserver_url: Option<String>,
     pub payload_hf_activation_daa_score: Option<u64>,
 
@@ -149,7 +148,7 @@ impl Default for Args {
             hfa_microblock_interval_ms_normal: 50,
             autoban: true,
             banserver: true,
-            banserver_url: Some(DEFAULT_BANSERVER_URL.to_owned()),
+            banserver_url: None,
             payload_hf_activation_daa_score: None,
 
             #[cfg(feature = "devnet-prealloc")]
@@ -461,13 +460,6 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
                 .conflicts_with("banserver")
                 .help("Disable remote ban list synchronization from the antifraud banserver (overrides config)."),
         )
-        .arg(
-            Arg::new("banserver-url")
-                .long("banserver-url")
-                .value_name("URL")
-                .require_equals(true)
-                .help("Override the remote banserver URL used for fetching IP blocklist entries."),
-        )
         .arg(arg!(--"disable-upnp" "Disable upnp"))
         .arg(arg!(--"nodnsseed" "Disable DNS seeding for peers"))
         .arg(arg!(--"nogrpc" "Disable gRPC server"))
@@ -592,7 +584,7 @@ impl Args {
             ),
             autoban: autoban_enabled,
             banserver: banserver_enabled,
-            banserver_url: m.get_one::<String>("banserver-url").cloned().or(defaults.banserver_url),
+            banserver_url: defaults.banserver_url,
             payload_hf_activation_daa_score: m
                 .get_one::<u64>("payload-hf-activation-daa-score")
                 .copied()

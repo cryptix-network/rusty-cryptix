@@ -120,7 +120,7 @@ impl Flow for AntiFraudSnapshotSyncFlow {
                         mode_mismatch_streak = 0;
                         continue;
                     };
-                    if !self.ctx.is_payload_hf_active() || !connection_manager.is_antifraud_runtime_enabled() {
+                    if !self.ctx.is_payload_hf_active() {
                         protocol_mismatch_streak = 0;
                         mode_mismatch_streak = 0;
                         continue;
@@ -139,6 +139,10 @@ impl Flow for AntiFraudSnapshotSyncFlow {
                         return Ok(());
                     }
                     if protocol_mismatch {
+                        mode_mismatch_streak = 0;
+                        continue;
+                    }
+                    if !connection_manager.is_antifraud_runtime_enabled() {
                         mode_mismatch_streak = 0;
                         continue;
                     }

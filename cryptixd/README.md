@@ -12,6 +12,6 @@ For more information please refer to the GitHub repository `README.md` located a
 
 ## Banserver Sync
 
-- CLI: `--banserver` (enable), `--no-banserver` (disable), `--banserver-url=<URL>` (override endpoint)
-- Config file: `banserver = true|false`, `banserver-url = "<URL>"`
-- Default: enabled, endpoint `https://antifraud.cryptix-network.org/api/v1/antifraud/snapshot`
+- CLI: `--banserver` (enable), `--no-banserver` (disable)
+- Config file: `banserver = true|false`
+

@@ -38,6 +38,7 @@ pub const ANTI_FRAUD_HASH_WINDOW_LEN: usize = 3;
 const BANSERVER_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const BANSERVER_CONSISTENCY_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const BANSERVER_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+const BANSERVER_REPLICATION_LAG_TOLERANCE: Duration = Duration::from_secs(15);
 const BANSERVER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const BANSERVER_MAX_IPS: usize = 4096;
 const BANSERVER_MAX_IP_ENTRY_LEN: usize = 64;
@@ -83,7 +84,7 @@ struct ConnectionRequest {
     attempts: u32,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct BanserverPayload {
     enabled: bool,
     snapshot: AntiFraudSnapshot,
@@ -92,7 +93,7 @@ struct BanserverPayload {
 #[derive(Debug)]
 enum BanserverFetchOutcome {
     Enabled(BanserverPayload),
-    DisabledByGate,
+    DisabledByGate(BanserverPayload),
     Unavailable,
 }
 
@@ -249,15 +250,11 @@ impl ConnectionManager {
         default_port: u16,
         address_manager: Arc<ParkingLotMutex<AddressManager>>,
         banserver_enabled: bool,
-        banserver_url: Option<String>,
         network_name: String,
         anti_fraud_persist_base_dir: Option<PathBuf>,
     ) -> Arc<Self> {
         let (tx, rx) = unbounded_channel::<()>();
-        let banserver_primary_url = banserver_url
-            .map(|url| url.trim().to_owned())
-            .filter(|url| !url.is_empty())
-            .unwrap_or_else(|| DEFAULT_BANSERVER_URL.to_owned());
+        let banserver_primary_url = DEFAULT_BANSERVER_URL.to_owned();
         let banserver_secondary_url = DEFAULT_BANSERVER_SECONDARY_URL.to_owned();
         let anti_fraud_network = AntiFraudNetwork::from_network_name(&network_name).unwrap_or(AntiFraudNetwork::Mainnet);
         let anti_fraud_persist_dir = anti_fraud_persist_base_dir.map(|path| path.join(ANTI_FRAUD_PERSIST_DIR));
@@ -568,9 +565,6 @@ impl ConnectionManager {
 
     /// Bans the given unified node ID and disconnects all active peers advertising this identity.
     pub async fn ban_unified_node_id(&self, node_id: [u8; 32]) {
-        if !self.is_antifraud_runtime_enabled() {
-            return;
-        }
         self.locally_banned_unified_node_ids.lock().insert(node_id);
         self.disconnect_peers_by_node_id_list(vec![node_id]).await;
     }
@@ -610,10 +604,10 @@ impl ConnectionManager {
     }
 
     pub fn is_unified_node_id_banned(&self, node_id_raw: &[u8; 32]) -> bool {
-        if !self.is_antifraud_runtime_enabled() {
-            return false;
+        if self.locally_banned_unified_node_ids.lock().contains(node_id_raw) {
+            return true;
         }
-        self.is_banserver_banned_node_id(node_id_raw) || self.locally_banned_unified_node_ids.lock().contains(node_id_raw)
+        self.is_banserver_banned_node_id(node_id_raw)
     }
 
     pub fn is_banserver_banned_strong_node_id(&self, static_id_raw: &[u8; 32]) -> bool {
@@ -630,9 +624,6 @@ impl ConnectionManager {
 
     pub fn anti_fraud_snapshot_envelope(&self) -> Option<AntiFraudSnapshotEnvelope> {
         let state = self.anti_fraud_state.lock();
-        if !state.runtime_enabled {
-            return None;
-        }
         state.current_snapshot.clone().map(Into::into)
     }
 
@@ -747,6 +738,14 @@ impl ConnectionManager {
         }
 
         let winner = candidates.into_iter().find(|candidate| candidate.root_hash == winner_hash).expect("winner hash exists");
+        if !winner.antifraud_enabled {
+            drop(state);
+            if let Err(err) = self.try_apply_snapshot(winner.clone(), "peer-majority-gate-disabled") {
+                warn!("Failed to cache disabled peer-gate snapshot: {}", err);
+            }
+            self.disable_antifraud_runtime("peer snapshot majority gate is false");
+            return Ok(IngestPeerSnapshotResult { applied: false, root_hash: peer_root_hash });
+        }
         drop(state);
         let applied = self.try_apply_snapshot(winner, "peer-majority")?;
         Ok(IngestPeerSnapshotResult { applied, root_hash: peer_root_hash })
@@ -795,7 +794,6 @@ impl ConnectionManager {
         let had_hashes = state.hash_window.iter().any(|hash| *hash != ANTI_FRAUD_ZERO_HASH);
         let was_enabled = state.runtime_enabled;
         state.runtime_enabled = false;
-        state.current_snapshot = None;
         state.hash_window = [ANTI_FRAUD_ZERO_HASH; ANTI_FRAUD_HASH_WINDOW_LEN];
         state.peer_votes.clear();
         state.peer_fallback_required = false;
@@ -806,12 +804,32 @@ impl ConnectionManager {
         let had_node_ids = !self.banserver_banned_strong_node_ids.lock().is_empty();
         self.banserver_banned_ips.lock().clear();
         self.banserver_banned_strong_node_ids.lock().clear();
-        self.locally_banned_unified_node_ids.lock().clear();
 
         Self::log_antifraud_runtime_transition(was_enabled, false, reason);
         if was_enabled || had_snapshot || had_hashes || had_ips || had_node_ids {
-            info!("AntiFraud runtime disabled: {}. Cleared all active anti-fraud state.", reason);
+            info!("AntiFraud runtime disabled: {}. Cleared active anti-fraud enforcement state.", reason);
         }
+        self.log_antifraud_runtime_state(reason);
+    }
+
+    fn ensure_peer_only_antifraud_runtime(&self, reason: &str) {
+        let was_enabled = {
+            let mut state = self.anti_fraud_state.lock();
+            let was_enabled = state.runtime_enabled;
+            if state.current_snapshot.as_ref().map(|snapshot| !snapshot.antifraud_enabled).unwrap_or(false) {
+                // Honor the latest signed OFF gate and do not auto-reenable in peer-only mode.
+                return;
+            }
+            let already_peer_only = state.runtime_enabled && state.peer_fallback_required && !state.seed_server_retry_pending;
+            if already_peer_only {
+                return;
+            }
+            state.runtime_enabled = true;
+            state.peer_fallback_required = true;
+            state.seed_server_retry_pending = false;
+            was_enabled
+        };
+        Self::log_antifraud_runtime_transition(was_enabled, true, reason);
         self.log_antifraud_runtime_state(reason);
     }
 
@@ -862,13 +880,16 @@ impl ConnectionManager {
 
     async fn refresh_banserver_bans(self: Arc<Self>) {
         if !self.banserver_enabled {
-            self.disable_antifraud_runtime("banserver disabled by configuration");
+            self.ensure_peer_only_antifraud_runtime("banserver disabled by configuration; peer snapshot fallback only");
             return;
         }
 
         let fetched = match self.fetch_banserver_payload().await {
             BanserverFetchOutcome::Enabled(payload) => payload,
-            BanserverFetchOutcome::DisabledByGate => {
+            BanserverFetchOutcome::DisabledByGate(payload) => {
+                if let Err(err) = self.try_apply_snapshot(payload.snapshot, "seed-server-gate-disabled") {
+                    warn!("Failed to cache disabled anti-fraud gate snapshot: {}", err);
+                }
                 self.disable_antifraud_runtime("snapshot endpoint antifraud_enabled flag is false");
                 return;
             }
@@ -934,7 +955,30 @@ impl ConnectionManager {
                 .collect_vec();
             states.extend(endpoint_errors.iter().cloned());
             info!("AntiFraud runtime gate from snapshots: {} -> disabled", states.join("; "));
-            return BanserverFetchOutcome::DisabledByGate;
+            let mut disabled_payloads = endpoint_payloads
+                .iter()
+                .filter(|entry| !entry.enabled)
+                .filter_map(|entry| entry.payload.as_ref().map(|payload| (entry.endpoint_name, payload.clone())))
+                .collect_vec();
+            if disabled_payloads.is_empty() {
+                return BanserverFetchOutcome::Unavailable;
+            }
+            let mut selected_index = 0usize;
+            for i in 1..disabled_payloads.len() {
+                let candidate_seq = disabled_payloads[i].1.snapshot.snapshot_seq;
+                let selected_seq = disabled_payloads[selected_index].1.snapshot.snapshot_seq;
+                if candidate_seq > selected_seq {
+                    selected_index = i;
+                    continue;
+                }
+                if candidate_seq == selected_seq
+                    && disabled_payloads[selected_index].0 != "primary"
+                    && disabled_payloads[i].0 == "primary"
+                {
+                    selected_index = i;
+                }
+            }
+            return BanserverFetchOutcome::DisabledByGate(disabled_payloads.swap_remove(selected_index).1);
         }
 
         let mut enabled_payloads = endpoint_payloads
@@ -971,24 +1015,77 @@ impl ConnectionManager {
             }
         }
         let selected = enabled_payloads.swap_remove(selected_index);
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_millis() as u64).unwrap_or(0);
 
         for (endpoint_name, endpoint_url, payload) in enabled_payloads.iter() {
-            if payload.snapshot.root_hash != selected.2.snapshot.root_hash {
-                warn!(
-                    "AntiFraud snapshot mismatch while runtime stays enabled: selected {} {} seq={} hash={}, {} {} seq={} hash={}",
-                    selected.0,
-                    selected.1,
-                    selected.2.snapshot.snapshot_seq,
-                    Self::encode_hex(&selected.2.snapshot.root_hash),
-                    endpoint_name,
-                    endpoint_url,
-                    payload.snapshot.snapshot_seq,
-                    Self::encode_hex(&payload.snapshot.root_hash)
-                );
+            match Self::evaluate_enabled_snapshot_pair(selected.0, &selected.2.snapshot, endpoint_name, &payload.snapshot, now_ms) {
+                Ok(None) => {}
+                Ok(Some((newer_label, newer_seq, older_label, older_seq, newer_age_ms))) => {
+                    warn!(
+                        "AntiFraud snapshot temporary replication skew tolerated: newer {} seq={}, older {} seq={}, newer_age_ms={} (<= {})",
+                        newer_label,
+                        newer_seq,
+                        older_label,
+                        older_seq,
+                        newer_age_ms,
+                        BANSERVER_REPLICATION_LAG_TOLERANCE.as_millis()
+                    );
+                }
+                Err(reason) => {
+                    warn!(
+                        "AntiFraud snapshot mismatch: rejecting update (selected {} {} seq={} hash={}, {} {} seq={} hash={}): {}",
+                        selected.0,
+                        selected.1,
+                        selected.2.snapshot.snapshot_seq,
+                        Self::encode_hex(&selected.2.snapshot.root_hash),
+                        endpoint_name,
+                        endpoint_url,
+                        payload.snapshot.snapshot_seq,
+                        Self::encode_hex(&payload.snapshot.root_hash),
+                        reason
+                    );
+                    return BanserverFetchOutcome::Unavailable;
+                }
             }
         }
 
         BanserverFetchOutcome::Enabled(selected.2)
+    }
+
+    fn evaluate_enabled_snapshot_pair(
+        selected_label: &str,
+        selected_snapshot: &AntiFraudSnapshot,
+        peer_label: &str,
+        peer_snapshot: &AntiFraudSnapshot,
+        now_ms: u64,
+    ) -> Result<Option<(String, u64, String, u64, u64)>, String> {
+        if peer_snapshot.snapshot_seq == selected_snapshot.snapshot_seq {
+            if peer_snapshot.root_hash != selected_snapshot.root_hash {
+                return Err("enabled endpoints disagree on identical snapshot_seq".to_string());
+            }
+            return Ok(None);
+        }
+
+        let (newer_label, newer_snapshot, older_label, older_snapshot) = if peer_snapshot.snapshot_seq > selected_snapshot.snapshot_seq
+        {
+            (peer_label, peer_snapshot, selected_label, selected_snapshot)
+        } else {
+            (selected_label, selected_snapshot, peer_label, peer_snapshot)
+        };
+
+        let newer_seq = newer_snapshot.snapshot_seq;
+        let older_seq = older_snapshot.snapshot_seq;
+        let seq_gap = newer_seq - older_seq;
+        let newer_age_ms = now_ms.saturating_sub(newer_snapshot.generated_at_ms);
+        let tolerance_ms = BANSERVER_REPLICATION_LAG_TOLERANCE.as_millis() as u64;
+        if seq_gap == 1 && newer_age_ms <= tolerance_ms {
+            return Ok(Some((newer_label.to_owned(), newer_seq, older_label.to_owned(), older_seq, newer_age_ms)));
+        }
+
+        Err(format!(
+            "enabled endpoints diverged beyond tolerance (seq_gap={} newer_age_ms={} tolerance_ms={})",
+            seq_gap, newer_age_ms, tolerance_ms
+        ))
     }
 
     async fn fetch_banserver_payload_from_endpoint(
@@ -1825,6 +1922,68 @@ mod tests {
         assert!(!state.seed_server_retry_pending);
     }
 
+    #[test]
+    fn evaluate_enabled_snapshot_pair_rejects_same_seq_different_hash() {
+        let now_ms = 1_700_000_020_000u64;
+        let selected = snapshot_for_consistency(10, 1_700_000_000_000, 0x11);
+        let peer = snapshot_for_consistency(10, 1_700_000_000_100, 0x22);
+
+        let err = ConnectionManager::evaluate_enabled_snapshot_pair("primary", &selected, "secondary", &peer, now_ms)
+            .expect_err("same seq with different root hash must fail");
+        assert!(err.contains("identical snapshot_seq"));
+    }
+
+    #[test]
+    fn evaluate_enabled_snapshot_pair_accepts_same_seq_same_hash() {
+        let now_ms = 1_700_000_020_000u64;
+        let selected = snapshot_for_consistency(10, 1_700_000_000_000, 0x11);
+        let peer = snapshot_for_consistency(10, 1_700_000_000_100, 0x11);
+
+        let result = ConnectionManager::evaluate_enabled_snapshot_pair("primary", &selected, "secondary", &peer, now_ms)
+            .expect("same seq/hash should pass");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn evaluate_enabled_snapshot_pair_allows_one_step_skew_within_tolerance() {
+        let tolerance_ms = BANSERVER_REPLICATION_LAG_TOLERANCE.as_millis() as u64;
+        let now_ms = 1_700_000_020_000u64;
+        let selected = snapshot_for_consistency(11, now_ms - tolerance_ms, 0x22);
+        let peer = snapshot_for_consistency(10, now_ms - 30_000, 0x11);
+
+        let result = ConnectionManager::evaluate_enabled_snapshot_pair("primary", &selected, "secondary", &peer, now_ms)
+            .expect("one-step skew inside tolerance should pass")
+            .expect("skew should be flagged as tolerated");
+        assert_eq!(result.0, "primary");
+        assert_eq!(result.1, 11);
+        assert_eq!(result.2, "secondary");
+        assert_eq!(result.3, 10);
+        assert_eq!(result.4, tolerance_ms);
+    }
+
+    #[test]
+    fn evaluate_enabled_snapshot_pair_rejects_skew_beyond_tolerance() {
+        let tolerance_ms = BANSERVER_REPLICATION_LAG_TOLERANCE.as_millis() as u64;
+        let now_ms = 1_700_000_020_000u64;
+        let selected = snapshot_for_consistency(11, now_ms - tolerance_ms - 1, 0x22);
+        let peer = snapshot_for_consistency(10, now_ms - 30_000, 0x11);
+
+        let err = ConnectionManager::evaluate_enabled_snapshot_pair("primary", &selected, "secondary", &peer, now_ms)
+            .expect_err("skew past tolerance must fail");
+        assert!(err.contains("diverged beyond tolerance"));
+    }
+
+    #[test]
+    fn evaluate_enabled_snapshot_pair_rejects_large_seq_gap() {
+        let now_ms = 1_700_000_020_000u64;
+        let selected = snapshot_for_consistency(14, now_ms - 1000, 0x44);
+        let peer = snapshot_for_consistency(10, now_ms - 30_000, 0x11);
+
+        let err = ConnectionManager::evaluate_enabled_snapshot_pair("primary", &selected, "secondary", &peer, now_ms)
+            .expect_err("seq gap > 1 must fail");
+        assert!(err.contains("diverged beyond tolerance"));
+    }
+
     fn build_seed_payload() -> JsonValue {
         json!({
             "antifraud_enabled": true,
@@ -1846,5 +2005,22 @@ mod tests {
     fn http_fallback_url_converts_https_443_to_http_80() {
         let fallback = ConnectionManager::http_fallback_url("https://example.org:443/path").unwrap();
         assert_eq!(fallback, "http://example.org/path");
+    }
+
+    fn snapshot_for_consistency(seq: u64, generated_at_ms: u64, root_hash_byte: u8) -> AntiFraudSnapshot {
+        let mut root_hash = [0u8; 32];
+        root_hash[0] = root_hash_byte;
+        AntiFraudSnapshot {
+            schema_version: ANTI_FRAUD_SCHEMA_VERSION,
+            network: AntiFraudNetwork::Mainnet,
+            snapshot_seq: seq,
+            generated_at_ms,
+            signing_key_id: 0,
+            antifraud_enabled: true,
+            banned_ip_entries: Vec::new(),
+            banned_node_id_entries: Vec::new(),
+            signature: [0u8; 64],
+            root_hash,
+        }
     }
 }

@@ -269,9 +269,8 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     info!("Strong-Node claimant overlay: ENABLED");
     info!("Auto-ban: {} (default strike threshold: 5, ban duration: 3h)", if args.autoban { "ENABLED" } else { "DISABLED" });
     info!(
-        "Banserver sync: {} ({})",
-        if args.banserver { "ENABLED" } else { "DISABLED" },
-        args.banserver_url.as_deref().unwrap_or("default URL")
+        "Banserver sync: {} (fixed endpoint: https://antifraud.cryptix-network.org/api/v1/antifraud/snapshot)",
+        if args.banserver { "ENABLED" } else { "DISABLED" }
     );
 
     assert!(!db_dir.to_str().unwrap().is_empty());
@@ -499,7 +498,6 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         dns_seeders,
         config.default_p2p_port(),
         args.banserver,
-        args.banserver_url.clone(),
         Some(db_dir.clone()),
         p2p_tower_counters.clone(),
     ));
