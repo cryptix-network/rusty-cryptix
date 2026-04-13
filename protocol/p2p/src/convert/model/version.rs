@@ -22,6 +22,7 @@ pub struct Version {
     pub node_pubkey_xonly: Option<[u8; 32]>,
     pub node_pow_nonce: Option<u64>,
     pub node_challenge_nonce: Option<u64>,
+    pub pq_ml_kem1024_pubkey: Option<Vec<u8>>,
 }
 
 impl Version {
@@ -46,6 +47,7 @@ impl Version {
             node_pubkey_xonly: None,
             node_pow_nonce: None,
             node_challenge_nonce: None,
+            pq_ml_kem1024_pubkey: None,
         }
     }
 

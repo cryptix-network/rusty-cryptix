@@ -17,6 +17,7 @@ use tokio::{select, time::interval};
 const ANTI_FRAUD_REQUEST_INTERVAL: Duration = Duration::from_secs(20);
 const ANTI_FRAUD_MODE_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 const HARD_FORK_PROTOCOL_VERSION: u32 = 8;
+const MODE_MISMATCH_THRESHOLD: u8 = 5;
 
 fn anti_fraud_hash_window_from_vec(entries: &[[u8; 32]]) -> Option<[[u8; 32]; 3]> {
     if entries.len() != 3 {
@@ -32,6 +33,16 @@ fn normalized_peer_hash_window(entries: &[[u8; 32]]) -> [[u8; 32]; ANTI_FRAUD_HA
     } else {
         [ANTI_FRAUD_ZERO_HASH; ANTI_FRAUD_HASH_WINDOW_LEN]
     }
+}
+
+fn should_disconnect_on_consecutive_mismatch(streak: &mut u8, mismatch: bool) -> bool {
+    if !mismatch {
+        *streak = 0;
+        return false;
+    }
+
+    *streak = streak.saturating_add(1);
+    *streak >= MODE_MISMATCH_THRESHOLD
 }
 
 pub struct AntiFraudSnapshotRequestsFlow {
@@ -70,6 +81,7 @@ impl Flow for AntiFraudSnapshotRequestsFlow {
                 banned_ips: snapshot.banned_ips,
                 banned_node_ids: snapshot.banned_node_ids,
                 signature: snapshot.signature,
+                antifraud_enabled: snapshot.antifraud_enabled,
             };
             self.router.enqueue(make_response!(Payload::AntiFraudSnapshotV1, response, request_id)).await?;
         }
@@ -98,18 +110,25 @@ impl Flow for AntiFraudSnapshotSyncFlow {
         let request_id = self.incoming_route.id();
         let mut request_ticker = interval(ANTI_FRAUD_REQUEST_INTERVAL);
         let mut mode_ticker = interval(ANTI_FRAUD_MODE_RECHECK_INTERVAL);
+        let mut protocol_mismatch_streak = 0u8;
+        let mut mode_mismatch_streak = 0u8;
         loop {
             select! {
                 _ = mode_ticker.tick() => {
                     let Some(connection_manager) = self.ctx.connection_manager() else {
+                        protocol_mismatch_streak = 0;
+                        mode_mismatch_streak = 0;
                         continue;
                     };
                     if !self.ctx.is_payload_hf_active() || !connection_manager.is_antifraud_runtime_enabled() {
+                        protocol_mismatch_streak = 0;
+                        mode_mismatch_streak = 0;
                         continue;
                     }
 
                     let properties = self.router.properties();
-                    if properties.protocol_version < HARD_FORK_PROTOCOL_VERSION {
+                    let protocol_mismatch = properties.protocol_version < HARD_FORK_PROTOCOL_VERSION;
+                    if should_disconnect_on_consecutive_mismatch(&mut protocol_mismatch_streak, protocol_mismatch) {
                         warn!(
                             "Peer {} still uses pre-HF protocol version {}; reconnecting to enforce v{}+",
                             self.router,
@@ -119,10 +138,19 @@ impl Flow for AntiFraudSnapshotSyncFlow {
                         self.ctx.hub().terminate(self.router.key()).await;
                         return Ok(());
                     }
+                    if protocol_mismatch {
+                        mode_mismatch_streak = 0;
+                        continue;
+                    }
 
                     let current_mode = anti_fraud_hash_window_from_vec(&properties.anti_fraud_hashes)
                         .map(|peer_hash_window| connection_manager.anti_fraud_mode_for_peer_hashes(&peer_hash_window))
                         .unwrap_or(AntiFraudMode::Restricted);
+                    let mode_mismatch = (properties.anti_fraud_restricted && current_mode == AntiFraudMode::Full)
+                        || (!properties.anti_fraud_restricted && current_mode == AntiFraudMode::Restricted);
+                    if !should_disconnect_on_consecutive_mismatch(&mut mode_mismatch_streak, mode_mismatch) {
+                        continue;
+                    }
                     if properties.anti_fraud_restricted && current_mode == AntiFraudMode::Full {
                         debug!(
                             "Peer {} anti-fraud overlap became valid; reconnecting to upgrade from RESTRICTED_AF to FULL",
@@ -131,14 +159,12 @@ impl Flow for AntiFraudSnapshotSyncFlow {
                         self.ctx.hub().terminate(self.router.key()).await;
                         return Ok(());
                     }
-                    if !properties.anti_fraud_restricted && current_mode == AntiFraudMode::Restricted {
-                        warn!(
-                            "Peer {} lost anti-fraud hash overlap; reconnecting to enforce RESTRICTED_AF",
-                            self.router
-                        );
-                        self.ctx.hub().terminate(self.router.key()).await;
-                        return Ok(());
-                    }
+                    warn!(
+                        "Peer {} lost anti-fraud hash overlap; reconnecting to enforce RESTRICTED_AF",
+                        self.router
+                    );
+                    self.ctx.hub().terminate(self.router.key()).await;
+                    return Ok(());
                 }
                 _ = request_ticker.tick() => {
                     if let Some(connection_manager) = self.ctx.connection_manager() {
@@ -182,6 +208,7 @@ impl Flow for AntiFraudSnapshotSyncFlow {
                         banned_ips: payload.banned_ips,
                         banned_node_ids: payload.banned_node_ids,
                         signature: payload.signature,
+                        antifraud_enabled: payload.antifraud_enabled,
                     };
                     match connection_manager.ingest_peer_snapshot(self.router.key(), envelope) {
                         Ok(result) => {
@@ -207,5 +234,27 @@ impl Flow for AntiFraudSnapshotSyncFlow {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_disconnect_on_consecutive_mismatch, MODE_MISMATCH_THRESHOLD};
+
+    #[test]
+    fn disconnect_helper_triggers_at_threshold() {
+        let mut streak = 0u8;
+        for _ in 0..(MODE_MISMATCH_THRESHOLD - 1) {
+            assert!(!should_disconnect_on_consecutive_mismatch(&mut streak, true));
+        }
+        assert!(should_disconnect_on_consecutive_mismatch(&mut streak, true));
+    }
+
+    #[test]
+    fn disconnect_helper_resets_on_healthy_tick() {
+        let mut streak = 0u8;
+        assert!(!should_disconnect_on_consecutive_mismatch(&mut streak, true));
+        assert!(!should_disconnect_on_consecutive_mismatch(&mut streak, false));
+        assert_eq!(streak, 0);
     }
 }

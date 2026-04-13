@@ -8,6 +8,10 @@ use crate::node_identity::{
     compute_node_id, create_ephemeral_identity, is_valid_pow_nonce, load_or_create_identity, network_code_from_name,
     sign_node_auth_proof, verify_node_auth_proof, UnifiedNodeIdentity,
 };
+use crate::pq_handshake::{
+    compute_pq_handshake_proof, decapsulate_mlkem1024, encapsulate_mlkem1024, generate_mlkem1024_keypair, PQ_HANDSHAKE_PROOF_SIZE,
+    PQ_MLKEM1024_CIPHERTEXT_SIZE, PQ_MLKEM1024_PUBLIC_KEY_SIZE,
+};
 use crate::strong_node_claims::{
     ClaimIngestOutcome, StrongNodeClaimsEngine, StrongNodeClaimsRuntimeSnapshot, STRONG_NODE_CLAIMS_P2P_SERVICE_BIT,
 };
@@ -59,7 +63,7 @@ use std::{
     iter::once,
     ops::Deref,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc,
     },
     time::Duration,
@@ -76,6 +80,9 @@ const PROTOCOL_VERSION: u32 = 8;
 const PRE_HARD_FORK_PROTOCOL_VERSION: u32 = 7;
 const LEGACY_PROTOCOL_VERSION: u32 = 6;
 const MIN_PRE_HARD_FORK_PROTOCOL_VERSION: u32 = 5;
+const QUANTUM_HANDSHAKE_STATE_UNKNOWN: u8 = 0;
+const QUANTUM_HANDSHAKE_STATE_LEGACY: u8 = 1;
+const QUANTUM_HANDSHAKE_STATE_ENFORCED: u8 = 2;
 
 /// See `check_orphan_resolution_range`
 const BASELINE_ORPHAN_RESOLUTION_RANGE: u32 = 5;
@@ -115,6 +122,16 @@ fn anti_fraud_hash_window_from_vec(entries: &[[u8; 32]]) -> Option<[[u8; 32]; 3]
         return None;
     }
     Some([entries[0], entries[1], entries[2]])
+}
+
+fn short_hex_for_log(data: &[u8]) -> String {
+    if data.is_empty() {
+        return "<empty>".to_string();
+    }
+    if data.len() <= 8 {
+        return hex::encode(data);
+    }
+    format!("{}...{}", hex::encode(&data[..4]), hex::encode(&data[data.len() - 4..]))
 }
 
 fn is_compatible_peer_network(local_network: &str, remote_network: &str) -> bool {
@@ -282,6 +299,9 @@ pub struct FlowContextInner {
     mining_manager: MiningManagerProxy,
     pub(crate) tick_service: Arc<TickService>,
     notification_root: Arc<ConsensusNotificationRoot>,
+    quantum_handshake_mode_state: AtomicU8,
+    quantum_handshake_start_logged: AtomicBool,
+    quantum_handshake_key_sample_logged: AtomicBool,
 
     // Special sampling logger used only for high-bps networks where logs must be throttled
     block_event_logger: Option<BlockEventLogger>,
@@ -430,6 +450,9 @@ impl FlowContext {
                 mining_manager,
                 tick_service,
                 notification_root,
+                quantum_handshake_mode_state: AtomicU8::new(QUANTUM_HANDSHAKE_STATE_UNKNOWN),
+                quantum_handshake_start_logged: AtomicBool::new(false),
+                quantum_handshake_key_sample_logged: AtomicBool::new(false),
                 block_event_logger: if config.bps() > 1 { Some(BlockEventLogger::new(config.bps() as usize)) } else { None },
                 orphan_resolution_range,
                 max_orphans,
@@ -451,6 +474,7 @@ impl FlowContext {
     }
 
     pub fn start_async_services(&self) {
+        info!("Quantum-safe ML-KEM-1024 handshake support enabled (ephemeral per-connection keys; no static startup key loaded)");
         if let Some(logger) = self.block_event_logger.as_ref() {
             logger.start();
         }
@@ -654,6 +678,44 @@ impl FlowContext {
     pub fn is_payload_hf_active(&self) -> bool {
         let virtual_daa_score = self.consensus().unguarded_session().get_virtual_daa_score();
         virtual_daa_score >= self.config.params.payload_hf_activation_daa_score
+    }
+
+    fn log_quantum_handshake_mode_transition(&self, enforce_quantum_handshake: bool) {
+        let next_state = if enforce_quantum_handshake { QUANTUM_HANDSHAKE_STATE_ENFORCED } else { QUANTUM_HANDSHAKE_STATE_LEGACY };
+        let previous_state = self.quantum_handshake_mode_state.swap(next_state, Ordering::SeqCst);
+        if previous_state == next_state {
+            return;
+        }
+
+        if next_state == QUANTUM_HANDSHAKE_STATE_ENFORCED {
+            info!("Hardfork reached: switching to quantum-safe handshake (ML-KEM-1024 enforced)");
+            return;
+        }
+
+        if previous_state == QUANTUM_HANDSHAKE_STATE_ENFORCED {
+            warn!("Quantum-safe handshake enforcement disabled; returning to legacy-compatible handshake mode");
+        } else {
+            info!("Handshake mode initialized: legacy-compatible (quantum-safe ML-KEM-1024 is not enforced)");
+        }
+    }
+
+    fn log_quantum_handshake_startup_once(&self, enforce_quantum_handshake: bool) {
+        if self.quantum_handshake_start_logged.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if enforce_quantum_handshake {
+            info!("Peer handshake started: running in quantum-safe mode (ML-KEM-1024 enforced)");
+        } else {
+            info!("Peer handshake started: running in legacy-compatible mode");
+        }
+    }
+
+    fn log_quantum_handshake_key_sample_once(&self, public_key: &[u8]) {
+        if self.quantum_handshake_key_sample_logged.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let sample = short_hex_for_log(public_key);
+        info!("Quantum-safe ML-KEM-1024 handshake key policy: using ephemeral per-connection keys (public key sample: {})", sample);
     }
 
     pub fn is_strong_node_claims_p2p_enabled(&self) -> bool {
@@ -1198,6 +1260,14 @@ impl ConnectionInitializer for FlowContext {
         self_version_message.node_pow_nonce = Some(self.unified_node_identity.pow_nonce);
         let local_node_challenge_nonce = rand::random::<u64>();
         self_version_message.node_challenge_nonce = Some(local_node_challenge_nonce);
+        let (local_pq_ml_kem1024_public_key, local_pq_ml_kem1024_private_key) = generate_mlkem1024_keypair();
+        if local_pq_ml_kem1024_public_key.len() != PQ_MLKEM1024_PUBLIC_KEY_SIZE {
+            return Err(ProtocolError::OtherOwned(format!(
+                "local ML-KEM-1024 public key must be exactly {PQ_MLKEM1024_PUBLIC_KEY_SIZE} bytes"
+            )));
+        }
+        self.log_quantum_handshake_key_sample_once(local_pq_ml_kem1024_public_key.as_slice());
+        self_version_message.pq_ml_kem1024_pubkey = Some(local_pq_ml_kem1024_public_key);
         if self.is_hfa_p2p_enabled() {
             self_version_message.services |= HFA_P2P_SERVICE_BIT;
         }
@@ -1226,6 +1296,7 @@ impl ConnectionInitializer for FlowContext {
             _ => return Err(ProtocolError::OtherOwned("peer sent incomplete node identity handshake fields".to_string())),
         };
         let peer_node_challenge_nonce = peer_version.node_challenge_nonce;
+        let peer_pq_ml_kem1024_public_key = peer_version.pq_ml_kem1024_pubkey.clone();
         if peer_unified_node_id.is_none() && peer_node_challenge_nonce.is_some() {
             return Err(ProtocolError::OtherOwned("peer sent node challenge nonce without node identity fields".to_string()));
         }
@@ -1241,12 +1312,22 @@ impl ConnectionInitializer for FlowContext {
         let payload_hf_active = self.is_payload_hf_active();
         let anti_fraud_runtime_enabled = self.connection_manager().map(|cm| cm.is_antifraud_runtime_enabled()).unwrap_or(false);
         let enforce_anti_fraud = payload_hf_active && anti_fraud_runtime_enabled;
+        self.log_quantum_handshake_mode_transition(enforce_anti_fraud);
+        self.log_quantum_handshake_startup_once(enforce_anti_fraud);
+        debug!(
+            "Starting handshake with peer {} in {} mode",
+            router,
+            if enforce_anti_fraud { "quantum-safe (ML-KEM-1024 enforced)" } else { "legacy-compatible" }
+        );
 
         if enforce_anti_fraud && peer_unified_node_id.is_none() {
             return Err(ProtocolError::OtherOwned("peer missing mandatory unified node identity after hardfork".to_string()));
         }
         if enforce_anti_fraud && peer_node_challenge_nonce.is_none() {
             return Err(ProtocolError::OtherOwned("peer missing mandatory node challenge nonce after hardfork".to_string()));
+        }
+        if enforce_anti_fraud && peer_pq_ml_kem1024_public_key.is_none() {
+            return Err(ProtocolError::OtherOwned("peer missing mandatory ML-KEM-1024 public key after hardfork".to_string()));
         }
         if let Some(peer_node_id) = peer_unified_node_id {
             if peer_node_id == self.unified_node_identity.node_id {
@@ -1349,11 +1430,34 @@ impl ConnectionInitializer for FlowContext {
             ),
             _ => None,
         };
+        let local_ready_pq_payload = match (peer_unified_node_id, peer_node_challenge_nonce, peer_pq_ml_kem1024_public_key.as_deref())
+        {
+            (Some(peer_node_id), Some(peer_nonce), Some(peer_public_key)) => {
+                let (ciphertext, shared_secret) = encapsulate_mlkem1024(peer_public_key)
+                    .map_err(|err| ProtocolError::OtherOwned(format!("failed encapsulating ML-KEM-1024 payload: {err}")))?;
+                let proof = compute_pq_handshake_proof(
+                    network_code,
+                    &self.unified_node_identity.node_id,
+                    &peer_node_id,
+                    local_node_challenge_nonce,
+                    peer_nonce,
+                    &shared_secret,
+                );
+                Some((ciphertext, proof.to_vec()))
+            }
+            (Some(_), Some(_), None) if enforce_anti_fraud => {
+                return Err(ProtocolError::OtherOwned("peer missing mandatory ML-KEM-1024 public key after hardfork".to_string()))
+            }
+            _ => None,
+        };
+        let (local_ready_pq_ciphertext, local_ready_pq_proof) = local_ready_pq_payload.unwrap_or_else(|| (Vec::new(), Vec::new()));
 
         // Send and receive the ready signal
         let received_ready_message = handshake
             .exchange_ready_messages(cryptix_p2p_lib::pb::ReadyMessage {
                 node_auth_signature: local_ready_signature.map(|value| value.to_vec()).unwrap_or_default(),
+                pq_ml_kem1024_ciphertext: local_ready_pq_ciphertext,
+                pq_handshake_proof: local_ready_pq_proof,
             })
             .await?;
 
@@ -1380,6 +1484,50 @@ impl ConnectionInitializer for FlowContext {
                     &peer_signature,
                 ) {
                     return Err(ProtocolError::OtherOwned("peer ready auth signature verification failed".to_string()));
+                }
+            }
+
+            let peer_has_pq_ready_payload =
+                !received_ready_message.pq_ml_kem1024_ciphertext.is_empty() || !received_ready_message.pq_handshake_proof.is_empty();
+            if !peer_has_pq_ready_payload {
+                if enforce_anti_fraud {
+                    return Err(ProtocolError::OtherOwned(
+                        "peer missing mandatory quantum-safe ready payload after hardfork".to_string(),
+                    ));
+                }
+            } else {
+                if received_ready_message.pq_ml_kem1024_ciphertext.len() != PQ_MLKEM1024_CIPHERTEXT_SIZE {
+                    return Err(ProtocolError::OtherOwned(format!(
+                        "peer ML-KEM-1024 ciphertext must be exactly {PQ_MLKEM1024_CIPHERTEXT_SIZE} bytes"
+                    )));
+                }
+                if received_ready_message.pq_handshake_proof.len() != PQ_HANDSHAKE_PROOF_SIZE {
+                    return Err(ProtocolError::OtherOwned(format!(
+                        "peer quantum-safe handshake proof must be exactly {PQ_HANDSHAKE_PROOF_SIZE} bytes"
+                    )));
+                }
+
+                let peer_shared_secret = decapsulate_mlkem1024(
+                    &local_pq_ml_kem1024_private_key,
+                    received_ready_message.pq_ml_kem1024_ciphertext.as_slice(),
+                )
+                .map_err(|err| ProtocolError::OtherOwned(format!("failed decapsulating peer ML-KEM-1024 payload: {err}")))?;
+                let expected_peer_proof = compute_pq_handshake_proof(
+                    network_code,
+                    &peer_node_id,
+                    &self.unified_node_identity.node_id,
+                    peer_nonce,
+                    local_node_challenge_nonce,
+                    &peer_shared_secret,
+                );
+                let peer_proof: [u8; PQ_HANDSHAKE_PROOF_SIZE] =
+                    received_ready_message.pq_handshake_proof.as_slice().try_into().map_err(|_| {
+                        ProtocolError::OtherOwned(format!(
+                            "peer quantum-safe handshake proof must be exactly {PQ_HANDSHAKE_PROOF_SIZE} bytes"
+                        ))
+                    })?;
+                if peer_proof != expected_peer_proof {
+                    return Err(ProtocolError::OtherOwned("peer quantum-safe handshake proof verification failed".to_string()));
                 }
             }
         }

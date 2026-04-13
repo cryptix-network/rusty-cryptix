@@ -151,6 +151,7 @@ message VersionMessage{
   bytes nodePubkeyXonly = 12;
   optional uint64 nodePowNonce = 13;
   optional uint64 nodeChallengeNonce = 14;
+  bytes pqMlKem1024Pubkey = 15;
 }
 
 message RequestAntiFraudSnapshotV1Message{
@@ -165,6 +166,7 @@ message AntiFraudSnapshotV1Message{
   repeated bytes bannedIps = 6;
   repeated bytes bannedNodeIds = 7;
   bytes signature = 8;
+  bool antifraudEnabled = 9;
 }
 
 message RejectMessage{
@@ -301,6 +303,8 @@ message PruningPointProofHeaderArray {
 
 message ReadyMessage {
   bytes nodeAuthSignature = 1;
+  bytes pqMlKem1024Ciphertext = 2;
+  bytes pqHandshakeProof = 3;
 }
 
 message BlockWithTrustedDataV4Message {

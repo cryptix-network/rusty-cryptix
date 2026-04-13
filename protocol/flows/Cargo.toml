@@ -44,3 +44,5 @@ serde.workspace = true
 serde_json.workspace = true
 prost.workspace = true
 sha2.workspace = true
+kem.workspace = true
+ml-kem.workspace = true

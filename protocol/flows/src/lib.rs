@@ -4,6 +4,7 @@ pub mod flow_trait;
 pub mod flowcontext;
 pub mod hfa;
 pub mod node_identity;
+pub mod pq_handshake;
 pub mod service;
 pub mod strong_node_claims;
 pub mod v5;

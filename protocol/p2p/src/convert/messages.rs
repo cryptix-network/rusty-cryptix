@@ -17,6 +17,8 @@ use cryptix_utils::networking::{IpAddress, PeerId};
 
 use std::sync::Arc;
 
+const PQ_MLKEM1024_PUBLIC_KEY_SIZE: usize = 1568;
+
 // ----------------------------------------------------------------------------
 // consensus_core to protowire
 // ----------------------------------------------------------------------------
@@ -37,6 +39,7 @@ impl From<Version> for protowire::VersionMessage {
             node_pubkey_xonly: item.node_pubkey_xonly.map(|value| value.to_vec()).unwrap_or_default(),
             node_pow_nonce: item.node_pow_nonce,
             node_challenge_nonce: item.node_challenge_nonce,
+            pq_ml_kem1024_pubkey: item.pq_ml_kem1024_pubkey.unwrap_or_default(),
         }
     }
 }
@@ -62,6 +65,7 @@ impl TryFrom<protowire::VersionMessage> for Version {
             node_pubkey_xonly: parse_optional_32_bytes(msg.node_pubkey_xonly)?,
             node_pow_nonce: msg.node_pow_nonce,
             node_challenge_nonce: msg.node_challenge_nonce,
+            pq_ml_kem1024_pubkey: parse_optional_mlkem1024_pubkey(msg.pq_ml_kem1024_pubkey)?,
         })
     }
 }
@@ -79,6 +83,16 @@ fn parse_optional_32_bytes(raw: Vec<u8>) -> Result<Option<[u8; 32]>, ConversionE
     }
     let value: [u8; 32] = raw.as_slice().try_into().map_err(|_| ConversionError::General)?;
     Ok(Some(value))
+}
+
+fn parse_optional_mlkem1024_pubkey(raw: Vec<u8>) -> Result<Option<Vec<u8>>, ConversionError> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if raw.len() != PQ_MLKEM1024_PUBLIC_KEY_SIZE {
+        return Err(ConversionError::General);
+    }
+    Ok(Some(raw))
 }
 
 impl TryFrom<protowire::RequestHeadersMessage> for (Hash, Hash) {
