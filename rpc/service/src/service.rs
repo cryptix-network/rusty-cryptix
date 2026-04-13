@@ -211,7 +211,8 @@ impl RpcCoreService {
                 ListenerLifespan::Static(policies),
             );
 
-            let index_events: EventSwitches = [EventType::UtxosChanged, EventType::PruningPointUtxoSetOverride].as_ref().into();
+            let index_event_types: &[EventType] = &[EventType::UtxosChanged, EventType::PruningPointUtxoSetOverride];
+            let index_events: EventSwitches = index_event_types.into();
             let index_collector =
                 Arc::new(CollectorFromIndex::new("rpc-core <= index", index_notify_channel.receiver(), index_converter.clone()));
             let index_subscriber =
