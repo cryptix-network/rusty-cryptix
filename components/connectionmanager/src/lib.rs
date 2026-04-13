@@ -92,7 +92,8 @@ struct BanserverPayload {
 struct EndpointBanserverPayload {
     endpoint_name: &'static str,
     source_url: String,
-    payload: BanserverPayload,
+    enabled: bool,
+    payload: Option<BanserverPayload>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -189,6 +190,7 @@ pub struct IngestPeerSnapshotResult {
 
 #[derive(Debug)]
 struct AntiFraudState {
+    runtime_enabled: bool,
     current_snapshot: Option<AntiFraudSnapshot>,
     hash_window: [[u8; 32]; ANTI_FRAUD_HASH_WINDOW_LEN],
     peer_votes: HashMap<String, PeerSnapshotVote>,
@@ -199,6 +201,7 @@ struct AntiFraudState {
 impl Default for AntiFraudState {
     fn default() -> Self {
         Self {
+            runtime_enabled: false,
             current_snapshot: None,
             hash_window: [ANTI_FRAUD_ZERO_HASH; ANTI_FRAUD_HASH_WINDOW_LEN],
             peer_votes: HashMap::new(),
@@ -542,6 +545,9 @@ impl ConnectionManager {
 
     /// Bans the given unified node ID and disconnects all active peers advertising this identity.
     pub async fn ban_unified_node_id(&self, node_id: [u8; 32]) {
+        if !self.is_antifraud_runtime_enabled() {
+            return;
+        }
         self.locally_banned_unified_node_ids.lock().insert(node_id);
         self.disconnect_peers_by_node_id_list(vec![node_id]).await;
     }
@@ -562,15 +568,28 @@ impl ConnectionManager {
         self.connection_requests.lock().await.iter().any(|(address, request)| request.is_permanent && address.ip() == ip)
     }
 
+    pub fn is_antifraud_runtime_enabled(&self) -> bool {
+        self.anti_fraud_state.lock().runtime_enabled
+    }
+
     fn is_banserver_banned_ip(&self, ip: IpAddr) -> bool {
+        if !self.is_antifraud_runtime_enabled() {
+            return false;
+        }
         self.banserver_banned_ips.lock().contains(&ip)
     }
 
     pub fn is_banserver_banned_node_id(&self, node_id_raw: &[u8; 32]) -> bool {
+        if !self.is_antifraud_runtime_enabled() {
+            return false;
+        }
         self.banserver_banned_strong_node_ids.lock().contains(node_id_raw)
     }
 
     pub fn is_unified_node_id_banned(&self, node_id_raw: &[u8; 32]) -> bool {
+        if !self.is_antifraud_runtime_enabled() {
+            return false;
+        }
         self.is_banserver_banned_node_id(node_id_raw) || self.locally_banned_unified_node_ids.lock().contains(node_id_raw)
     }
 
@@ -579,26 +598,50 @@ impl ConnectionManager {
     }
 
     pub fn anti_fraud_hash_window(&self) -> [[u8; 32]; ANTI_FRAUD_HASH_WINDOW_LEN] {
-        self.anti_fraud_state.lock().hash_window
+        let state = self.anti_fraud_state.lock();
+        if !state.runtime_enabled {
+            return [ANTI_FRAUD_ZERO_HASH; ANTI_FRAUD_HASH_WINDOW_LEN];
+        }
+        state.hash_window
     }
 
     pub fn anti_fraud_snapshot_envelope(&self) -> Option<AntiFraudSnapshotEnvelope> {
-        self.anti_fraud_state.lock().current_snapshot.clone().map(Into::into)
+        let state = self.anti_fraud_state.lock();
+        if !state.runtime_enabled {
+            return None;
+        }
+        state.current_snapshot.clone().map(Into::into)
     }
 
     pub fn should_request_peer_snapshots(&self) -> bool {
         let state = self.anti_fraud_state.lock();
+        if !state.runtime_enabled {
+            return false;
+        }
         !self.banserver_enabled || state.peer_fallback_required
     }
 
     pub fn should_retry_seed_server_snapshot_validation(&self) -> bool {
-        self.anti_fraud_state.lock().seed_server_retry_pending
+        let state = self.anti_fraud_state.lock();
+        state.runtime_enabled && state.seed_server_retry_pending
     }
 
     pub fn anti_fraud_mode_for_peer_hashes(&self, peer_hashes: &[[u8; 32]]) -> AntiFraudMode {
+        if !self.is_antifraud_runtime_enabled() {
+            return AntiFraudMode::Full;
+        }
+
         let local = self.anti_fraud_hash_window();
+        if Self::is_hash_window_all_zero(&local) {
+            return AntiFraudMode::Full;
+        }
+
         if !Self::validate_hash_window(peer_hashes) {
             return AntiFraudMode::Restricted;
+        }
+        if Self::is_hash_window_all_zero(peer_hashes) {
+            // Smooth transition support: peers with AF disabled advertise zero-hash windows.
+            return AntiFraudMode::Full;
         }
         if Self::has_nonzero_hash_overlap(&local, peer_hashes) {
             AntiFraudMode::Full
@@ -628,6 +671,10 @@ impl ConnectionManager {
         true
     }
 
+    fn is_hash_window_all_zero(entries: &[[u8; 32]]) -> bool {
+        entries.iter().all(|hash| *hash == ANTI_FRAUD_ZERO_HASH)
+    }
+
     pub fn has_nonzero_hash_overlap(local: &[[u8; 32]], remote: &[[u8; 32]]) -> bool {
         local
             .iter()
@@ -640,6 +687,10 @@ impl ConnectionManager {
         peer_key: PeerKey,
         envelope: AntiFraudSnapshotEnvelope,
     ) -> Result<IngestPeerSnapshotResult, String> {
+        if !self.is_antifraud_runtime_enabled() {
+            return Ok(IngestPeerSnapshotResult { applied: false, root_hash: ANTI_FRAUD_ZERO_HASH });
+        }
+
         let snapshot = self.normalize_snapshot_envelope(envelope)?;
         let peer_root_hash = snapshot.root_hash;
         let peer_label = peer_key.to_string();
@@ -684,21 +735,52 @@ impl ConnectionManager {
         let _ = self.force_next_iteration.send(());
     }
 
+    fn set_antifraud_runtime_enabled(&self, enabled: bool) {
+        self.anti_fraud_state.lock().runtime_enabled = enabled;
+    }
+
+    fn disable_antifraud_runtime(&self, reason: &str) {
+        let mut state = self.anti_fraud_state.lock();
+        let had_snapshot = state.current_snapshot.is_some();
+        let had_hashes = state.hash_window.iter().any(|hash| *hash != ANTI_FRAUD_ZERO_HASH);
+        let was_enabled = state.runtime_enabled;
+        state.runtime_enabled = false;
+        state.current_snapshot = None;
+        state.hash_window = [ANTI_FRAUD_ZERO_HASH; ANTI_FRAUD_HASH_WINDOW_LEN];
+        state.peer_votes.clear();
+        state.peer_fallback_required = false;
+        state.seed_server_retry_pending = false;
+        drop(state);
+
+        let had_ips = !self.banserver_banned_ips.lock().is_empty();
+        let had_node_ids = !self.banserver_banned_strong_node_ids.lock().is_empty();
+        self.banserver_banned_ips.lock().clear();
+        self.banserver_banned_strong_node_ids.lock().clear();
+        self.locally_banned_unified_node_ids.lock().clear();
+
+        if was_enabled || had_snapshot || had_hashes || had_ips || had_node_ids {
+            info!("AntiFraud runtime disabled: {}. Cleared all active anti-fraud state.", reason);
+        }
+    }
+
     async fn refresh_banserver_bans(self: Arc<Self>) {
         if !self.banserver_enabled {
-            let mut state = self.anti_fraud_state.lock();
-            state.peer_fallback_required = true;
-            state.seed_server_retry_pending = false;
+            self.disable_antifraud_runtime("banserver disabled by configuration");
             return;
         }
 
         let fetched = match self.fetch_banserver_payload().await {
-            Ok(payload) => payload,
+            Ok(Some(payload)) => payload,
+            Ok(None) => {
+                self.disable_antifraud_runtime("snapshot endpoint antifraud_enabled flag is false or unavailable");
+                return;
+            }
             Err(err) => {
-                self.handle_seed_server_refresh_failure(&err);
+                self.disable_antifraud_runtime(&format!("snapshot endpoint fetch/validation failed: {err}"));
                 return;
             }
         };
+        self.set_antifraud_runtime_enabled(true);
 
         match self.try_apply_snapshot(fetched.snapshot, "seed-server") {
             Ok(applied) => {
@@ -719,7 +801,7 @@ impl ConnectionManager {
                 }
             }
             Err(err) => {
-                self.handle_seed_server_refresh_failure(&format!("snapshot rejected: {err}"));
+                self.disable_antifraud_runtime(&format!("snapshot rejected: {err}"));
                 return;
             }
         }
@@ -728,25 +810,84 @@ impl ConnectionManager {
         let _ = self.force_next_iteration.send(());
     }
 
-    async fn fetch_banserver_payload(&self) -> Result<BanserverPayload, String> {
-        let primary = self.fetch_banserver_payload_from_endpoint("primary", self.banserver_primary_url.trim()).await?;
-        let secondary = self.fetch_banserver_payload_from_endpoint("secondary", self.banserver_secondary_url.trim()).await?;
+    async fn fetch_banserver_payload(&self) -> Result<Option<BanserverPayload>, String> {
+        let primary_result = self.fetch_banserver_payload_from_endpoint("primary", self.banserver_primary_url.trim()).await;
+        let secondary_result = self.fetch_banserver_payload_from_endpoint("secondary", self.banserver_secondary_url.trim()).await;
 
-        if primary.payload.snapshot.root_hash != secondary.payload.snapshot.root_hash {
-            return Err(format!(
-                "snapshot mismatch between endpoints: {} {} (seq={}, hash={}) vs {} {} (seq={}, hash={})",
-                primary.endpoint_name,
-                primary.source_url,
-                primary.payload.snapshot.snapshot_seq,
-                Self::encode_hex(&primary.payload.snapshot.root_hash),
-                secondary.endpoint_name,
-                secondary.source_url,
-                secondary.payload.snapshot.snapshot_seq,
-                Self::encode_hex(&secondary.payload.snapshot.root_hash),
-            ));
+        let mut endpoint_payloads = Vec::<EndpointBanserverPayload>::with_capacity(2);
+        let mut endpoint_errors = Vec::<String>::new();
+
+        match primary_result {
+            Ok(payload) => endpoint_payloads.push(payload),
+            Err(err) => endpoint_errors.push(format!("primary endpoint unavailable: {err}")),
+        }
+        match secondary_result {
+            Ok(payload) => endpoint_payloads.push(payload),
+            Err(err) => endpoint_errors.push(format!("secondary endpoint unavailable: {err}")),
         }
 
-        Ok(primary.payload)
+        if endpoint_payloads.iter().any(|entry| !entry.enabled) {
+            let mut states = endpoint_payloads
+                .iter()
+                .map(|entry| format!("{} {}={}", entry.endpoint_name, entry.source_url, entry.enabled))
+                .collect_vec();
+            states.extend(endpoint_errors.iter().cloned());
+            info!("AntiFraud runtime gate from snapshots: {} -> disabled", states.join("; "));
+            return Ok(None);
+        }
+
+        let mut enabled_payloads = endpoint_payloads
+            .into_iter()
+            .filter_map(|entry| entry.payload.map(|payload| (entry.endpoint_name, entry.source_url, payload)))
+            .collect_vec();
+
+        if enabled_payloads.is_empty() {
+            if endpoint_errors.is_empty() {
+                warn!("AntiFraud runtime gate from snapshots: no endpoint provided usable antifraud payload -> disabled");
+            } else {
+                warn!("AntiFraud runtime gate from snapshots: {} -> disabled", endpoint_errors.join("; "));
+            }
+            return Ok(None);
+        }
+
+        if !endpoint_errors.is_empty() {
+            warn!(
+                "AntiFraud snapshot fetch degraded: {}. Continuing because at least one endpoint is enabled and valid.",
+                endpoint_errors.join("; ")
+            );
+        }
+
+        let mut selected_index = 0usize;
+        for i in 1..enabled_payloads.len() {
+            let candidate_seq = enabled_payloads[i].2.snapshot.snapshot_seq;
+            let selected_seq = enabled_payloads[selected_index].2.snapshot.snapshot_seq;
+            if candidate_seq > selected_seq {
+                selected_index = i;
+                continue;
+            }
+            if candidate_seq == selected_seq && enabled_payloads[selected_index].0 != "primary" && enabled_payloads[i].0 == "primary" {
+                selected_index = i;
+            }
+        }
+        let selected = enabled_payloads.swap_remove(selected_index);
+
+        for (endpoint_name, endpoint_url, payload) in enabled_payloads.iter() {
+            if payload.snapshot.root_hash != selected.2.snapshot.root_hash {
+                warn!(
+                    "AntiFraud snapshot mismatch while runtime stays enabled: selected {} {} seq={} hash={}, {} {} seq={} hash={}",
+                    selected.0,
+                    selected.1,
+                    selected.2.snapshot.snapshot_seq,
+                    Self::encode_hex(&selected.2.snapshot.root_hash),
+                    endpoint_name,
+                    endpoint_url,
+                    payload.snapshot.snapshot_seq,
+                    Self::encode_hex(&payload.snapshot.root_hash)
+                );
+            }
+        }
+
+        Ok(Some(selected.2))
     }
 
     async fn fetch_banserver_payload_from_endpoint(
@@ -765,10 +906,7 @@ impl ConnectionManager {
                                 "Banserver {} HTTPS fetch failed for {} ({}), HTTP fallback {} succeeded",
                                 endpoint_name, endpoint_url, primary_err, fallback_url
                             );
-                            let parsed = Self::parse_banserver_payload(payload).map_err(|err| {
-                                format!("{} endpoint payload parse failed for {}: {}", endpoint_name, fallback_url, err)
-                            })?;
-                            return Ok(EndpointBanserverPayload { endpoint_name, source_url: fallback_url, payload: parsed });
+                            return Self::parse_endpoint_payload(endpoint_name, &fallback_url, payload);
                         }
                         Err(fallback_err) => {
                             return Err(format!(
@@ -782,27 +920,24 @@ impl ConnectionManager {
             }
         };
 
-        let parsed = Self::parse_banserver_payload(primary_payload)
-            .map_err(|err| format!("{} endpoint payload parse failed for {}: {}", endpoint_name, endpoint_url, err))?;
-
-        Ok(EndpointBanserverPayload { endpoint_name, source_url: endpoint_url.to_owned(), payload: parsed })
+        Self::parse_endpoint_payload(endpoint_name, endpoint_url, primary_payload)
     }
 
-    fn handle_seed_server_refresh_failure(&self, reason: &str) {
-        let mut state = self.anti_fraud_state.lock();
-        if state.seed_server_retry_pending {
-            state.seed_server_retry_pending = false;
-            state.peer_fallback_required = true;
-            warn!("Banserver dual-endpoint validation failed again: {}. Activating peer snapshot fallback.", reason);
-            return;
+    fn parse_endpoint_payload(
+        endpoint_name: &'static str,
+        endpoint_url: &str,
+        payload: JsonValue,
+    ) -> Result<EndpointBanserverPayload, String> {
+        let enabled = Self::read_antifraud_enabled(&payload)
+            .map_err(|err| format!("{} endpoint payload parse failed for {}: {}", endpoint_name, endpoint_url, err))?;
+        if !enabled {
+            return Ok(EndpointBanserverPayload { endpoint_name, source_url: endpoint_url.to_owned(), enabled: false, payload: None });
         }
 
-        state.seed_server_retry_pending = true;
-        warn!(
-            "Banserver dual-endpoint validation failed: {}. Retrying in {}s before peer fallback.",
-            reason,
-            BANSERVER_CONSISTENCY_RETRY_INTERVAL.as_secs()
-        );
+        let parsed = Self::parse_banserver_payload(payload)
+            .map_err(|err| format!("{} endpoint payload parse failed for {}: {}", endpoint_name, endpoint_url, err))?;
+
+        Ok(EndpointBanserverPayload { endpoint_name, source_url: endpoint_url.to_owned(), enabled: true, payload: Some(parsed) })
     }
 
     async fn fetch_banserver_json(&self, url: &str) -> Result<JsonValue, String> {
@@ -815,8 +950,8 @@ impl ConnectionManager {
         let client = HttpClient::builder()
             // Explicitly allow self-signed/invalid TLS chains to maximize compatibility.
             .danger_accept_invalid_certs(true)
-            // Keep hostname verification enabled (default), only cert chain/date checks are relaxed.
-            .danger_accept_invalid_hostnames(false)
+            // Explicitly disable hostname verification as requested for legacy endpoint compatibility.
+            .danger_accept_invalid_hostnames(true)
             .redirect(RedirectPolicy::limited(2))
             .timeout(BANSERVER_FETCH_TIMEOUT)
             .build()
@@ -922,6 +1057,17 @@ impl ConnectionManager {
 
         let snapshot = Self::normalize_snapshot_static(envelope, AntiFraudNetwork::from_u8(network).ok_or("invalid network enum")?)?;
         Ok(BanserverPayload { snapshot })
+    }
+
+    fn read_antifraud_enabled(payload: &JsonValue) -> Result<bool, String> {
+        let root = payload.get("data").unwrap_or(payload);
+        let value = root
+            .get("antifraud_enabled")
+            .or_else(|| root.get("antifraudEnabled"))
+            .or_else(|| payload.get("antifraud_enabled"))
+            .or_else(|| payload.get("antifraudEnabled"))
+            .ok_or("missing antifraud_enabled")?;
+        value.as_bool().ok_or("antifraud_enabled must be strict boolean true/false".to_string())
     }
 
     fn read_str<'a>(value: &'a JsonValue, keys: &[&str]) -> Option<&'a str> {
@@ -1464,6 +1610,19 @@ mod tests {
         payload["banned_ips"] = json!(ips);
         let err = ConnectionManager::parse_banserver_payload(payload).expect_err("payload must fail");
         assert!(err.contains("banned_ips_count"));
+    }
+
+    #[test]
+    fn read_antifraud_enabled_requires_strict_boolean() {
+        let enabled_true = json!({"antifraud_enabled": true});
+        assert_eq!(ConnectionManager::read_antifraud_enabled(&enabled_true).unwrap(), true);
+
+        let enabled_false = json!({"data": {"antifraud_enabled": false}});
+        assert_eq!(ConnectionManager::read_antifraud_enabled(&enabled_false).unwrap(), false);
+
+        let invalid = json!({"antifraud_enabled": "true"});
+        let err = ConnectionManager::read_antifraud_enabled(&invalid).expect_err("string flag must be rejected");
+        assert!(err.contains("strict boolean"));
     }
 
     #[test]

@@ -1239,19 +1239,24 @@ impl ConnectionInitializer for FlowContext {
         }
 
         let payload_hf_active = self.is_payload_hf_active();
-        if payload_hf_active && peer_unified_node_id.is_none() {
+        let anti_fraud_runtime_enabled = self.connection_manager().map(|cm| cm.is_antifraud_runtime_enabled()).unwrap_or(false);
+        let enforce_anti_fraud = payload_hf_active && anti_fraud_runtime_enabled;
+
+        if enforce_anti_fraud && peer_unified_node_id.is_none() {
             return Err(ProtocolError::OtherOwned("peer missing mandatory unified node identity after hardfork".to_string()));
         }
-        if payload_hf_active && peer_node_challenge_nonce.is_none() {
+        if enforce_anti_fraud && peer_node_challenge_nonce.is_none() {
             return Err(ProtocolError::OtherOwned("peer missing mandatory node challenge nonce after hardfork".to_string()));
         }
         if let Some(peer_node_id) = peer_unified_node_id {
             if peer_node_id == self.unified_node_identity.node_id {
                 return Err(ProtocolError::LoopbackConnection(router.key()));
             }
-            if let Some(connection_manager) = self.connection_manager() {
-                if connection_manager.is_unified_node_id_banned(&peer_node_id) {
-                    return Err(ProtocolError::OtherOwned("peer unified node identity is externally banned".to_string()));
+            if enforce_anti_fraud {
+                if let Some(connection_manager) = self.connection_manager() {
+                    if connection_manager.is_unified_node_id_banned(&peer_node_id) {
+                        return Err(ProtocolError::OtherOwned("peer unified node identity is externally banned".to_string()));
+                    }
                 }
             }
         } else if self.node_id == router.identity() {
@@ -1281,32 +1286,35 @@ impl ConnectionInitializer for FlowContext {
             strong_node_claims_capable
         );
 
-        let anti_fraud_mode = self
-            .connection_manager()
-            .map(|cm| match anti_fraud_hash_window_from_vec(&peer_version.anti_fraud_hashes) {
-                Some(peer_hash_window) => cm.anti_fraud_mode_for_peer_hashes(&peer_hash_window),
-                None => AntiFraudMode::Restricted,
-            })
-            .unwrap_or(AntiFraudMode::Restricted);
+        let anti_fraud_mode = if enforce_anti_fraud {
+            self.connection_manager()
+                .map(|cm| match anti_fraud_hash_window_from_vec(&peer_version.anti_fraud_hashes) {
+                    Some(peer_hash_window) => cm.anti_fraud_mode_for_peer_hashes(&peer_hash_window),
+                    None => AntiFraudMode::Restricted,
+                })
+                .unwrap_or(AntiFraudMode::Restricted)
+        } else {
+            AntiFraudMode::Full
+        };
 
-        let minimum_protocol_version = if payload_hf_active { PROTOCOL_VERSION } else { MIN_PRE_HARD_FORK_PROTOCOL_VERSION };
+        let minimum_protocol_version = if enforce_anti_fraud { PROTOCOL_VERSION } else { MIN_PRE_HARD_FORK_PROTOCOL_VERSION };
         let (flows, applied_protocol_version) = match peer_version.protocol_version {
             // New protocol line.
             v if v >= PROTOCOL_VERSION => {
-                if payload_hf_active && anti_fraud_mode == AntiFraudMode::Restricted {
+                if enforce_anti_fraud && anti_fraud_mode == AntiFraudMode::Restricted {
                     (v6::register_restricted(self.clone(), router.clone()), PROTOCOL_VERSION)
                 } else {
                     (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), PROTOCOL_VERSION)
                 }
             }
             // Pre-HF compatibility lines.
-            PRE_HARD_FORK_PROTOCOL_VERSION if !payload_hf_active => {
+            PRE_HARD_FORK_PROTOCOL_VERSION if !enforce_anti_fraud => {
                 (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), PRE_HARD_FORK_PROTOCOL_VERSION)
             }
-            LEGACY_PROTOCOL_VERSION if !payload_hf_active => {
+            LEGACY_PROTOCOL_VERSION if !enforce_anti_fraud => {
                 (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), LEGACY_PROTOCOL_VERSION)
             }
-            MIN_PRE_HARD_FORK_PROTOCOL_VERSION if !payload_hf_active => (
+            MIN_PRE_HARD_FORK_PROTOCOL_VERSION if !enforce_anti_fraud => (
                 v5::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
                 MIN_PRE_HARD_FORK_PROTOCOL_VERSION,
             ),
@@ -1323,7 +1331,7 @@ impl ConnectionInitializer for FlowContext {
             subnetwork_id: peer_version.subnetwork_id.to_owned(),
             time_offset,
             anti_fraud_hashes: peer_version.anti_fraud_hashes.clone(),
-            anti_fraud_restricted: payload_hf_active && anti_fraud_mode == AntiFraudMode::Restricted,
+            anti_fraud_restricted: enforce_anti_fraud && anti_fraud_mode == AntiFraudMode::Restricted,
             unified_node_id: peer_unified_node_id,
         });
         router.set_properties(peer_properties);
@@ -1353,7 +1361,7 @@ impl ConnectionInitializer for FlowContext {
             (peer_unified_node_id, peer_pubkey_xonly, peer_node_challenge_nonce)
         {
             if received_ready_message.node_auth_signature.is_empty() {
-                if payload_hf_active {
+                if enforce_anti_fraud {
                     return Err(ProtocolError::OtherOwned("peer missing mandatory ready auth signature after hardfork".to_string()));
                 }
             } else {

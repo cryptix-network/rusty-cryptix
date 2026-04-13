@@ -101,40 +101,43 @@ impl Flow for AntiFraudSnapshotSyncFlow {
         loop {
             select! {
                 _ = mode_ticker.tick() => {
-                    if self.ctx.is_payload_hf_active() {
-                        let properties = self.router.properties();
-                        if properties.protocol_version < HARD_FORK_PROTOCOL_VERSION {
-                            warn!(
-                                "Peer {} still uses pre-HF protocol version {}; reconnecting to enforce v{}+",
-                                self.router,
-                                properties.protocol_version,
-                                HARD_FORK_PROTOCOL_VERSION
-                            );
-                            self.ctx.hub().terminate(self.router.key()).await;
-                            return Ok(());
-                        }
-                        let Some(connection_manager) = self.ctx.connection_manager() else {
-                            continue;
-                        };
-                        let current_mode = anti_fraud_hash_window_from_vec(&properties.anti_fraud_hashes)
-                            .map(|peer_hash_window| connection_manager.anti_fraud_mode_for_peer_hashes(&peer_hash_window))
-                            .unwrap_or(AntiFraudMode::Restricted);
-                        if properties.anti_fraud_restricted && current_mode == AntiFraudMode::Full {
-                            debug!(
-                                "Peer {} anti-fraud overlap became valid; reconnecting to upgrade from RESTRICTED_AF to FULL",
-                                self.router
-                            );
-                            self.ctx.hub().terminate(self.router.key()).await;
-                            return Ok(());
-                        }
-                        if !properties.anti_fraud_restricted && current_mode == AntiFraudMode::Restricted {
-                            warn!(
-                                "Peer {} lost anti-fraud hash overlap; reconnecting to enforce RESTRICTED_AF",
-                                self.router
-                            );
-                            self.ctx.hub().terminate(self.router.key()).await;
-                            return Ok(());
-                        }
+                    let Some(connection_manager) = self.ctx.connection_manager() else {
+                        continue;
+                    };
+                    if !self.ctx.is_payload_hf_active() || !connection_manager.is_antifraud_runtime_enabled() {
+                        continue;
+                    }
+
+                    let properties = self.router.properties();
+                    if properties.protocol_version < HARD_FORK_PROTOCOL_VERSION {
+                        warn!(
+                            "Peer {} still uses pre-HF protocol version {}; reconnecting to enforce v{}+",
+                            self.router,
+                            properties.protocol_version,
+                            HARD_FORK_PROTOCOL_VERSION
+                        );
+                        self.ctx.hub().terminate(self.router.key()).await;
+                        return Ok(());
+                    }
+
+                    let current_mode = anti_fraud_hash_window_from_vec(&properties.anti_fraud_hashes)
+                        .map(|peer_hash_window| connection_manager.anti_fraud_mode_for_peer_hashes(&peer_hash_window))
+                        .unwrap_or(AntiFraudMode::Restricted);
+                    if properties.anti_fraud_restricted && current_mode == AntiFraudMode::Full {
+                        debug!(
+                            "Peer {} anti-fraud overlap became valid; reconnecting to upgrade from RESTRICTED_AF to FULL",
+                            self.router
+                        );
+                        self.ctx.hub().terminate(self.router.key()).await;
+                        return Ok(());
+                    }
+                    if !properties.anti_fraud_restricted && current_mode == AntiFraudMode::Restricted {
+                        warn!(
+                            "Peer {} lost anti-fraud hash overlap; reconnecting to enforce RESTRICTED_AF",
+                            self.router
+                        );
+                        self.ctx.hub().terminate(self.router.key()).await;
+                        return Ok(());
                     }
                 }
                 _ = request_ticker.tick() => {
@@ -158,6 +161,9 @@ impl Flow for AntiFraudSnapshotSyncFlow {
                     let Some(connection_manager) = self.ctx.connection_manager() else {
                         continue;
                     };
+                    if !connection_manager.is_antifraud_runtime_enabled() {
+                        continue;
+                    }
                     let Ok(network) = u8::try_from(payload.network) else {
                         continue;
                     };
