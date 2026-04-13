@@ -4,7 +4,7 @@ use crate::{
     errors::MiningManagerResult,
     feerate::{FeeEstimateVerbose, FeerateEstimations, FeerateEstimatorArgs},
     mempool::{
-        config::Config,
+        config::{Config, DEFAULT_PAYLOAD_MAX_STANDARD_LEN},
         model::tx::{MempoolTransaction, TransactionPostValidation, TransactionPreValidation, TxRemovalReason},
         populate_entries_and_try_validate::{
             populate_mempool_transactions_in_parallel, validate_mempool_transaction, validate_mempool_transactions_in_parallel,
@@ -65,8 +65,29 @@ impl MiningManager {
         cache_lifetime: Option<u64>,
         counters: Arc<MiningCounters>,
     ) -> Self {
-        let config =
+        Self::new_with_extended_config_and_payload_policy(
+            target_time_per_block,
+            relay_non_std_transactions,
+            max_block_mass,
+            ram_scale,
+            cache_lifetime,
+            counters,
+            DEFAULT_PAYLOAD_MAX_STANDARD_LEN,
+        )
+    }
+
+    pub fn new_with_extended_config_and_payload_policy(
+        target_time_per_block: u64,
+        relay_non_std_transactions: bool,
+        max_block_mass: u64,
+        ram_scale: f64,
+        cache_lifetime: Option<u64>,
+        counters: Arc<MiningCounters>,
+        payload_max_len_standard: usize,
+    ) -> Self {
+        let mut config =
             Config::build_default(target_time_per_block, relay_non_std_transactions, max_block_mass).apply_ram_scale(ram_scale);
+        config.payload_max_len_standard = payload_max_len_standard;
         Self::with_config(config, cache_lifetime, counters)
     }
 
@@ -1129,5 +1150,21 @@ mod tests {
         let calculated_fees = vec![100u64, 200, 300, 400];
         let txs = transactions(calculated_fees.len());
         assert!(feerate_stats(txs, calculated_fees).is_none());
+    }
+
+    #[test]
+    fn extended_config_can_override_payload_standard_limit() {
+        let counters = Arc::new(MiningCounters::default());
+        let payload_max_len_standard = 4096;
+        let manager = MiningManager::new_with_extended_config_and_payload_policy(
+            1_000,
+            false,
+            500_000,
+            1.0,
+            None,
+            counters,
+            payload_max_len_standard,
+        );
+        assert_eq!(manager.config.payload_max_len_standard, payload_max_len_standard);
     }
 }

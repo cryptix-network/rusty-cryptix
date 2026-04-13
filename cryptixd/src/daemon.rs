@@ -467,13 +467,14 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
     let (address_manager, port_mapping_extender_svc) =
         AddressManager::new(config.clone(), meta_db, tick_service.clone(), args.datacenter);
 
-    let mining_manager = MiningManagerProxy::new(Arc::new(MiningManager::new_with_extended_config(
+    let mining_manager = MiningManagerProxy::new(Arc::new(MiningManager::new_with_extended_config_and_payload_policy(
         config.target_time_per_block,
         false,
         config.max_block_mass,
         config.ram_scale,
         config.block_template_cache_lifetime,
         mining_counters.clone(),
+        config.params.payload_max_len_standard,
     )));
     let mining_monitor =
         Arc::new(MiningMonitor::new(mining_manager.clone(), mining_counters, tx_script_cache_counters.clone(), tick_service.clone()));

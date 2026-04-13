@@ -150,12 +150,12 @@ impl RelayTransactionsFlow {
         // by another peer
         let transaction_ids = self.ctx.mining_manager().clone().unknown_transactions(transaction_ids).await;
         let mut requests = Vec::new();
-        let snapshot_delta = curr_snapshot - &self.ctx.mining_manager().clone().p2p_tx_count_sample();
+        let now_snapshot = self.ctx.mining_manager().clone().p2p_tx_count_sample();
+        let curr_p2p_tps = p2p_tps_delta(curr_snapshot, &now_snapshot);
 
         // To reduce the P2P TPS to below the threshold, we need to request up to a max of
         // whatever the balances overage. If MAX_TPS_THRESHOLD is 3000 and the current TPS is 4000,
         // then we can only request up to 2000 (MAX - (4000 - 3000)) to average out into the threshold.
-        let curr_p2p_tps = 1000 * snapshot_delta.low_priority_tx_counts / (snapshot_delta.elapsed_time.as_millis().max(1) as u64);
         let overage = if should_throttle && curr_p2p_tps > MAX_TPS_THRESHOLD { curr_p2p_tps - MAX_TPS_THRESHOLD } else { 0 };
 
         let limit = MAX_TPS_THRESHOLD.saturating_sub(overage);
@@ -333,6 +333,11 @@ impl RequestTransactionsFlow {
     }
 }
 
+fn p2p_tps_delta(from_snapshot: &P2pTxCountSample, to_snapshot: &P2pTxCountSample) -> u64 {
+    let snapshot_delta = to_snapshot - from_snapshot;
+    1000 * snapshot_delta.low_priority_tx_counts / (snapshot_delta.elapsed_time.as_millis().max(1) as u64)
+}
+
 /// If in the last 10 seconds we exceeded the TPS threshold, we will throttle tx relay
 fn check_tx_throttling(throttling_state: &mut ThrottlingState, next_snapshot: P2pTxCountSample) {
     let snapshot_delta = &next_snapshot - &throttling_state.curr_snapshot;
@@ -402,5 +407,13 @@ mod tests {
         elapsed_time += 1000;
         check_tx_throttling(&mut throttling_state, create_snapshot(p2p_tx_counts, elapsed_time));
         assert!(!throttling_state.should_throttle);
+    }
+
+    #[test]
+    fn test_p2p_tps_delta_direction() {
+        let from = create_snapshot(1_000, 1_000);
+        let to = create_snapshot(1_600, 1_200);
+        assert_eq!(p2p_tps_delta(&from, &to), 3_000);
+        assert_eq!(p2p_tps_delta(&to, &from), 0);
     }
 }
