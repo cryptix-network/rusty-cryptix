@@ -383,12 +383,29 @@ impl HfaEngine {
         &self.config
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.config.enabled
+    }
+
     pub fn effective_feerate_floor(&self, minimum_relay_feerate: f64) -> f64 {
         self.config.min_feerate_floor.max(minimum_relay_feerate.max(0.0) * MIN_FEERATE_FLOOR_MULTIPLIER)
     }
 
     pub fn node_epoch(&self) -> u64 {
         self.lock_state().node_epoch
+    }
+
+    fn effective_cpu_ratio(&self, cpu_ratio: f64) -> f64 {
+        if cpu_ratio.is_finite() && cpu_ratio > 0.0 {
+            return cpu_ratio.clamp(0.0, 1.0);
+        }
+
+        let state = self.lock_state();
+        if let Some(sample) = state.mode_samples.back() {
+            return sample.cpu_ratio.clamp(0.0, 1.0);
+        }
+
+        self.config.cpu_low_water_ratio.max(0.5).clamp(0.0, 1.0)
     }
 
     pub async fn submit_fast_intent(
@@ -403,7 +420,7 @@ impl HfaEngine {
         source: FastIngressSource,
     ) -> SubmitFastIntentResponse {
         let now_ms = unix_now();
-        let cpu_ratio = cpu_ratio.clamp(0.0, 1.0);
+        let cpu_ratio = self.effective_cpu_ratio(cpu_ratio);
         self.revalidate_active_budgeted(session.clone(), is_synced, cpu_ratio, basechain_block_latency_ms).await;
 
         let tentative_intent_id = derive_intent_id_from_rpc_tx(

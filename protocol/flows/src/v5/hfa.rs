@@ -17,6 +17,9 @@ use cryptix_p2p_lib::{
 };
 use std::{collections::HashMap, sync::Arc};
 
+const HFA_PULL_STATE_TTL_MS: u64 = 30_000;
+const HFA_PULL_STATE_MAX_TRACKED_INTENTS: usize = 4096;
+
 #[derive(Default)]
 struct PeerHfaRateWindow {
     window_start_ms: u64,
@@ -166,6 +169,31 @@ impl FastIntentRelayFlow {
         }
     }
 
+    fn prune_pull_state(&mut self, now_ms: u64) {
+        let mut stale_ids = Vec::new();
+        for (intent_id, last_request_ms) in self.pull_last_request_ms.iter() {
+            if now_ms.saturating_sub(*last_request_ms) > HFA_PULL_STATE_TTL_MS {
+                stale_ids.push(*intent_id);
+            }
+        }
+        for intent_id in stale_ids {
+            self.pull_last_request_ms.remove(&intent_id);
+            self.pull_retries.remove(&intent_id);
+        }
+
+        if self.pull_last_request_ms.len() > HFA_PULL_STATE_MAX_TRACKED_INTENTS {
+            let overflow = self.pull_last_request_ms.len() - HFA_PULL_STATE_MAX_TRACKED_INTENTS;
+            let mut by_age = self.pull_last_request_ms.iter().map(|(intent_id, ts)| (*intent_id, *ts)).collect::<Vec<_>>();
+            by_age.sort_by_key(|(_, ts)| *ts);
+            for (intent_id, _) in by_age.into_iter().take(overflow) {
+                self.pull_last_request_ms.remove(&intent_id);
+                self.pull_retries.remove(&intent_id);
+            }
+        }
+
+        self.pull_retries.retain(|intent_id, _| self.pull_last_request_ms.contains_key(intent_id));
+    }
+
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
         loop {
             let msg = self.incoming_route.recv().await.ok_or(ProtocolError::ConnectionClosed)?;
@@ -234,6 +262,7 @@ impl FastIntentRelayFlow {
         }
 
         let now_ms = unix_now();
+        self.prune_pull_state(now_ms);
         let mut intent_ids = Vec::with_capacity(payload.intent_ids.len());
         for item in payload.intent_ids {
             intent_ids.push(item.try_into()?);

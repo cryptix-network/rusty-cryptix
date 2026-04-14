@@ -56,6 +56,7 @@ const ANTI_FRAUD_PREVIOUS_FILE: &str = "previous.snapshot";
 const ANTI_FRAUD_PUBKEY_CURRENT_HEX: &str = "c93b4ed533a76866a3c3ea1cc0bc3e70c0dbe32a945057b5dff95b88ce9280dd";
 const ANTI_FRAUD_PUBKEY_NEXT_HEX: &str = "fc10777c57060195c83e9885c790c8a26496d305b366b8e5fbf475203c680f79";
 const PEER_CANDIDATE_MAX_AGE: Duration = Duration::from_secs(120);
+const PEER_CANDIDATE_MAX_SIZE: usize = 512;
 
 pub struct ConnectionManager {
     p2p_adaptor: Arc<cryptix_p2p_lib::Adaptor>,
@@ -724,6 +725,14 @@ impl ConnectionManager {
         let mut state = self.anti_fraud_state.lock();
         state.peer_votes.insert(peer_label, PeerSnapshotVote { received_at: now, snapshot });
         state.peer_votes.retain(|_, vote| vote.received_at.elapsed() <= PEER_CANDIDATE_MAX_AGE);
+        if state.peer_votes.len() > PEER_CANDIDATE_MAX_SIZE {
+            let overflow = state.peer_votes.len() - PEER_CANDIDATE_MAX_SIZE;
+            let mut by_age = state.peer_votes.iter().map(|(peer_id, vote)| (peer_id.clone(), vote.received_at)).collect_vec();
+            by_age.sort_by_key(|(_, received_at)| *received_at);
+            for (peer_id, _) in by_age.into_iter().take(overflow) {
+                state.peer_votes.remove(&peer_id);
+            }
+        }
 
         let Some(max_seq) = state.peer_votes.values().map(|vote| vote.snapshot.snapshot_seq).max() else {
             return Ok(IngestPeerSnapshotResult { applied: false, root_hash: peer_root_hash });

@@ -78,7 +78,10 @@ use std::{
     sync::{atomic::Ordering, Arc},
     vec,
 };
-use tokio::join;
+use tokio::{
+    join, select,
+    time::{interval, MissedTickBehavior},
+};
 use workflow_rpc::server::WebSocketCounters as WrpcServerCounters;
 
 /// A service implementing the Rpc API at cryptix_rpc_core level.
@@ -125,6 +128,7 @@ pub struct RpcCoreService {
 
 const RPC_CORE: &str = "rpc-core";
 const NORMAL_POLICY_REJECT_FAST_LOCK_CONFLICT: &str = "normal_policy_reject_fast_lock_conflict";
+const HFA_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
 
 impl RpcCoreService {
     pub const IDENT: &'static str = "rpc-core-service";
@@ -260,6 +264,40 @@ impl RpcCoreService {
 
     pub fn start_impl(&self) {
         self.notifier().start();
+        if !self.hfa_engine.is_enabled() {
+            return;
+        }
+
+        let shutdown_listener = self.shutdown.listener.clone();
+        let hfa_engine = self.hfa_engine.clone();
+        let flow_context = self.flow_context.clone();
+        let consensus_manager = self.consensus_manager.clone();
+        let perf_monitor = self.perf_monitor.clone();
+
+        tokio::spawn(async move {
+            let mut tick = interval(HFA_MAINTENANCE_INTERVAL);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let shutdown = shutdown_listener;
+            tokio::pin!(shutdown);
+
+            loop {
+                select! {
+                    _ = &mut shutdown => break,
+                    _ = tick.tick() => {
+                        let session = consensus_manager.consensus().unguarded_session();
+                        let has_sufficient_peer_connectivity =
+                            !matches!(flow_context.config.net.network_type, Mainnet | Testnet) || flow_context.hub().has_peers();
+                        let is_synced = has_sufficient_peer_connectivity && session.async_is_nearly_synced().await;
+                        let sink_timestamp_ms = session.async_get_sink_timestamp().await;
+                        let basechain_block_latency_ms = unix_now().saturating_sub(sink_timestamp_ms) as f64;
+                        let cpu_ratio = (perf_monitor.snapshot().cpu_usage as f64 / 100.0).clamp(0.0, 1.0);
+
+                        hfa_engine.revalidate_active_budgeted(session, is_synced, cpu_ratio, basechain_block_latency_ms).await;
+                        flow_context.broadcast_outbound_fast_microblocks().await;
+                    }
+                }
+            }
+        });
     }
 
     pub async fn join(&self) -> RpcResult<()> {
