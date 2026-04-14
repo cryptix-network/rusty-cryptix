@@ -715,7 +715,7 @@ impl FlowContext {
             return;
         }
         let sample = short_hex_for_log(public_key);
-        info!("Quantum-safe ML-KEM-1024 handshake key policy: using ephemeral per-connection keys (public key sample: {})", sample);
+        info!("Quantum-safe ML-KEM-1024 handshake key policy: using ephemeral per-connection keys ({})", sample);
     }
 
     pub fn is_strong_node_claims_p2p_enabled(&self) -> bool {

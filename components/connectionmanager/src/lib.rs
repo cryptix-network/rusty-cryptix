@@ -35,6 +35,7 @@ pub const DEFAULT_BANSERVER_URL: &str = "https://antifraud.cryptix-network.org/a
 pub const DEFAULT_BANSERVER_SECONDARY_URL: &str = "https://guard.seed2.cryptix-network.org/api/v1/antifraud/snapshot";
 pub const ANTI_FRAUD_ZERO_HASH: [u8; 32] = [0u8; 32];
 pub const ANTI_FRAUD_HASH_WINDOW_LEN: usize = 3;
+const LOCAL_UNIFIED_NODE_BAN_DURATION: Duration = Duration::from_secs(3 * 60 * 60);
 const BANSERVER_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const BANSERVER_CONSISTENCY_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const BANSERVER_RETRY_INTERVAL: Duration = Duration::from_secs(60);
@@ -74,7 +75,7 @@ pub struct ConnectionManager {
     anti_fraud_state: ParkingLotMutex<AntiFraudState>,
     banserver_banned_ips: ParkingLotMutex<HashSet<IpAddr>>,
     banserver_banned_strong_node_ids: ParkingLotMutex<HashSet<[u8; 32]>>,
-    locally_banned_unified_node_ids: ParkingLotMutex<HashSet<[u8; 32]>>,
+    locally_banned_unified_node_ids: ParkingLotMutex<HashMap<[u8; 32], Instant>>,
 }
 
 #[derive(Clone, Debug)]
@@ -276,7 +277,7 @@ impl ConnectionManager {
             anti_fraud_state: ParkingLotMutex::new(AntiFraudState::default()),
             banserver_banned_ips: ParkingLotMutex::new(HashSet::new()),
             banserver_banned_strong_node_ids: ParkingLotMutex::new(HashSet::new()),
-            locally_banned_unified_node_ids: ParkingLotMutex::new(HashSet::new()),
+            locally_banned_unified_node_ids: ParkingLotMutex::new(HashMap::new()),
         });
         manager.try_load_persisted_snapshot();
         manager.clone().start_event_loop(rx);
@@ -565,7 +566,13 @@ impl ConnectionManager {
 
     /// Bans the given unified node ID and disconnects all active peers advertising this identity.
     pub async fn ban_unified_node_id(&self, node_id: [u8; 32]) {
-        self.locally_banned_unified_node_ids.lock().insert(node_id);
+        let now = Instant::now();
+        let expires_at = now + LOCAL_UNIFIED_NODE_BAN_DURATION;
+        {
+            let mut local_bans = self.locally_banned_unified_node_ids.lock();
+            local_bans.retain(|_, entry_expires_at| *entry_expires_at > now);
+            local_bans.insert(node_id, expires_at);
+        }
         self.disconnect_peers_by_node_id_list(vec![node_id]).await;
     }
 
@@ -604,7 +611,10 @@ impl ConnectionManager {
     }
 
     pub fn is_unified_node_id_banned(&self, node_id_raw: &[u8; 32]) -> bool {
-        if self.locally_banned_unified_node_ids.lock().contains(node_id_raw) {
+        let now = Instant::now();
+        let mut local_bans = self.locally_banned_unified_node_ids.lock();
+        local_bans.retain(|_, entry_expires_at| *entry_expires_at > now);
+        if local_bans.contains_key(node_id_raw) {
             return true;
         }
         self.is_banserver_banned_node_id(node_id_raw)
@@ -647,15 +657,16 @@ impl ConnectionManager {
 
         let local = self.anti_fraud_hash_window();
         if Self::is_hash_window_all_zero(&local) {
-            return AntiFraudMode::Full;
+            // No local non-zero anchor yet => remain gated until overlap exists.
+            return AntiFraudMode::Restricted;
         }
 
         if !Self::validate_hash_window(peer_hashes) {
             return AntiFraudMode::Restricted;
         }
         if Self::is_hash_window_all_zero(peer_hashes) {
-            // Smooth transition support: peers with AF disabled advertise zero-hash windows.
-            return AntiFraudMode::Full;
+            // Peer did not provide any non-zero anchor yet => remain gated.
+            return AntiFraudMode::Restricted;
         }
         if Self::has_nonzero_hash_overlap(&local, peer_hashes) {
             AntiFraudMode::Full
@@ -1660,9 +1671,46 @@ impl ConnectionManager {
             }
         };
 
-        let banned_ips = parsed.banned_ips.iter().filter_map(|raw| Self::decode_hex(raw)).collect_vec();
-        let banned_node_ids = parsed.banned_node_ids.iter().filter_map(|raw| Self::decode_hex(raw)).collect_vec();
-        let signature = Self::decode_hex(&parsed.signature)?;
+        let banned_ips = match parsed
+            .banned_ips
+            .iter()
+            .enumerate()
+            .map(|(index, raw)| {
+                Self::decode_hex(raw).ok_or_else(|| format!("invalid banned_ips[{index}] hex entry"))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+        {
+            Ok(entries) => entries,
+            Err(err) => {
+                warn!("anti-fraud snapshot {} is invalid: {}", path.display(), err);
+                self.quarantine_file(path);
+                return None;
+            }
+        };
+        let banned_node_ids = match parsed
+            .banned_node_ids
+            .iter()
+            .enumerate()
+            .map(|(index, raw)| {
+                Self::decode_hex(raw).ok_or_else(|| format!("invalid banned_node_ids[{index}] hex entry"))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+        {
+            Ok(entries) => entries,
+            Err(err) => {
+                warn!("anti-fraud snapshot {} is invalid: {}", path.display(), err);
+                self.quarantine_file(path);
+                return None;
+            }
+        };
+        let signature = match Self::decode_hex(&parsed.signature) {
+            Some(signature) => signature,
+            None => {
+                warn!("anti-fraud snapshot {} is invalid: invalid signature hex entry", path.display());
+                self.quarantine_file(path);
+                return None;
+            }
+        };
         let envelope = AntiFraudSnapshotEnvelope {
             schema_version: parsed.schema_version,
             network: parsed.network,
@@ -1674,7 +1722,14 @@ impl ConnectionManager {
             banned_node_ids,
             signature,
         };
-        self.normalize_snapshot_envelope(envelope).ok()
+        match self.normalize_snapshot_envelope(envelope) {
+            Ok(snapshot) => Some(snapshot),
+            Err(err) => {
+                warn!("anti-fraud snapshot {} is invalid: {}", path.display(), err);
+                self.quarantine_file(path);
+                None
+            }
+        }
     }
 
     fn persist_snapshots(&self, previous: Option<&AntiFraudSnapshot>, current: Option<&AntiFraudSnapshot>) -> Result<(), String> {
