@@ -739,7 +739,7 @@ async fn sanity_test() {
                 let rpc_client = client.clone();
                 tst!(op, {
                     let response = rpc_client.get_strong_nodes_call(None, GetStrongNodesRequest {}).await.unwrap();
-                    assert_eq!(response.seq_conflict_total, 0);
+                    assert_eq!(response.conflict_total, 0);
                     assert!(response.entries.is_empty());
                 })
             }
