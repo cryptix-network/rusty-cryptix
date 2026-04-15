@@ -80,6 +80,30 @@ pub struct RequestFastIntentsFlow {
     rate_window: PeerHfaRateWindow,
 }
 
+pub struct IgnoreHFAPayloadsFlow {
+    router: Arc<Router>,
+    incoming_route: IncomingRoute,
+}
+
+#[async_trait::async_trait]
+impl Flow for IgnoreHFAPayloadsFlow {
+    fn router(&self) -> Option<Arc<Router>> {
+        Some(self.router.clone())
+    }
+
+    async fn start(&mut self) -> Result<(), ProtocolError> {
+        loop {
+            self.incoming_route.recv().await.ok_or(ProtocolError::ConnectionClosed)?;
+        }
+    }
+}
+
+impl IgnoreHFAPayloadsFlow {
+    pub fn new(router: Arc<Router>, incoming_route: IncomingRoute) -> Self {
+        Self { router, incoming_route }
+    }
+}
+
 #[async_trait::async_trait]
 impl Flow for RequestFastIntentsFlow {
     fn router(&self) -> Option<Arc<Router>> {

@@ -2,7 +2,7 @@ use crate::antifraud::{AntiFraudSnapshotRequestsFlow, AntiFraudSnapshotSyncFlow}
 use crate::v5::{
     address::{ReceiveAddressesFlow, SendAddressesFlow},
     blockrelay::{flow::HandleRelayInvsFlow, handle_requests::HandleRelayBlockRequests},
-    hfa::{FastIntentRelayFlow, RequestFastIntentsFlow},
+    hfa::{FastIntentRelayFlow, IgnoreHFAPayloadsFlow, RequestFastIntentsFlow},
     ibd::IbdFlow,
     ping::{ReceivePingsFlow, SendPingsFlow},
     request_antipast::HandleAntipastRequests,
@@ -196,6 +196,17 @@ pub fn register_restricted(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn
     vec![
         Box::new(ReceivePingsFlow::new(ctx.clone(), router.clone(), router.subscribe(vec![CryptixdMessagePayloadType::Ping]))),
         Box::new(SendPingsFlow::new(ctx.clone(), router.clone(), router.subscribe(vec![CryptixdMessagePayloadType::Pong]))),
+        Box::new(IgnoreHFAPayloadsFlow::new(
+            router.clone(),
+            router.subscribe_with_capacity(
+                vec![
+                    CryptixdMessagePayloadType::RequestFastIntents,
+                    CryptixdMessagePayloadType::FastIntent,
+                    CryptixdMessagePayloadType::FastMicroblock,
+                ],
+                4096,
+            ),
+        )),
         Box::new(AntiFraudSnapshotRequestsFlow::new(
             ctx.clone(),
             router.clone(),
