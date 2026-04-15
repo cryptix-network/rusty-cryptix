@@ -478,16 +478,22 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
     let mining_monitor =
         Arc::new(MiningMonitor::new(mining_manager.clone(), mining_counters, tx_script_cache_counters.clone(), tick_service.clone()));
 
-    let flow_context = Arc::new(FlowContext::new(
-        consensus_manager.clone(),
-        address_manager,
-        config.clone(),
-        mining_manager.clone(),
-        tick_service.clone(),
-        notification_root,
-        args.autoban,
-        db_dir.clone(),
-    ));
+    let flow_context = Arc::new(
+        FlowContext::new(
+            consensus_manager.clone(),
+            address_manager,
+            config.clone(),
+            mining_manager.clone(),
+            tick_service.clone(),
+            notification_root,
+            args.autoban,
+            db_dir.clone(),
+        )
+        .unwrap_or_else(|err| {
+            eprintln!("{err}");
+            exit(1);
+        }),
+    );
     let p2p_service = Arc::new(P2pService::new(
         flow_context.clone(),
         connect_peers,

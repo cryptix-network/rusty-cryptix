@@ -566,7 +566,27 @@ impl ConnectionManager {
     }
 
     /// Bans the given unified node ID and disconnects all active peers advertising this identity.
-    pub async fn ban_unified_node_id(&self, node_id: [u8; 32]) {
+    ///
+    /// Returns `true` if the ban was applied. Returns `false` if a matching active peer is configured as permanent.
+    pub async fn ban_unified_node_id(&self, node_id: [u8; 32]) -> bool {
+        let matching_peers = self
+            .p2p_adaptor
+            .active_peers()
+            .into_iter()
+            .filter(|peer| peer.properties().unified_node_id == Some(node_id))
+            .collect_vec();
+
+        for peer in &matching_peers {
+            if self.is_permanent(&peer.net_address()).await {
+                warn!(
+                    "Refusing to ban unified node ID {} because {} is a permanent connection",
+                    Self::encode_node_id_hex(&node_id),
+                    peer.net_address()
+                );
+                return false;
+            }
+        }
+
         let now = Instant::now();
         let expires_at = now + LOCAL_UNIFIED_NODE_BAN_DURATION;
         {
@@ -575,6 +595,7 @@ impl ConnectionManager {
             local_bans.insert(node_id, expires_at);
         }
         self.disconnect_peers_by_node_id_list(vec![node_id]).await;
+        true
     }
 
     /// Returns whether the given address is banned.

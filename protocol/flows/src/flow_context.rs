@@ -5,8 +5,8 @@ use crate::flowcontext::{
 };
 use crate::hfa::{FastIntentP2pData, FastMicroblockP2pData, HfaP2pBridge, HFA_P2P_SERVICE_BIT};
 use crate::node_identity::{
-    compute_node_id, create_ephemeral_identity, is_valid_pow_nonce, load_or_create_identity, network_code_from_name,
-    sign_node_auth_proof, verify_node_auth_proof, UnifiedNodeIdentity,
+    compute_node_id, is_valid_pow_nonce, load_or_create_identity, network_code_from_name, sign_node_auth_proof,
+    verify_node_auth_proof, UnifiedNodeIdentity,
 };
 use crate::pq_handshake::{
     compute_pq_handshake_proof, decapsulate_mlkem1024, encapsulate_mlkem1024, generate_mlkem1024_keypair, PQ_HANDSHAKE_PROOF_SIZE,
@@ -409,23 +409,18 @@ impl FlowContext {
         notification_root: Arc<ConsensusNotificationRoot>,
         autoban_enabled: bool,
         app_data_dir: PathBuf,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let hub = Hub::new();
         let strong_node_claims_engine = Arc::new(StrongNodeClaimsEngine::new(true, &config.network_name(), &app_data_dir));
-        let unified_node_identity = match load_or_create_identity(&app_data_dir, &config.network_name()) {
-            Ok(identity) => identity,
-            Err(err) => {
-                warn!("failed loading persistent unified node identity: {err}; falling back to ephemeral identity");
-                create_ephemeral_identity(&config.network_name()).expect("failed creating ephemeral unified node identity")
-            }
-        };
+        let unified_node_identity = load_or_create_identity(&app_data_dir, &config.network_name())
+            .map_err(|err| format!("failed loading persistent unified node identity: {err}"))?;
 
         let orphan_resolution_range = BASELINE_ORPHAN_RESOLUTION_RANGE + (config.bps() as f64).log2().ceil() as u32;
 
         // The maximum amount of orphans allowed in the orphans pool. This number is an approximation
         // of how many orphans there can possibly be on average bounded by an upper bound.
         let max_orphans = (2u64.pow(orphan_resolution_range) as usize * config.ghostdag_k as usize).min(MAX_ORPHANS_UPPER_BOUND);
-        Self {
+        Ok(Self {
             inner: Arc::new(FlowContextInner {
                 node_id: Uuid::new_v4().into(),
                 unified_node_identity: Arc::new(unified_node_identity),
@@ -458,7 +453,7 @@ impl FlowContext {
                 max_orphans,
                 config,
             }),
-        }
+        })
     }
 
     pub fn block_invs_channel_size(&self) -> usize {
@@ -618,14 +613,23 @@ impl FlowContext {
             if let Some(connection_manager) = self.connection_manager() {
                 match identity {
                     MisbehaviorIdentity::UnifiedNodeId(node_id) => {
-                        warn!(
-                            "Auto-ban: banning unified node ID {} after {}/{} strikes ({})",
-                            ConnectionManager::encode_node_id_hex(&node_id),
-                            score,
-                            MISBEHAVIOR_BAN_SCORE,
-                            reason
-                        );
-                        connection_manager.ban_unified_node_id(node_id).await;
+                        if connection_manager.ban_unified_node_id(node_id).await {
+                            warn!(
+                                "Auto-ban: banning unified node ID {} after {}/{} strikes ({})",
+                                ConnectionManager::encode_node_id_hex(&node_id),
+                                score,
+                                MISBEHAVIOR_BAN_SCORE,
+                                reason
+                            );
+                        } else {
+                            warn!(
+                                "Auto-ban: refusing to ban unified node ID {} after {}/{} strikes because a matching permanent peer is configured ({})",
+                                ConnectionManager::encode_node_id_hex(&node_id),
+                                score,
+                                MISBEHAVIOR_BAN_SCORE,
+                                reason
+                            );
+                        }
                     }
                     MisbehaviorIdentity::Ip(_) => {
                         warn!(
