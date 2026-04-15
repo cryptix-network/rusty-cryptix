@@ -1,4 +1,4 @@
-use crate::{flow_context::FlowContext, flow_trait::Flow};
+use crate::{flow_context::FlowContext, flow_trait::Flow, strong_node_claims::STRONG_NODE_CLAIMS_P2P_SERVICE_BIT};
 use async_trait::async_trait;
 use cryptix_connectionmanager::{
     AntiFraudMode, AntiFraudSnapshotEnvelope, ConnectionManager, ANTI_FRAUD_HASH_WINDOW_LEN, ANTI_FRAUD_ZERO_HASH,
@@ -111,17 +111,20 @@ impl Flow for AntiFraudSnapshotSyncFlow {
         let mut request_ticker = interval(ANTI_FRAUD_REQUEST_INTERVAL);
         let mut mode_ticker = interval(ANTI_FRAUD_MODE_RECHECK_INTERVAL);
         let mut protocol_mismatch_streak = 0u8;
+        let mut service_mismatch_streak = 0u8;
         let mut mode_mismatch_streak = 0u8;
         loop {
             select! {
                 _ = mode_ticker.tick() => {
                     let Some(connection_manager) = self.ctx.connection_manager() else {
                         protocol_mismatch_streak = 0;
+                        service_mismatch_streak = 0;
                         mode_mismatch_streak = 0;
                         continue;
                     };
                     if !self.ctx.is_payload_hf_active() {
                         protocol_mismatch_streak = 0;
+                        service_mismatch_streak = 0;
                         mode_mismatch_streak = 0;
                         continue;
                     }
@@ -139,9 +142,29 @@ impl Flow for AntiFraudSnapshotSyncFlow {
                         return Ok(());
                     }
                     if protocol_mismatch {
+                        service_mismatch_streak = 0;
                         mode_mismatch_streak = 0;
                         continue;
                     }
+
+                    let missing_strong_node_claims_service =
+                        (properties.services & STRONG_NODE_CLAIMS_P2P_SERVICE_BIT) == 0;
+                    if should_disconnect_on_consecutive_mismatch(
+                        &mut service_mismatch_streak,
+                        missing_strong_node_claims_service,
+                    ) {
+                        warn!(
+                            "Peer {} is missing mandatory strong-node-claims service bit after hardfork; reconnecting to renegotiate post-HF capabilities",
+                            self.router
+                        );
+                        self.ctx.hub().terminate(self.router.key()).await;
+                        return Ok(());
+                    }
+                    if missing_strong_node_claims_service {
+                        mode_mismatch_streak = 0;
+                        continue;
+                    }
+
                     if !connection_manager.is_antifraud_runtime_enabled() {
                         mode_mismatch_streak = 0;
                         continue;
