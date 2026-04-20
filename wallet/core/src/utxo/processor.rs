@@ -708,14 +708,14 @@ impl UtxoProcessor {
     }
 
     async fn handle_notification(&self, notification: Notification) -> Result<()> {
-        let _lock = self.inner.notification_guard.write().await;
-
         match notification {
             Notification::VirtualDaaScoreChanged(virtual_daa_score_changed_notification) => {
+                let _lock = self.inner.notification_guard.write().await;
                 self.handle_daa_score_change(virtual_daa_score_changed_notification.virtual_daa_score).await?;
             }
 
             Notification::UtxosChanged(utxos_changed_notification) => {
+                let _lock = self.inner.notification_guard.write().await;
                 if !self.is_synced() {
                     self.sync_proc().track(true).await?;
                 }
@@ -724,6 +724,10 @@ impl UtxoProcessor {
             }
 
             Notification::VirtualChainChanged(virtual_chain_changed_notification) => {
+                // @ZeroBytes
+                // Keep the heavy payload-enrichment path outside notification_guard.write()
+                // so send/submit paths waiting on notification_lock() are not blocked by
+                // expensive get_block() mergeset traversal. There was a Bug before. 
                 self.handle_virtual_chain_changed(virtual_chain_changed_notification).await?;
             }
 
