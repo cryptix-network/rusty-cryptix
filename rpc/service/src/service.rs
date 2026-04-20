@@ -16,6 +16,7 @@ use cryptix_atomicindex::{
 use cryptix_consensus_core::api::counters::ProcessingCounters;
 use cryptix_consensus_core::errors::block::RuleError;
 use cryptix_consensus_core::{
+    blockhash::BlockHashExtensions,
     block::Block,
     coinbase::MinerData,
     config::Config,
@@ -1377,9 +1378,44 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
     async fn get_headers_call(
         &self,
         _connection: Option<&DynRpcConnection>,
-        _request: GetHeadersRequest,
+        request: GetHeadersRequest,
     ) -> RpcResult<GetHeadersResponse> {
-        Err(RpcError::NotImplemented)
+        if request.limit == 0 {
+            return Ok(GetHeadersResponse { headers: vec![] });
+        }
+
+        let session = self.consensus_manager.consensus().session().await;
+        let limit = request.limit as usize;
+        let mut header_hashes = Vec::with_capacity(limit);
+
+        if request.is_ascending {
+            header_hashes.push(request.start_hash);
+
+            if limit > 1 {
+                let chain_path =
+                    session.async_get_virtual_chain_from_block(request.start_hash, Some(limit.saturating_sub(1))).await?;
+                header_hashes.extend(chain_path.added);
+            }
+        } else {
+            let mut current = request.start_hash;
+            for _ in 0..limit {
+                header_hashes.push(current);
+
+                let ghostdag = session.async_get_ghostdag_data(current).await?;
+                if ghostdag.selected_parent.is_origin() {
+                    break;
+                }
+                current = ghostdag.selected_parent;
+            }
+        }
+
+        let mut headers = Vec::with_capacity(header_hashes.len());
+        for hash in header_hashes.into_iter() {
+            let header = session.async_get_header(hash).await?;
+            headers.push((&*header).into());
+        }
+
+        Ok(GetHeadersResponse { headers })
     }
 
     async fn get_block_dag_info_call(

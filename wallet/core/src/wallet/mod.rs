@@ -120,6 +120,12 @@ pub struct Wallet {
     inner: Arc<Inner>,
 }
 
+const TX_ENRICH_LOOKBACK_MARGIN_DAA: u64 = 64;
+const TX_ENRICH_LOOKBACK_MIN_HEADERS: u64 = 256;
+const TX_ENRICH_LOOKBACK_MAX_HEADERS: u64 = 8192;
+const TX_ENRICH_DAA_WINDOW: u64 = 16;
+const TX_ENRICH_MAX_CANDIDATE_BLOCKS: usize = 64;
+
 impl Default for Wallet {
     fn default() -> Self {
         let storage = Wallet::local_store().expect("Unable to initialize local storage");
@@ -1070,13 +1076,72 @@ impl Wallet {
         )
     }
 
+    fn transaction_enrichment_header_limit(&self, target_block_daa_score: u64) -> u64 {
+        let current_daa_score = self.current_daa_score().unwrap_or(target_block_daa_score);
+        current_daa_score
+            .saturating_sub(target_block_daa_score)
+            .saturating_add(TX_ENRICH_LOOKBACK_MARGIN_DAA)
+            .clamp(TX_ENRICH_LOOKBACK_MIN_HEADERS, TX_ENRICH_LOOKBACK_MAX_HEADERS)
+    }
+
+    async fn resolve_record_transaction_from_chain(&self, record: &TransactionRecord) -> Option<cryptix_consensus_core::tx::Transaction> {
+        let target_txid = *record.id();
+        let target_block_daa_score = record.block_daa_score();
+        let header_limit = self.transaction_enrichment_header_limit(target_block_daa_score);
+
+        let dag_info = self.rpc_api().get_block_dag_info().await.ok()?;
+        let headers = self.rpc_api().get_headers(dag_info.sink, header_limit, false).await.ok()?;
+        if headers.is_empty() {
+            return None;
+        }
+
+        let mut exact_matches = Vec::new();
+        let mut near_matches = Vec::new();
+        for header in headers.into_iter() {
+            if header.daa_score == target_block_daa_score {
+                exact_matches.push(header.hash);
+            } else if header.daa_score.abs_diff(target_block_daa_score) <= TX_ENRICH_DAA_WINDOW {
+                near_matches.push(header.hash);
+            }
+        }
+
+        let candidate_hashes = if exact_matches.is_empty() { near_matches } else { exact_matches };
+        if candidate_hashes.is_empty() {
+            return None;
+        }
+
+        for block_hash in candidate_hashes.into_iter().take(TX_ENRICH_MAX_CANDIDATE_BLOCKS) {
+            let block = match self.rpc_api().get_block(block_hash, true).await {
+                Ok(block) => block,
+                Err(_) => continue,
+            };
+
+            for rpc_transaction in block.transactions.into_iter() {
+                let Ok(transaction) = cryptix_consensus_core::tx::Transaction::try_from(rpc_transaction) else {
+                    continue;
+                };
+
+                if transaction.id() == target_txid {
+                    return Some(transaction);
+                }
+            }
+        }
+
+        None
+    }
+
     async fn resolve_record_transaction(&self, record: &TransactionRecord) -> Option<cryptix_consensus_core::tx::Transaction> {
         if let Some(transaction) = self.utxo_processor().confirmed_transaction(record.id()) {
             return Some(transaction);
         }
 
-        let mempool_entry = self.rpc_api().get_mempool_entry(*record.id(), true, false).await.ok()?;
-        cryptix_consensus_core::tx::Transaction::try_from(mempool_entry.transaction).ok()
+        if let Ok(mempool_entry) = self.rpc_api().get_mempool_entry(*record.id(), true, false).await {
+            if let Ok(transaction) = cryptix_consensus_core::tx::Transaction::try_from(mempool_entry.transaction) {
+                return Some(transaction);
+            }
+        }
+
+        self.resolve_record_transaction_from_chain(record).await
     }
 
     async fn enrich_record_transaction(&self, record: &TransactionRecord) -> Result<TransactionRecord> {

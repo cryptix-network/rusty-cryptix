@@ -554,6 +554,7 @@ impl WalletApi for super::Wallet {
             store.load_range(&binding, &network_id, filter, start as usize..end as usize).await?;
         let current_daa_score = self.current_daa_score();
         let mut resolved = Vec::with_capacity(transactions.len());
+        let mut records_to_persist = Vec::<TransactionRecord>::new();
         for record in transactions.into_iter() {
             let mut record = (*record).clone();
             record.refresh_payload_availability(current_daa_score);
@@ -562,11 +563,19 @@ impl WalletApi for super::Wallet {
             // availability can recover from "missing" once the tx is resolvable.
             if !record.has_embedded_transaction() {
                 if let Ok(enriched) = self.enrich_record_transaction(&record).await {
+                    if enriched.has_embedded_transaction() {
+                        records_to_persist.push(enriched.clone());
+                    }
                     record = enriched;
                 }
             }
 
             resolved.push(Arc::new(record));
+        }
+
+        if !records_to_persist.is_empty() {
+            let record_refs: Vec<&TransactionRecord> = records_to_persist.iter().collect();
+            store.store(&record_refs).await?;
         }
 
         Ok(TransactionsDataGetResponse { transactions: resolved, total, account_id, start })
