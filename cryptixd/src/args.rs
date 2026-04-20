@@ -53,6 +53,13 @@ pub struct Args {
     #[serde(rename = "uacomment")]
     pub user_agent_comments: Vec<String>,
     pub utxoindex: bool,
+    pub atomic_unsafe_skip_snapshot_finality_check: bool,
+    #[serde_as(as = "Vec<DisplayFromStr>")]
+    #[serde(rename = "atomic-bootstrap-peer")]
+    pub atomic_bootstrap_peers: Vec<ContextualNetAddress>,
+    pub atomic_bootstrap_trusted_manifest_pubkeys: Vec<String>,
+    pub atomic_bootstrap_required_manifest_signatures: usize,
+    pub atomic_bootstrap_allow_peer_fallback: bool,
     pub reset_db: bool,
     #[serde(rename = "outpeers")]
     pub outbound_target: usize,
@@ -87,6 +94,7 @@ pub struct Args {
     pub banserver: bool,
     // Deprecated and ignored: banserver endpoint is fixed in code.
     pub banserver_url: Option<String>,
+    pub coinbase_maturity_override: Option<u64>,
     pub payload_hf_activation_daa_score: Option<u64>,
 
     #[cfg(feature = "devnet-prealloc")]
@@ -114,6 +122,11 @@ impl Default for Args {
             unsafe_rpc: false,
             async_threads: num_cpus::get(),
             utxoindex: false,
+            atomic_unsafe_skip_snapshot_finality_check: false,
+            atomic_bootstrap_peers: vec![],
+            atomic_bootstrap_trusted_manifest_pubkeys: vec![],
+            atomic_bootstrap_required_manifest_signatures: 0,
+            atomic_bootstrap_allow_peer_fallback: false,
             reset_db: false,
             outbound_target: 8,
             inbound_limit: 128,
@@ -149,6 +162,7 @@ impl Default for Args {
             autoban: true,
             banserver: true,
             banserver_url: None,
+            coinbase_maturity_override: None,
             payload_hf_activation_daa_score: None,
 
             #[cfg(feature = "devnet-prealloc")]
@@ -169,6 +183,7 @@ impl Default for Args {
 impl Args {
     pub fn apply_to_config(&self, config: &mut Config) {
         config.utxoindex = self.utxoindex;
+        config.atomic_unsafe_skip_snapshot_finality_check = self.atomic_unsafe_skip_snapshot_finality_check;
         config.disable_upnp = self.disable_upnp;
         config.unsafe_rpc = self.unsafe_rpc;
         config.enable_unsynced_mining = self.enable_unsynced_mining;
@@ -182,6 +197,9 @@ impl Args {
         config.p2p_listen_address = self.listen.unwrap_or(ContextualNetAddress::unspecified());
         config.externalip = self.externalip.map(|v| v.normalize(config.default_p2p_port()));
         config.ram_scale = self.ram_scale;
+        if let Some(coinbase_maturity_override) = self.coinbase_maturity_override {
+            config.params.coinbase_maturity = coinbase_maturity_override;
+        }
         if let Some(payload_hf_activation_daa_score) = self.payload_hf_activation_daa_score {
             config.params.payload_hf_activation_daa_score = payload_hf_activation_daa_score;
         }
@@ -336,7 +354,63 @@ pub fn cli() -> Command {
                 .hide(true)
                 .help("Allow mainnet mining (currently enabled by default while the flag is kept for backwards compatibility)"),
         )
+        .arg(
+            Arg::new("payload-hf-activation-daa-score")
+                .long("payload-hf-activation-daa-score")
+                .value_name("DAA_SCORE")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(u64))
+                .help("Override payload hardfork activation DAA score."),
+        )
+        .arg(
+            Arg::new("atomic-unsafe-skip-snapshot-finality-check")
+                .long("atomic-unsafe-skip-snapshot-finality-check")
+                .action(ArgAction::SetTrue)
+                .hide(true)
+                .help("UNSAFE testing override: skip Atomic snapshot finality sanity checks (forbidden on mainnet)."),
+        )
+        .arg(
+            Arg::new("coinbase-maturity-override")
+                .long("coinbase-maturity-override")
+                .value_name("BLOCKS")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(u64))
+                .hide(true)
+                .help("Testing override for consensus coinbase maturity."),
+        )
         .arg(arg!(--utxoindex "Enable the UTXO index"))
+        .arg(
+            Arg::new("atomic-bootstrap-peer")
+                .long("atomic-bootstrap-peer")
+                .value_name("IP[:PORT]")
+                .action(ArgAction::Append)
+                .require_equals(true)
+                .value_parser(clap::value_parser!(ContextualNetAddress))
+                .help("Add a Cryptix Atomic bootstrap gRPC peer endpoint override for snapshot discovery/fetch."),
+        )
+        .arg(
+            Arg::new("atomic-bootstrap-trusted-manifest-pubkey")
+                .long("atomic-bootstrap-trusted-manifest-pubkey")
+                .value_name("XONLY_PUBKEY_HEX")
+                .action(ArgAction::Append)
+                .require_equals(true)
+                .value_parser(clap::value_parser!(String))
+                .help("Add a trusted x-only Schnorr pubkey for Cryptix Atomic bootstrap manifest signature attestations."),
+        )
+        .arg(
+            Arg::new("atomic-bootstrap-required-manifest-signatures")
+                .long("atomic-bootstrap-required-manifest-signatures")
+                .value_name("N")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(usize))
+                .help("Require at least N trusted manifest signatures for Cryptix Atomic bootstrap (0 disables signature attestation)."),
+        )
+        .arg(
+            Arg::new("atomic-bootstrap-allow-peer-fallback")
+                .long("atomic-bootstrap-allow-peer-fallback")
+                .action(ArgAction::SetTrue)
+                .help("Enable peer-only fallback when no seed source is reachable (mainnet safety override; disabled by default)."),
+        )
         .arg(
             Arg::new("max-tracked-addresses")
                 .long("max-tracked-addresses")
@@ -349,14 +423,6 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
         .arg(arg!(--testnet "Use the test network"))
         .arg(arg!(--devnet "Use the development test network"))
         .arg(arg!(--simnet "Use the simulation test network"))
-        .arg(
-            Arg::new("payload-hf-activation-daa-score")
-                .long("payload-hf-activation-daa-score")
-                .value_name("DAA_SCORE")
-                .require_equals(true)
-                .value_parser(clap::value_parser!(u64))
-                .help("Override payload hardfork activation DAA score for this node instance."),
-        )
         .arg(arg!(--archival "Run as an archival node: avoids deleting old block data when moving the pruning point (Warning: heavy disk usage)"))
         .arg(arg!(--sanity "Enable various sanity checks which might be compute-intensive (mostly performed during pruning)"))
         .arg(arg!(--yes "Answer yes to all interactive console questions"))
@@ -555,6 +621,31 @@ impl Args {
             enable_unsynced_mining: arg_match_unwrap_or::<bool>(&m, "enable-unsynced-mining", defaults.enable_unsynced_mining),
             enable_mainnet_mining: arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", defaults.enable_mainnet_mining),
             utxoindex: arg_match_unwrap_or::<bool>(&m, "utxoindex", defaults.utxoindex),
+            atomic_unsafe_skip_snapshot_finality_check: arg_match_unwrap_or::<bool>(
+                &m,
+                "atomic-unsafe-skip-snapshot-finality-check",
+                defaults.atomic_unsafe_skip_snapshot_finality_check,
+            ),
+            atomic_bootstrap_peers: arg_match_many_unwrap_or::<ContextualNetAddress>(
+                &m,
+                "atomic-bootstrap-peer",
+                defaults.atomic_bootstrap_peers,
+            ),
+            atomic_bootstrap_trusted_manifest_pubkeys: arg_match_many_unwrap_or::<String>(
+                &m,
+                "atomic-bootstrap-trusted-manifest-pubkey",
+                defaults.atomic_bootstrap_trusted_manifest_pubkeys,
+            ),
+            atomic_bootstrap_required_manifest_signatures: arg_match_unwrap_or::<usize>(
+                &m,
+                "atomic-bootstrap-required-manifest-signatures",
+                defaults.atomic_bootstrap_required_manifest_signatures,
+            ),
+            atomic_bootstrap_allow_peer_fallback: arg_match_unwrap_or::<bool>(
+                &m,
+                "atomic-bootstrap-allow-peer-fallback",
+                defaults.atomic_bootstrap_allow_peer_fallback,
+            ),
             testnet: arg_match_unwrap_or::<bool>(&m, "testnet", defaults.testnet),
             testnet_suffix: defaults.testnet_suffix,
             devnet: arg_match_unwrap_or::<bool>(&m, "devnet", defaults.devnet),
@@ -585,6 +676,10 @@ impl Args {
             autoban: autoban_enabled,
             banserver: banserver_enabled,
             banserver_url: defaults.banserver_url,
+            coinbase_maturity_override: m
+                .get_one::<u64>("coinbase-maturity-override")
+                .copied()
+                .or(defaults.coinbase_maturity_override),
             payload_hf_activation_daa_score: m
                 .get_one::<u64>("payload-hf-activation-daa-score")
                 .copied()
@@ -622,87 +717,3 @@ fn arg_match_many_unwrap_or<T: Clone + Send + Sync + 'static>(m: &clap::ArgMatch
         None => default,
     }
 }
-
-/*
-
-  -V, --version                             Display version information and exit
-  -C, --configfile=                         Path to configuration file (default: /Users/aspect/Library/Application
-                                            Support/Cryptixd/cryptixd.conf)
-  -b, --appdir=                             Directory to store data (default: /Users/aspect/Library/Application
-                                            Support/Cryptixd)
-      --logdir=                             Directory to log output.
-  -a, --addpeer=                            Add a peer to connect with at startup
-      --connect=                            Connect only to the specified peers at startup
-      --nolisten                            Disable listening for incoming connections -- NOTE: Listening is
-                                            automatically disabled if the --connect or --proxy options are used
-                                            without also specifying listen interfaces via --listen
-      --listen=                             Add an interface/port to listen for connections (default all interfaces
-                                            port: 19101, testnet: 19102)
-      --outpeers=                           Target number of outbound peers (default: 8)
-      --maxinpeers=                         Max number of inbound peers (default: 117)
-      --enablebanning                       Enable banning of misbehaving peers
-      --banduration=                        How long to ban misbehaving peers. Valid time units are {s, m, h}. Minimum
-                                            1 second (default: 24h0m0s)
-      --banthreshold=                       Maximum allowed ban score before disconnecting and banning misbehaving
-                                            peers. (default: 100)
-      --whitelist=                          Add an IP network or IP that will not be banned. (eg. 192.168.1.0/24 or
-                                            ::1)
-      --rpclisten=                          Add an interface/port to listen for RPC connections (default port: 19201,
-                                            testnet: 19202)
-      --rpccert=                            File containing the certificate file (default:
-                                            /Users/aspect/Library/Application Support/Cryptixd/rpc.cert)
-      --rpckey=                             File containing the certificate key (default:
-                                            /Users/aspect/Library/Application Support/Cryptixd/rpc.key)
-      --rpcmaxclients=                      Max number of RPC clients for standard connections (default: 128)
-      --rpcmaxwebsockets=                   Max number of RPC websocket connections (default: 25)
-      --rpcmaxconcurrentreqs=               Max number of concurrent RPC requests that may be processed concurrently
-                                            (default: 20)
-      --norpc                               Disable built-in RPC server
-      --saferpc                             Disable RPC commands which affect the state of the node
-      --nodnsseed                           Disable DNS seeding for peers
-      --dnsseed=                            Override DNS seeds with specified hostname (Only 1 hostname allowed)
-      --grpcseed=                           Hostname of gRPC server for seeding peers
-      --externalip=                         Add an ip to the list of local addresses we claim to listen on to peers
-      --proxy=                              Connect via SOCKS5 proxy (eg. 127.0.0.1:9050)
-      --proxyuser=                          Username for proxy server
-      --proxypass=                          Password for proxy server
-      --dbtype=                             Database backend to use for the Block DAG
-      --profile=                            Enable HTTP profiling on given port -- NOTE port must be between 1024 and
-                                            65536
-  -d, --loglevel=                           Logging level for all subsystems {trace, debug, info, warn, error,
-                                            critical} -- You may also specify
-                                            <subsystem>=<level>,<subsystem2>=<level>,... to set the log level for
-                                            individual subsystems -- Use show to list available subsystems (default:
-                                            info)
-      --upnp                                Use UPnP to map our listening port outside of NAT
-      --minrelaytxfee=                      The minimum transaction fee in CPAY/kB to be considered a non-zero fee.
-                                            (default: 1e-05)
-      --maxorphantx=                        Max number of orphan transactions to keep in memory (default: 100)
-      --blockmaxmass=                       Maximum transaction mass to be used when creating a block (default:
-                                            10000000)
-      --uacomment=                          Comment to add to the user agent -- See BIP 14 for more information.
-      --nopeerbloomfilters                  Disable bloom filtering support
-      --sigcachemaxsize=                    The maximum number of entries in the signature verification cache
-                                            (default: 100000)
-      --blocksonly                          Do not accept transactions from remote peers.
-      --relaynonstd                         Relay non-standard transactions regardless of the default settings for the
-                                            active network.
-      --rejectnonstd                        Reject non-standard transactions regardless of the default settings for
-                                            the active network.
-      --reset-db                            Reset database before starting node. It's needed when switching between
-                                            subnetworks.
-      --maxutxocachesize=                   Max size of loaded UTXO into ram from the disk in bytes (default:
-                                            5000000000)
-      --utxoindex                           Enable the UTXO index
-      --archival                            Run as an archival node: don't delete old block data when moving the
-                                            pruning point (Warning: heavy disk usage)'
-      --protocol-version=                   Use non default p2p protocol version (default: 5)
-      --enable-unsynced-mining              Allow the node to accept blocks from RPC while not synced
-                                            (required when initiating a new network from genesis)
-      --testnet                             Use the test network
-      --simnet                              Use the simulation test network
-      --devnet                              Use the development test network
-      --override-dag-params-file=           Overrides DAG params (allowed only on devnet)
-  -s, --service=                            Service command {install, remove, start, stop}
-      --nogrpc                              Don't initialize the gRPC server
-*/

@@ -498,6 +498,7 @@ pub struct AccountsSendRequest {
     pub account_id: AccountId,
     pub wallet_secret: Secret,
     pub payment_secret: Option<Secret>,
+    pub sender_address: Option<Address>,
     pub destination: PaymentDestination,
     pub priority_fee_sompi: Fees,
     pub payload: Option<Vec<u8>>,
@@ -541,6 +542,7 @@ pub struct AccountsTransferResponse {
 #[serde(rename_all = "camelCase")]
 pub struct AccountsEstimateRequest {
     pub account_id: AccountId,
+    pub sender_address: Option<Address>,
     pub destination: PaymentDestination,
     pub priority_fee_sompi: Fees,
     pub payload: Option<Vec<u8>>,
@@ -621,4 +623,7 @@ pub struct AddressBookEnumerateResponse {}
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WalletNotification {}
+pub struct WalletNotification {
+    pub kind: String,
+    pub event_json: String,
+}

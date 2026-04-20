@@ -2619,6 +2619,1424 @@ impl Deserializer for GetStrongNodesResponse {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTokenContext {
+    pub at_block_hash: RpcHash,
+    pub at_daa_score: u64,
+    pub state_hash: String,
+    pub is_degraded: bool,
+}
+
+impl Serializer for RpcTokenContext {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcHash, &self.at_block_hash, writer)?;
+        store!(u64, &self.at_daa_score, writer)?;
+        store!(String, &self.state_hash, writer)?;
+        store!(bool, &self.is_degraded, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcTokenContext {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let at_block_hash = load!(RpcHash, reader)?;
+        let at_daa_score = load!(u64, reader)?;
+        let state_hash = load!(String, reader)?;
+        let is_degraded = load!(bool, reader)?;
+        Ok(Self { at_block_hash, at_daa_score, state_hash, is_degraded })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimulateTokenOpRequest {
+    pub payload_hex: String,
+    pub owner_id: String,
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for SimulateTokenOpRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &2, writer)?;
+        store!(String, &self.payload_hex, writer)?;
+        store!(String, &self.owner_id, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for SimulateTokenOpRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let payload_hex = load!(String, reader)?;
+        let owner_id = load!(String, reader)?;
+        let at_block_hash = if version >= 2 { load!(Option<RpcHash>, reader)? } else { None };
+        Ok(Self { payload_hex, owner_id, at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimulateTokenOpResponse {
+    pub result: String,
+    pub noop_reason: Option<u32>,
+    pub expected_next_nonce: u64,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for SimulateTokenOpResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.result, writer)?;
+        store!(Option<u32>, &self.noop_reason, writer)?;
+        store!(u64, &self.expected_next_nonce, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for SimulateTokenOpResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let result = load!(String, reader)?;
+        let noop_reason = load!(Option<u32>, reader)?;
+        let expected_next_nonce = load!(u64, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { result, noop_reason, expected_next_nonce, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenBalanceRequest {
+    pub asset_id: String,
+    pub owner_id: String,
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetTokenBalanceRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &2, writer)?;
+        store!(String, &self.asset_id, writer)?;
+        store!(String, &self.owner_id, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenBalanceRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let asset_id = load!(String, reader)?;
+        let owner_id = load!(String, reader)?;
+        let at_block_hash = if version >= 2 { load!(Option<RpcHash>, reader)? } else { None };
+        Ok(Self { asset_id, owner_id, at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenBalanceResponse {
+    pub balance: String,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetTokenBalanceResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.balance, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenBalanceResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let balance = load!(String, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { balance, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenNonceRequest {
+    pub owner_id: String,
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetTokenNonceRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &2, writer)?;
+        store!(String, &self.owner_id, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenNonceRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let owner_id = load!(String, reader)?;
+        let at_block_hash = if version >= 2 { load!(Option<RpcHash>, reader)? } else { None };
+        Ok(Self { owner_id, at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenNonceResponse {
+    pub expected_next_nonce: u64,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetTokenNonceResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(u64, &self.expected_next_nonce, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenNonceResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let expected_next_nonce = load!(u64, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { expected_next_nonce, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTokenAsset {
+    pub asset_id: String,
+    pub creator_owner_id: String,
+    pub mint_authority_owner_id: String,
+    pub decimals: u32,
+    pub supply_mode: u32,
+    pub max_supply: String,
+    pub total_supply: String,
+    pub name: String,
+    pub symbol: String,
+    pub metadata_hex: String,
+    pub created_block_hash: Option<RpcHash>,
+    pub created_daa_score: Option<u64>,
+    pub created_at: Option<u64>,
+}
+
+impl Serializer for RpcTokenAsset {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &2, writer)?;
+        store!(String, &self.asset_id, writer)?;
+        store!(String, &self.creator_owner_id, writer)?;
+        store!(String, &self.mint_authority_owner_id, writer)?;
+        store!(u32, &self.decimals, writer)?;
+        store!(u32, &self.supply_mode, writer)?;
+        store!(String, &self.max_supply, writer)?;
+        store!(String, &self.total_supply, writer)?;
+        store!(String, &self.name, writer)?;
+        store!(String, &self.symbol, writer)?;
+        store!(String, &self.metadata_hex, writer)?;
+        store!(Option<RpcHash>, &self.created_block_hash, writer)?;
+        store!(Option<u64>, &self.created_daa_score, writer)?;
+        store!(Option<u64>, &self.created_at, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcTokenAsset {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let asset_id = load!(String, reader)?;
+        let creator_owner_id = load!(String, reader)?;
+        let mint_authority_owner_id = load!(String, reader)?;
+        let decimals = load!(u32, reader)?;
+        let supply_mode = load!(u32, reader)?;
+        let max_supply = load!(String, reader)?;
+        let total_supply = load!(String, reader)?;
+        let name = load!(String, reader)?;
+        let symbol = load!(String, reader)?;
+        let metadata_hex = load!(String, reader)?;
+        let created_block_hash = if version >= 2 { load!(Option<RpcHash>, reader)? } else { None };
+        let created_daa_score = if version >= 2 { load!(Option<u64>, reader)? } else { None };
+        let created_at = if version >= 2 { load!(Option<u64>, reader)? } else { None };
+        Ok(Self {
+            asset_id,
+            creator_owner_id,
+            mint_authority_owner_id,
+            decimals,
+            supply_mode,
+            max_supply,
+            total_supply,
+            name,
+            symbol,
+            metadata_hex,
+            created_block_hash,
+            created_daa_score,
+            created_at,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenAssetRequest {
+    pub asset_id: String,
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetTokenAssetRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &2, writer)?;
+        store!(String, &self.asset_id, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenAssetRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let asset_id = load!(String, reader)?;
+        let at_block_hash = if version >= 2 { load!(Option<RpcHash>, reader)? } else { None };
+        Ok(Self { asset_id, at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenAssetResponse {
+    pub asset: Option<RpcTokenAsset>,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetTokenAssetResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Option<RpcTokenAsset>, &self.asset, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenAssetResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let asset = load!(Option<RpcTokenAsset>, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { asset, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenOpStatusRequest {
+    pub txid: RpcHash,
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetTokenOpStatusRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &2, writer)?;
+        store!(RpcHash, &self.txid, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenOpStatusRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let txid = load!(RpcHash, reader)?;
+        let at_block_hash = if version >= 2 { load!(Option<RpcHash>, reader)? } else { None };
+        Ok(Self { txid, at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenOpStatusResponse {
+    pub accepting_block_hash: Option<RpcHash>,
+    pub apply_status: Option<u32>,
+    pub noop_reason: Option<u32>,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetTokenOpStatusResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Option<RpcHash>, &self.accepting_block_hash, writer)?;
+        store!(Option<u32>, &self.apply_status, writer)?;
+        store!(Option<u32>, &self.noop_reason, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenOpStatusResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let accepting_block_hash = load!(Option<RpcHash>, reader)?;
+        let apply_status = load!(Option<u32>, reader)?;
+        let noop_reason = load!(Option<u32>, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { accepting_block_hash, apply_status, noop_reason, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenStateHashRequest {
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetTokenStateHashRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &2, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenStateHashRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let at_block_hash = if version >= 2 { load!(Option<RpcHash>, reader)? } else { None };
+        Ok(Self { at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenStateHashResponse {
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetTokenStateHashResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenStateHashResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenSpendabilityRequest {
+    pub asset_id: String,
+    pub owner_id: String,
+    pub min_daa_for_spend: Option<u64>,
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetTokenSpendabilityRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &2, writer)?;
+        store!(String, &self.asset_id, writer)?;
+        store!(String, &self.owner_id, writer)?;
+        store!(Option<u64>, &self.min_daa_for_spend, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenSpendabilityRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let asset_id = load!(String, reader)?;
+        let owner_id = load!(String, reader)?;
+        let min_daa_for_spend = load!(Option<u64>, reader)?;
+        let at_block_hash = if version >= 2 { load!(Option<RpcHash>, reader)? } else { None };
+        Ok(Self { asset_id, owner_id, min_daa_for_spend, at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenSpendabilityResponse {
+    pub can_spend: bool,
+    pub reason: Option<String>,
+    pub balance: String,
+    pub expected_next_nonce: u64,
+    pub min_daa_for_spend: u64,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetTokenSpendabilityResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(bool, &self.can_spend, writer)?;
+        store!(Option<String>, &self.reason, writer)?;
+        store!(String, &self.balance, writer)?;
+        store!(u64, &self.expected_next_nonce, writer)?;
+        store!(u64, &self.min_daa_for_spend, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenSpendabilityResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let can_spend = load!(bool, reader)?;
+        let reason = load!(Option<String>, reader)?;
+        let balance = load!(String, reader)?;
+        let expected_next_nonce = load!(u64, reader)?;
+        let min_daa_for_spend = load!(u64, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { can_spend, reason, balance, expected_next_nonce, min_daa_for_spend, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTokenEvent {
+    pub event_id: String,
+    pub sequence: u64,
+    pub accepting_block_hash: RpcHash,
+    pub txid: RpcHash,
+    pub event_type: u32,
+    pub apply_status: u32,
+    pub noop_reason: u32,
+    pub ordinal: u32,
+    pub reorg_of_event_id: Option<String>,
+    pub op_type: Option<u32>,
+    pub asset_id: Option<String>,
+    pub from_owner_id: Option<String>,
+    pub to_owner_id: Option<String>,
+    pub amount: Option<String>,
+}
+
+impl Serializer for RpcTokenEvent {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &2, writer)?;
+        store!(String, &self.event_id, writer)?;
+        store!(u64, &self.sequence, writer)?;
+        store!(RpcHash, &self.accepting_block_hash, writer)?;
+        store!(RpcHash, &self.txid, writer)?;
+        store!(u32, &self.event_type, writer)?;
+        store!(u32, &self.apply_status, writer)?;
+        store!(u32, &self.noop_reason, writer)?;
+        store!(u32, &self.ordinal, writer)?;
+        store!(Option<String>, &self.reorg_of_event_id, writer)?;
+        store!(Option<u32>, &self.op_type, writer)?;
+        store!(Option<String>, &self.asset_id, writer)?;
+        store!(Option<String>, &self.from_owner_id, writer)?;
+        store!(Option<String>, &self.to_owner_id, writer)?;
+        store!(Option<String>, &self.amount, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcTokenEvent {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let event_id = load!(String, reader)?;
+        let sequence = load!(u64, reader)?;
+        let accepting_block_hash = load!(RpcHash, reader)?;
+        let txid = load!(RpcHash, reader)?;
+        let event_type = load!(u32, reader)?;
+        let apply_status = load!(u32, reader)?;
+        let noop_reason = load!(u32, reader)?;
+        let ordinal = load!(u32, reader)?;
+        let reorg_of_event_id = load!(Option<String>, reader)?;
+        let op_type = if version >= 2 { load!(Option<u32>, reader)? } else { None };
+        let asset_id = if version >= 2 { load!(Option<String>, reader)? } else { None };
+        let from_owner_id = if version >= 2 { load!(Option<String>, reader)? } else { None };
+        let to_owner_id = if version >= 2 { load!(Option<String>, reader)? } else { None };
+        let amount = if version >= 2 { load!(Option<String>, reader)? } else { None };
+        Ok(Self {
+            event_id,
+            sequence,
+            accepting_block_hash,
+            txid,
+            event_type,
+            apply_status,
+            noop_reason,
+            ordinal,
+            reorg_of_event_id,
+            op_type,
+            asset_id,
+            from_owner_id,
+            to_owner_id,
+            amount,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTokenOwnerBalance {
+    pub asset_id: String,
+    pub balance: String,
+    pub asset: Option<RpcTokenAsset>,
+}
+
+impl Serializer for RpcTokenOwnerBalance {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.asset_id, writer)?;
+        store!(String, &self.balance, writer)?;
+        store!(Option<RpcTokenAsset>, &self.asset, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcTokenOwnerBalance {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let asset_id = load!(String, reader)?;
+        let balance = load!(String, reader)?;
+        let asset = load!(Option<RpcTokenAsset>, reader)?;
+        Ok(Self { asset_id, balance, asset })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTokenHolder {
+    pub owner_id: String,
+    pub balance: String,
+}
+
+impl Serializer for RpcTokenHolder {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.owner_id, writer)?;
+        store!(String, &self.balance, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcTokenHolder {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let owner_id = load!(String, reader)?;
+        let balance = load!(String, reader)?;
+        Ok(Self { owner_id, balance })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenEventsRequest {
+    pub after_sequence: u64,
+    pub limit: u32,
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetTokenEventsRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &2, writer)?;
+        store!(u64, &self.after_sequence, writer)?;
+        store!(u32, &self.limit, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenEventsRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let after_sequence = load!(u64, reader)?;
+        let limit = load!(u32, reader)?;
+        let at_block_hash = if version >= 2 { load!(Option<RpcHash>, reader)? } else { None };
+        Ok(Self { after_sequence, limit, at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenEventsResponse {
+    pub events: Vec<RpcTokenEvent>,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetTokenEventsResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Vec<RpcTokenEvent>, &self.events, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenEventsResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let events = load!(Vec<RpcTokenEvent>, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { events, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenAssetsRequest {
+    pub offset: u32,
+    pub limit: u32,
+    pub query: Option<String>,
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetTokenAssetsRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(u32, &self.offset, writer)?;
+        store!(u32, &self.limit, writer)?;
+        store!(Option<String>, &self.query, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenAssetsRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let offset = load!(u32, reader)?;
+        let limit = load!(u32, reader)?;
+        let query = load!(Option<String>, reader)?;
+        let at_block_hash = load!(Option<RpcHash>, reader)?;
+        Ok(Self { offset, limit, query, at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenAssetsResponse {
+    pub assets: Vec<RpcTokenAsset>,
+    pub total: u64,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetTokenAssetsResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Vec<RpcTokenAsset>, &self.assets, writer)?;
+        store!(u64, &self.total, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenAssetsResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let assets = load!(Vec<RpcTokenAsset>, reader)?;
+        let total = load!(u64, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { assets, total, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenBalancesByOwnerRequest {
+    pub owner_id: String,
+    pub offset: u32,
+    pub limit: u32,
+    pub include_assets: bool,
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetTokenBalancesByOwnerRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.owner_id, writer)?;
+        store!(u32, &self.offset, writer)?;
+        store!(u32, &self.limit, writer)?;
+        store!(bool, &self.include_assets, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenBalancesByOwnerRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let owner_id = load!(String, reader)?;
+        let offset = load!(u32, reader)?;
+        let limit = load!(u32, reader)?;
+        let include_assets = load!(bool, reader)?;
+        let at_block_hash = load!(Option<RpcHash>, reader)?;
+        Ok(Self { owner_id, offset, limit, include_assets, at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenBalancesByOwnerResponse {
+    pub balances: Vec<RpcTokenOwnerBalance>,
+    pub total: u64,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetTokenBalancesByOwnerResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Vec<RpcTokenOwnerBalance>, &self.balances, writer)?;
+        store!(u64, &self.total, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenBalancesByOwnerResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let balances = load!(Vec<RpcTokenOwnerBalance>, reader)?;
+        let total = load!(u64, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { balances, total, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenHoldersRequest {
+    pub asset_id: String,
+    pub offset: u32,
+    pub limit: u32,
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetTokenHoldersRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.asset_id, writer)?;
+        store!(u32, &self.offset, writer)?;
+        store!(u32, &self.limit, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenHoldersRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let asset_id = load!(String, reader)?;
+        let offset = load!(u32, reader)?;
+        let limit = load!(u32, reader)?;
+        let at_block_hash = load!(Option<RpcHash>, reader)?;
+        Ok(Self { asset_id, offset, limit, at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenHoldersResponse {
+    pub holders: Vec<RpcTokenHolder>,
+    pub total: u64,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetTokenHoldersResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Vec<RpcTokenHolder>, &self.holders, writer)?;
+        store!(u64, &self.total, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenHoldersResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let holders = load!(Vec<RpcTokenHolder>, reader)?;
+        let total = load!(u64, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { holders, total, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenOwnerIdByAddressRequest {
+    pub address: String,
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetTokenOwnerIdByAddressRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.address, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenOwnerIdByAddressRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let address = load!(String, reader)?;
+        let at_block_hash = load!(Option<RpcHash>, reader)?;
+        Ok(Self { address, at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenOwnerIdByAddressResponse {
+    pub owner_id: Option<String>,
+    pub reason: Option<String>,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetTokenOwnerIdByAddressResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Option<String>, &self.owner_id, writer)?;
+        store!(Option<String>, &self.reason, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenOwnerIdByAddressResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let owner_id = load!(Option<String>, reader)?;
+        let reason = load!(Option<String>, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { owner_id, reason, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportTokenSnapshotRequest {
+    pub path: String,
+}
+
+impl Serializer for ExportTokenSnapshotRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.path, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for ExportTokenSnapshotRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let path = load!(String, reader)?;
+        Ok(Self { path })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportTokenSnapshotResponse {
+    pub exported: bool,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for ExportTokenSnapshotResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(bool, &self.exported, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for ExportTokenSnapshotResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let exported = load!(bool, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { exported, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportTokenSnapshotRequest {
+    pub path: String,
+}
+
+impl Serializer for ImportTokenSnapshotRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.path, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for ImportTokenSnapshotRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let path = load!(String, reader)?;
+        Ok(Self { path })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportTokenSnapshotResponse {
+    pub imported: bool,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for ImportTokenSnapshotResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(bool, &self.imported, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for ImportTokenSnapshotResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let imported = load!(bool, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { imported, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenHealthRequest {
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetTokenHealthRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &2, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenHealthRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let at_block_hash = if version >= 2 { load!(Option<RpcHash>, reader)? } else { None };
+        Ok(Self { at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTokenHealthResponse {
+    pub is_degraded: bool,
+    pub bootstrap_in_progress: bool,
+    pub live_correct: bool,
+    pub token_state: String,
+    pub last_applied_block: Option<RpcHash>,
+    pub last_sequence: u64,
+    pub state_hash: String,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetTokenHealthResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &3, writer)?;
+        store!(bool, &self.is_degraded, writer)?;
+        store!(bool, &self.bootstrap_in_progress, writer)?;
+        store!(bool, &self.live_correct, writer)?;
+        store!(String, &self.token_state, writer)?;
+        store!(Option<RpcHash>, &self.last_applied_block, writer)?;
+        store!(u64, &self.last_sequence, writer)?;
+        store!(String, &self.state_hash, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTokenHealthResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let is_degraded = load!(bool, reader)?;
+        let bootstrap_in_progress = if version >= 2 { load!(bool, reader)? } else { false };
+        let live_correct = load!(bool, reader)?;
+        let token_state = if version >= 3 {
+            load!(String, reader)?
+        } else if is_degraded {
+            "degraded".to_string()
+        } else if bootstrap_in_progress {
+            "recovering".to_string()
+        } else if live_correct {
+            "healthy".to_string()
+        } else {
+            "not_ready".to_string()
+        };
+        let last_applied_block = load!(Option<RpcHash>, reader)?;
+        let last_sequence = load!(u64, reader)?;
+        let state_hash = load!(String, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self {
+            is_degraded,
+            bootstrap_in_progress,
+            live_correct,
+            token_state,
+            last_applied_block,
+            last_sequence,
+            state_hash,
+            context,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcScBootstrapSource {
+    pub snapshot_id: String,
+    pub protocol_version: u32,
+    pub network_id: String,
+    pub node_identity: String,
+    pub at_block_hash: RpcHash,
+    pub at_daa_score: u64,
+    pub state_hash_at_fp: String,
+    pub window_start_block_hash: RpcHash,
+    pub window_end_block_hash: RpcHash,
+}
+
+impl Serializer for RpcScBootstrapSource {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &2, writer)?;
+        store!(String, &self.snapshot_id, writer)?;
+        store!(u32, &self.protocol_version, writer)?;
+        store!(String, &self.network_id, writer)?;
+        store!(String, &self.node_identity, writer)?;
+        store!(RpcHash, &self.at_block_hash, writer)?;
+        store!(u64, &self.at_daa_score, writer)?;
+        store!(String, &self.state_hash_at_fp, writer)?;
+        store!(RpcHash, &self.window_start_block_hash, writer)?;
+        store!(RpcHash, &self.window_end_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcScBootstrapSource {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let snapshot_id = load!(String, reader)?;
+        let protocol_version = load!(u32, reader)?;
+        let network_id = load!(String, reader)?;
+        let node_identity = if version >= 2 { load!(String, reader)? } else { String::new() };
+        let at_block_hash = load!(RpcHash, reader)?;
+        let at_daa_score = load!(u64, reader)?;
+        let state_hash_at_fp = load!(String, reader)?;
+        let window_start_block_hash = load!(RpcHash, reader)?;
+        let window_end_block_hash = load!(RpcHash, reader)?;
+        Ok(Self {
+            snapshot_id,
+            protocol_version,
+            network_id,
+            node_identity,
+            at_block_hash,
+            at_daa_score,
+            state_hash_at_fp,
+            window_start_block_hash,
+            window_end_block_hash,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcScManifestSignature {
+    pub signer_pubkey_hex: String,
+    pub signature_hex: String,
+}
+
+impl Serializer for RpcScManifestSignature {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.signer_pubkey_hex, writer)?;
+        store!(String, &self.signature_hex, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcScManifestSignature {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let signer_pubkey_hex = load!(String, reader)?;
+        let signature_hex = load!(String, reader)?;
+        Ok(Self { signer_pubkey_hex, signature_hex })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetScBootstrapSourcesRequest {}
+
+impl Serializer for GetScBootstrapSourcesRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetScBootstrapSourcesRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        Ok(Self {})
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetScBootstrapSourcesResponse {
+    pub sources: Vec<RpcScBootstrapSource>,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetScBootstrapSourcesResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Vec<RpcScBootstrapSource>, &self.sources, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetScBootstrapSourcesResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let sources = load!(Vec<RpcScBootstrapSource>, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { sources, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetScSnapshotManifestRequest {
+    pub snapshot_id: String,
+}
+
+impl Serializer for GetScSnapshotManifestRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.snapshot_id, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetScSnapshotManifestRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let snapshot_id = load!(String, reader)?;
+        Ok(Self { snapshot_id })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetScSnapshotManifestResponse {
+    pub snapshot_id: String,
+    pub manifest_hex: String,
+    #[serde(default)]
+    pub manifest_signatures: Vec<RpcScManifestSignature>,
+}
+
+impl Serializer for GetScSnapshotManifestResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &2, writer)?;
+        store!(String, &self.snapshot_id, writer)?;
+        store!(String, &self.manifest_hex, writer)?;
+        store!(Vec<RpcScManifestSignature>, &self.manifest_signatures, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetScSnapshotManifestResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let snapshot_id = load!(String, reader)?;
+        let manifest_hex = load!(String, reader)?;
+        let manifest_signatures = if version >= 2 { load!(Vec<RpcScManifestSignature>, reader)? } else { Vec::new() };
+        Ok(Self { snapshot_id, manifest_hex, manifest_signatures })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetScSnapshotChunkRequest {
+    pub snapshot_id: String,
+    pub chunk_index: u32,
+    pub chunk_size: Option<u32>,
+}
+
+impl Serializer for GetScSnapshotChunkRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.snapshot_id, writer)?;
+        store!(u32, &self.chunk_index, writer)?;
+        store!(Option<u32>, &self.chunk_size, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetScSnapshotChunkRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let snapshot_id = load!(String, reader)?;
+        let chunk_index = load!(u32, reader)?;
+        let chunk_size = load!(Option<u32>, reader)?;
+        Ok(Self { snapshot_id, chunk_index, chunk_size })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetScSnapshotChunkResponse {
+    pub snapshot_id: String,
+    pub chunk_index: u32,
+    pub total_chunks: u32,
+    pub file_size: u64,
+    pub chunk_hex: String,
+}
+
+impl Serializer for GetScSnapshotChunkResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.snapshot_id, writer)?;
+        store!(u32, &self.chunk_index, writer)?;
+        store!(u32, &self.total_chunks, writer)?;
+        store!(u64, &self.file_size, writer)?;
+        store!(String, &self.chunk_hex, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetScSnapshotChunkResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let snapshot_id = load!(String, reader)?;
+        let chunk_index = load!(u32, reader)?;
+        let total_chunks = load!(u32, reader)?;
+        let file_size = load!(u64, reader)?;
+        let chunk_hex = load!(String, reader)?;
+        Ok(Self { snapshot_id, chunk_index, total_chunks, file_size, chunk_hex })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetScReplayWindowChunkRequest {
+    pub snapshot_id: String,
+    pub chunk_index: u32,
+    pub chunk_size: Option<u32>,
+}
+
+impl Serializer for GetScReplayWindowChunkRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.snapshot_id, writer)?;
+        store!(u32, &self.chunk_index, writer)?;
+        store!(Option<u32>, &self.chunk_size, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetScReplayWindowChunkRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let snapshot_id = load!(String, reader)?;
+        let chunk_index = load!(u32, reader)?;
+        let chunk_size = load!(Option<u32>, reader)?;
+        Ok(Self { snapshot_id, chunk_index, chunk_size })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetScReplayWindowChunkResponse {
+    pub snapshot_id: String,
+    pub chunk_index: u32,
+    pub total_chunks: u32,
+    pub file_size: u64,
+    pub chunk_hex: String,
+}
+
+impl Serializer for GetScReplayWindowChunkResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.snapshot_id, writer)?;
+        store!(u32, &self.chunk_index, writer)?;
+        store!(u32, &self.total_chunks, writer)?;
+        store!(u64, &self.file_size, writer)?;
+        store!(String, &self.chunk_hex, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetScReplayWindowChunkResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let snapshot_id = load!(String, reader)?;
+        let chunk_index = load!(u32, reader)?;
+        let total_chunks = load!(u32, reader)?;
+        let file_size = load!(u64, reader)?;
+        let chunk_hex = load!(String, reader)?;
+        Ok(Self { snapshot_id, chunk_index, total_chunks, file_size, chunk_hex })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetScSnapshotHeadRequest {}
+
+impl Serializer for GetScSnapshotHeadRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetScSnapshotHeadRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        Ok(Self {})
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetScSnapshotHeadResponse {
+    pub head: Option<RpcScBootstrapSource>,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetScSnapshotHeadResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Option<RpcScBootstrapSource>, &self.head, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetScSnapshotHeadResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let head = load!(Option<RpcScBootstrapSource>, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { head, context })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetDaaScoreTimestampEstimateRequest {
@@ -3780,6 +5198,89 @@ impl Deserializer for NewBlockTemplateNotification {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
         let _version = load!(u16, reader)?;
         Ok(Self {})
+    }
+}
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// TokenEventsChangedNotification
+
+/// NotifyTokenEventsRequest registers this connection for tokenEventsChanged notifications.
+///
+/// See: TokenEventsChangedNotification
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotifyTokenEventsRequest {
+    pub command: Command,
+}
+
+impl NotifyTokenEventsRequest {
+    pub fn new(command: Command) -> Self {
+        Self { command }
+    }
+}
+
+impl Serializer for NotifyTokenEventsRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Command, &self.command, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for NotifyTokenEventsRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let command = load!(Command, reader)?;
+        Ok(Self { command })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotifyTokenEventsResponse {}
+
+impl Serializer for NotifyTokenEventsResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for NotifyTokenEventsResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        Ok(Self {})
+    }
+}
+
+/// TokenEventsChangedNotification is sent whenever new Cryptix Atomic token events are recorded.
+///
+/// `from_sequence` and `to_sequence` provide a best-effort inclusive range hint for follow-up GetTokenEvents polling.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenEventsChangedNotification {
+    pub from_sequence: u64,
+    pub to_sequence: u64,
+    pub event_count: u32,
+}
+
+impl Serializer for TokenEventsChangedNotification {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(u64, &self.from_sequence, writer)?;
+        store!(u64, &self.to_sequence, writer)?;
+        store!(u32, &self.event_count, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for TokenEventsChangedNotification {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let from_sequence = load!(u64, reader)?;
+        let to_sequence = load!(u64, reader)?;
+        let event_count = load!(u32, reader)?;
+        Ok(Self { from_sequence, to_sequence, event_count })
     }
 }
 

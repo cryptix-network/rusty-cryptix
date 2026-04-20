@@ -69,6 +69,27 @@ message CryptixdRequest {
     GetFastIntentStatusRequestMessage getFastIntentStatusRequest = 1114;
     CancelFastIntentRequestMessage cancelFastIntentRequest = 1116;
     GetStrongNodesRequestMessage getStrongNodesRequest = 1118;
+    SimulateTokenOpRequestMessage simulateTokenOpRequest = 1120;
+    GetTokenBalanceRequestMessage getTokenBalanceRequest = 1122;
+    GetTokenNonceRequestMessage getTokenNonceRequest = 1124;
+    GetTokenAssetRequestMessage getTokenAssetRequest = 1126;
+    GetTokenOpStatusRequestMessage getTokenOpStatusRequest = 1128;
+    GetTokenStateHashRequestMessage getTokenStateHashRequest = 1130;
+    GetTokenSpendabilityRequestMessage getTokenSpendabilityRequest = 1132;
+    GetTokenEventsRequestMessage getTokenEventsRequest = 1134;
+    ExportTokenSnapshotRequestMessage exportTokenSnapshotRequest = 1136;
+    ImportTokenSnapshotRequestMessage importTokenSnapshotRequest = 1138;
+    GetTokenHealthRequestMessage getTokenHealthRequest = 1140;
+    GetScBootstrapSourcesRequestMessage getScBootstrapSourcesRequest = 1142;
+    GetScSnapshotManifestRequestMessage getScSnapshotManifestRequest = 1144;
+    GetScSnapshotChunkRequestMessage getScSnapshotChunkRequest = 1146;
+    GetScReplayWindowChunkRequestMessage getScReplayWindowChunkRequest = 1148;
+    GetScSnapshotHeadRequestMessage getScSnapshotHeadRequest = 1150;
+    GetTokenAssetsRequestMessage getTokenAssetsRequest = 1152;
+    GetTokenBalancesByOwnerRequestMessage getTokenBalancesByOwnerRequest = 1154;
+    GetTokenHoldersRequestMessage getTokenHoldersRequest = 1156;
+    GetTokenOwnerIdByAddressRequestMessage getTokenOwnerIdByAddressRequest = 1158;
+    NotifyTokenEventsRequestMessage notifyTokenEventsRequest = 1160;
   }
 }
 
@@ -138,6 +159,28 @@ message CryptixdResponse {
     GetFastIntentStatusResponseMessage getFastIntentStatusResponse = 1115;
     CancelFastIntentResponseMessage cancelFastIntentResponse = 1117;
     GetStrongNodesResponseMessage getStrongNodesResponse = 1119;
+    SimulateTokenOpResponseMessage simulateTokenOpResponse = 1121;
+    GetTokenBalanceResponseMessage getTokenBalanceResponse = 1123;
+    GetTokenNonceResponseMessage getTokenNonceResponse = 1125;
+    GetTokenAssetResponseMessage getTokenAssetResponse = 1127;
+    GetTokenOpStatusResponseMessage getTokenOpStatusResponse = 1129;
+    GetTokenStateHashResponseMessage getTokenStateHashResponse = 1131;
+    GetTokenSpendabilityResponseMessage getTokenSpendabilityResponse = 1133;
+    GetTokenEventsResponseMessage getTokenEventsResponse = 1135;
+    ExportTokenSnapshotResponseMessage exportTokenSnapshotResponse = 1137;
+    ImportTokenSnapshotResponseMessage importTokenSnapshotResponse = 1139;
+    GetTokenHealthResponseMessage getTokenHealthResponse = 1141;
+    GetScBootstrapSourcesResponseMessage getScBootstrapSourcesResponse = 1143;
+    GetScSnapshotManifestResponseMessage getScSnapshotManifestResponse = 1145;
+    GetScSnapshotChunkResponseMessage getScSnapshotChunkResponse = 1147;
+    GetScReplayWindowChunkResponseMessage getScReplayWindowChunkResponse = 1149;
+    GetScSnapshotHeadResponseMessage getScSnapshotHeadResponse = 1151;
+    GetTokenAssetsResponseMessage getTokenAssetsResponse = 1153;
+    GetTokenBalancesByOwnerResponseMessage getTokenBalancesByOwnerResponse = 1155;
+    GetTokenHoldersResponseMessage getTokenHoldersResponse = 1157;
+    GetTokenOwnerIdByAddressResponseMessage getTokenOwnerIdByAddressResponse = 1159;
+    NotifyTokenEventsResponseMessage notifyTokenEventsResponse = 1161;
+    TokenEventsChangedNotificationMessage tokenEventsChangedNotification = 1162;
   }
 }
 

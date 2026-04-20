@@ -1359,11 +1359,16 @@ declare! {
      *  
      * @category Wallet API
      */
-    export interface IAccountsSendRequest {
+export interface IAccountsSendRequest {
         /**
          * Hex identifier of the account.
          */
         accountId : HexString;
+        /**
+         * Optional sender address pinning for deterministic input ownership.
+         * When set, the transaction generator strictly selects inputs from this address only.
+         */
+        senderAddress? : Address | string;
         /**
          * Wallet encryption secret.
          */
@@ -1406,6 +1411,7 @@ declare! {
 
 try_from! ( args: IAccountsSendRequest, AccountsSendRequest, {
     let account_id = args.get_account_id("accountId")?;
+    let sender_address = args.try_cast_into::<Address>("senderAddress")?;
     let wallet_secret = args.get_secret("walletSecret")?;
     let payment_secret = args.try_get_secret("paymentSecret")?;
     let priority_fee_sompi = args.get::<IFees>("priorityFeeSompi")?.try_into()?;
@@ -1430,7 +1436,7 @@ try_from! ( args: IAccountsSendRequest, AccountsSendRequest, {
         None
     };
 
-    Ok(AccountsSendRequest { account_id, wallet_secret, payment_secret, priority_fee_sompi, destination, payload, fast_path })
+    Ok(AccountsSendRequest { account_id, sender_address, wallet_secret, payment_secret, priority_fee_sompi, destination, payload, fast_path })
 });
 
 declare! {
@@ -1558,8 +1564,9 @@ declare! {
      *  
      * @category Wallet API
      */
-    export interface IAccountsEstimateRequest {
+export interface IAccountsEstimateRequest {
         accountId : HexString;
+        senderAddress? : Address | string;
         destination : IPaymentOutput[];
         priorityFeeSompi : IFees | bigint;
         payload? : Uint8Array | string;
@@ -1569,6 +1576,7 @@ declare! {
 
 try_from! ( args: IAccountsEstimateRequest, AccountsEstimateRequest, {
     let account_id = args.get_account_id("accountId")?;
+    let sender_address = args.try_cast_into::<Address>("senderAddress")?;
     let priority_fee_sompi = args.get::<IFees>("priorityFeeSompi")?.try_into()?;
     let payload = args.try_get_value("payload")?.map(|v| v.try_as_vec_u8()).transpose()?;
 
@@ -1576,7 +1584,7 @@ try_from! ( args: IAccountsEstimateRequest, AccountsEstimateRequest, {
     let destination: PaymentDestination =
         if outputs.is_undefined() { PaymentDestination::Change } else { PaymentOutputs::try_owned_from(outputs)?.into() };
 
-    Ok(AccountsEstimateRequest { account_id, priority_fee_sompi, destination, payload })
+    Ok(AccountsEstimateRequest { account_id, sender_address, priority_fee_sompi, destination, payload })
 });
 
 declare! {

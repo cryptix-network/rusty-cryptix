@@ -19,6 +19,7 @@ cryptix-alloc.workspace = true # This changes the global allocator for all of th
 
 cryptix-addresses.workspace = true
 cryptix-addressmanager.workspace = true
+cryptix-atomicindex.workspace = true
 cryptix-consensus-core.workspace = true
 cryptix-consensus-notify.workspace = true
 cryptix-consensus.workspace = true
@@ -26,11 +27,13 @@ cryptix-consensusmanager.workspace = true
 cryptix-core.workspace = true
 cryptix-database.workspace = true
 cryptix-grpc-server.workspace = true
+cryptix-grpc-client.workspace = true
 cryptix-hashes.workspace = true
 cryptix-index-processor.workspace = true
 cryptix-mining.workspace = true
 cryptix-notify.workspace = true
 cryptix-p2p-flows.workspace = true
+cryptix-p2p-lib.workspace = true
 cryptix-perf-monitor.workspace = true
 cryptix-rpc-core.workspace = true
 cryptix-rpc-service.workspace = true
@@ -41,16 +44,20 @@ cryptix-utxoindex.workspace = true
 cryptix-wrpc-server.workspace = true
 
 async-channel.workspace = true
+blake2b_simd.workspace = true
+borsh.workspace = true
 cfg-if.workspace = true
 clap.workspace = true
 dhat = { workspace = true, optional = true }
 dirs.workspace = true
 futures-util.workspace = true
+hex.workspace = true
 log.workspace = true
 num_cpus.workspace = true
 rand.workspace = true
 rayon.workspace = true
 serde.workspace = true
+secp256k1.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }

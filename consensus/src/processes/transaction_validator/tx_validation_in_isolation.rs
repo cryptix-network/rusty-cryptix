@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use super::{
     errors::{TxResult, TxRuleError},
+    transaction_validator_populated::parse_atomic_payload,
     TransactionValidator,
 };
 
@@ -128,11 +129,26 @@ fn check_transaction_payload(tx: &Transaction, payload_hf_activated: bool, paylo
         if payload_len > payload_max_len_consensus {
             return Err(TxRuleError::PayloadLengthAboveMax(payload_len, payload_max_len_consensus));
         }
+        validate_atomic_payload_shape(tx).map_err(TxRuleError::InvalidAtomicPayload)?;
         return Ok(());
     }
 
     if !tx.payload.is_empty() {
         return Err(TxRuleError::PayloadInInvalidSubnetwork(tx.subnetwork_id.clone()));
+    }
+    Ok(())
+}
+
+fn validate_atomic_payload_shape(tx: &Transaction) -> Result<(), String> {
+    let Some(parsed_payload) = parse_atomic_payload(tx.payload.as_slice())? else {
+        return Ok(());
+    };
+    if parsed_payload.auth_input_index as usize >= tx.inputs.len() {
+        return Err(format!(
+            "auth_input_index `{}` is out of range for {} tx input(s)",
+            parsed_payload.auth_input_index,
+            tx.inputs.len()
+        ));
     }
     Ok(())
 }
@@ -375,5 +391,90 @@ mod tests {
         let mut tx = valid_tx;
         tx.subnetwork_id = SubnetworkId::from_byte(10);
         assert_match!(tv_post_hf.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::SubnetworksDisabled(_)));
+
+        let mut tx = Transaction::new(
+            0,
+            vec![TransactionInput {
+                previous_outpoint: TransactionOutpoint {
+                    transaction_id: TransactionId::from_slice(&[
+                        0x13, 0x2e, 0x38, 0xe9, 0xc0, 0xa8, 0x4c, 0x60, 0x46, 0xd6, 0x87, 0xd1, 0x05, 0x56, 0xdc, 0xac, 0xc4, 0x1d,
+                        0x27, 0x5e, 0xc5, 0x5f, 0xc0, 0x07, 0x79, 0xac, 0x88, 0xfd, 0xf3, 0x57, 0xa1, 0x88,
+                    ]),
+                    index: 0,
+                },
+                signature_script: vec![0x51],
+                sequence: u64::MAX,
+                sig_op_count: 0,
+            }],
+            vec![TransactionOutput {
+                value: 0x108e20f00,
+                script_public_key: ScriptPublicKey::new(
+                    0,
+                    scriptvec!(
+                        0x76, // OP_DUP
+                        0xa9, // OP_HASH160
+                        0x14, // OP_DATA_20
+                        0x94, 0x8c, 0x76, 0x5a, 0x69, 0x14, 0xd4, 0x3f, 0x2a, 0x7a, 0xc1, 0x77, 0xda, 0x2c, 0x2f, 0x6b, 0x52, 0xde,
+                        0x3d, 0x7c, 0x88, // OP_EQUALVERIFY
+                        0xac  // OP_CHECKSIG
+                    ),
+                ),
+            }],
+            0,
+            SUBNETWORK_ID_PAYLOAD,
+            0,
+            vec![],
+        );
+
+        let mut valid_cat_transfer_payload = Vec::new();
+        valid_cat_transfer_payload.extend_from_slice(b"CAT");
+        valid_cat_transfer_payload.push(1); // version
+        valid_cat_transfer_payload.push(1); // Transfer
+        valid_cat_transfer_payload.push(0); // flags
+        valid_cat_transfer_payload.extend_from_slice(&0u16.to_le_bytes()); // auth_input_index
+        valid_cat_transfer_payload.extend_from_slice(&1u64.to_le_bytes()); // nonce
+        valid_cat_transfer_payload.extend_from_slice(&[5u8; 32]); // asset_id
+        valid_cat_transfer_payload.extend_from_slice(&[7u8; 32]); // to_owner_id
+        valid_cat_transfer_payload.extend_from_slice(&1u128.to_le_bytes()); // amount
+
+        tx.payload = valid_cat_transfer_payload.clone();
+        tv_post_hf.validate_tx_in_isolation(&tx, 0).unwrap();
+
+        let mut bad_auth_index_payload = valid_cat_transfer_payload.clone();
+        let bad_auth_index_bytes = 1u16.to_le_bytes();
+        bad_auth_index_payload[6] = bad_auth_index_bytes[0];
+        bad_auth_index_payload[7] = bad_auth_index_bytes[1];
+        tx.payload = bad_auth_index_payload;
+        assert_match!(tv_post_hf.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::InvalidAtomicPayload(_)));
+
+        let mut bad_version_payload = valid_cat_transfer_payload.clone();
+        bad_version_payload[3] = 2;
+        tx.payload = bad_version_payload;
+        assert_match!(tv_post_hf.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::InvalidAtomicPayload(_)));
+
+        let mut bad_nonce_payload = valid_cat_transfer_payload.clone();
+        bad_nonce_payload[8..16].copy_from_slice(&0u64.to_le_bytes());
+        tx.payload = bad_nonce_payload;
+        assert_match!(tv_post_hf.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::InvalidAtomicPayload(_)));
+
+        let mut bad_create_payload = Vec::new();
+        bad_create_payload.extend_from_slice(b"CAT");
+        bad_create_payload.push(1); // version
+        bad_create_payload.push(0); // CreateAsset
+        bad_create_payload.push(0); // flags
+        bad_create_payload.extend_from_slice(&0u16.to_le_bytes()); // auth_input_index
+        bad_create_payload.extend_from_slice(&2u64.to_le_bytes()); // nonce
+        bad_create_payload.push(8); // decimals
+        bad_create_payload.push(1); // Capped
+        bad_create_payload.extend_from_slice(&0u128.to_le_bytes()); // invalid max_supply for capped assets
+        bad_create_payload.extend_from_slice(&[9u8; 32]); // mint_authority_owner_id
+        bad_create_payload.push(4); // name len
+        bad_create_payload.push(3); // symbol len
+        bad_create_payload.extend_from_slice(&5u16.to_le_bytes()); // metadata len
+        bad_create_payload.extend_from_slice(b"Gold");
+        bad_create_payload.extend_from_slice(b"GLD");
+        bad_create_payload.extend_from_slice(b"hello");
+        tx.payload = bad_create_payload;
+        assert_match!(tv_post_hf.validate_tx_in_isolation(&tx, 0), Err(TxRuleError::InvalidAtomicPayload(_)));
     }
 }

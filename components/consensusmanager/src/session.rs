@@ -13,6 +13,7 @@ use cryptix_consensus_core::{
     pruning::{PruningPointProof, PruningPointTrustedData, PruningPointsList},
     trusted::{ExternalGhostdagData, TrustedBlock},
     tx::{MutableTransaction, Transaction, TransactionOutpoint, UtxoEntry},
+    utxo::utxo_diff::UtxoDiff,
     BlockHashSet, BlueWorkType, ChainPath, Hash,
 };
 use cryptix_utils::sync::rwlock::*;
@@ -379,6 +380,10 @@ impl ConsensusSessionOwned {
 
     pub async fn async_get_block_acceptance_data(&self, hash: Hash) -> ConsensusResult<Arc<AcceptanceData>> {
         self.clone().spawn_blocking(move |c| c.get_block_acceptance_data(hash)).await
+    }
+
+    pub async fn async_get_block_utxo_diff(&self, hash: Hash) -> ConsensusResult<Arc<UtxoDiff>> {
+        self.clone().spawn_blocking(move |c| c.get_block_utxo_diff(hash)).await
     }
 
     /// Returns acceptance data for a set of blocks belonging to the selected parent chain.

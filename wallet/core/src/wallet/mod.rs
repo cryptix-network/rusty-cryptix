@@ -81,6 +81,11 @@ pub enum WalletBusMessage {
     Discovery { record: TransactionRecord },
 }
 
+#[derive(Clone)]
+struct NotificationRelay {
+    task_ctl: DuplexChannel,
+}
+
 pub struct Inner {
     active_accounts: ActiveAccountMap,
     legacy_accounts: ActiveAccountMap,
@@ -96,6 +101,8 @@ pub struct Inner {
     messenger_dedup_indexes: AsyncMutex<HashMap<String, crate::tx::MessengerDedupIndex>>,
     estimation_abortables: Mutex<HashMap<AccountId, Abortable>>,
     retained_contexts: Mutex<HashMap<String, Arc<Vec<u8>>>>,
+    notification_relays: Mutex<HashMap<u64, NotificationRelay>>,
+    next_notification_relay_id: AtomicU64,
     // Mutex used to protect concurrent access to accounts at the wallet api level
     guard: Arc<AsyncMutex<()>>,
     account_guard: Arc<AsyncMutex<()>>,
@@ -171,6 +178,8 @@ impl Wallet {
                 messenger_dedup_indexes: AsyncMutex::new(HashMap::new()),
                 estimation_abortables: Mutex::new(HashMap::new()),
                 retained_contexts: Mutex::new(HashMap::new()),
+                notification_relays: Mutex::new(HashMap::new()),
+                next_notification_relay_id: AtomicU64::new(1),
                 guard: Arc::new(AsyncMutex::new(())),
                 account_guard: Arc::new(AsyncMutex::new(())),
             }),
@@ -619,6 +628,10 @@ impl Wallet {
     // intended for stopping async management task
     pub async fn stop(&self) -> Result<()> {
         self.utxo_processor().stop().await?;
+        let relays = self.inner.notification_relays.lock().unwrap().drain().map(|(_, relay)| relay).collect::<Vec<_>>();
+        for relay in relays {
+            let _ = relay.task_ctl.signal(()).await;
+        }
         self.stop_task().await?;
         Ok(())
     }

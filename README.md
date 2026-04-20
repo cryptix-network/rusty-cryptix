@@ -32,6 +32,7 @@ Feedback and contributions are always welcome.
 | `--enable-unsynced-mining` | switch | `false` | Accept RPC block submits while unsynced (testing-oriented). |
 | `--enable-mainnet-mining` | switch | `true` (deprecated flag) | Backward-compatible flag; mainnet mining is enabled by default. |
 | `--utxoindex` | switch | `false` | Enable UTXO index. |
+| `--atomic-bootstrap-peer=<IP[:PORT]>` | address (repeatable) | empty | gRPC peer override used for Atomic snapshot bootstrap discovery/fetch. |
 | `--max-tracked-addresses=<N>` | integer | `0` | Preallocated max addresses for UTXO change tracking. |
 | `--testnet` | switch | `false` | Use testnet. |
 | `--netsuffix=<N>` | integer | none | Optional testnet suffix (for dedicated parallel testnet variants). |
@@ -281,6 +282,14 @@ The framework is compatible with all major desktop and mobile browsers.
   # or with UTXO-index enabled (needed when using wallets)
   cargo run --release --bin cryptixd -- --utxoindex
   ```
+  **Atomic bootstrap peer pinning (optional)**
+
+  ```bash
+  cargo run --release --bin cryptixd -- \
+    --atomic-bootstrap-peer=203.0.113.10:19201 \
+    --atomic-bootstrap-peer=203.0.113.11:19201
+  ```
+
   **Start a testnet node**
 
   ```bash
@@ -288,6 +297,7 @@ cargo run --release --bin cryptixd -- --testnet
   ```
 
   Optionally, `--netsuffix=<N>` can be used to run an isolated suffixed testnet id when needed.
+
 
 <details>
 

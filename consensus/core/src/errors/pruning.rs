@@ -51,6 +51,12 @@ pub enum PruningImportError {
     #[error("new pruning point transaction {0} is missing a UTXO entry")]
     NewPruningPointTxMissingUTXOEntry(Hash),
 
+    #[error("new pruning point `{0}` is missing persisted atomic consensus state")]
+    NewPruningPointMissingAtomicState(Hash),
+
+    #[error("failed reading atomic consensus state during pruning import: {0}")]
+    AtomicStateStoreError(String),
+
     #[error("the imported multiset hash was expected to be {0} and was actually {1}")]
     ImportedMultisetHashMismatch(Hash, Hash),
 

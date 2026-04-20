@@ -1,6 +1,6 @@
 use crate::{
     NotifyBlockAddedRequest, NotifyFinalityConflictRequest, NotifyNewBlockTemplateRequest, NotifyPruningPointUtxoSetOverrideRequest,
-    NotifySinkBlueScoreChangedRequest, NotifyUtxosChangedRequest, NotifyVirtualChainChangedRequest,
+    NotifySinkBlueScoreChangedRequest, NotifyTokenEventsRequest, NotifyUtxosChangedRequest, NotifyVirtualChainChangedRequest,
     NotifyVirtualDaaScoreChangedRequest,
 };
 use cryptix_notify::scope::*;
@@ -60,3 +60,15 @@ from!(SinkBlueScoreChanged);
 from!(VirtualDaaScoreChanged);
 from!(PruningPointUtxoSetOverride);
 from!(NewBlockTemplate);
+
+impl From<NotifyTokenEventsRequest> for TokenEventsChangedScope {
+    fn from(_: NotifyTokenEventsRequest) -> Self {
+        Self {}
+    }
+}
+
+impl From<NotifyTokenEventsRequest> for Scope {
+    fn from(item: NotifyTokenEventsRequest) -> Self {
+        TokenEventsChangedScope::from(item).into()
+    }
+}

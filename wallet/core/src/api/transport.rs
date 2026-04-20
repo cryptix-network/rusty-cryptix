@@ -54,14 +54,20 @@ impl WalletClient {
     }
 }
 
-use workflow_core::channel::{DuplexChannel, Receiver};
+use workflow_core::channel::{DuplexChannel, Sender};
 #[async_trait]
 impl WalletApi for WalletClient {
-    async fn register_notifications(self: Arc<Self>, _channel: Receiver<WalletNotification>) -> Result<u64> {
-        todo!()
+    async fn register_notifications(self: Arc<Self>, _channel: Sender<WalletNotification>) -> Result<u64> {
+        Err(Error::Custom(
+            "WalletClient::register_notifications is not supported over serialized transport; use WalletServer event handler or direct wallet API"
+                .to_string(),
+        ))
     }
     async fn unregister_notifications(self: Arc<Self>, _channel_id: u64) -> Result<()> {
-        todo!()
+        Err(Error::Custom(
+            "WalletClient::unregister_notifications is not supported over serialized transport; use WalletServer event handler or direct wallet API"
+                .to_string(),
+        ))
     }
 
     build_wallet_client_transport_interface! {[

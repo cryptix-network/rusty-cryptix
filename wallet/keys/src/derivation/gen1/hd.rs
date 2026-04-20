@@ -445,56 +445,55 @@ impl WalletDerivationManagerTrait for WalletDerivationManager {
 #[cfg(test)]
 mod tests {
     use super::{PubkeyDerivationManager, WalletDerivationManager, WalletDerivationManagerTrait};
-    use cryptix_addresses::Prefix;
+    use cryptix_addresses::{Address, Prefix};
 
     fn gen1_receive_addresses() -> Vec<&'static str> {
         vec![
-            "cryptix:qz7ulu4c25dh7fzec9zjyrmlhnkzrg4wmf89q7gzr3gfrsj3uz6xjellj43pf",
-            "cryptix:qzn3qjzf2nzyd3zj303nk4sgv0aae42v3ufutk5xsxckfels57dxjjed4qvlx",
-            "cryptix:qpakxqlesqywgkq7rg4wyhjd93kmw7trkl3gpa3vd5flyt59a43yyjp28qsku",
-            "cryptix:qz0skffpert8cav6h2c9nfndmhzzfhvkrjexclmwgjjwt0sutysnw6lp55ak0",
-            "cryptix:qrmzemw6sm67svltul0qsk3974ema4auhrja3k68f4sfhxe4mxjwx0cj353df",
-            "cryptix:qpe4apax5dquy600py9rprmukhq8fqyqv9qu072twkvgse0glhqa74ynxmvfr",
-            "cryptix:qrptdge6ykdq672xqjd4rv2cedwdcz030jngsr2xhaxrn5l8pfhc294x9c7x6",
-            "cryptix:qqnys5nyennjkvyl77vwneq5j2vmjss57zerd88ptzaeqhm998smxw28uth8l",
-            "cryptix:qztckuvk02885rdazvj9w079qujg5qpxcdnmsvxqx0q8z7l483prkszjqwwff",
-            "cryptix:qrp53krck4m0x6n0dxs7vzf5mg0x6we8e06xjpmu8xr8p4du6f89khqdzw6uw",
-            "cryptix:qr4l3mahqe0jeeu6c474q5tywz08mudhddgtdneeq46unv0qx0j77kdtr52uu",
-            "cryptix:qzatdsueklx7pkfzanh9u0pwr47sd3a25gfm8wypsevdejhhpj8ck3v74v54j",
-            "cryptix:qqk3g5l6ymdkjfmzezx4zrv9fhr5rh0d8tm07udkqxq79n6t60tzu3fa7lnqg",
-            "cryptix:qqasa6d590u6875hsese68fa9f8mnedzesn2udehp0s73ggt5cklw2ge393eq",
-            "cryptix:qpuzq5jc757uxue9fradme33jd6egxr9fdznd8qysqcc5xy8k7alqpjgpdgrn",
-            "cryptix:qqygznwmkl56vprrnvyvnta9qql43yv52m3qz2462vxskn32axl0xccnpsqx9",
-            "cryptix:qqk974yml6uuustenwu57hn8n7d202luvn4dum0txvzjgg60g2jzsknngheak",
-            "cryptix:qpxqat995cxnjla8nm0dwnneesqnk5enc6hqrua7jztels0eqjg8vsm032lww",
-            "cryptix:qpyzkjs2a6k8ljx2qt4pwscj6jccr6k7pmru9k7r2t25teajjuzaz7zkesu0e",
-            "cryptix:qzf5mxtvk8wgp8gr3dcj3dkzdu6w4dgpvp2f0gm9pepv9vazxrhy577fy87rt",
-            "cryptix:qz44rhjkrddak9vf5z4swlmenxtfhmqc47d0lyf0j7ednyjln0u824ue33gvr",
+            "cryptix:qz7ulu4c25dh7fzec9zjyrmlhnkzrg4wmf89q7gzr3gfrsj3uz6xjuey0pw9d",
+            "cryptix:qzn3qjzf2nzyd3zj303nk4sgv0aae42v3ufutk5xsxckfels57dxjhlkg5nmz",
+            "cryptix:qpakxqlesqywgkq7rg4wyhjd93kmw7trkl3gpa3vd5flyt59a43yyh83650jc",
+            "cryptix:qz0skffpert8cav6h2c9nfndmhzzfhvkrjexclmwgjjwt0sutysnwle6fqzjt",
+            "cryptix:qrmzemw6sm67svltul0qsk3974ema4auhrja3k68f4sfhxe4mxjwx27fvqwfd",
+            "cryptix:qpe4apax5dquy600py9rprmukhq8fqyqv9qu072twkvgse0glhqa7szgm0nd8",
+            "cryptix:qrptdge6ykdq672xqjd4rv2cedwdcz030jngsr2xhaxrn5l8pfhc2qnacvpz7",
+            "cryptix:qqnys5nyennjkvyl77vwneq5j2vmjss57zerd88ptzaeqhm998smxtvuplgrm",
+            "cryptix:qztckuvk02885rdazvj9w079qujg5qpxcdnmsvxqx0q8z7l483prk4yfa63dd",
+            "cryptix:qrp53krck4m0x6n0dxs7vzf5mg0x6we8e06xjpmu8xr8p4du6f89kjxkl69c2",
+            "cryptix:qr4l3mahqe0jeeu6c474q5tywz08mudhddgtdneeq46unv0qx0j77nts7q4cc",
+            "cryptix:qzatdsueklx7pkfzanh9u0pwr47sd3a25gfm8wypsevdejhhpj8ck529gct3k",
+            "cryptix:qqk3g5l6ymdkjfmzezx4zrv9fhr5rh0d8tm07udkqxq79n6t60tzu50xrtvyv",
+            "cryptix:qqasa6d590u6875hsese68fa9f8mnedzesn2udehp0s73ggt5cklw0wzv3way",
+            "cryptix:qpuzq5jc757uxue9fradme33jd6egxr9fdznd8qysqcc5xy8k7alqy5nueh8h",
+            "cryptix:qqygznwmkl56vprrnvyvnta9qql43yv52m3qz2462vxskn32axl0xa7guylzp",
+            "cryptix:qqk974yml6uuustenwu57hn8n7d202luvn4dum0txvzjgg60g2jzsn4g4rxej",
+            "cryptix:qpxqat995cxnjla8nm0dwnneesqnk5enc6hqrua7jztels0eqjg8v4a5v7q22",
+            "cryptix:qpyzkjs2a6k8ljx2qt4pwscj6jccr6k7pmru9k7r2t25teajjuzazmydyyrta",
+            "cryptix:qzf5mxtvk8wgp8gr3dcj3dkzdu6w4dgpvp2f0gm9pepv9vazxrhy5mcjenp80",
         ]
     }
 
     fn gen1_change_addresses() -> Vec<&'static str> {
         vec![
-            "cryptix:qrqrnyzdwh9ec2q05guzy3vv33f86nvdyw52qwlmk0mewzx3dgdss3pmcd692",
-            "cryptix:qqx8jlz0hh0wun5ru4glt9za3v8wj3jn7v3w55a0lyud74ppetqfqny4yhw87",
-            "cryptix:qzpa69mrh2nj6xk6gq38vcnzu64necp0jwaxxyusr9xcy5udhu2m7uvql8rnd",
-            "cryptix:qqxddf76hr39dc7k7lpdzg065ajtvrhlm5p3edm4gyen0waneryss2c0la85t",
-            "cryptix:qps4qh9dtskwvf923yl9utl74r8sdm9h2wv3mftuxcfc2cshwswc6txj0k2kl",
-            "cryptix:qrds58d6nw9uz7z93ds4l6x9cgw3rquqzr69dtch6n4d8fxum8c65f7nqmhzx",
-            "cryptix:qrajjrpj0krqkww7rymwuwzcd36grjr6688ynvna649q26zukhcq6eqf4jmnx",
-            "cryptix:qrumkgz7hlsa748tnzvpztmf6wu9zsgqh6rppw4gzw2mvyq4ccj0y3ms9ju5l",
-            "cryptix:qz2g3cj3jcklk4w95djwnm9dffcwg75aqct2pefsxujrldgs08wac99rz70rc",
-            "cryptix:qznmzsvk0srfkur8l9pf55st0hnh3x8tmdyskjl9570w99lxsgs7cwrhxap2r",
-            "cryptix:qptamza95k7tchmukulldps4kl6wk853dnwa52t4azzm76h588qjufmnu3rn7",
-            "cryptix:qqt9h5cjqu9an68cn9k9jc2ywqmqu6kswjzeu09tqulswxkuccaxg6wz45f5r",
-            "cryptix:qphr6uy46ad3ca7rerzkx7kkzfzsvfe0xanh4u5mrh538cexs4yjkww0pa4dh",
-            "cryptix:qzv3qlh5q4fpy6eu5s4wj080l64del4lvg986z5uh0c3g7wf6n8pvsgm3c9e0",
-            "cryptix:qp2dd6y4szgyhcendh7ncxws0qvx8k3s92tg7lvy8eel5npg4pd2ks0ctx4hl",
-            "cryptix:qpkqvnkler4rwlpt720unepf3q8cayv0shx0vzydrae7a6u7ryy8zdvnmncyc",
-            "cryptix:qr4v33jupxv9h6juqads0znrnw6g7an2ajuzusthnjqujquz66rewtjekhz4l",
-            "cryptix:qz5pq2yzpz8ce5avrsa4uzzwrlr5a86rvs74afd6qdm3h649v08nk0qxhrl9n",
-            "cryptix:qrajmn035raezl6rcvd0wvnfmdnc0qzwr686ccsrn3z5x8aqnpt8qa0e954jk",
-            "cryptix:qrqg7r05nk7syxjh8rdz8wanzmyh8sdts9uexxnnwkq8fplrjammvcnrdggw0",
+            "cryptix:qrqrnyzdwh9ec2q05guzy3vv33f86nvdyw52qwlmk0mewzx3dgdss58q9e9pw",
+            "cryptix:qqx8jlz0hh0wun5ru4glt9za3v8wj3jn7v3w55a0lyud74ppetqfqkzwer3r6",
+            "cryptix:qzpa69mrh2nj6xk6gq38vcnzu64necp0jwaxxyusr9xcy5udhu2m7e2mznuhf",
+            "cryptix:qqxddf76hr39dc7k7lpdzg065ajtvrhlm5p3edm4gyen0waneryss075zfcs0",
+            "cryptix:qps4qh9dtskwvf923yl9utl74r8sdm9h2wv3mftuxcfc2cshwswc6wqfjz4jm",
+            "cryptix:qrds58d6nw9uz7z93ds4l6x9cgw3rquqzr69dtch6n4d8fxum8c65vcga0gxz",
+            "cryptix:qrajjrpj0krqkww7rymwuwzcd36grjr6688ynvna649q26zukhcq6uxjgxyhz",
+            "cryptix:qrumkgz7hlsa748tnzvpztmf6wu9zsgqh6rppw4gzw2mvyq4ccj0y5atcxrsm",
+            "cryptix:qz2g3cj3jcklk4w95djwnm9dffcwg75aqct2pefsxujrldgs08wacqrcl2s8u",
+            "cryptix:qznmzsvk0srfkur8l9pf55st0hnh3x8tmdyskjl9570w99lxsgs7ct9vmf7w8",
+            "cryptix:qptamza95k7tchmukulldps4kl6wk853dnwa52t4azzm76h588qjuvagp9uh6",
+            "cryptix:qqt9h5cjqu9an68cn9k9jc2ywqmqu6kswjzeu09tqulswxkuccaxglgegqks8",
+            "cryptix:qphr6uy46ad3ca7rerzkx7kkzfzsvfe0xanh4u5mrh538cexs4yjktg5uf2fn",
+            "cryptix:qzv3qlh5q4fpy6eu5s4wj080l64del4lvg986z5uh0c3g7wf6n8pv4wqvv6at",
+            "cryptix:qp2dd6y4szgyhcendh7ncxws0qvx8k3s92tg7lvy8eel5npg4pd2k4frkj2nm",
+            "cryptix:qpkqvnkler4rwlpt720unepf3q8cayv0shx0vzydrae7a6u7ryy8zg2gx88qu",
+            "cryptix:qr4v33jupxv9h6juqads0znrnw6g7an2ajuzusthnjqujquz66reww5ztra3m",
+            "cryptix:qz5pq2yzpz8ce5avrsa4uzzwrlr5a86rvs74afd6qdm3h649v08nk2xa2hqph",
+            "cryptix:qrajmn035raezl6rcvd0wvnfmdnc0qzwr686ccsrn3z5x8aqnpt8qcfzcq2kj",
+            "cryptix:qrqg7r05nk7syxjh8rdz8wanzmyh8sdts9uexxnnwkq8fplrjammva4csuh2t",
         ]
     }
 
@@ -565,7 +564,7 @@ mod tests {
 
         let key = wallet.derive_receive_pubkey(1).unwrap();
         let address = PubkeyDerivationManager::create_address(&key, Prefix::Testnet, false).unwrap().to_string();
-        assert_eq!(address, "cryptixtest:qrc2959g0pqda53glnfd238cdnmk24zxzkj8n5x83rkktx4h73dkc4ave6wyg")
+        assert_eq!(address, "cryptixtest:qrc2959g0pqda53glnfd238cdnmk24zxzkj8n5x83rkktx4h73dkc0t5twsz4")
     }
 
     #[tokio::test]
@@ -599,28 +598,13 @@ mod tests {
 
     #[tokio::test]
     async fn generate_cryptixtest_addresses() {
-        let receive_addresses = [
-            "cryptixtest:qz7ulu4c25dh7fzec9zjyrmlhnkzrg4wmf89q7gzr3gfrsj3uz6xjceef60sd",
-            "cryptixtest:qzn3qjzf2nzyd3zj303nk4sgv0aae42v3ufutk5xsxckfels57dxjnltw0jwz",
-            "cryptixtest:qpakxqlesqywgkq7rg4wyhjd93kmw7trkl3gpa3vd5flyt59a43yyn8vu0w8c",
-            "cryptixtest:qz0skffpert8cav6h2c9nfndmhzzfhvkrjexclmwgjjwt0sutysnwme80mr8t",
-            "cryptixtest:qrmzemw6sm67svltul0qsk3974ema4auhrja3k68f4sfhxe4mxjwxw752m0ud",
-            "cryptixtest:qpe4apax5dquy600py9rprmukhq8fqyqv9qu072twkvgse0glhqa75z4a5jc8",
-            "cryptixtest:qrptdge6ykdq672xqjd4rv2cedwdcz030jngsr2xhaxrn5l8pfhc2ynq7hqh7",
-            "cryptixtest:qqnys5nyennjkvyl77vwneq5j2vmjss57zerd88ptzaeqhm998smx0vp8yfkm",
-            "cryptixtest:qztckuvk02885rdazvj9w079qujg5qpxcdnmsvxqx0q8z7l483prk3y5mpscd",
-            "cryptixtest:qrp53krck4m0x6n0dxs7vzf5mg0x6we8e06xjpmu8xr8p4du6f89kkxtepyd2",
-            "cryptixtest:qr4l3mahqe0jeeu6c474q5tywz08mudhddgtdneeq46unv0qx0j77htdcm5dc",
-            "cryptixtest:qzatdsueklx7pkfzanh9u0pwr47sd3a25gfm8wypsevdejhhpj8cks2cwr2yk",
-            "cryptixtest:qqk3g5l6ymdkjfmzezx4zrv9fhr5rh0d8tm07udkqxq79n6t60tzus0m9sd3v",
-            "cryptixtest:qqasa6d590u6875hsese68fa9f8mnedzesn2udehp0s73ggt5cklwtwl220gy",
-            "cryptixtest:qpuzq5jc757uxue9fradme33jd6egxr9fdznd8qysqcc5xy8k7alqq5w6zkjh",
-            "cryptixtest:qqygznwmkl56vprrnvyvnta9qql43yv52m3qz2462vxskn32axl0xe746l7hp",
-            "cryptixtest:qqk974yml6uuustenwu57hn8n7d202luvn4dum0txvzjgg60g2jzsh44nc8vj",
-            "cryptixtest:qpxqat995cxnjla8nm0dwnneesqnk5enc6hqrua7jztels0eqjg8v3af29pl2",
-            "cryptixtest:qpyzkjs2a6k8ljx2qt4pwscj6jccr6k7pmru9k7r2t25teajjuzazlyszlz7a",
-            "cryptixtest:qzf5mxtvk8wgp8gr3dcj3dkzdu6w4dgpvp2f0gm9pepv9vazxrhy5lc0lgqj0",
-        ];
+        let receive_addresses = gen1_receive_addresses()
+            .iter()
+            .map(|address| {
+                let mainnet: Address = (*address).try_into().unwrap();
+                Address::new(Prefix::Testnet, mainnet.version, mainnet.payload.as_slice()).to_string()
+            })
+            .collect::<Vec<String>>();
 
         let master_xprv =
             "kprv5y2qurMHCsXYrNfU3GCihuwG3vMqFji7PZXajMEqyBkNh9UZUJgoHYBLTKu1eM4MvUtomcXPQ3Sw9HZ5ebbM4byoUciHo1zrPJBQfqpLorQ";

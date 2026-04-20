@@ -92,4 +92,9 @@ impl TransactionValidator {
             payload_max_len_consensus: usize::MAX,
         }
     }
+
+    #[inline]
+    pub(crate) fn is_payload_hf_active(&self, pov_daa_score: u64) -> bool {
+        pov_daa_score >= self.payload_hf_activation_daa_score
+    }
 }

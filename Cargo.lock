@@ -1151,6 +1151,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "cryptix-atomicindex"
+version = "0.16.0"
+dependencies = [
+ "async-channel 2.3.1",
+ "bincode",
+ "blake2b_simd",
+ "borsh",
+ "cryptix-consensus-core",
+ "cryptix-consensus-notify",
+ "cryptix-consensusmanager",
+ "cryptix-core",
+ "cryptix-notify",
+ "cryptix-txscript",
+ "cryptix-utils",
+ "hex",
+ "log",
+ "secp256k1",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "cryptix-bip32"
 version = "0.16.0"
 dependencies = [
@@ -1253,6 +1276,7 @@ dependencies = [
  "arc-swap",
  "async-channel 2.3.1",
  "bincode",
+ "blake2b_simd",
  "criterion",
  "crossbeam-channel",
  "cryptix-consensus-core",
@@ -1932,7 +1956,9 @@ name = "cryptix-rpc-service"
 version = "0.16.0"
 dependencies = [
  "async-trait",
+ "blake2b_simd",
  "cryptix-addresses",
+ "cryptix-atomicindex",
  "cryptix-consensus-core",
  "cryptix-consensus-notify",
  "cryptix-consensusmanager",
@@ -1963,6 +1989,7 @@ dependencies = [
  "async-channel 2.3.1",
  "async-trait",
  "bincode",
+ "blake2b_simd",
  "chrono",
  "clap 4.5.34",
  "criterion",
@@ -2489,23 +2516,28 @@ name = "cryptixd"
 version = "0.16.0"
 dependencies = [
  "async-channel 2.3.1",
+ "blake2b_simd",
+ "borsh",
  "cfg-if 1.0.0",
  "clap 4.5.34",
  "cryptix-addresses",
  "cryptix-addressmanager",
  "cryptix-alloc",
+ "cryptix-atomicindex",
  "cryptix-consensus",
  "cryptix-consensus-core",
  "cryptix-consensus-notify",
  "cryptix-consensusmanager",
  "cryptix-core",
  "cryptix-database",
+ "cryptix-grpc-client",
  "cryptix-grpc-server",
  "cryptix-hashes",
  "cryptix-index-processor",
  "cryptix-mining",
  "cryptix-notify",
  "cryptix-p2p-flows",
+ "cryptix-p2p-lib",
  "cryptix-perf-monitor",
  "cryptix-rpc-core",
  "cryptix-rpc-service",
@@ -2517,10 +2549,12 @@ dependencies = [
  "dhat",
  "dirs",
  "futures-util",
+ "hex",
  "log",
  "num_cpus",
  "rand 0.8.5",
  "rayon",
+ "secp256k1",
  "serde",
  "serde_with",
  "tempfile",

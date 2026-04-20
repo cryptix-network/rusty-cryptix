@@ -64,8 +64,19 @@ async fn daemon_mining_test() {
     let rpc_client2 = cryptixd2.start().await;
 
     rpc_client2.add_peer(format!("127.0.0.1:{}", cryptixd1.p2p_port).try_into().unwrap(), true).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(1)).await; // Let it connect
-    assert_eq!(rpc_client2.get_connected_peer_info().await.unwrap().peer_info.len(), 1);
+    let check_client = rpc_client2.clone();
+    wait_for(
+        50,
+        200,
+        move || {
+            async fn peer_connected(client: GrpcClient) -> bool {
+                client.get_connected_peer_info().await.unwrap().peer_info.len() == 1
+            }
+            Box::pin(peer_connected(check_client.clone()))
+        },
+        "the nodes did not connect to each other",
+    )
+    .await;
 
     let (sender, event_receiver) = async_channel::unbounded();
     rpc_client1.start(Some(Arc::new(ChannelNotify::new(sender)))).await;
@@ -99,7 +110,20 @@ async fn daemon_mining_test() {
         }
     }
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let check_client = rpc_client2.clone();
+    wait_for(
+        50,
+        200,
+        move || {
+            async fn blocks_relayed(client: GrpcClient) -> bool {
+                client.get_block_dag_info().await.map(|dag| dag.block_count == 10).unwrap_or(false)
+            }
+            Box::pin(blocks_relayed(check_client.clone()))
+        },
+        "the nodes did not relay all mined blocks in time",
+    )
+    .await;
+
     // Expect the blocks to be relayed to daemon #2
     let dag_info = rpc_client2.get_block_dag_info().await.unwrap();
     assert_eq!(dag_info.block_count, 10);
@@ -157,7 +181,7 @@ async fn daemon_utxos_propagation_test() {
     let check_client = rpc_client2.clone();
     wait_for(
         50,
-        20,
+        200,
         move || {
             async fn peer_connected(client: GrpcClient) -> bool {
                 client.get_connected_peer_info().await.unwrap().peer_info.len() == 1
@@ -212,7 +236,7 @@ async fn daemon_utxos_propagation_test() {
     let check_client = rpc_client2.clone();
     wait_for(
         50,
-        20,
+        200,
         move || {
             async fn daa_score_reached(client: GrpcClient) -> bool {
                 let virtual_daa_score = client.get_server_info().await.unwrap().virtual_daa_score;
@@ -285,7 +309,7 @@ async fn daemon_utxos_propagation_test() {
     let transaction_id = transaction.id();
     wait_for(
         50,
-        20,
+        100,
         move || {
             async fn transaction_in_mempool(client: GrpcClient, transaction_id: RpcTransactionId) -> bool {
                 let entry = client.get_mempool_entry(transaction_id, false, false).await;

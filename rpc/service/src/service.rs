@@ -6,6 +6,13 @@ use crate::converter::{consensus::ConsensusConverter, index::IndexConverter, pro
 use crate::hfa::{FastIngressSource, HfaEngine, HfaRuntimeConfig};
 use crate::service::NetworkType::{Mainnet, Testnet};
 use async_trait::async_trait;
+use blake2b_simd::Params as Blake2bParams;
+use cryptix_addresses::Address;
+use cryptix_atomicindex::{
+    payload::{parse_atomic_token_payload, NoopReason, SupplyMode, TokenOp},
+    service::{AtomicTokenService, ScBootstrapSource, ScSnapshotChunk, ScSnapshotManifestSignature},
+    state::{AtomicTokenHealth, AtomicTokenReadView, AtomicTokenRuntimeState, ProcessedOp, TokenAsset, TokenEvent},
+};
 use cryptix_consensus_core::api::counters::ProcessingCounters;
 use cryptix_consensus_core::errors::block::RuleError;
 use cryptix_consensus_core::{
@@ -14,7 +21,7 @@ use cryptix_consensus_core::{
     config::Config,
     constants::MAX_SOMPI,
     network::NetworkType,
-    tx::{Transaction, COINBASE_TRANSACTION_INDEX},
+    tx::{ScriptPublicKey, Transaction, COINBASE_TRANSACTION_INDEX},
 };
 use cryptix_consensus_notify::{
     notifier::ConsensusNotifier,
@@ -47,7 +54,7 @@ use cryptix_notify::{
     connection::ChannelType,
     events::{EventSwitches, EventType, EVENT_TYPE_ARRAY},
     listener::ListenerId,
-    notifier::Notifier,
+    notifier::{Notifier, Notify},
     scope::Scope,
     subscriber::{Subscriber, SubscriptionManager},
 };
@@ -65,8 +72,9 @@ use cryptix_rpc_core::{
     notify::connection::ChannelConnection,
     Notification, RpcError, RpcResult,
 };
-use cryptix_txscript::{extract_script_pub_key_address, pay_to_address_script};
+use cryptix_txscript::{extract_script_pub_key_address, pay_to_address_script, script_class::ScriptClass};
 use cryptix_utils::expiring_cache::ExpiringCache;
+use cryptix_utils::hex::{FromHex, ToHex};
 use cryptix_utils::sysinfo::SystemInfo;
 use cryptix_utils::{channel::Channel, triggers::SingleTrigger};
 use cryptix_utils_tower::counters::TowerConnectionCounters;
@@ -107,6 +115,7 @@ pub struct RpcCoreService {
     mining_manager: MiningManagerProxy,
     flow_context: Arc<FlowContext>,
     utxoindex: Option<UtxoIndexProxy>,
+    atomic_token_service: Arc<AtomicTokenService>,
     config: Arc<Config>,
     consensus_converter: Arc<ConsensusConverter>,
     index_converter: Arc<IndexConverter>,
@@ -129,6 +138,15 @@ pub struct RpcCoreService {
 const RPC_CORE: &str = "rpc-core";
 const NORMAL_POLICY_REJECT_FAST_LOCK_CONFLICT: &str = "normal_policy_reject_fast_lock_conflict";
 const HFA_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
+const TOKEN_EVENTS_NOTIFY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const TOKEN_EVENTS_LIMIT_MAX: usize = 4096;
+const TOKEN_ASSETS_LIMIT_MAX: usize = 2048;
+const TOKEN_OWNER_BALANCES_LIMIT_MAX: usize = 4096;
+const TOKEN_HOLDERS_LIMIT_MAX: usize = 4096;
+const CAT_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
+const OWNER_AUTH_SCHEME_PUBKEY: u8 = 0;
+const OWNER_AUTH_SCHEME_PUBKEY_ECDSA: u8 = 1;
+const OWNER_AUTH_SCHEME_SCRIPT_HASH: u8 = 2;
 
 impl RpcCoreService {
     pub const IDENT: &'static str = "rpc-core-service";
@@ -166,6 +184,7 @@ impl RpcCoreService {
         flow_context: Arc<FlowContext>,
         subscription_context: SubscriptionContext,
         utxoindex: Option<UtxoIndexProxy>,
+        atomic_token_service: Arc<AtomicTokenService>,
         config: Arc<Config>,
         core: Arc<Core>,
         processing_counters: Arc<ProcessingCounters>,
@@ -242,6 +261,7 @@ impl RpcCoreService {
             mining_manager,
             flow_context,
             utxoindex,
+            atomic_token_service,
             config,
             consensus_converter,
             index_converter,
@@ -264,6 +284,43 @@ impl RpcCoreService {
 
     pub fn start_impl(&self) {
         self.notifier().start();
+
+        let token_shutdown_listener = self.shutdown.listener.clone();
+        let atomic_token_service = self.atomic_token_service.clone();
+        let notifier = self.notifier.clone();
+        tokio::spawn(async move {
+            let mut tick = interval(TOKEN_EVENTS_NOTIFY_POLL_INTERVAL);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            let shutdown = token_shutdown_listener;
+            tokio::pin!(shutdown);
+
+            let mut last_sequence = atomic_token_service.get_health().await.last_sequence;
+            loop {
+                select! {
+                    _ = &mut shutdown => break,
+                    _ = tick.tick() => {
+                        let current_sequence = atomic_token_service.get_health().await.last_sequence;
+                        if current_sequence > last_sequence {
+                            let from_sequence = last_sequence.saturating_add(1);
+                            let to_sequence = current_sequence;
+                            let delta = current_sequence.saturating_sub(last_sequence);
+                            let event_count = delta.min(u64::from(u32::MAX)) as u32;
+
+                            if let Err(err) = notifier.notify(Notification::TokenEventsChanged(TokenEventsChangedNotification {
+                                from_sequence,
+                                to_sequence,
+                                event_count,
+                            })) {
+                                warn!("failed broadcasting token-events-changed notification: {err}");
+                            }
+                        }
+                        last_sequence = current_sequence;
+                    }
+                }
+            }
+        });
+
         if !self.hfa_engine.is_enabled() {
             return;
         }
@@ -344,6 +401,291 @@ impl RpcCoreService {
     fn has_sufficient_peer_connectivity(&self) -> bool {
         // Other network types can be used in an isolated environment without peers
         !matches!(self.flow_context.config.net.network_type, Mainnet | Testnet) || self.flow_context.hub().has_peers()
+    }
+
+    fn atomic_service(&self) -> RpcResult<Arc<AtomicTokenService>> {
+        Ok(self.atomic_token_service.clone())
+    }
+
+    fn parse_hex_32(value: &str, field: &str) -> RpcResult<[u8; 32]> {
+        <[u8; 32]>::from_hex(value).map_err(|err| RpcError::General(format!("invalid `{field}` hex: {err}")))
+    }
+
+    fn token_state_unavailable_error(runtime_state: AtomicTokenRuntimeState) -> RpcError {
+        match runtime_state {
+            AtomicTokenRuntimeState::NotReady => RpcError::AtomicStateNotReady,
+            AtomicTokenRuntimeState::Recovering => RpcError::AtomicStateRecovering,
+            AtomicTokenRuntimeState::Degraded => RpcError::AtomicStateDegraded,
+            AtomicTokenRuntimeState::Healthy => RpcError::General("invalid token runtime state guard".to_string()),
+        }
+    }
+
+    fn ensure_token_read_ready(view: &AtomicTokenReadView) -> RpcResult<()> {
+        match view.runtime_state {
+            AtomicTokenRuntimeState::Healthy => Ok(()),
+            other => Err(Self::token_state_unavailable_error(other)),
+        }
+    }
+
+    fn ensure_token_simulation_ready(view: &AtomicTokenReadView) -> RpcResult<()> {
+        Self::ensure_token_read_ready(view)
+    }
+
+    async fn atomic_context(&self, view: &AtomicTokenReadView) -> RpcResult<RpcTokenContext> {
+        let consensus = self.consensus_manager.consensus();
+        let session = consensus.session().await;
+        let at_block_hash = view.at_block_hash;
+        let at_daa_score = session
+            .async_get_header(at_block_hash)
+            .await
+            .map_err(|err| RpcError::General(format!("failed reading token context header: {err}")))?
+            .daa_score;
+        Ok(RpcTokenContext {
+            at_block_hash,
+            at_daa_score,
+            state_hash: view.state_hash.as_slice().to_hex(),
+            is_degraded: view.is_degraded,
+        })
+    }
+
+    fn map_token_asset(asset: TokenAsset) -> RpcTokenAsset {
+        let safe_name = Self::sanitize_token_display_text(&asset.name);
+        let safe_symbol = Self::sanitize_token_display_text(&asset.symbol);
+        RpcTokenAsset {
+            asset_id: asset.asset_id.as_slice().to_hex(),
+            creator_owner_id: asset.creator_owner_id.as_slice().to_hex(),
+            mint_authority_owner_id: asset.mint_authority_owner_id.as_slice().to_hex(),
+            decimals: asset.decimals as u32,
+            supply_mode: asset.supply_mode as u32,
+            max_supply: asset.max_supply.to_string(),
+            total_supply: asset.total_supply.to_string(),
+            name: safe_name,
+            symbol: safe_symbol,
+            metadata_hex: asset.metadata.to_hex(),
+            created_block_hash: asset.created_block_hash,
+            created_daa_score: asset.created_daa_score,
+            created_at: asset.created_at,
+        }
+    }
+
+    fn map_token_event(event: TokenEvent) -> RpcTokenEvent {
+        RpcTokenEvent {
+            event_id: event.event_id.as_slice().to_hex(),
+            sequence: event.sequence,
+            accepting_block_hash: event.accepting_block_hash,
+            txid: event.txid,
+            event_type: event.event_type as u32,
+            apply_status: event.apply_status as u32,
+            noop_reason: event.noop_reason as u32,
+            ordinal: event.ordinal,
+            reorg_of_event_id: event.reorg_of_event_id.map(|id| id.as_slice().to_hex()),
+            op_type: event.details.op_type.map(|op| op as u32),
+            asset_id: event.details.asset_id.map(|id| id.as_slice().to_hex()),
+            from_owner_id: event.details.from_owner_id.map(|id| id.as_slice().to_hex()),
+            to_owner_id: event.details.to_owner_id.map(|id| id.as_slice().to_hex()),
+            amount: event.details.amount.map(|amount| amount.to_string()),
+        }
+    }
+
+    fn map_token_owner_balance(entry: ([u8; 32], u128, Option<TokenAsset>)) -> RpcTokenOwnerBalance {
+        RpcTokenOwnerBalance {
+            asset_id: entry.0.as_slice().to_hex(),
+            balance: entry.1.to_string(),
+            asset: entry.2.map(Self::map_token_asset),
+        }
+    }
+
+    fn map_token_holder(entry: ([u8; 32], u128)) -> RpcTokenHolder {
+        RpcTokenHolder { owner_id: entry.0.as_slice().to_hex(), balance: entry.1.to_string() }
+    }
+
+    fn token_asset_matches_query(asset: &TokenAsset, query: &str) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+
+        let q = query.to_ascii_lowercase();
+        let symbol = Self::sanitize_token_display_text(&asset.symbol).to_ascii_lowercase();
+        let name = Self::sanitize_token_display_text(&asset.name).to_ascii_lowercase();
+        let asset_id = asset.asset_id.as_slice().to_hex();
+        symbol.contains(&q) || name.contains(&q) || asset_id.starts_with(&q)
+    }
+
+    fn sanitize_token_display_text(bytes: &[u8]) -> String {
+        let decoded = String::from_utf8_lossy(bytes);
+        let mut out = String::with_capacity(decoded.len());
+
+        for ch in decoded.chars() {
+            if ch.is_control()
+                || matches!(
+                    ch,
+                    '\u{202A}' | '\u{202B}' | '\u{202C}' | '\u{202D}' | '\u{202E}' | '\u{2066}' | '\u{2067}' | '\u{2068}' | '\u{2069}'
+                )
+                || ch == '<'
+                || ch == '>'
+            {
+                out.push(' ');
+            } else {
+                out.push(ch);
+            }
+        }
+
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn owner_id_from_script(script_public_key: &ScriptPublicKey) -> Option<[u8; 32]> {
+        let script_bytes = script_public_key.script();
+        let (auth_scheme, canonical_pubkey_bytes) = match ScriptClass::from_script(script_public_key) {
+            ScriptClass::PubKey if script_bytes.len() == 34 => (OWNER_AUTH_SCHEME_PUBKEY, &script_bytes[1..33]),
+            ScriptClass::PubKeyECDSA if script_bytes.len() == 35 => (OWNER_AUTH_SCHEME_PUBKEY_ECDSA, &script_bytes[1..34]),
+            ScriptClass::ScriptHash if script_bytes.len() == 34 => (OWNER_AUTH_SCHEME_SCRIPT_HASH, &script_bytes[2..34]),
+            _ => return None,
+        };
+        let pubkey_len = u16::try_from(canonical_pubkey_bytes.len()).ok()?;
+        let mut hasher = Blake2bParams::new().hash_length(32).to_state();
+        hasher.update(CAT_OWNER_DOMAIN);
+        hasher.update(&[auth_scheme]);
+        hasher.update(&pubkey_len.to_le_bytes());
+        hasher.update(canonical_pubkey_bytes);
+        let digest = hasher.finalize();
+        let mut owner_id = [0u8; 32];
+        owner_id.copy_from_slice(digest.as_bytes());
+        Some(owner_id)
+    }
+
+    fn map_sc_bootstrap_source(source: ScBootstrapSource) -> RpcScBootstrapSource {
+        RpcScBootstrapSource {
+            snapshot_id: source.snapshot_id,
+            protocol_version: source.protocol_version as u32,
+            network_id: source.network_id,
+            node_identity: source.node_identity.as_slice().to_hex(),
+            at_block_hash: source.at_block_hash,
+            at_daa_score: source.at_daa_score,
+            state_hash_at_fp: source.state_hash_at_fp.as_slice().to_hex(),
+            window_start_block_hash: source.window_start_block_hash,
+            window_end_block_hash: source.window_end_block_hash,
+        }
+    }
+
+    fn map_sc_chunk(chunk: ScSnapshotChunk) -> GetScSnapshotChunkResponse {
+        GetScSnapshotChunkResponse {
+            snapshot_id: chunk.snapshot_id,
+            chunk_index: chunk.chunk_index,
+            total_chunks: chunk.total_chunks,
+            file_size: chunk.file_size,
+            chunk_hex: chunk.chunk_data.to_hex(),
+        }
+    }
+
+    fn map_sc_manifest_signature(signature: ScSnapshotManifestSignature) -> RpcScManifestSignature {
+        RpcScManifestSignature {
+            signer_pubkey_hex: signature.signer_pubkey.as_slice().to_hex(),
+            signature_hex: signature.signature.as_slice().to_hex(),
+        }
+    }
+
+    fn map_processed_op(op: ProcessedOp, context: RpcTokenContext) -> GetTokenOpStatusResponse {
+        GetTokenOpStatusResponse {
+            accepting_block_hash: Some(op.accepting_block_hash),
+            apply_status: Some(op.apply_status as u32),
+            noop_reason: Some(op.noop_reason as u32),
+            context,
+        }
+    }
+
+    fn map_health_response(health: AtomicTokenHealth, context: RpcTokenContext) -> GetTokenHealthResponse {
+        GetTokenHealthResponse {
+            is_degraded: health.is_degraded,
+            bootstrap_in_progress: health.bootstrap_in_progress,
+            live_correct: health.live_correct,
+            token_state: health.runtime_state.as_str().to_string(),
+            last_applied_block: health.last_applied_block,
+            last_sequence: health.last_sequence,
+            state_hash: health.current_state_hash.as_slice().to_hex(),
+            context,
+        }
+    }
+
+    fn simulate_token_noop_reason(
+        &self,
+        view: &AtomicTokenReadView,
+        owner_id: [u8; 32],
+        parsed: &cryptix_atomicindex::payload::ParsedTokenPayload,
+    ) -> Option<NoopReason> {
+        let expected_next_nonce = view.nonces.get(&owner_id).copied().unwrap_or(1);
+        if parsed.header.nonce != expected_next_nonce {
+            return Some(NoopReason::BadNonce);
+        }
+
+        match &parsed.op {
+            TokenOp::CreateAsset(op) => match op.supply_mode {
+                SupplyMode::Capped if op.max_supply == 0 => Some(NoopReason::BadMaxSupply),
+                SupplyMode::Uncapped if op.max_supply != 0 => Some(NoopReason::BadMaxSupply),
+                _ => None,
+            },
+            TokenOp::Transfer(op) => {
+                if !view.assets.contains_key(&op.asset_id) {
+                    return Some(NoopReason::AssetNotFound);
+                }
+                let sender_balance = view
+                    .balances
+                    .get(&cryptix_atomicindex::state::BalanceKey { asset_id: op.asset_id, owner_id })
+                    .copied()
+                    .unwrap_or(0);
+                if sender_balance < op.amount {
+                    return Some(NoopReason::InsufficientBalance);
+                }
+                let receiver_balance = view
+                    .balances
+                    .get(&cryptix_atomicindex::state::BalanceKey { asset_id: op.asset_id, owner_id: op.to_owner_id })
+                    .copied()
+                    .unwrap_or(0);
+                if receiver_balance.checked_add(op.amount).is_none() {
+                    return Some(NoopReason::BalanceOverflow);
+                }
+                None
+            }
+            TokenOp::Mint(op) => {
+                let Some(asset) = view.assets.get(&op.asset_id) else {
+                    return Some(NoopReason::AssetNotFound);
+                };
+                if asset.mint_authority_owner_id != owner_id {
+                    return Some(NoopReason::UnauthorizedMint);
+                }
+                let Some(new_total_supply) = asset.total_supply.checked_add(op.amount) else {
+                    return Some(NoopReason::SupplyOverflow);
+                };
+                if matches!(asset.supply_mode, SupplyMode::Capped) && new_total_supply > asset.max_supply {
+                    return Some(NoopReason::SupplyCapExceeded);
+                }
+                let receiver_balance = view
+                    .balances
+                    .get(&cryptix_atomicindex::state::BalanceKey { asset_id: op.asset_id, owner_id: op.to_owner_id })
+                    .copied()
+                    .unwrap_or(0);
+                if receiver_balance.checked_add(op.amount).is_none() {
+                    return Some(NoopReason::BalanceOverflow);
+                }
+                None
+            }
+            TokenOp::Burn(op) => {
+                let Some(asset) = view.assets.get(&op.asset_id) else {
+                    return Some(NoopReason::AssetNotFound);
+                };
+                let sender_balance = view
+                    .balances
+                    .get(&cryptix_atomicindex::state::BalanceKey { asset_id: op.asset_id, owner_id })
+                    .copied()
+                    .unwrap_or(0);
+                if sender_balance < op.amount {
+                    return Some(NoopReason::InsufficientBalance);
+                }
+                if asset.total_supply < op.amount {
+                    return Some(NoopReason::SupplyUnderflow);
+                }
+                None
+            }
+        }
     }
 
     fn extract_tx_query(&self, filter_transaction_pool: bool, include_orphan_pool: bool) -> RpcResult<TransactionQuery> {
@@ -1459,6 +1801,406 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             window_size: snapshot.window_size,
             entries,
         })
+    }
+
+    async fn simulate_token_op_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: SimulateTokenOpRequest,
+    ) -> RpcResult<SimulateTokenOpResponse> {
+        let SimulateTokenOpRequest { payload_hex, owner_id, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_simulation_ready(&view)?;
+        let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
+        let payload = Vec::<u8>::from_hex(&payload_hex).map_err(|err| RpcError::General(format!("invalid `payloadHex`: {err}")))?;
+        let expected_next_nonce = view.nonces.get(&owner_id).copied().unwrap_or(1);
+
+        let (result, noop_reason) = match parse_atomic_token_payload(&payload) {
+            None => ("ignored".to_string(), None),
+            Some(Err(noop_reason)) => ("noop".to_string(), Some(noop_reason as u32)),
+            Some(Ok(parsed)) => {
+                let noop_reason = self.simulate_token_noop_reason(&view, owner_id, &parsed).map(|reason| reason as u32);
+                if noop_reason.is_some() {
+                    ("noop".to_string(), noop_reason)
+                } else {
+                    ("state_only".to_string(), None)
+                }
+            }
+        };
+
+        let context = self.atomic_context(&view).await?;
+        Ok(SimulateTokenOpResponse { result, noop_reason, expected_next_nonce, context })
+    }
+
+    async fn get_token_balance_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenBalanceRequest,
+    ) -> RpcResult<GetTokenBalanceResponse> {
+        let GetTokenBalanceRequest { asset_id, owner_id, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
+        let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
+        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_read_ready(&view)?;
+        let balance =
+            view.balances.get(&cryptix_atomicindex::state::BalanceKey { asset_id, owner_id }).copied().unwrap_or(0).to_string();
+        let context = self.atomic_context(&view).await?;
+        Ok(GetTokenBalanceResponse { balance, context })
+    }
+
+    async fn get_token_nonce_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenNonceRequest,
+    ) -> RpcResult<GetTokenNonceResponse> {
+        let GetTokenNonceRequest { owner_id, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
+        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_read_ready(&view)?;
+        let expected_next_nonce = view.nonces.get(&owner_id).copied().unwrap_or(1);
+        let context = self.atomic_context(&view).await?;
+        Ok(GetTokenNonceResponse { expected_next_nonce, context })
+    }
+
+    async fn get_token_asset_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenAssetRequest,
+    ) -> RpcResult<GetTokenAssetResponse> {
+        let GetTokenAssetRequest { asset_id, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
+        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_read_ready(&view)?;
+        let asset = view.assets.get(&asset_id).cloned().map(Self::map_token_asset);
+        let context = self.atomic_context(&view).await?;
+        Ok(GetTokenAssetResponse { asset, context })
+    }
+
+    async fn get_token_op_status_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenOpStatusRequest,
+    ) -> RpcResult<GetTokenOpStatusResponse> {
+        let GetTokenOpStatusRequest { txid, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_read_ready(&view)?;
+        let context = self.atomic_context(&view).await?;
+        let status = view.processed_ops.get(&txid).cloned();
+        Ok(match status {
+            Some(status) => Self::map_processed_op(status, context),
+            None => GetTokenOpStatusResponse { accepting_block_hash: None, apply_status: None, noop_reason: None, context },
+        })
+    }
+
+    async fn get_token_state_hash_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenStateHashRequest,
+    ) -> RpcResult<GetTokenStateHashResponse> {
+        let GetTokenStateHashRequest { at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_read_ready(&view)?;
+        let context = self.atomic_context(&view).await?;
+        Ok(GetTokenStateHashResponse { context })
+    }
+
+    async fn get_token_spendability_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenSpendabilityRequest,
+    ) -> RpcResult<GetTokenSpendabilityResponse> {
+        let GetTokenSpendabilityRequest { asset_id, owner_id, min_daa_for_spend, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
+        let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
+        let min_daa_for_spend = min_daa_for_spend.unwrap_or(10);
+        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        match view.runtime_state {
+            AtomicTokenRuntimeState::NotReady => return Err(RpcError::AtomicStateNotReady),
+            AtomicTokenRuntimeState::Recovering => return Err(RpcError::AtomicStateRecovering),
+            AtomicTokenRuntimeState::Healthy | AtomicTokenRuntimeState::Degraded => {}
+        }
+        let balance = view.balances.get(&cryptix_atomicindex::state::BalanceKey { asset_id, owner_id }).copied().unwrap_or(0);
+        let anchor_count = view.anchor_counts.get(&owner_id).copied().unwrap_or(0);
+        let expected_next_nonce = view.nonces.get(&owner_id).copied().unwrap_or(1);
+        let context = self.atomic_context(&view).await?;
+
+        let (can_spend, reason) = if context.is_degraded {
+            (false, Some("token_state_degraded".to_string()))
+        } else if context.at_daa_score < min_daa_for_spend {
+            (false, Some("min_daa_not_reached".to_string()))
+        } else if balance == 0 {
+            (false, Some("zero_balance".to_string()))
+        } else if anchor_count == 0 {
+            (false, Some("missing_anchor_utxo".to_string()))
+        } else {
+            (true, None)
+        };
+
+        Ok(GetTokenSpendabilityResponse {
+            can_spend,
+            reason,
+            balance: balance.to_string(),
+            expected_next_nonce,
+            min_daa_for_spend,
+            context,
+        })
+    }
+
+    async fn get_token_events_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenEventsRequest,
+    ) -> RpcResult<GetTokenEventsResponse> {
+        let GetTokenEventsRequest { after_sequence, limit, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_EVENTS_LIMIT_MAX);
+        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_read_ready(&view)?;
+        let events = atomic
+            .get_events_since_capped(after_sequence, limit, view.event_sequence_cutoff)
+            .await
+            .into_iter()
+            .map(Self::map_token_event)
+            .collect();
+        let context = self.atomic_context(&view).await?;
+        Ok(GetTokenEventsResponse { events, context })
+    }
+
+    async fn get_token_assets_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenAssetsRequest,
+    ) -> RpcResult<GetTokenAssetsResponse> {
+        let GetTokenAssetsRequest { offset, limit, query, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_ASSETS_LIMIT_MAX);
+        let offset = usize::try_from(offset).map_err(|e| RpcError::General(e.to_string()))?;
+        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_read_ready(&view)?;
+        let query = query.unwrap_or_default();
+
+        let mut assets: Vec<TokenAsset> =
+            view.assets.values().filter(|asset| Self::token_asset_matches_query(asset, &query)).cloned().collect();
+        assets.sort_by(|a, b| {
+            let a_symbol = String::from_utf8_lossy(&a.symbol);
+            let b_symbol = String::from_utf8_lossy(&b.symbol);
+            a_symbol
+                .cmp(&b_symbol)
+                .then_with(|| String::from_utf8_lossy(&a.name).cmp(&String::from_utf8_lossy(&b.name)))
+                .then_with(|| a.asset_id.cmp(&b.asset_id))
+        });
+
+        let total = assets.len() as u64;
+        let assets = assets.into_iter().skip(offset).take(limit).map(Self::map_token_asset).collect();
+        let context = self.atomic_context(&view).await?;
+        Ok(GetTokenAssetsResponse { assets, total, context })
+    }
+
+    async fn get_token_balances_by_owner_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenBalancesByOwnerRequest,
+    ) -> RpcResult<GetTokenBalancesByOwnerResponse> {
+        let GetTokenBalancesByOwnerRequest { owner_id, offset, limit, include_assets, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
+        let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_OWNER_BALANCES_LIMIT_MAX);
+        let offset = usize::try_from(offset).map_err(|e| RpcError::General(e.to_string()))?;
+        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_read_ready(&view)?;
+
+        let mut balances: Vec<([u8; 32], u128, Option<TokenAsset>)> = view
+            .balances
+            .iter()
+            .filter_map(|(key, balance)| {
+                if key.owner_id != owner_id || *balance == 0 {
+                    return None;
+                }
+                let asset = if include_assets { view.assets.get(&key.asset_id).cloned() } else { None };
+                Some((key.asset_id, *balance, asset))
+            })
+            .collect();
+
+        balances.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let total = balances.len() as u64;
+        let balances = balances.into_iter().skip(offset).take(limit).map(Self::map_token_owner_balance).collect();
+        let context = self.atomic_context(&view).await?;
+        Ok(GetTokenBalancesByOwnerResponse { balances, total, context })
+    }
+
+    async fn get_token_holders_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenHoldersRequest,
+    ) -> RpcResult<GetTokenHoldersResponse> {
+        let GetTokenHoldersRequest { asset_id, offset, limit, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
+        let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_HOLDERS_LIMIT_MAX);
+        let offset = usize::try_from(offset).map_err(|e| RpcError::General(e.to_string()))?;
+        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_read_ready(&view)?;
+
+        let mut holders: Vec<([u8; 32], u128)> = view
+            .balances
+            .iter()
+            .filter_map(|(key, balance)| if key.asset_id == asset_id && *balance > 0 { Some((key.owner_id, *balance)) } else { None })
+            .collect();
+        holders.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let total = holders.len() as u64;
+        let holders = holders.into_iter().skip(offset).take(limit).map(Self::map_token_holder).collect();
+        let context = self.atomic_context(&view).await?;
+        Ok(GetTokenHoldersResponse { holders, total, context })
+    }
+
+    async fn get_token_owner_id_by_address_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenOwnerIdByAddressRequest,
+    ) -> RpcResult<GetTokenOwnerIdByAddressResponse> {
+        let GetTokenOwnerIdByAddressRequest { address, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_read_ready(&view)?;
+        let address = Address::try_from(address.as_str()).map_err(|e| RpcError::General(format!("invalid `address` string: {e}")))?;
+        let script_public_key = pay_to_address_script(&address);
+        let (owner_id, reason) = match Self::owner_id_from_script(&script_public_key) {
+            Some(owner_id) => (Some(owner_id.as_slice().to_hex()), None),
+            None => (None, Some("unsupported_script_class".to_string())),
+        };
+        let context = self.atomic_context(&view).await?;
+        Ok(GetTokenOwnerIdByAddressResponse { owner_id, reason, context })
+    }
+
+    async fn export_token_snapshot_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: ExportTokenSnapshotRequest,
+    ) -> RpcResult<ExportTokenSnapshotResponse> {
+        let atomic = self.atomic_service()?;
+        if !self.config.unsafe_rpc {
+            warn!("ExportTokenSnapshot RPC command called while node in safe RPC mode -- rejecting.");
+            return Err(RpcError::UnavailableInSafeMode);
+        }
+        atomic.export_snapshot_to_file(&request.path).await.map_err(|err| RpcError::General(err.to_string()))?;
+        let view = atomic.get_read_view(None).await.ok_or(RpcError::StaleContext)?;
+        let context = self.atomic_context(&view).await?;
+        Ok(ExportTokenSnapshotResponse { exported: true, context })
+    }
+
+    async fn import_token_snapshot_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: ImportTokenSnapshotRequest,
+    ) -> RpcResult<ImportTokenSnapshotResponse> {
+        let atomic = self.atomic_service()?;
+        if !self.config.unsafe_rpc {
+            warn!("ImportTokenSnapshot RPC command called while node in safe RPC mode -- rejecting.");
+            return Err(RpcError::UnavailableInSafeMode);
+        }
+        atomic.import_snapshot_from_file(&request.path).await.map_err(|err| RpcError::General(err.to_string()))?;
+        let view = atomic.get_read_view(None).await.ok_or(RpcError::StaleContext)?;
+        let context = self.atomic_context(&view).await?;
+        Ok(ImportTokenSnapshotResponse { imported: true, context })
+    }
+
+    async fn get_token_health_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenHealthRequest,
+    ) -> RpcResult<GetTokenHealthResponse> {
+        let GetTokenHealthRequest { at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        let health = atomic.get_health().await;
+        let context = self.atomic_context(&view).await?;
+        Ok(Self::map_health_response(health, context))
+    }
+
+    async fn get_sc_bootstrap_sources_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetScBootstrapSourcesRequest,
+    ) -> RpcResult<GetScBootstrapSourcesResponse> {
+        let atomic = self.atomic_service()?;
+        let view = atomic.get_read_view(None).await.ok_or(RpcError::StaleContext)?;
+        let context = self.atomic_context(&view).await?;
+        let sources = atomic
+            .get_sc_bootstrap_sources()
+            .await
+            .map_err(|err| RpcError::General(err.to_string()))?
+            .into_iter()
+            .map(Self::map_sc_bootstrap_source)
+            .collect();
+        Ok(GetScBootstrapSourcesResponse { sources, context })
+    }
+
+    async fn get_sc_snapshot_manifest_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetScSnapshotManifestRequest,
+    ) -> RpcResult<GetScSnapshotManifestResponse> {
+        let atomic = self.atomic_service()?;
+        let manifest_payload =
+            atomic.get_sc_snapshot_manifest(&request.snapshot_id).await.map_err(|err| RpcError::General(err.to_string()))?;
+        Ok(GetScSnapshotManifestResponse {
+            snapshot_id: manifest_payload.snapshot_id,
+            manifest_hex: manifest_payload.manifest_bytes.to_hex(),
+            manifest_signatures: manifest_payload.signatures.into_iter().map(Self::map_sc_manifest_signature).collect(),
+        })
+    }
+
+    async fn get_sc_snapshot_chunk_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetScSnapshotChunkRequest,
+    ) -> RpcResult<GetScSnapshotChunkResponse> {
+        let atomic = self.atomic_service()?;
+        let chunk = atomic
+            .get_sc_snapshot_chunk(&request.snapshot_id, request.chunk_index, request.chunk_size)
+            .await
+            .map_err(|err| RpcError::General(err.to_string()))?;
+        Ok(Self::map_sc_chunk(chunk))
+    }
+
+    async fn get_sc_replay_window_chunk_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetScReplayWindowChunkRequest,
+    ) -> RpcResult<GetScReplayWindowChunkResponse> {
+        let atomic = self.atomic_service()?;
+        let chunk = atomic
+            .get_sc_replay_window_chunk(&request.snapshot_id, request.chunk_index, request.chunk_size)
+            .await
+            .map_err(|err| RpcError::General(err.to_string()))?;
+        Ok(GetScReplayWindowChunkResponse {
+            snapshot_id: chunk.snapshot_id,
+            chunk_index: chunk.chunk_index,
+            total_chunks: chunk.total_chunks,
+            file_size: chunk.file_size,
+            chunk_hex: chunk.chunk_data.to_hex(),
+        })
+    }
+
+    async fn get_sc_snapshot_head_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetScSnapshotHeadRequest,
+    ) -> RpcResult<GetScSnapshotHeadResponse> {
+        let atomic = self.atomic_service()?;
+        let view = atomic.get_read_view(None).await.ok_or(RpcError::StaleContext)?;
+        let context = self.atomic_context(&view).await?;
+        let head =
+            atomic.get_sc_snapshot_head().await.map_err(|err| RpcError::General(err.to_string()))?.map(Self::map_sc_bootstrap_source);
+        Ok(GetScSnapshotHeadResponse { head, context })
     }
 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

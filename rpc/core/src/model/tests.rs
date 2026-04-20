@@ -302,6 +302,11 @@ mod mockery {
                 time_offset: mock(),
                 user_agent: "0.4.2".to_string(),
                 advertised_protocol_version: mock(),
+                advertised_services: mock(),
+                is_hfa_fastchain: mock(),
+                is_cryptix_atomic: mock(),
+                is_strong_node_claims: mock(),
+                is_archival: mock(),
                 time_connected: mock(),
                 is_ibd_peer: mock(),
                 unified_node_id: Some("00".repeat(32)),
@@ -1326,6 +1331,30 @@ mod mockery {
     }
 
     test!(NewBlockTemplateNotification);
+
+    impl Mock for NotifyTokenEventsRequest {
+        fn mock() -> Self {
+            NotifyTokenEventsRequest { command: Command::Start }
+        }
+    }
+
+    test!(NotifyTokenEventsRequest);
+
+    impl Mock for NotifyTokenEventsResponse {
+        fn mock() -> Self {
+            NotifyTokenEventsResponse {}
+        }
+    }
+
+    test!(NotifyTokenEventsResponse);
+
+    impl Mock for TokenEventsChangedNotification {
+        fn mock() -> Self {
+            TokenEventsChangedNotification { from_sequence: mock(), to_sequence: mock(), event_count: mock() }
+        }
+    }
+
+    test!(TokenEventsChangedNotification);
 
     impl Mock for SubscribeResponse {
         fn mock() -> Self {

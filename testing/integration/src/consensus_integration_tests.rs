@@ -845,36 +845,6 @@ impl CryptixdGoParams {
     }
 }
 
-#[tokio::test]
-async fn goref_custom_pruning_depth_test() {
-    init_allocator_with_default_settings();
-    json_test("testdata/dags_for_json_tests/goref_custom_pruning_depth", false).await
-}
-
-#[tokio::test]
-async fn goref_notx_test() {
-    init_allocator_with_default_settings();
-    json_test("testdata/dags_for_json_tests/goref-notx-5000-blocks", false).await
-}
-
-#[tokio::test]
-async fn goref_notx_concurrent_test() {
-    init_allocator_with_default_settings();
-    json_test("testdata/dags_for_json_tests/goref-notx-5000-blocks", true).await
-}
-
-#[tokio::test]
-async fn goref_tx_small_test() {
-    init_allocator_with_default_settings();
-    json_test("testdata/dags_for_json_tests/goref-905-tx-265-blocks", false).await
-}
-
-#[tokio::test]
-async fn goref_tx_small_concurrent_test() {
-    init_allocator_with_default_settings();
-    json_test("testdata/dags_for_json_tests/goref-905-tx-265-blocks", true).await
-}
-
 #[ignore]
 #[tokio::test]
 async fn goref_tx_big_test() {

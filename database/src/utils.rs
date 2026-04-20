@@ -30,7 +30,17 @@ impl Drop for DbLifetime {
                 break;
             }
         }
-        assert_eq!(self.weak_db_ref.strong_count(), 0, "DB is expected to have no strong references when lifetime is dropped");
+        let strong_refs = self.weak_db_ref.strong_count();
+        if strong_refs != 0 {
+            // Avoid double-panic aborts when another panic is already in flight (e.g. failing tests).
+            if std::thread::panicking() {
+                eprintln!(
+                    "warning: dropping DbLifetime during panic with {strong_refs} remaining strong DB references; skipping destroy"
+                );
+                return;
+            }
+            panic!("DB is expected to have no strong references when lifetime is dropped (found {strong_refs})");
+        }
         if let Some(dir) = self.optional_tempdir.take() {
             let options = rocksdb::Options::default();
             let path_buf = dir.path().to_owned();

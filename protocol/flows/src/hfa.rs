@@ -3,9 +3,10 @@ use cryptix_consensus_core::tx::Transaction;
 use cryptix_consensusmanager::ConsensusProxy;
 use cryptix_hashes::Hash;
 use cryptix_mining::manager::MiningManagerProxy;
+use cryptix_p2p_lib::P2P_SERVICE_BIT_HFA;
 
 // Service-bit advertised in VersionMessage.services when this node supports HF-A P2P relay.
-pub const HFA_P2P_SERVICE_BIT: u64 = 1 << 20;
+pub const HFA_P2P_SERVICE_BIT: u64 = P2P_SERVICE_BIT_HFA;
 
 // Hard bounds for P2P fast relay and pull-on-miss.
 pub const HFA_MAX_INTENT_IDS_PER_MESSAGE: usize = 256;

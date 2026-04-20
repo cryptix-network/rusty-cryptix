@@ -2,6 +2,17 @@ use cryptix_consensus_core::subnets::SubnetworkId;
 use cryptix_utils::networking::{IpAddress, PeerId};
 use std::{fmt::Display, net::SocketAddr, sync::Arc, time::Instant};
 
+/// Service bit indicating support for HFA fastchain gossip compatibility.
+pub const P2P_SERVICE_BIT_HFA: u64 = 1 << 20;
+/// Service bit indicating support for Cryptix Atomic features in this process.
+pub const P2P_SERVICE_BIT_ATOMIC: u64 = 1 << 21;
+/// Service bit indicating support for strong-node claimant gossip.
+pub const P2P_SERVICE_BIT_STRONG_NODE_CLAIMS: u64 = 1 << 22;
+/// Service bit indicating an archival node profile.
+pub const P2P_SERVICE_BIT_ARCHIVAL: u64 = 1 << 23;
+/// Service bit indicating support for post-HF quantum-handshake fallback negotiation.
+pub const P2P_SERVICE_BIT_QUANTUM_HANDSHAKE_FALLBACK: u64 = 1 << 24;
+
 #[derive(Debug, Clone, Default)]
 pub struct PeerProperties {
     pub user_agent: String,
@@ -14,6 +25,10 @@ pub struct PeerProperties {
     pub anti_fraud_hashes: Vec<[u8; 32]>,
     pub anti_fraud_restricted: bool,
     pub unified_node_id: Option<[u8; 32]>,
+    pub hfa_enabled: bool,
+    pub atomic_enabled: bool,
+    pub strong_node_claims_enabled: bool,
+    pub archival_node: bool,
 }
 
 #[derive(Debug)]

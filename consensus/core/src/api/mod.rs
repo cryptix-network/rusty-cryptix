@@ -20,6 +20,7 @@ use crate::{
     pruning::{PruningPointProof, PruningPointTrustedData, PruningPointsList},
     trusted::{ExternalGhostdagData, TrustedBlock},
     tx::{MutableTransaction, Transaction, TransactionOutpoint, UtxoEntry},
+    utxo::utxo_diff::UtxoDiff,
     BlockHashSet, BlueWorkType, ChainPath,
 };
 use cryptix_hashes::Hash;
@@ -296,6 +297,10 @@ pub trait ConsensusApi: Send + Sync {
     }
 
     fn get_block_acceptance_data(&self, hash: Hash) -> ConsensusResult<Arc<AcceptanceData>> {
+        unimplemented!()
+    }
+
+    fn get_block_utxo_diff(&self, hash: Hash) -> ConsensusResult<Arc<UtxoDiff>> {
         unimplemented!()
     }
 

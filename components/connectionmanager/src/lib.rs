@@ -62,6 +62,7 @@ pub struct ConnectionManager {
     p2p_adaptor: Arc<cryptix_p2p_lib::Adaptor>,
     outbound_target: usize,
     inbound_limit: usize,
+    preferred_service_mask: u64,
     dns_seeders: &'static [&'static str],
     default_port: u16,
     address_manager: Arc<ParkingLotMutex<AddressManager>>,
@@ -244,10 +245,15 @@ impl ConnectionRequest {
 }
 
 impl ConnectionManager {
+    fn same_connection_request(lhs: &ConnectionRequest, rhs: &ConnectionRequest) -> bool {
+        lhs.next_attempt == rhs.next_attempt && lhs.is_permanent == rhs.is_permanent && lhs.attempts == rhs.attempts
+    }
+
     pub fn new(
         p2p_adaptor: Arc<cryptix_p2p_lib::Adaptor>,
         outbound_target: usize,
         inbound_limit: usize,
+        preferred_service_mask: u64,
         dns_seeders: &'static [&'static str],
         default_port: u16,
         address_manager: Arc<ParkingLotMutex<AddressManager>>,
@@ -264,6 +270,7 @@ impl ConnectionManager {
             p2p_adaptor,
             outbound_target,
             inbound_limit,
+            preferred_service_mask,
             address_manager,
             connection_requests: Default::default(),
             force_next_iteration: tx,
@@ -339,21 +346,25 @@ impl ConnectionManager {
     }
 
     async fn handle_connection_requests(self: &Arc<Self>, peer_by_address: &HashMap<SocketAddr, Peer>) {
-        let mut requests = self.connection_requests.lock().await;
-        let mut new_requests = HashMap::with_capacity(requests.len());
-        for (address, request) in requests.iter() {
+        let requests_snapshot = { self.connection_requests.lock().await.clone() };
+        let mut updated_requests = HashMap::with_capacity(requests_snapshot.len());
+        for (address, request) in requests_snapshot.iter() {
             let address = *address;
             let request = request.clone();
-            let is_connected = peer_by_address.contains_key(&address);
-            if is_connected && !request.is_permanent {
-                // The peer is connected and the request is not permanent - no need to keep the request
+            let is_connected = Self::is_request_satisfied(address, peer_by_address);
+            if is_connected {
+                if request.is_permanent {
+                    // Keep permanent requests, but reset retry backoff because the connection is currently satisfied.
+                    updated_requests.insert(address, ConnectionRequest::new(true));
+                }
+                // For one-shot requests, remove once the request has been satisfied.
                 continue;
             }
 
             if !is_connected && request.next_attempt <= SystemTime::now() {
                 if self.is_banserver_banned_ip(address.ip()) {
                     debug!("Skipping connection request {} because it is blocked by banserver list", address);
-                    new_requests.insert(
+                    updated_requests.insert(
                         address,
                         ConnectionRequest {
                             next_attempt: SystemTime::now() + BANSERVER_BANNED_CONNECTION_RETRY_DELAY,
@@ -366,6 +377,13 @@ impl ConnectionManager {
 
                 debug!("Connecting to peer request {}", address);
                 match self.p2p_adaptor.connect_peer(address.to_string()).await {
+                    Err(ConnectionError::ProtocolError(ProtocolError::PeerAlreadyExists(_))) if request.is_permanent => {
+                        // We are already connected to the same peer identity (possibly through a different socket
+                        // address, e.g. inbound ephemeral source port). Keep the permanent request without
+                        // escalating retry backoff.
+                        debug!("Peer request {} is already satisfied by existing peer identity", address);
+                        updated_requests.insert(address, ConnectionRequest::new(true));
+                    }
                     Err(err) => {
                         debug!("Failed connecting to peer request: {}, {}", address, err);
                         if request.is_permanent {
@@ -373,7 +391,7 @@ impl ConnectionManager {
                             let retry_duration =
                                 Duration::from_secs(30u64 * 2u64.pow(min(request.attempts, MAX_ACCOUNTABLE_ATTEMPTS)));
                             debug!("Will retry peer request {} in {}", address, DurationString::from(retry_duration));
-                            new_requests.insert(
+                            updated_requests.insert(
                                 address,
                                 ConnectionRequest {
                                     next_attempt: SystemTime::now() + retry_duration,
@@ -385,27 +403,59 @@ impl ConnectionManager {
                     }
                     Ok(_) if request.is_permanent => {
                         // Permanent requests are kept forever
-                        new_requests.insert(address, ConnectionRequest::new(true));
+                        updated_requests.insert(address, ConnectionRequest::new(true));
                     }
                     Ok(_) => {}
                 }
             } else {
-                new_requests.insert(address, request);
+                updated_requests.insert(address, request);
             }
         }
 
-        *requests = new_requests;
+        // Do not hold the request lock across async connection attempts.
+        // Also avoid clobbering any concurrent updates that may have happened while processing.
+        let mut requests = self.connection_requests.lock().await;
+        for (address, snapshot_request) in requests_snapshot.iter() {
+            let concurrent_update_detected =
+                requests.get(address).is_some_and(|current| !Self::same_connection_request(current, snapshot_request));
+            if concurrent_update_detected {
+                continue;
+            }
+
+            match updated_requests.remove(address) {
+                Some(next_request) => {
+                    requests.insert(*address, next_request);
+                }
+                None => {
+                    requests.remove(address);
+                }
+            }
+        }
+    }
+
+    fn is_request_satisfied(requested_address: SocketAddr, peer_by_address: &HashMap<SocketAddr, Peer>) -> bool {
+        if peer_by_address.contains_key(&requested_address) {
+            return true;
+        }
+
+        // Treat same-host peers as satisfying the request as well. This avoids reconnect loops when the active
+        // connection to a requested peer arrived inbound from an ephemeral source port.
+        peer_by_address.keys().any(|peer_address| peer_address.ip() == requested_address.ip())
     }
 
     async fn handle_outbound_connections(self: &Arc<Self>, peer_by_address: &HashMap<SocketAddr, Peer>) {
         let active_outbound: HashSet<cryptix_addressmanager::NetAddress> =
             peer_by_address.values().filter(|peer| peer.is_outbound()).map(|peer| peer.net_address().into()).collect();
-        if active_outbound.len() >= self.outbound_target {
+        let desired_outbound_target = self.outbound_target.max(active_outbound.len());
+        if active_outbound.len() >= desired_outbound_target {
             return;
         }
 
-        let mut missing_connections = self.outbound_target - active_outbound.len();
-        let mut addr_iter = self.address_manager.lock().iterate_prioritized_random_addresses(active_outbound);
+        let mut missing_connections = desired_outbound_target - active_outbound.len();
+        let mut addr_iter = self
+            .address_manager
+            .lock()
+            .iterate_prioritized_random_addresses_with_service_preference(active_outbound, self.preferred_service_mask);
 
         let mut progressing = true;
         let mut connecting = true;
@@ -434,16 +484,16 @@ impl ConnectionManager {
                 // Log only if progress was made
                 info!(
                     "Connection manager: has {}/{} outgoing P2P connections, trying to obtain {} additional connection(s)...",
-                    self.outbound_target - missing_connections,
-                    self.outbound_target,
+                    desired_outbound_target - missing_connections,
+                    desired_outbound_target,
                     jobs.len(),
                 );
                 progressing = false;
             } else {
                 debug!(
                     "Connection manager: outgoing: {}/{} , connecting: {}, iterator: {}",
-                    self.outbound_target - missing_connections,
-                    self.outbound_target,
+                    desired_outbound_target - missing_connections,
+                    desired_outbound_target,
                     jobs.len(),
                     addr_iter.len(),
                 );
@@ -469,7 +519,7 @@ impl ConnectionManager {
         }
 
         if missing_connections > 0 && !self.dns_seeders.is_empty() {
-            if missing_connections > self.outbound_target / 2 {
+            if missing_connections > desired_outbound_target / 2 {
                 // If we are missing more than half of our target, query all in parallel.
                 // This will always be the case on new node start-up and is the most resilient strategy in such a case.
                 self.dns_seed_many(self.dns_seeders.len()).await;
@@ -606,7 +656,7 @@ impl ConnectionManager {
 
     /// Returns whether the given address is a permanent request.
     pub async fn is_permanent(&self, address: &SocketAddr) -> bool {
-        self.connection_requests.lock().await.contains_key(address)
+        self.connection_requests.lock().await.get(address).map(|request| request.is_permanent).unwrap_or(false)
     }
 
     /// Returns whether the given IP has some permanent request.
@@ -803,9 +853,9 @@ impl ConnectionManager {
             return;
         }
         if enabled {
-            warn!("AntiFraud runtime switched: OFF -> ON ({})", reason);
+            warn!("AntiFraud runtime switched: OFF -> ON; reason: {}", reason);
         } else {
-            warn!("AntiFraud runtime switched: ON -> OFF ({})", reason);
+            warn!("AntiFraud runtime switched: ON -> OFF; reason: {}", reason);
         }
     }
 
@@ -813,7 +863,7 @@ impl ConnectionManager {
         let state = self.anti_fraud_state.lock();
         let snapshot_seq = state.current_snapshot.as_ref().map(|snapshot| snapshot.snapshot_seq).unwrap_or(0);
         info!(
-            "AntiFraud runtime state: enabled={}, peer_fallback_required={}, seed_server_retry_pending={}, snapshot_seq={} ({})",
+            "AntiFraud runtime state: enabled={}, peer_fallback_required={}, seed_server_retry_pending={}, snapshot_seq={}, reason={}",
             state.runtime_enabled, state.peer_fallback_required, state.seed_server_retry_pending, snapshot_seq, reason
         );
     }
@@ -943,7 +993,7 @@ impl ConnectionManager {
             self.disable_antifraud_runtime("snapshot endpoint antifraud_enabled flag is false");
             return;
         }
-        self.set_antifraud_runtime_enabled_with_reason(true, "signed snapshot gate is enabled");
+        self.set_antifraud_runtime_enabled_with_reason(true, "signed snapshot mode enabled");
 
         match self.try_apply_snapshot(fetched.snapshot, "seed-server") {
             Ok(applied) => {
@@ -1705,9 +1755,7 @@ impl ConnectionManager {
             .banned_ips
             .iter()
             .enumerate()
-            .map(|(index, raw)| {
-                Self::decode_hex(raw).ok_or_else(|| format!("invalid banned_ips[{index}] hex entry"))
-            })
+            .map(|(index, raw)| Self::decode_hex(raw).ok_or_else(|| format!("invalid banned_ips[{index}] hex entry")))
             .collect::<std::result::Result<Vec<_>, _>>()
         {
             Ok(entries) => entries,
@@ -1721,9 +1769,7 @@ impl ConnectionManager {
             .banned_node_ids
             .iter()
             .enumerate()
-            .map(|(index, raw)| {
-                Self::decode_hex(raw).ok_or_else(|| format!("invalid banned_node_ids[{index}] hex entry"))
-            })
+            .map(|(index, raw)| Self::decode_hex(raw).ok_or_else(|| format!("invalid banned_node_ids[{index}] hex entry")))
             .collect::<std::result::Result<Vec<_>, _>>()
         {
             Ok(entries) => entries,

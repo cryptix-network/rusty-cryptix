@@ -7,11 +7,73 @@ use cryptix_rpc_core::api::ops::RpcApiOps;
 pub struct Rpc;
 
 impl Rpc {
+    fn sanitize_terminal_output(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let bytes = input.as_bytes();
+        let mut i = 0usize;
+
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == 0x1B {
+                // Strip ANSI CSI: ESC [ ... final-byte
+                if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                    i += 2;
+                    while i < bytes.len() {
+                        let c = bytes[i];
+                        if (0x40..=0x7E).contains(&c) {
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                // Strip ANSI OSC: ESC ] ... BEL or ESC \
+                if i + 1 < bytes.len() && bytes[i + 1] == b']' {
+                    i += 2;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1B && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                // Drop standalone ESC.
+                i += 1;
+                continue;
+            }
+
+            if b < 0x20 && b != b'\n' && b != b'\r' && b != b'\t' {
+                out.push(' ');
+                i += 1;
+                continue;
+            }
+
+            let ch = input[i..].chars().next().unwrap_or('\u{FFFD}');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+
+        out
+    }
+
     fn println<T>(&self, ctx: &Arc<CryptixCli>, v: T)
     where
         T: core::fmt::Debug,
     {
-        ctx.term().writeln(format!("{v:#?}").crlf());
+        let rendered = format!("{v:#?}");
+        let sanitized = Self::sanitize_terminal_output(&rendered);
+        ctx.term().writeln(sanitized.crlf());
+    }
+
+    fn parse_optional_hash(value: Option<&String>) -> Result<Option<RpcHash>> {
+        value.map(|hash| RpcHash::from_hex(hash.as_str()).map_err(Error::from)).transpose()
     }
 
     async fn main(self: Arc<Self>, ctx: &Arc<dyn Context>, mut argv: Vec<String>, cmd: &str) -> Result<()> {
@@ -267,6 +329,196 @@ impl Rpc {
                 let hash = argv.remove(0);
                 let hash = RpcHash::from_hex(hash.as_str())?;
                 let result = rpc.get_current_block_color_call(None, GetCurrentBlockColorRequest { hash }).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::SimulateTokenOp => {
+                if argv.len() < 2 {
+                    return Err(Error::custom("Usage: rpc simulate-token-op <payloadHex> <ownerId> [atBlockHash]"));
+                }
+                let payload_hex = argv.remove(0);
+                let owner_id = argv.remove(0);
+                let at_block_hash = Self::parse_optional_hash(argv.first())?;
+                let result = rpc.simulate_token_op_call(None, SimulateTokenOpRequest { payload_hex, owner_id, at_block_hash }).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetTokenBalance => {
+                if argv.len() < 2 {
+                    return Err(Error::custom("Usage: rpc get-token-balance <assetId> <ownerId> [atBlockHash]"));
+                }
+                let asset_id = argv.remove(0);
+                let owner_id = argv.remove(0);
+                let at_block_hash = Self::parse_optional_hash(argv.first())?;
+                let result = rpc.get_token_balance_call(None, GetTokenBalanceRequest { asset_id, owner_id, at_block_hash }).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetTokenNonce => {
+                if argv.is_empty() {
+                    return Err(Error::custom("Usage: rpc get-token-nonce <ownerId> [atBlockHash]"));
+                }
+                let owner_id = argv.remove(0);
+                let at_block_hash = Self::parse_optional_hash(argv.first())?;
+                let result = rpc.get_token_nonce_call(None, GetTokenNonceRequest { owner_id, at_block_hash }).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetTokenAsset => {
+                if argv.is_empty() {
+                    return Err(Error::custom("Usage: rpc get-token-asset <assetId> [atBlockHash]"));
+                }
+                let asset_id = argv.remove(0);
+                let at_block_hash = Self::parse_optional_hash(argv.first())?;
+                let result = rpc.get_token_asset_call(None, GetTokenAssetRequest { asset_id, at_block_hash }).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetTokenOpStatus => {
+                if argv.is_empty() {
+                    return Err(Error::custom("Usage: rpc get-token-op-status <txid> [atBlockHash]"));
+                }
+                let txid = RpcHash::from_hex(argv.remove(0).as_str())?;
+                let at_block_hash = Self::parse_optional_hash(argv.first())?;
+                let result = rpc.get_token_op_status_call(None, GetTokenOpStatusRequest { txid, at_block_hash }).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetTokenStateHash => {
+                let at_block_hash = Self::parse_optional_hash(argv.first())?;
+                let result = rpc.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash }).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetTokenSpendability => {
+                if argv.len() < 2 {
+                    return Err(Error::custom("Usage: rpc get-token-spendability <assetId> <ownerId> [minDaaForSpend] [atBlockHash]"));
+                }
+                let asset_id = argv.remove(0);
+                let owner_id = argv.remove(0);
+                let min_daa_for_spend = argv.first().and_then(|value| value.parse::<u64>().ok());
+                let at_block_hash = if min_daa_for_spend.is_some() {
+                    Self::parse_optional_hash(argv.get(1))?
+                } else {
+                    Self::parse_optional_hash(argv.first())?
+                };
+                let result = rpc
+                    .get_token_spendability_call(
+                        None,
+                        GetTokenSpendabilityRequest { asset_id, owner_id, min_daa_for_spend, at_block_hash },
+                    )
+                    .await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetTokenEvents => {
+                let after_sequence = argv.first().and_then(|value| value.parse::<u64>().ok()).unwrap_or(0);
+                let limit = argv.get(1).and_then(|value| value.parse::<u32>().ok()).unwrap_or(100);
+                let at_block_hash = Self::parse_optional_hash(argv.get(2))?;
+                let result = rpc.get_token_events_call(None, GetTokenEventsRequest { after_sequence, limit, at_block_hash }).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetTokenAssets => {
+                let offset = argv.first().and_then(|value| value.parse::<u32>().ok()).unwrap_or(0);
+                let limit = argv.get(1).and_then(|value| value.parse::<u32>().ok()).unwrap_or(100);
+                let query = argv.get(2).cloned().filter(|value| !value.is_empty());
+                let at_block_hash = Self::parse_optional_hash(argv.get(3))?;
+                let result = rpc.get_token_assets_call(None, GetTokenAssetsRequest { offset, limit, query, at_block_hash }).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetTokenBalancesByOwner => {
+                if argv.is_empty() {
+                    return Err(Error::custom(
+                        "Usage: rpc get-token-balances-by-owner <ownerId> [offset] [limit] [includeAssets] [atBlockHash]",
+                    ));
+                }
+                let owner_id = argv.remove(0);
+                let offset = argv.first().and_then(|value| value.parse::<u32>().ok()).unwrap_or(0);
+                let limit = argv.get(1).and_then(|value| value.parse::<u32>().ok()).unwrap_or(100);
+                let include_assets = argv.get(2).and_then(|value| value.parse::<bool>().ok()).unwrap_or(false);
+                let at_block_hash = Self::parse_optional_hash(argv.get(3))?;
+                let result = rpc
+                    .get_token_balances_by_owner_call(
+                        None,
+                        GetTokenBalancesByOwnerRequest { owner_id, offset, limit, include_assets, at_block_hash },
+                    )
+                    .await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetTokenHolders => {
+                if argv.is_empty() {
+                    return Err(Error::custom("Usage: rpc get-token-holders <assetId> [offset] [limit] [atBlockHash]"));
+                }
+                let asset_id = argv.remove(0);
+                let offset = argv.first().and_then(|value| value.parse::<u32>().ok()).unwrap_or(0);
+                let limit = argv.get(1).and_then(|value| value.parse::<u32>().ok()).unwrap_or(100);
+                let at_block_hash = Self::parse_optional_hash(argv.get(2))?;
+                let result =
+                    rpc.get_token_holders_call(None, GetTokenHoldersRequest { asset_id, offset, limit, at_block_hash }).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetTokenOwnerIdByAddress => {
+                if argv.is_empty() {
+                    return Err(Error::custom("Usage: rpc get-token-owner-id-by-address <address> [atBlockHash]"));
+                }
+                let address = argv.remove(0);
+                let at_block_hash = Self::parse_optional_hash(argv.first())?;
+                let result =
+                    rpc.get_token_owner_id_by_address_call(None, GetTokenOwnerIdByAddressRequest { address, at_block_hash }).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::ExportTokenSnapshot => {
+                if argv.is_empty() {
+                    return Err(Error::custom("Usage: rpc export-token-snapshot <path>"));
+                }
+                let path = argv.remove(0);
+                let result = rpc.export_token_snapshot_call(None, ExportTokenSnapshotRequest { path }).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::ImportTokenSnapshot => {
+                if argv.is_empty() {
+                    return Err(Error::custom("Usage: rpc import-token-snapshot <path>"));
+                }
+                let path = argv.remove(0);
+                let result = rpc.import_token_snapshot_call(None, ImportTokenSnapshotRequest { path }).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetTokenHealth => {
+                let at_block_hash = Self::parse_optional_hash(argv.first())?;
+                let result = rpc.get_token_health_call(None, GetTokenHealthRequest { at_block_hash }).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetScBootstrapSources => {
+                let result = rpc.get_sc_bootstrap_sources_call(None, GetScBootstrapSourcesRequest {}).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetScSnapshotManifest => {
+                if argv.is_empty() {
+                    return Err(Error::custom("Usage: rpc get-sc-snapshot-manifest <snapshotId>"));
+                }
+                let snapshot_id = argv.remove(0);
+                let result = rpc.get_sc_snapshot_manifest_call(None, GetScSnapshotManifestRequest { snapshot_id }).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetScSnapshotChunk => {
+                if argv.len() < 2 {
+                    return Err(Error::custom("Usage: rpc get-sc-snapshot-chunk <snapshotId> <chunkIndex> [chunkSize]"));
+                }
+                let snapshot_id = argv.remove(0);
+                let chunk_index = argv.remove(0).parse::<u32>().map_err(|err| Error::custom(err.to_string()))?;
+                let chunk_size =
+                    argv.first().map(|value| value.parse::<u32>().map_err(|err| Error::custom(err.to_string()))).transpose()?;
+                let result =
+                    rpc.get_sc_snapshot_chunk_call(None, GetScSnapshotChunkRequest { snapshot_id, chunk_index, chunk_size }).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetScReplayWindowChunk => {
+                if argv.len() < 2 {
+                    return Err(Error::custom("Usage: rpc get-sc-replay-window-chunk <snapshotId> <chunkIndex> [chunkSize]"));
+                }
+                let snapshot_id = argv.remove(0);
+                let chunk_index = argv.remove(0).parse::<u32>().map_err(|err| Error::custom(err.to_string()))?;
+                let chunk_size =
+                    argv.first().map(|value| value.parse::<u32>().map_err(|err| Error::custom(err.to_string()))).transpose()?;
+                let result = rpc
+                    .get_sc_replay_window_chunk_call(None, GetScReplayWindowChunkRequest { snapshot_id, chunk_index, chunk_size })
+                    .await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetScSnapshotHead => {
+                let result = rpc.get_sc_snapshot_head_call(None, GetScSnapshotHeadRequest {}).await?;
                 self.println(&ctx, result);
             }
             _ => {

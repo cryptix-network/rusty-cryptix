@@ -3,8 +3,8 @@ use cryptix_notify::{scope::Scope, subscription::Command};
 use crate::protowire::{
     cryptixd_request, cryptixd_response, CryptixdRequest, CryptixdResponse, NotifyBlockAddedRequestMessage,
     NotifyFinalityConflictRequestMessage, NotifyNewBlockTemplateRequestMessage, NotifyPruningPointUtxoSetOverrideRequestMessage,
-    NotifySinkBlueScoreChangedRequestMessage, NotifyUtxosChangedRequestMessage, NotifyVirtualChainChangedRequestMessage,
-    NotifyVirtualDaaScoreChangedRequestMessage,
+    NotifySinkBlueScoreChangedRequestMessage, NotifyTokenEventsRequestMessage, NotifyUtxosChangedRequestMessage,
+    NotifyVirtualChainChangedRequestMessage, NotifyVirtualDaaScoreChangedRequestMessage,
 };
 
 impl CryptixdRequest {
@@ -64,6 +64,9 @@ impl cryptixd_request::Payload {
                     command: command.into(),
                 })
             }
+            Scope::TokenEventsChanged(_) => {
+                cryptixd_request::Payload::NotifyTokenEventsRequest(NotifyTokenEventsRequestMessage { command: command.into() })
+            }
         }
     }
 
@@ -79,6 +82,7 @@ impl cryptixd_request::Payload {
                 | Payload::NotifyVirtualDaaScoreChangedRequest(_)
                 | Payload::NotifyPruningPointUtxoSetOverrideRequest(_)
                 | Payload::NotifyNewBlockTemplateRequest(_)
+                | Payload::NotifyTokenEventsRequest(_)
                 | Payload::StopNotifyingUtxosChangedRequest(_)
                 | Payload::StopNotifyingPruningPointUtxoSetOverrideRequest(_)
         )
@@ -108,6 +112,7 @@ impl cryptixd_response::Payload {
             Payload::VirtualDaaScoreChangedNotification(_) => true,
             Payload::PruningPointUtxoSetOverrideNotification(_) => true,
             Payload::NewBlockTemplateNotification(_) => true,
+            Payload::TokenEventsChangedNotification(_) => true,
             _ => false,
         }
     }

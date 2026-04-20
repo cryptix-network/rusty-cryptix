@@ -281,6 +281,26 @@ impl RpcApi for GrpcClient {
     route!(get_fast_intent_status_call, GetFastIntentStatus);
     route!(cancel_fast_intent_call, CancelFastIntent);
     route!(get_strong_nodes_call, GetStrongNodes);
+    route!(simulate_token_op_call, SimulateTokenOp);
+    route!(get_token_balance_call, GetTokenBalance);
+    route!(get_token_nonce_call, GetTokenNonce);
+    route!(get_token_asset_call, GetTokenAsset);
+    route!(get_token_op_status_call, GetTokenOpStatus);
+    route!(get_token_state_hash_call, GetTokenStateHash);
+    route!(get_token_spendability_call, GetTokenSpendability);
+    route!(get_token_events_call, GetTokenEvents);
+    route!(get_token_assets_call, GetTokenAssets);
+    route!(get_token_balances_by_owner_call, GetTokenBalancesByOwner);
+    route!(get_token_holders_call, GetTokenHolders);
+    route!(get_token_owner_id_by_address_call, GetTokenOwnerIdByAddress);
+    route!(export_token_snapshot_call, ExportTokenSnapshot);
+    route!(import_token_snapshot_call, ImportTokenSnapshot);
+    route!(get_token_health_call, GetTokenHealth);
+    route!(get_sc_bootstrap_sources_call, GetScBootstrapSources);
+    route!(get_sc_snapshot_manifest_call, GetScSnapshotManifest);
+    route!(get_sc_snapshot_chunk_call, GetScSnapshotChunk);
+    route!(get_sc_replay_window_chunk_call, GetScReplayWindowChunk);
+    route!(get_sc_snapshot_head_call, GetScSnapshotHead);
 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Notification API

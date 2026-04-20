@@ -24,6 +24,7 @@ use crate::{
             relations::RelationsStoreReader,
             statuses::StatusesStoreReader,
             tips::TipsStoreReader,
+            utxo_diffs::UtxoDiffsStoreReader,
             utxo_set::{UtxoSetStore, UtxoSetStoreReader},
             DB,
         },
@@ -67,6 +68,7 @@ use cryptix_consensus_core::{
     pruning::{PruningPointProof, PruningPointTrustedData, PruningPointsList},
     trusted::{ExternalGhostdagData, TrustedBlock},
     tx::{MutableTransaction, Transaction, TransactionOutpoint, UtxoEntry},
+    utxo::utxo_diff::UtxoDiff,
     BlockHashSet, BlueWorkType, ChainPath, HashMapCustomHasher,
 };
 use cryptix_consensus_notify::root::ConsensusNotificationRoot;
@@ -904,6 +906,10 @@ impl ConsensusApi for Consensus {
 
     fn get_block_acceptance_data(&self, hash: Hash) -> ConsensusResult<Arc<AcceptanceData>> {
         self.acceptance_data_store.get(hash).unwrap_option().ok_or(ConsensusError::MissingData(hash))
+    }
+
+    fn get_block_utxo_diff(&self, hash: Hash) -> ConsensusResult<Arc<UtxoDiff>> {
+        self.utxo_diffs_store.get(hash).unwrap_option().ok_or(ConsensusError::MissingData(hash))
     }
 
     fn get_blocks_acceptance_data(

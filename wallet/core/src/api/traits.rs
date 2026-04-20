@@ -11,14 +11,14 @@ use crate::api::message::*;
 use crate::imports::*;
 use crate::storage::{PrvKeyData, PrvKeyDataId, PrvKeyDataInfo, WalletDescriptor};
 use crate::tx::GeneratorSummary;
-use workflow_core::channel::Receiver;
+use workflow_core::channel::Sender;
 
 ///
 ///  API trait for interfacing with the Cryptix wallet subsystem.
 ///
 #[async_trait]
 pub trait WalletApi: Send + Sync + AnySync {
-    async fn register_notifications(self: Arc<Self>, channel: Receiver<WalletNotification>) -> Result<u64>;
+    async fn register_notifications(self: Arc<Self>, channel: Sender<WalletNotification>) -> Result<u64>;
     async fn unregister_notifications(self: Arc<Self>, channel_id: u64) -> Result<()>;
 
     async fn retain_context(self: Arc<Self>, name: &str, data: Option<Vec<u8>>) -> Result<()> {

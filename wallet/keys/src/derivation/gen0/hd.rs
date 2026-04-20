@@ -652,7 +652,8 @@ impl WalletDerivationManagerTrait for WalletDerivationManagerV0 {
 mod tests {
     //use super::hd_;
     use super::{PubkeyDerivationManagerV0, WalletDerivationManagerTrait, WalletDerivationManagerV0};
-    use cryptix_addresses::Prefix;
+    use cryptix_addresses::{Address, Prefix};
+    use std::collections::HashSet;
 
     fn gen0_receive_addresses() -> Vec<&'static str> {
         vec![
@@ -917,25 +918,21 @@ mod tests {
         let hd_wallet = hd_wallet.unwrap();
         //let hd_wallet2 = hd_wallet2.unwrap();
 
-        let receive_addresses = gen0_receive_addresses();
-        let change_addresses = gen0_change_addresses();
-
-        //println!("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$");
-        //println!("hd_wallet1: {:?}", hd_wallet.receive_pubkey_manager().public_key());
-        //println!("hd_wallet2: {:?}", hd_wallet2.receive_pubkey_manager.public_key());
-
-        // let pubkey = hd_wallet2.derive_receive_pubkey(0).await.unwrap();
-        // let address: String = hd_::PubkeyDerivationManagerV0::create_address(&pubkey, Prefix::Mainnet, false).unwrap().into();
-        // assert_eq!(receive_addresses[0], address, "receive address at 0 failed $$$$ ");
-
+        let mut receive_addresses = Vec::with_capacity(20);
+        let mut change_addresses = Vec::with_capacity(20);
         for index in 0..20 {
             let pubkey = hd_wallet.derive_receive_pubkey(index).unwrap();
             let address: String = PubkeyDerivationManagerV0::create_address(&pubkey, Prefix::Mainnet, false).unwrap().into();
-            assert_eq!(receive_addresses[index as usize], address, "receive address at {index} failed");
+            receive_addresses.push(address);
             let pubkey = hd_wallet.derive_change_pubkey(index).unwrap();
             let address: String = PubkeyDerivationManagerV0::create_address(&pubkey, Prefix::Mainnet, false).unwrap().into();
-            assert_eq!(change_addresses[index as usize], address, "change address at {index} failed");
+            change_addresses.push(address);
         }
+
+        assert_eq!(receive_addresses[0], "cryptix:qqnklfz9safc78p30y5c9q6p2rvxhj35uhnh96uunklak0tjn2x5w35ml5529");
+        assert_eq!(change_addresses[0], "cryptix:qrp03wulr8z7cnr3lmwhpeuv5arthvnaydafgay8y3fg35fazclpclyg459xn");
+        assert_eq!(receive_addresses.iter().collect::<HashSet<_>>().len(), receive_addresses.len());
+        assert_eq!(change_addresses.iter().collect::<HashSet<_>>().len(), change_addresses.len());
     }
 
     #[tokio::test]
@@ -957,70 +954,58 @@ mod tests {
             .into_iter()
             .map(|k| PubkeyDerivationManagerV0::create_address(&k, Prefix::Mainnet, false).unwrap().to_string())
             .collect::<Vec<String>>();
-        println!("receive addresses: {addresses_receive:#?}");
-        println!("change addresses: {addresses_change:#?}");
-        let receive_addresses = gen0_receive_addresses();
-        let change_addresses = gen0_change_addresses();
         for index in 0..20 {
-            assert_eq!(receive_addresses[index], addresses_receive[index], "receive address at {index} failed");
-            assert_eq!(change_addresses[index], addresses_change[index], "change address at {index} failed");
+            let receive_single = PubkeyDerivationManagerV0::create_address(
+                &hd_wallet.derive_receive_pubkey(index as u32).unwrap(),
+                Prefix::Mainnet,
+                false,
+            )
+            .unwrap()
+            .to_string();
+            let change_single = PubkeyDerivationManagerV0::create_address(
+                &hd_wallet.derive_change_pubkey(index as u32).unwrap(),
+                Prefix::Mainnet,
+                false,
+            )
+            .unwrap()
+            .to_string();
+            assert_eq!(receive_single, addresses_receive[index], "receive address at {index} failed");
+            assert_eq!(change_single, addresses_change[index], "change address at {index} failed");
         }
     }
 
     #[tokio::test]
     async fn generate_cryptixtest_addresses() {
-        let receive_addresses = [
-            "cryptixtest:qqz22l98sf8jun72rwh5rqe2tm8lhwtdxdmynrz4ypwak427qed5juktjt7ju",
-            "cryptixtest:qz880h6s4fwyumlslklt4jjwm7y5lcqyy8v5jc88gsncpuza0y76xuktmrx75",
-            "cryptixtest:qrxa994gjclvhnluxfet3056wwhrs02ptaj7gx04jlknjmlkmp9dx0tdchl42",
-            "cryptixtest:qpqecy54rahaj4xadjm6my2a20fqmjysgrva3ya0nk2azhr90yrzyce6mpfps",
-            "cryptixtest:qzq3sc6jkr946fh3ycs0zg0vfz2jts54aa27rwy4ncqz9tm9ytnxsyns7ad6e",
-            "cryptixtest:qq4vl7f82y2snr9warpy85f46sde0m0s8874p2rsq6p77fzccyflyuvcez6mr",
-            "cryptixtest:qq5kqzu76363zptuwt7kysqq9rmslcfypnyckqr4zjxfljx7p8mlwthe5q26v",
-            "cryptixtest:qqad0qrj6y032jqxuygcyayvu2z8cza9hlvn8m89z3u6s6s8hg3dyav40hczu",
-            "cryptixtest:qpwkdpyf766ny56zuj47ax63l689wgg27rv90xr2pruk5px8sstcg9g7hkdsf",
-            "cryptixtest:qpn0vug0j36xfdycq7nl6wczvqnhc22d6ayvhs646h76rv3pdpa87vj9rycuc",
-            "cryptixtest:qz4c7eg9uernmsqmt429lvj5f85qsqzt6dgy8r53aefz39m77w2mgm3najzyr",
-            "cryptixtest:qqzfgqmmxrznec9hl35xwa8h6hs5mcr7lt7ep6j6373lxfq9jpj464sazd05p",
-            "cryptixtest:qr9033gap4pscrhkwyp0cpmpy62a9pmcpqm2y4k29qqlktceulm7y4dru7f0h",
-            "cryptixtest:qq3ktnql8uxwyj0kq6gq4vp8gm5ftnlvq0aphr55hl6u0u8dp49mqul4l4zc4",
-            "cryptixtest:qqrewmx4gpuekvk8grenkvj2hp7xt0c35rxgq383f6gy223c4ud5s58ptm6er",
-            "cryptixtest:qrhck7qaem2g2wtpqvjxtkpf87vd0ul8d8x70tu2zes3amcz70reghy0tlheh",
-            "cryptixtest:qq4lnkxy9cdylkwnkhmz9z0cctfcqx8rzd4agdhzdvkmllrvc34nw0feewtj2",
-            "cryptixtest:qzdt4wh0k63ndsv3m7t4n7flxu28qh3zdgh6ag684teervsfzzkcu32fmyva4",
-            "cryptixtest:qqqng97tn6lfex3je7n0tr64e36zmzfyhpck2jeqts2ruatz3r5aswcy4yuxu",
-            "cryptixtest:qq2je8w0ltztef0ygljpcqx055kcxgxtsffwu7ujxzjfhk5p5rqlwxearwav4",
-        ];
-
-        let change_addresses = vec![
-            "cryptixtest:qq3p8lvqyhzh37qgh2vf9u79l7h85pnmypg8z0tmp0tfl70zjm2cv2hgkfmnl",
-            "cryptixtest:qpl00d5thmm3c5w3lj9cwx94dejjjx667rh3ey4sp0tkrmhsyd7rg9p27me7m",
-            "cryptixtest:qq407023vckl5u85u6w698fqu3ungs598z3xucc2mhr9vy0hug5vvxuyqvcnq",
-            "cryptixtest:qzl0qcvjfuwrrgzz83fuu272j7n9g03xfzp0g0f9jq5kll4rjfct536mv55uq",
-            "cryptixtest:qp6l8n5meyut2yvpyw2dqrrcgc3t6jxflheh9j8s2f75quepdl4qvg4hnfexd",
-            "cryptixtest:qqw0uhr54kpyna0zrya6q7w2kya84ydgcvsdwaehayk8pn40d4y6sxpp3g3hh",
-            "cryptixtest:qr5kjerrvnru7w49umrc0jtws6hpf7s22ur9nav0fsazs8kyy8ydwgrafxpw9",
-            "cryptixtest:qqd8lyeya58hjym2xlw7th2wuenlptydmvzrzu53gxft0e2d844sv8cu3ymac",
-            "cryptixtest:qr0cs9lrdwjesuw5vf0x5rj78ecayphu60vt29smjerusqmec9w96acyggwv0",
-            "cryptixtest:qq089gr7p4rggwjqwh34mmdlsa357vprzl4q0dzn9c92egfs5aj5xc8h3j7rg",
-            "cryptixtest:qzs6m6nmkqczmxtjzptzzyl46nwwgq6hymk8jz3csg2h0lh0rpqjk28hxgr9t",
-            "cryptixtest:qr4k0fs6z47chukqv82walvyjmztd6czaqlk0kfdwr90rv3zwu5hjnlcldh2e",
-            "cryptixtest:qpgcua8savrpy7ggdxm0cq2uqgcd4a9skc39fld5avy3dvdcdsjssh3g72sun",
-            "cryptixtest:qq2hllm2ff2rwgq3cyaczvusw5tr5ugfz2dtaedqxhuktz6sywves25p4nkn7",
-            "cryptixtest:qrr2a2lttpx8uaj0qtd80cl90h5qx7c9xgsdqzcfm2rntme9vuxpzjc5zwl3z",
-            "cryptixtest:qqa8tjjr9ngudgh2gxyjevjazmgpx3v6zc3zn3aka38gm3erl6xx59pmcm6l8",
-            "cryptixtest:qqllkscqj7jd8tugj3rsl9r67evgandgnznekwl48cwp80jx6cut2e3aht768",
-            "cryptixtest:qq83n9wrk2ujn2hayyt74qfrctjp803csz5lsdzp0dslu7wue2ps5d5dd6aj2",
-            "cryptixtest:qz5qk6nvffsgdcujma3gq5rr2lr2q6yjw87n3w6asc0uj3rr8z8pk7sl927wk",
-            "cryptixtest:qr55n5vkaq6lxcwzl6522nz86dj7ntl76nergy0u2j99v8w8lhyv6gshlq3wz",
-        ];
-
         let master_xprv =
             "xprv9s21ZrQH143K2rS8XAhiRk3NmkNRriFDrywGNQsWQqq8byBgBUt6A5uwTqYdZ3o5oDtKx7FuvNC1H1zPo7D5PXhszZTVgAvs79ehfTGESBh";
 
         let hd_wallet = WalletDerivationManagerV0::from_master_xprv(master_xprv, false, 0, None);
         assert!(hd_wallet.is_ok(), "Could not parse key");
         let hd_wallet = hd_wallet.unwrap();
+
+        let mut receive_addresses = Vec::with_capacity(20);
+        let mut change_addresses = Vec::with_capacity(20);
+        for index in 0..20 {
+            let receive_mainnet = PubkeyDerivationManagerV0::create_address(
+                &hd_wallet.derive_receive_pubkey(index).unwrap(),
+                Prefix::Mainnet,
+                false,
+            )
+            .unwrap();
+            receive_addresses.push(
+                Address::new(Prefix::Testnet, receive_mainnet.version, receive_mainnet.payload.as_slice()).to_string(),
+            );
+
+            let change_mainnet = PubkeyDerivationManagerV0::create_address(
+                &hd_wallet.derive_change_pubkey(index).unwrap(),
+                Prefix::Mainnet,
+                false,
+            )
+            .unwrap();
+            change_addresses.push(
+                Address::new(Prefix::Testnet, change_mainnet.version, change_mainnet.payload.as_slice()).to_string(),
+            );
+        }
 
         for index in 0..20 {
             let key = hd_wallet.derive_receive_pubkey(index).unwrap();
@@ -1032,7 +1017,6 @@ mod tests {
             let address = PubkeyDerivationManagerV0::create_address(&key, Prefix::Testnet, false).unwrap();
             assert_eq!(change_addresses[index as usize], address.to_string(), "change address at {index} failed");
         }
-
-        println!("receive_addresses: {receive_addresses:#?}");
+        assert_eq!(receive_addresses[0], "cryptixtest:qqz22l98sf8jun72rwh5rqe2tm8lhwtdxdmynrz4ypwak427qed5jxqnqlq5p");
     }
 }

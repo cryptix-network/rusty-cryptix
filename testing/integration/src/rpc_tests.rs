@@ -11,7 +11,8 @@ use cryptix_notify::{
     connection::{ChannelConnection, ChannelType},
     scope::{
         BlockAddedScope, FinalityConflictScope, NewBlockTemplateScope, PruningPointUtxoSetOverrideScope, Scope,
-        SinkBlueScoreChangedScope, UtxosChangedScope, VirtualChainChangedScope, VirtualDaaScoreChangedScope,
+        SinkBlueScoreChangedScope, TokenEventsChangedScope, UtxosChangedScope, VirtualChainChangedScope,
+        VirtualDaaScoreChangedScope,
     },
 };
 use cryptix_rpc_core::{api::rpc::RpcApi, model::*, Notification};
@@ -744,6 +745,239 @@ async fn sanity_test() {
                 })
             }
 
+            CryptixdPayloadOps::SimulateTokenOp => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .simulate_token_op_call(
+                            None,
+                            SimulateTokenOpRequest { payload_hex: String::new(), owner_id: String::new(), at_block_hash: None },
+                        )
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetTokenBalance => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_token_balance_call(
+                            None,
+                            GetTokenBalanceRequest { asset_id: String::new(), owner_id: String::new(), at_block_hash: None },
+                        )
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetTokenNonce => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_token_nonce_call(None, GetTokenNonceRequest { owner_id: String::new(), at_block_hash: None })
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetTokenAsset => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_token_asset_call(None, GetTokenAssetRequest { asset_id: String::new(), at_block_hash: None })
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetTokenOpStatus => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_token_op_status_call(None, GetTokenOpStatusRequest { txid: Hash::from(0u64), at_block_hash: None })
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetTokenStateHash => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetTokenSpendability => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_token_spendability_call(
+                            None,
+                            GetTokenSpendabilityRequest {
+                                asset_id: String::new(),
+                                owner_id: String::new(),
+                                min_daa_for_spend: None,
+                                at_block_hash: None,
+                            },
+                        )
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetTokenEvents => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_token_events_call(None, GetTokenEventsRequest { after_sequence: 0, limit: 10, at_block_hash: None })
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetTokenAssets => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_token_assets_call(None, GetTokenAssetsRequest { offset: 0, limit: 10, query: None, at_block_hash: None })
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetTokenBalancesByOwner => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_token_balances_by_owner_call(
+                            None,
+                            GetTokenBalancesByOwnerRequest {
+                                owner_id: String::new(),
+                                offset: 0,
+                                limit: 10,
+                                include_assets: false,
+                                at_block_hash: None,
+                            },
+                        )
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetTokenHolders => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_token_holders_call(
+                            None,
+                            GetTokenHoldersRequest { asset_id: String::new(), offset: 0, limit: 10, at_block_hash: None },
+                        )
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetTokenOwnerIdByAddress => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_token_owner_id_by_address_call(
+                            None,
+                            GetTokenOwnerIdByAddressRequest { address: String::new(), at_block_hash: None },
+                        )
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::ExportTokenSnapshot => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .export_token_snapshot_call(None, ExportTokenSnapshotRequest { path: "atomic.snapshot".to_string() })
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::ImportTokenSnapshot => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .import_token_snapshot_call(None, ImportTokenSnapshotRequest { path: "atomic.snapshot".to_string() })
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetTokenHealth => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client.get_token_health_call(None, GetTokenHealthRequest { at_block_hash: None }).await;
+                    assert!(result.is_ok());
+                    let health = result.unwrap();
+                    assert!(!health.token_state.is_empty());
+                })
+            }
+
+            CryptixdPayloadOps::GetScBootstrapSources => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client.get_sc_bootstrap_sources_call(None, GetScBootstrapSourcesRequest {}).await;
+                    if let Err(err) = result {
+                        assert!(err.to_string().contains("bootstrap source export unavailable"));
+                    }
+                })
+            }
+
+            CryptixdPayloadOps::GetScSnapshotManifest => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_sc_snapshot_manifest_call(None, GetScSnapshotManifestRequest { snapshot_id: String::new() })
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetScSnapshotChunk => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_sc_snapshot_chunk_call(
+                            None,
+                            GetScSnapshotChunkRequest { snapshot_id: String::new(), chunk_index: 0, chunk_size: None },
+                        )
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetScReplayWindowChunk => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_sc_replay_window_chunk_call(
+                            None,
+                            GetScReplayWindowChunkRequest { snapshot_id: String::new(), chunk_index: 0, chunk_size: None },
+                        )
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetScSnapshotHead => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client.get_sc_snapshot_head_call(None, GetScSnapshotHeadRequest {}).await;
+                    if let Err(err) = result {
+                        assert!(err.to_string().contains("bootstrap source export unavailable"));
+                    }
+                })
+            }
+
             CryptixdPayloadOps::NotifyBlockAdded => {
                 let rpc_client = client.clone();
                 let id = listener_id;
@@ -803,6 +1037,13 @@ async fn sanity_test() {
                         .start_notify(id, VirtualChainChangedScope { include_accepted_transaction_ids: false }.into())
                         .await
                         .unwrap();
+                })
+            }
+            CryptixdPayloadOps::NotifyTokenEvents => {
+                let rpc_client = client.clone();
+                let id = listener_id;
+                tst!(op, {
+                    rpc_client.start_notify(id, TokenEventsChangedScope {}.into()).await.unwrap();
                 })
             }
             CryptixdPayloadOps::StopNotifyingUtxosChanged => {

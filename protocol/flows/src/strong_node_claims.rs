@@ -2,7 +2,7 @@ use crate::node_identity::{network_code_from_name, UnifiedNodeIdentity};
 use cryptix_consensus_core::ChainPath;
 use cryptix_core::{time::unix_now, warn};
 use cryptix_hashes::Hash;
-use cryptix_p2p_lib::pb::BlockProducerClaimV1Message;
+use cryptix_p2p_lib::{pb::BlockProducerClaimV1Message, P2P_SERVICE_BIT_STRONG_NODE_CLAIMS};
 use hex::{decode as hex_decode, encode as hex_encode};
 use parking_lot::Mutex;
 use secp256k1::{schnorr::Signature as SchnorrSignature, Keypair, Message as SecpMessage, XOnlyPublicKey};
@@ -12,7 +12,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub const STRONG_NODE_CLAIMS_P2P_SERVICE_BIT: u64 = 1 << 22;
+pub const STRONG_NODE_CLAIMS_P2P_SERVICE_BIT: u64 = P2P_SERVICE_BIT_STRONG_NODE_CLAIMS;
 pub const CLAIM_WINDOW_SIZE_BLOCKS: usize = 1000;
 pub const CLAIM_REORG_MARGIN_BLOCKS: usize = 256;
 pub const PENDING_UNKNOWN_CLAIMS_CAP: usize = 4096;

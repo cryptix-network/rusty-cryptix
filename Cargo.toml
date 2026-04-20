@@ -29,6 +29,7 @@ members = [
     "notify",
     "indexes/core",
     "indexes/processor",
+    "indexes/atomicindex",
     "indexes/utxoindex",
     "rpc/macros",
     "rpc/core",
@@ -101,6 +102,7 @@ cryptix-grpc-server = { version = "0.16.0", path = "rpc/grpc/server" }
 cryptix-hashes = { version = "0.16.0", path = "crypto/hashes" }
 cryptix-index-core = { version = "0.16.0", path = "indexes/core" }
 cryptix-index-processor = { version = "0.16.0", path = "indexes/processor" }
+cryptix-atomicindex = { version = "0.16.0", path = "indexes/atomicindex" }
 cryptix-math = { version = "0.16.0", path = "math" }
 cryptix-merkle = { version = "0.16.0", path = "crypto/merkle" }
 cryptix-metrics-core = { version = "0.16.0", path = "metrics/core" }
@@ -257,7 +259,7 @@ toml = "0.8.8"
 tonic = { version = "0.10.2", features = ["tls-webpki-roots", "gzip", "transport"] }
 tonic-build = { version = "0.10.2", features = ["prost"] }
 triggered = "0.1.2"
-uuid = { version = "1.5.0", features = ["v4", "fast-rng", "serde"] }
+uuid = { version = "1.5.0", features = ["v4", "fast-rng", "serde", "js"] }
 wasm-bindgen = { version = "0.2.93", features = ["serde-serialize"] }
 wasm-bindgen-futures = "0.4.43"
 wasm-bindgen-test = "0.3.43"

@@ -17,7 +17,8 @@ const NODE_IDENTITY_FILE: &str = "node_identity.json";
 const NODE_POW_DOMAIN_TAG: &[u8] = b"cryptix-node-id-pow-v1";
 const NODE_AUTH_DOMAIN_TAG: &[u8] = b"cryptix-node-id-auth-v1";
 const MAINNET_NODE_POW_DIFFICULTY: u8 = 24;
-const NON_MAINNET_NODE_POW_DIFFICULTY: u8 = 22;
+const TESTNET_DEVNET_NODE_POW_DIFFICULTY: u8 = 22;
+const SIMNET_NODE_POW_DIFFICULTY: u8 = 8;
 
 #[derive(Clone, Debug)]
 pub struct UnifiedNodeIdentity {
@@ -98,7 +99,8 @@ pub fn network_code_from_name(network_name: &str) -> Option<u8> {
 pub fn node_pow_difficulty(network_code: u8) -> Option<u8> {
     match network_code {
         0 => Some(MAINNET_NODE_POW_DIFFICULTY),
-        1 | 2 | 3 => Some(NON_MAINNET_NODE_POW_DIFFICULTY),
+        1 | 2 => Some(TESTNET_DEVNET_NODE_POW_DIFFICULTY),
+        3 => Some(SIMNET_NODE_POW_DIFFICULTY),
         _ => None,
     }
 }
@@ -366,7 +368,8 @@ mod tests {
     #[test]
     fn pow_difficulty_constants_are_locked() {
         assert_eq!(MAINNET_NODE_POW_DIFFICULTY, 24);
-        assert_eq!(NON_MAINNET_NODE_POW_DIFFICULTY, 22);
+        assert_eq!(TESTNET_DEVNET_NODE_POW_DIFFICULTY, 22);
+        assert_eq!(SIMNET_NODE_POW_DIFFICULTY, 8);
     }
 
     #[test]

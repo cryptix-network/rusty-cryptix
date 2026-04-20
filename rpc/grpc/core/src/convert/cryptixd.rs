@@ -67,6 +67,26 @@ pub mod cryptixd_request_convert {
     impl_into_cryptixd_request!(GetFastIntentStatus);
     impl_into_cryptixd_request!(CancelFastIntent);
     impl_into_cryptixd_request!(GetStrongNodes);
+    impl_into_cryptixd_request!(SimulateTokenOp);
+    impl_into_cryptixd_request!(GetTokenBalance);
+    impl_into_cryptixd_request!(GetTokenNonce);
+    impl_into_cryptixd_request!(GetTokenAsset);
+    impl_into_cryptixd_request!(GetTokenOpStatus);
+    impl_into_cryptixd_request!(GetTokenStateHash);
+    impl_into_cryptixd_request!(GetTokenSpendability);
+    impl_into_cryptixd_request!(GetTokenEvents);
+    impl_into_cryptixd_request!(GetTokenAssets);
+    impl_into_cryptixd_request!(GetTokenBalancesByOwner);
+    impl_into_cryptixd_request!(GetTokenHolders);
+    impl_into_cryptixd_request!(GetTokenOwnerIdByAddress);
+    impl_into_cryptixd_request!(ExportTokenSnapshot);
+    impl_into_cryptixd_request!(ImportTokenSnapshot);
+    impl_into_cryptixd_request!(GetTokenHealth);
+    impl_into_cryptixd_request!(GetScBootstrapSources);
+    impl_into_cryptixd_request!(GetScSnapshotManifest);
+    impl_into_cryptixd_request!(GetScSnapshotChunk);
+    impl_into_cryptixd_request!(GetScReplayWindowChunk);
+    impl_into_cryptixd_request!(GetScSnapshotHead);
 
     impl_into_cryptixd_request!(NotifyBlockAdded);
     impl_into_cryptixd_request!(NotifyNewBlockTemplate);
@@ -76,6 +96,7 @@ pub mod cryptixd_request_convert {
     impl_into_cryptixd_request!(NotifyVirtualDaaScoreChanged);
     impl_into_cryptixd_request!(NotifyVirtualChainChanged);
     impl_into_cryptixd_request!(NotifySinkBlueScoreChanged);
+    impl_into_cryptixd_request!(NotifyTokenEvents);
 
     macro_rules! impl_into_cryptixd_request {
         ($name:tt) => {
@@ -208,6 +229,26 @@ pub mod cryptixd_response_convert {
     impl_into_cryptixd_response!(GetFastIntentStatus);
     impl_into_cryptixd_response!(CancelFastIntent);
     impl_into_cryptixd_response!(GetStrongNodes);
+    impl_into_cryptixd_response!(SimulateTokenOp);
+    impl_into_cryptixd_response!(GetTokenBalance);
+    impl_into_cryptixd_response!(GetTokenNonce);
+    impl_into_cryptixd_response!(GetTokenAsset);
+    impl_into_cryptixd_response!(GetTokenOpStatus);
+    impl_into_cryptixd_response!(GetTokenStateHash);
+    impl_into_cryptixd_response!(GetTokenSpendability);
+    impl_into_cryptixd_response!(GetTokenEvents);
+    impl_into_cryptixd_response!(GetTokenAssets);
+    impl_into_cryptixd_response!(GetTokenBalancesByOwner);
+    impl_into_cryptixd_response!(GetTokenHolders);
+    impl_into_cryptixd_response!(GetTokenOwnerIdByAddress);
+    impl_into_cryptixd_response!(ExportTokenSnapshot);
+    impl_into_cryptixd_response!(ImportTokenSnapshot);
+    impl_into_cryptixd_response!(GetTokenHealth);
+    impl_into_cryptixd_response!(GetScBootstrapSources);
+    impl_into_cryptixd_response!(GetScSnapshotManifest);
+    impl_into_cryptixd_response!(GetScSnapshotChunk);
+    impl_into_cryptixd_response!(GetScReplayWindowChunk);
+    impl_into_cryptixd_response!(GetScSnapshotHead);
 
     impl_into_cryptixd_notify_response!(NotifyBlockAdded);
     impl_into_cryptixd_notify_response!(NotifyNewBlockTemplate);
@@ -217,6 +258,7 @@ pub mod cryptixd_response_convert {
     impl_into_cryptixd_notify_response!(NotifyVirtualDaaScoreChanged);
     impl_into_cryptixd_notify_response!(NotifyVirtualChainChanged);
     impl_into_cryptixd_notify_response!(NotifySinkBlueScoreChanged);
+    impl_into_cryptixd_notify_response!(NotifyTokenEvents);
 
     impl_into_cryptixd_notify_response!(NotifyUtxosChanged, StopNotifyingUtxosChanged);
     impl_into_cryptixd_notify_response!(NotifyPruningPointUtxoSetOverride, StopNotifyingPruningPointUtxoSetOverride);

@@ -4,10 +4,17 @@ use crate::{
         BlockProcessResult,
         RuleError::{BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadUTXOCommitment, InvalidTransactionsInUtxoContext},
     },
-    model::stores::{block_transactions::BlockTransactionsStoreReader, daa::DaaStoreReader, ghostdag::GhostdagData},
+    model::stores::{
+        atomic_state::{AtomicAssetState, AtomicBalanceKey, AtomicConsensusState, AtomicSupplyMode},
+        block_transactions::BlockTransactionsStoreReader,
+        daa::DaaStoreReader,
+        ghostdag::GhostdagData,
+    },
     processes::transaction_validator::{
         errors::{TxResult, TxRuleError},
-        transaction_validator_populated::TxValidationFlags,
+        transaction_validator_populated::{
+            atomic_owner_id_from_script, parse_atomic_payload, AtomicPayloadOp, AtomicPayloadSupplyMode, TxValidationFlags,
+        },
     },
 };
 use cryptix_consensus_core::{
@@ -31,7 +38,11 @@ use cryptix_muhash::MuHash;
 use cryptix_utils::refs::Refs;
 
 use rayon::prelude::*;
-use std::{iter::once, ops::Deref};
+use std::{
+    collections::{HashMap, HashSet},
+    iter::once,
+    ops::Deref,
+};
 
 /// A context for processing the UTXO state of a block with respect to its selected parent.
 /// Note this can also be the virtual block.
@@ -42,10 +53,15 @@ pub(super) struct UtxoProcessingContext<'a> {
     pub accepted_tx_ids: Vec<TransactionId>,
     pub mergeset_acceptance_data: Vec<MergesetBlockAcceptanceData>,
     pub mergeset_rewards: BlockHashMap<BlockRewardData>,
+    pub atomic_state: AtomicConsensusState,
 }
 
 impl<'a> UtxoProcessingContext<'a> {
-    pub fn new(ghostdag_data: Refs<'a, GhostdagData>, selected_parent_multiset_hash: MuHash) -> Self {
+    pub fn new(
+        ghostdag_data: Refs<'a, GhostdagData>,
+        selected_parent_multiset_hash: MuHash,
+        selected_parent_atomic_state: AtomicConsensusState,
+    ) -> Self {
         let mergeset_size = ghostdag_data.mergeset_size();
         Self {
             ghostdag_data,
@@ -54,6 +70,7 @@ impl<'a> UtxoProcessingContext<'a> {
             accepted_tx_ids: Vec::with_capacity(1), // We expect at least the selected parent coinbase tx
             mergeset_rewards: BlockHashMap::with_capacity(mergeset_size),
             mergeset_acceptance_data: Vec::with_capacity(mergeset_size),
+            atomic_state: selected_parent_atomic_state,
         }
     }
 
@@ -95,7 +112,10 @@ impl VirtualStateProcessor {
             // No need to fully validate selected parent transactions since selected parent txs were already validated
             // as part of selected parent UTXO state verification with the exact same UTXO context.
             let validation_flags = if is_selected_parent { TxValidationFlags::SkipScriptChecks } else { TxValidationFlags::Full };
-            let validated_transactions = self.validate_transactions_in_parallel(&txs, &composed_view, pov_daa_score, validation_flags);
+            let mut validated_transactions =
+                self.validate_transactions_in_parallel(&txs, &composed_view, pov_daa_score, validation_flags);
+            validated_transactions =
+                self.filter_validated_transactions_by_atomic_state(validated_transactions, pov_daa_score, &mut ctx.atomic_state);
 
             let mut block_fee = 0u64;
             for (validated_tx, _) in validated_transactions.iter() {
@@ -177,8 +197,11 @@ impl VirtualStateProcessor {
 
         // Verify all transactions are valid in context
         let current_utxo_view = selected_parent_utxo_view.compose(&ctx.mergeset_diff);
-        let validated_transactions =
+        let mut validated_transactions =
             self.validate_transactions_in_parallel(&txs, &current_utxo_view, header.daa_score, TxValidationFlags::Full);
+        let mut atomic_state = ctx.atomic_state.clone();
+        validated_transactions =
+            self.filter_validated_transactions_by_atomic_state(validated_transactions, header.daa_score, &mut atomic_state);
         if validated_transactions.len() < txs.len() - 1 {
             // Some non-coinbase transactions are invalid
             return Err(InvalidTransactionsInUtxoContext(txs.len() - 1 - validated_transactions.len(), txs.len() - 1));
@@ -227,6 +250,293 @@ impl VirtualStateProcessor {
                 .filter_map(|(i, tx)| self.validate_transaction_in_utxo_context(tx, &utxo_view, pov_daa_score, flags).ok().map(|vtx| (vtx, i as u32)))
                 .collect()
         })
+    }
+
+    fn filter_validated_transactions_by_atomic_state<'a>(
+        &self,
+        mut validated_transactions: Vec<(ValidatedTransaction<'a>, u32)>,
+        pov_daa_score: u64,
+        atomic_state: &mut AtomicConsensusState,
+    ) -> Vec<(ValidatedTransaction<'a>, u32)> {
+        validated_transactions.sort_by_key(|(_, tx_index)| *tx_index);
+
+        let mut filtered = Vec::with_capacity(validated_transactions.len());
+        for (validated_tx, tx_index) in validated_transactions.into_iter() {
+            let tx_id = validated_tx.id();
+            match self.validate_and_apply_atomic_state_transition(&validated_tx, pov_daa_score, atomic_state) {
+                Ok(()) => filtered.push((validated_tx, tx_index)),
+                Err(err) => {
+                    info!("Rejecting transaction {} due to transaction rule error at block tx index {}: {}", tx_id, tx_index, err);
+                }
+            }
+        }
+
+        filtered
+    }
+
+    pub(crate) fn validate_and_apply_atomic_state_transition(
+        &self,
+        tx: &impl VerifiableTransaction,
+        pov_daa_score: u64,
+        atomic_state: &mut AtomicConsensusState,
+    ) -> TxResult<()> {
+        let payload_hf_active = self.transaction_validator.is_payload_hf_active(pov_daa_score);
+
+        let tx_ref = tx.tx();
+        if !payload_hf_active || !tx_ref.subnetwork_id.is_payload() || tx_ref.payload.is_empty() {
+            self.apply_anchor_deltas_to_atomic_state(tx, atomic_state);
+            return Ok(());
+        }
+
+        let Some(parsed_payload) = parse_atomic_payload(tx_ref.payload.as_slice()).map_err(TxRuleError::InvalidAtomicPayload)? else {
+            self.apply_anchor_deltas_to_atomic_state(tx, atomic_state);
+            return Ok(());
+        };
+        let owner_id = self.resolve_atomic_owner_from_populated_tx(tx, parsed_payload.auth_input_index)?;
+
+        let expected_nonce = atomic_state.next_nonces.get(&owner_id).copied().unwrap_or(1);
+        if parsed_payload.nonce != expected_nonce {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "nonce baseline violation for owner `{}`: expected `{}`, got `{}`",
+                faster_hex::hex_string(&owner_id),
+                expected_nonce,
+                parsed_payload.nonce
+            )));
+        }
+
+        self.validate_replacement_anchor(tx, owner_id, atomic_state)?;
+        self.apply_atomic_op_to_state(tx.tx().id().as_bytes(), owner_id, parsed_payload.op, atomic_state)?;
+
+        let Some(next_nonce) = expected_nonce.checked_add(1) else {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "nonce progression overflow for owner `{}`",
+                faster_hex::hex_string(&owner_id)
+            )));
+        };
+        atomic_state.next_nonces.insert(owner_id, next_nonce);
+        self.apply_anchor_deltas_to_atomic_state(tx, atomic_state);
+        Ok(())
+    }
+
+    fn resolve_atomic_owner_from_populated_tx(&self, tx: &impl VerifiableTransaction, auth_input_index: u16) -> TxResult<[u8; 32]> {
+        let auth_input_index = auth_input_index as usize;
+        let (_, auth_entry) = tx.populated_inputs().nth(auth_input_index).ok_or_else(|| {
+            TxRuleError::InvalidAtomicPayload(format!(
+                "auth_input_index `{auth_input_index}` has no populated UTXO entry in contextual validation"
+            ))
+        })?;
+        atomic_owner_id_from_script(&auth_entry.script_public_key).ok_or_else(|| {
+            TxRuleError::InvalidAtomicPayload(
+                "auth input script public key is not a supported CAT owner authorization scheme (expected PubKey, PubKeyECDSA, or ScriptHash)"
+                    .to_string(),
+            )
+        })
+    }
+
+    fn validate_replacement_anchor(
+        &self,
+        tx: &impl VerifiableTransaction,
+        owner_id: [u8; 32],
+        atomic_state: &AtomicConsensusState,
+    ) -> TxResult<()> {
+        let before_count = atomic_state.anchor_counts.get(&owner_id).copied().unwrap_or(0);
+        let mut spent_for_owner = 0u64;
+        for (_, entry) in tx.populated_inputs() {
+            if atomic_owner_id_from_script(&entry.script_public_key) == Some(owner_id) {
+                spent_for_owner = spent_for_owner.saturating_add(1);
+            }
+        }
+
+        if before_count.saturating_sub(spent_for_owner) > 0 {
+            return Ok(());
+        }
+
+        let has_replacement_anchor =
+            tx.tx().outputs.iter().any(|output| atomic_owner_id_from_script(&output.script_public_key) == Some(owner_id));
+        if has_replacement_anchor {
+            Ok(())
+        } else {
+            Err(TxRuleError::InvalidAtomicPayload(
+                "auth owner would lose the final anchor UTXO without a replacement owner output".to_string(),
+            ))
+        }
+    }
+
+    fn apply_anchor_deltas_to_atomic_state(&self, tx: &impl VerifiableTransaction, atomic_state: &mut AtomicConsensusState) {
+        let mut spent_counts: HashMap<[u8; 32], u64> = HashMap::new();
+        for (_, entry) in tx.populated_inputs() {
+            let Some(owner_id) = atomic_owner_id_from_script(&entry.script_public_key) else {
+                continue;
+            };
+            *spent_counts.entry(owner_id).or_insert(0) += 1;
+        }
+
+        let mut created_counts: HashMap<[u8; 32], u64> = HashMap::new();
+        for output in tx.tx().outputs.iter() {
+            let Some(owner_id) = atomic_owner_id_from_script(&output.script_public_key) else {
+                continue;
+            };
+            *created_counts.entry(owner_id).or_insert(0) += 1;
+        }
+
+        let owners: HashSet<[u8; 32]> = spent_counts.keys().copied().chain(created_counts.keys().copied()).collect();
+        for owner_id in owners {
+            let old_count = atomic_state.anchor_counts.get(&owner_id).copied().unwrap_or(0);
+            let spent = spent_counts.get(&owner_id).copied().unwrap_or(0);
+            let created = created_counts.get(&owner_id).copied().unwrap_or(0);
+            let new_count = old_count.saturating_sub(spent).saturating_add(created);
+            if new_count == 0 {
+                atomic_state.anchor_counts.remove(&owner_id);
+            } else {
+                atomic_state.anchor_counts.insert(owner_id, new_count);
+            }
+        }
+    }
+
+    fn apply_atomic_op_to_state(
+        &self,
+        tx_id_bytes: [u8; 32],
+        owner_id: [u8; 32],
+        op: AtomicPayloadOp,
+        atomic_state: &mut AtomicConsensusState,
+    ) -> TxResult<()> {
+        match op {
+            AtomicPayloadOp::CreateAsset {
+                decimals: _,
+                supply_mode,
+                max_supply,
+                mint_authority_owner_id,
+                name: _,
+                symbol: _,
+                metadata: _,
+            } => {
+                let asset_id = tx_id_bytes;
+                if atomic_state.assets.contains_key(&asset_id) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "asset `{}` already exists",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+                let supply_mode = match supply_mode {
+                    AtomicPayloadSupplyMode::Uncapped => AtomicSupplyMode::Uncapped,
+                    AtomicPayloadSupplyMode::Capped => AtomicSupplyMode::Capped,
+                };
+                atomic_state
+                    .assets
+                    .insert(asset_id, AtomicAssetState { mint_authority_owner_id, supply_mode, max_supply, total_supply: 0 });
+            }
+            AtomicPayloadOp::Transfer { asset_id, to_owner_id, amount } => {
+                if !atomic_state.assets.contains_key(&asset_id) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "transfer references unknown asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+
+                let from_key = AtomicBalanceKey { asset_id, owner_id };
+                let to_key = AtomicBalanceKey { asset_id, owner_id: to_owner_id };
+
+                let sender_balance = atomic_state.balances.get(&from_key).copied().unwrap_or(0);
+                if from_key == to_key {
+                    sender_balance.checked_sub(amount).ok_or_else(|| {
+                        TxRuleError::InvalidAtomicPayload(format!(
+                            "insufficient balance for self-transfer of asset `{}`",
+                            faster_hex::hex_string(&asset_id)
+                        ))
+                    })?;
+                } else {
+                    let receiver_balance = atomic_state.balances.get(&to_key).copied().unwrap_or(0);
+                    let sender_after = sender_balance.checked_sub(amount).ok_or_else(|| {
+                        TxRuleError::InvalidAtomicPayload(format!(
+                            "insufficient balance for transfer of asset `{}`",
+                            faster_hex::hex_string(&asset_id)
+                        ))
+                    })?;
+                    let receiver_after = receiver_balance.checked_add(amount).ok_or_else(|| {
+                        TxRuleError::InvalidAtomicPayload(format!(
+                            "balance overflow for transfer receiver in asset `{}`",
+                            faster_hex::hex_string(&asset_id)
+                        ))
+                    })?;
+
+                    if sender_after == 0 {
+                        atomic_state.balances.remove(&from_key);
+                    } else {
+                        atomic_state.balances.insert(from_key, sender_after);
+                    }
+                    atomic_state.balances.insert(to_key, receiver_after);
+                }
+            }
+            AtomicPayloadOp::Mint { asset_id, to_owner_id, amount } => {
+                let mut asset = atomic_state.assets.get(&asset_id).cloned().ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!("mint references unknown asset `{}`", faster_hex::hex_string(&asset_id)))
+                })?;
+                if asset.mint_authority_owner_id != owner_id {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "owner `{}` is not mint authority for asset `{}`",
+                        faster_hex::hex_string(&owner_id),
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+
+                let new_total_supply = asset.total_supply.checked_add(amount).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "supply overflow while minting asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                if matches!(asset.supply_mode, AtomicSupplyMode::Capped) && new_total_supply > asset.max_supply {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "mint would exceed cap for asset `{}`: cap `{}`, attempted total `{}`",
+                        faster_hex::hex_string(&asset_id),
+                        asset.max_supply,
+                        new_total_supply
+                    )));
+                }
+
+                let receiver_key = AtomicBalanceKey { asset_id, owner_id: to_owner_id };
+                let receiver_balance = atomic_state.balances.get(&receiver_key).copied().unwrap_or(0);
+                let receiver_after = receiver_balance.checked_add(amount).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "balance overflow while minting asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+
+                asset.total_supply = new_total_supply;
+                atomic_state.assets.insert(asset_id, asset);
+                atomic_state.balances.insert(receiver_key, receiver_after);
+            }
+            AtomicPayloadOp::Burn { asset_id, amount } => {
+                let mut asset = atomic_state.assets.get(&asset_id).cloned().ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!("burn references unknown asset `{}`", faster_hex::hex_string(&asset_id)))
+                })?;
+                let sender_key = AtomicBalanceKey { asset_id, owner_id };
+                let sender_balance = atomic_state.balances.get(&sender_key).copied().unwrap_or(0);
+
+                let sender_after = sender_balance.checked_sub(amount).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "insufficient balance for burn in asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                let supply_after = asset.total_supply.checked_sub(amount).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "supply underflow while burning asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+
+                asset.total_supply = supply_after;
+                atomic_state.assets.insert(asset_id, asset);
+                if sender_after == 0 {
+                    atomic_state.balances.remove(&sender_key);
+                } else {
+                    atomic_state.balances.insert(sender_key, sender_after);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Attempts to populate the transaction with UTXO entries and performs all utxo-related tx validations

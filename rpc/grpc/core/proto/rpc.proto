@@ -274,6 +274,15 @@ message GetConnectedPeerInfoMessage{
   // The protocol version that this peer claims to support
   uint32 advertisedProtocolVersion = 9;
 
+  // Raw service bitfield advertised by the peer in Version.
+  uint64 advertisedServices = 13;
+
+  // Convenience capability flags derived from advertisedServices.
+  bool isHfaFastchain = 14;
+  bool isCryptixAtomic = 15;
+  bool isStrongNodeClaims = 16;
+  bool isArchival = 17;
+
   // The timestamp of when this peer connected to this cryptixd
   int64 timeConnected = 10;
 
@@ -740,6 +749,26 @@ message NotifyNewBlockTemplateResponseMessage {
 message NewBlockTemplateNotificationMessage {
 }
 
+// NotifyTokenEventsRequestMessage registers this connection for tokenEventsChanged notifications.
+//
+// See: TokenEventsChangedNotificationMessage
+message NotifyTokenEventsRequestMessage {
+  RpcNotifyCommand command = 101;
+}
+
+message NotifyTokenEventsResponseMessage {
+  RPCError error = 1000;
+}
+
+// TokenEventsChangedNotificationMessage is sent whenever new token events are recorded.
+//
+// See: NotifyTokenEventsRequestMessage
+message TokenEventsChangedNotificationMessage {
+  uint64 fromSequence = 1;
+  uint64 toSequence = 2;
+  uint32 eventCount = 3;
+}
+
 message RpcMempoolEntryByAddress{
   string address = 1;
   repeated RpcMempoolEntry sending = 2;
@@ -936,6 +965,321 @@ message GetStrongNodesResponseMessage{
   uint64 conflictTotal = 6;
   uint32 windowSize = 7;
   repeated RpcStrongNodeEntry entries = 8;
+  RPCError error = 1000;
+}
+
+message RpcTokenContextMessage {
+  string atBlockHash = 1;
+  uint64 atDaaScore = 2;
+  string stateHash = 3;
+  bool isDegraded = 4;
+}
+
+message SimulateTokenOpRequestMessage {
+  string payloadHex = 1;
+  string ownerId = 2;
+  optional string atBlockHash = 3;
+}
+
+message SimulateTokenOpResponseMessage {
+  string result = 1;
+  optional uint32 noopReason = 2;
+  uint64 expectedNextNonce = 3;
+  RpcTokenContextMessage context = 4;
+  RPCError error = 1000;
+}
+
+message GetTokenBalanceRequestMessage {
+  string assetId = 1;
+  string ownerId = 2;
+  optional string atBlockHash = 3;
+}
+
+message GetTokenBalanceResponseMessage {
+  string balance = 1;
+  RpcTokenContextMessage context = 2;
+  RPCError error = 1000;
+}
+
+message GetTokenNonceRequestMessage {
+  string ownerId = 1;
+  optional string atBlockHash = 2;
+}
+
+message GetTokenNonceResponseMessage {
+  uint64 expectedNextNonce = 1;
+  RpcTokenContextMessage context = 2;
+  RPCError error = 1000;
+}
+
+message RpcTokenAssetMessage {
+  string assetId = 1;
+  string creatorOwnerId = 2;
+  string mintAuthorityOwnerId = 3;
+  uint32 decimals = 4;
+  uint32 supplyMode = 5;
+  string maxSupply = 6;
+  string totalSupply = 7;
+  string name = 8;
+  string symbol = 9;
+  string metadataHex = 10;
+  optional string createdBlockHash = 11;
+  optional uint64 createdDaaScore = 12;
+  optional uint64 createdAt = 13;
+}
+
+message GetTokenAssetRequestMessage {
+  string assetId = 1;
+  optional string atBlockHash = 2;
+}
+
+message GetTokenAssetResponseMessage {
+  RpcTokenAssetMessage asset = 1;
+  RpcTokenContextMessage context = 2;
+  RPCError error = 1000;
+}
+
+message GetTokenOpStatusRequestMessage {
+  string txid = 1;
+  optional string atBlockHash = 2;
+}
+
+message GetTokenOpStatusResponseMessage {
+  optional string acceptingBlockHash = 1;
+  optional uint32 applyStatus = 2;
+  optional uint32 noopReason = 3;
+  RpcTokenContextMessage context = 4;
+  RPCError error = 1000;
+}
+
+message GetTokenStateHashRequestMessage {
+  optional string atBlockHash = 1;
+}
+
+message GetTokenStateHashResponseMessage {
+  RpcTokenContextMessage context = 1;
+  RPCError error = 1000;
+}
+
+message GetTokenSpendabilityRequestMessage {
+  string assetId = 1;
+  string ownerId = 2;
+  optional uint64 minDaaForSpend = 3;
+  optional string atBlockHash = 4;
+}
+
+message GetTokenSpendabilityResponseMessage {
+  bool canSpend = 1;
+  optional string reason = 2;
+  string balance = 3;
+  uint64 expectedNextNonce = 4;
+  uint64 minDaaForSpend = 5;
+  RpcTokenContextMessage context = 6;
+  RPCError error = 1000;
+}
+
+message RpcTokenEventMessage {
+  string eventId = 1;
+  uint64 sequence = 2;
+  string acceptingBlockHash = 3;
+  string txid = 4;
+  uint32 eventType = 5;
+  uint32 applyStatus = 6;
+  uint32 noopReason = 7;
+  uint32 ordinal = 8;
+  optional string reorgOfEventId = 9;
+  optional uint32 opType = 10;
+  optional string assetId = 11;
+  optional string fromOwnerId = 12;
+  optional string toOwnerId = 13;
+  optional string amount = 14;
+}
+
+message GetTokenEventsRequestMessage {
+  uint64 afterSequence = 1;
+  uint32 limit = 2;
+  optional string atBlockHash = 3;
+}
+
+message GetTokenEventsResponseMessage {
+  repeated RpcTokenEventMessage events = 1;
+  RpcTokenContextMessage context = 2;
+  RPCError error = 1000;
+}
+
+message GetTokenAssetsRequestMessage {
+  uint32 offset = 1;
+  uint32 limit = 2;
+  optional string query = 3;
+  optional string atBlockHash = 4;
+}
+
+message GetTokenAssetsResponseMessage {
+  repeated RpcTokenAssetMessage assets = 1;
+  uint64 total = 2;
+  RpcTokenContextMessage context = 3;
+  RPCError error = 1000;
+}
+
+message RpcTokenOwnerBalanceMessage {
+  string assetId = 1;
+  string balance = 2;
+  optional RpcTokenAssetMessage asset = 3;
+}
+
+message GetTokenBalancesByOwnerRequestMessage {
+  string ownerId = 1;
+  uint32 offset = 2;
+  uint32 limit = 3;
+  bool includeAssets = 4;
+  optional string atBlockHash = 5;
+}
+
+message GetTokenBalancesByOwnerResponseMessage {
+  repeated RpcTokenOwnerBalanceMessage balances = 1;
+  uint64 total = 2;
+  RpcTokenContextMessage context = 3;
+  RPCError error = 1000;
+}
+
+message RpcTokenHolderMessage {
+  string ownerId = 1;
+  string balance = 2;
+}
+
+message GetTokenHoldersRequestMessage {
+  string assetId = 1;
+  uint32 offset = 2;
+  uint32 limit = 3;
+  optional string atBlockHash = 4;
+}
+
+message GetTokenHoldersResponseMessage {
+  repeated RpcTokenHolderMessage holders = 1;
+  uint64 total = 2;
+  RpcTokenContextMessage context = 3;
+  RPCError error = 1000;
+}
+
+message GetTokenOwnerIdByAddressRequestMessage {
+  string address = 1;
+  optional string atBlockHash = 2;
+}
+
+message GetTokenOwnerIdByAddressResponseMessage {
+  optional string ownerId = 1;
+  optional string reason = 2;
+  RpcTokenContextMessage context = 3;
+  RPCError error = 1000;
+}
+
+message ExportTokenSnapshotRequestMessage {
+  string path = 1;
+}
+
+message ExportTokenSnapshotResponseMessage {
+  bool exported = 1;
+  RpcTokenContextMessage context = 2;
+  RPCError error = 1000;
+}
+
+message ImportTokenSnapshotRequestMessage {
+  string path = 1;
+}
+
+message ImportTokenSnapshotResponseMessage {
+  bool imported = 1;
+  RpcTokenContextMessage context = 2;
+  RPCError error = 1000;
+}
+
+message GetTokenHealthRequestMessage {
+  optional string atBlockHash = 1;
+}
+
+message GetTokenHealthResponseMessage {
+  bool isDegraded = 1;
+  bool liveCorrect = 2;
+  optional string lastAppliedBlock = 3;
+  uint64 lastSequence = 4;
+  string stateHash = 5;
+  RpcTokenContextMessage context = 6;
+  bool bootstrapInProgress = 7;
+  string tokenState = 8;
+  RPCError error = 1000;
+}
+
+message RpcScBootstrapSourceMessage {
+  string snapshotId = 1;
+  uint32 protocolVersion = 2;
+  string networkId = 3;
+  string nodeIdentity = 4;
+  string atBlockHash = 5;
+  uint64 atDaaScore = 6;
+  string stateHashAtFp = 7;
+  string windowStartBlockHash = 8;
+  string windowEndBlockHash = 9;
+}
+
+message GetScBootstrapSourcesRequestMessage {}
+
+message GetScBootstrapSourcesResponseMessage {
+  repeated RpcScBootstrapSourceMessage sources = 1;
+  RpcTokenContextMessage context = 2;
+  RPCError error = 1000;
+}
+
+message GetScSnapshotManifestRequestMessage {
+  string snapshotId = 1;
+}
+
+message RpcScManifestSignatureMessage {
+  string signerPubkeyHex = 1;
+  string signatureHex = 2;
+}
+
+message GetScSnapshotManifestResponseMessage {
+  string snapshotId = 1;
+  string manifestHex = 2;
+  repeated RpcScManifestSignatureMessage manifestSignatures = 3;
+  RPCError error = 1000;
+}
+
+message GetScSnapshotChunkRequestMessage {
+  string snapshotId = 1;
+  uint32 chunkIndex = 2;
+  optional uint32 chunkSize = 3;
+}
+
+message GetScSnapshotChunkResponseMessage {
+  string snapshotId = 1;
+  uint32 chunkIndex = 2;
+  uint32 totalChunks = 3;
+  uint64 fileSize = 4;
+  string chunkHex = 5;
+  RPCError error = 1000;
+}
+
+message GetScReplayWindowChunkRequestMessage {
+  string snapshotId = 1;
+  uint32 chunkIndex = 2;
+  optional uint32 chunkSize = 3;
+}
+
+message GetScReplayWindowChunkResponseMessage {
+  string snapshotId = 1;
+  uint32 chunkIndex = 2;
+  uint32 totalChunks = 3;
+  uint64 fileSize = 4;
+  string chunkHex = 5;
+  RPCError error = 1000;
+}
+
+message GetScSnapshotHeadRequestMessage {}
+
+message GetScSnapshotHeadResponseMessage {
+  optional RpcScBootstrapSourceMessage head = 1;
+  RpcTokenContextMessage context = 2;
   RPCError error = 1000;
 }
 

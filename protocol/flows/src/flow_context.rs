@@ -48,7 +48,8 @@ use cryptix_p2p_lib::{
         cryptixd_message::Payload, BlockProducerClaimV1Message, CryptixdMessage, FastIntentMessage, FastMicroblockMessage,
         InvRelayBlockMessage,
     },
-    ConnectionInitializer, CryptixdHandshake, Hub, PeerKey, PeerProperties, Router,
+    ConnectionInitializer, CryptixdHandshake, Hub, PeerKey, PeerProperties, Router, P2P_SERVICE_BIT_ARCHIVAL, P2P_SERVICE_BIT_ATOMIC,
+    P2P_SERVICE_BIT_QUANTUM_HANDSHAKE_FALLBACK,
 };
 use cryptix_utils::iter::IterExtensions;
 use cryptix_utils::networking::PeerId;
@@ -692,14 +693,14 @@ impl FlowContext {
         }
 
         if next_state == QUANTUM_HANDSHAKE_STATE_ENFORCED {
-            info!("Hardfork reached: switching to quantum-safe handshake (ML-KEM-1024 enforced)");
+            info!("Hardfork reached: switching to post-HF hybrid handshake policy (ML-KEM-1024 with negotiated fallback)");
             return;
         }
 
         if previous_state == QUANTUM_HANDSHAKE_STATE_ENFORCED {
-            warn!("Quantum-safe handshake enforcement disabled; returning to legacy-compatible handshake mode");
+            warn!("Post-HF hybrid handshake policy disabled; returning to legacy-compatible handshake mode");
         } else {
-            info!("Handshake mode initialized: legacy-compatible (quantum-safe ML-KEM-1024 is not enforced)");
+            info!("Handshake mode initialized: legacy-compatible");
         }
     }
 
@@ -1272,11 +1273,16 @@ impl ConnectionInitializer for FlowContext {
         }
         self.log_quantum_handshake_key_sample_once(local_pq_ml_kem1024_public_key.as_slice());
         self_version_message.pq_ml_kem1024_pubkey = Some(local_pq_ml_kem1024_public_key);
+        self_version_message.services |= P2P_SERVICE_BIT_QUANTUM_HANDSHAKE_FALLBACK;
         if self.is_hfa_p2p_enabled() {
             self_version_message.services |= HFA_P2P_SERVICE_BIT;
         }
         if self.is_strong_node_claims_p2p_enabled() {
             self_version_message.services |= STRONG_NODE_CLAIMS_P2P_SERVICE_BIT;
+        }
+        self_version_message.services |= P2P_SERVICE_BIT_ATOMIC;
+        if self.config.is_archival {
+            self_version_message.services |= P2P_SERVICE_BIT_ARCHIVAL;
         }
         // TODO: get number of live services
         // TODO: disable_relay_tx from config/cmd
@@ -1317,13 +1323,26 @@ impl ConnectionInitializer for FlowContext {
         let anti_fraud_runtime_enabled = self.connection_manager().map(|cm| cm.is_antifraud_runtime_enabled()).unwrap_or(false);
         let enforce_hardfork_core = payload_hf_active;
         let enforce_anti_fraud = enforce_hardfork_core && anti_fraud_runtime_enabled;
+        let peer_supports_quantum_fallback = (peer_version.services & P2P_SERVICE_BIT_QUANTUM_HANDSHAKE_FALLBACK) != 0;
+        let require_quantum_ready = enforce_hardfork_core && !peer_supports_quantum_fallback;
         self.log_quantum_handshake_mode_transition(enforce_hardfork_core);
         self.log_quantum_handshake_startup_once(enforce_hardfork_core);
         debug!(
             "Starting handshake with peer {} in {} mode",
             router,
-            if enforce_hardfork_core { "quantum-safe (ML-KEM-1024 enforced)" } else { "legacy-compatible" }
+            if enforce_hardfork_core {
+                if require_quantum_ready {
+                    "quantum-safe (ML-KEM-1024 required)"
+                } else {
+                    "quantum-hybrid (ML-KEM-1024 with negotiated fallback)"
+                }
+            } else {
+                "legacy-compatible"
+            }
         );
+        if enforce_hardfork_core && !require_quantum_ready {
+            debug!("Peer {} supports post-HF quantum-safe handshake fallback negotiation", router);
+        }
 
         if enforce_hardfork_core && peer_unified_node_id.is_none() {
             return Err(ProtocolError::OtherOwned("peer missing mandatory unified node identity after hardfork".to_string()));
@@ -1331,7 +1350,7 @@ impl ConnectionInitializer for FlowContext {
         if enforce_hardfork_core && peer_node_challenge_nonce.is_none() {
             return Err(ProtocolError::OtherOwned("peer missing mandatory node challenge nonce after hardfork".to_string()));
         }
-        if enforce_hardfork_core && peer_pq_ml_kem1024_public_key.is_none() {
+        if require_quantum_ready && peer_pq_ml_kem1024_public_key.is_none() {
             return Err(ProtocolError::OtherOwned("peer missing mandatory ML-KEM-1024 public key after hardfork".to_string()));
         }
         if let Some(peer_node_id) = peer_unified_node_id {
@@ -1354,8 +1373,15 @@ impl ConnectionInitializer for FlowContext {
         let local_hfa_enabled = self.is_hfa_p2p_enabled();
         let peer_hfa_enabled = (peer_version.services & HFA_P2P_SERVICE_BIT) != 0;
         let hfa_capable = local_hfa_enabled && peer_hfa_enabled;
+        let local_atomic_enabled = true;
+        let peer_atomic_enabled = (peer_version.services & P2P_SERVICE_BIT_ATOMIC) != 0;
+        let local_archival_enabled = self.config.is_archival;
+        let peer_archival_enabled = (peer_version.services & P2P_SERVICE_BIT_ARCHIVAL) != 0;
         let local_strong_node_claims_enabled = self.is_strong_node_claims_p2p_enabled();
         let peer_strong_node_claims_enabled = (peer_version.services & STRONG_NODE_CLAIMS_P2P_SERVICE_BIT) != 0;
+        if enforce_hardfork_core && !peer_atomic_enabled {
+            return Err(ProtocolError::OtherOwned("peer missing mandatory atomic service bit after hardfork".to_string()));
+        }
         if enforce_hardfork_core && !peer_strong_node_claims_enabled {
             return Err(ProtocolError::OtherOwned("peer missing mandatory strong-node-claims service bit after hardfork".to_string()));
         }
@@ -1372,6 +1398,20 @@ impl ConnectionInitializer for FlowContext {
             peer_version.services,
             strong_node_claims_capable
         );
+        debug!(
+            "Cryptix Atomic capability for peer {}: local_enabled={} peer_enabled={} peer_services=0x{:x}",
+            router, local_atomic_enabled, peer_atomic_enabled, peer_version.services
+        );
+        debug!(
+            "Archival capability for peer {}: local_archival={} peer_archival={} peer_services=0x{:x}",
+            router, local_archival_enabled, peer_archival_enabled, peer_version.services
+        );
+        if !enforce_hardfork_core {
+            debug!(
+                "Capability bits are running in legacy-compatible pre-HF mode for peer {} (informational only, no enforcement)",
+                router
+            );
+        }
 
         let anti_fraud_mode = if enforce_anti_fraud {
             self.connection_manager()
@@ -1420,6 +1460,10 @@ impl ConnectionInitializer for FlowContext {
             anti_fraud_hashes: peer_version.anti_fraud_hashes.clone(),
             anti_fraud_restricted: enforce_anti_fraud && anti_fraud_mode == AntiFraudMode::Restricted,
             unified_node_id: peer_unified_node_id,
+            hfa_enabled: peer_hfa_enabled,
+            atomic_enabled: peer_atomic_enabled,
+            strong_node_claims_enabled: peer_strong_node_claims_enabled,
+            archival_node: peer_archival_enabled,
         });
         router.set_properties(peer_properties);
 
@@ -1438,21 +1482,38 @@ impl ConnectionInitializer for FlowContext {
         };
         let local_ready_pq_payload = match (peer_unified_node_id, peer_node_challenge_nonce, peer_pq_ml_kem1024_public_key.as_deref())
         {
-            (Some(peer_node_id), Some(peer_nonce), Some(peer_public_key)) => {
-                let (ciphertext, shared_secret) = encapsulate_mlkem1024(peer_public_key)
-                    .map_err(|err| ProtocolError::OtherOwned(format!("failed encapsulating ML-KEM-1024 payload: {err}")))?;
-                let proof = compute_pq_handshake_proof(
-                    network_code,
-                    &self.unified_node_identity.node_id,
-                    &peer_node_id,
-                    local_node_challenge_nonce,
-                    peer_nonce,
-                    &shared_secret,
-                );
-                Some((ciphertext, proof.to_vec()))
+            (Some(peer_node_id), Some(peer_nonce), Some(peer_public_key)) => match encapsulate_mlkem1024(peer_public_key) {
+                Ok((ciphertext, shared_secret)) => {
+                    let proof = compute_pq_handshake_proof(
+                        network_code,
+                        &self.unified_node_identity.node_id,
+                        &peer_node_id,
+                        local_node_challenge_nonce,
+                        peer_nonce,
+                        &shared_secret,
+                    );
+                    Some((ciphertext, proof.to_vec()))
+                }
+                Err(err) if require_quantum_ready => {
+                    return Err(ProtocolError::OtherOwned(format!("failed encapsulating ML-KEM-1024 payload: {err}")));
+                }
+                Err(err) => {
+                    warn!(
+                            "Peer {} PQ fallback: failed encapsulating ML-KEM-1024 payload ({}); continuing with classical ready-auth only",
+                            router, err
+                        );
+                    None
+                }
+            },
+            (Some(_), Some(_), None) if require_quantum_ready => {
+                return Err(ProtocolError::OtherOwned("peer missing mandatory ML-KEM-1024 public key after hardfork".to_string()))
             }
             (Some(_), Some(_), None) if enforce_hardfork_core => {
-                return Err(ProtocolError::OtherOwned("peer missing mandatory ML-KEM-1024 public key after hardfork".to_string()))
+                warn!(
+                    "Peer {} PQ fallback: peer omitted ML-KEM-1024 public key after hardfork; continuing with classical ready-auth only",
+                    router
+                );
+                None
             }
             _ => None,
         };
@@ -1496,44 +1557,89 @@ impl ConnectionInitializer for FlowContext {
             let peer_has_pq_ready_payload =
                 !received_ready_message.pq_ml_kem1024_ciphertext.is_empty() || !received_ready_message.pq_handshake_proof.is_empty();
             if !peer_has_pq_ready_payload {
-                if enforce_hardfork_core {
+                if require_quantum_ready {
                     return Err(ProtocolError::OtherOwned(
                         "peer missing mandatory quantum-safe ready payload after hardfork".to_string(),
                     ));
                 }
+                if enforce_hardfork_core {
+                    warn!(
+                        "Peer {} PQ fallback: peer omitted quantum-safe ready payload after hardfork; accepting classical ready-auth only",
+                        router
+                    );
+                }
             } else {
                 if received_ready_message.pq_ml_kem1024_ciphertext.len() != PQ_MLKEM1024_CIPHERTEXT_SIZE {
-                    return Err(ProtocolError::OtherOwned(format!(
-                        "peer ML-KEM-1024 ciphertext must be exactly {PQ_MLKEM1024_CIPHERTEXT_SIZE} bytes"
-                    )));
+                    if require_quantum_ready {
+                        return Err(ProtocolError::OtherOwned(format!(
+                            "peer ML-KEM-1024 ciphertext must be exactly {PQ_MLKEM1024_CIPHERTEXT_SIZE} bytes"
+                        )));
+                    }
+                    warn!(
+                        "Peer {} PQ fallback: invalid ML-KEM-1024 ciphertext length {}; accepting classical ready-auth only",
+                        router,
+                        received_ready_message.pq_ml_kem1024_ciphertext.len()
+                    );
                 }
-                if received_ready_message.pq_handshake_proof.len() != PQ_HANDSHAKE_PROOF_SIZE {
-                    return Err(ProtocolError::OtherOwned(format!(
-                        "peer quantum-safe handshake proof must be exactly {PQ_HANDSHAKE_PROOF_SIZE} bytes"
-                    )));
+                if received_ready_message.pq_ml_kem1024_ciphertext.len() == PQ_MLKEM1024_CIPHERTEXT_SIZE
+                    && received_ready_message.pq_handshake_proof.len() != PQ_HANDSHAKE_PROOF_SIZE
+                {
+                    if require_quantum_ready {
+                        return Err(ProtocolError::OtherOwned(format!(
+                            "peer quantum-safe handshake proof must be exactly {PQ_HANDSHAKE_PROOF_SIZE} bytes"
+                        )));
+                    }
+                    warn!(
+                        "Peer {} PQ fallback: invalid quantum-safe handshake proof length {}; accepting classical ready-auth only",
+                        router,
+                        received_ready_message.pq_handshake_proof.len()
+                    );
                 }
 
-                let peer_shared_secret = decapsulate_mlkem1024(
-                    &local_pq_ml_kem1024_private_key,
-                    received_ready_message.pq_ml_kem1024_ciphertext.as_slice(),
-                )
-                .map_err(|err| ProtocolError::OtherOwned(format!("failed decapsulating peer ML-KEM-1024 payload: {err}")))?;
-                let expected_peer_proof = compute_pq_handshake_proof(
-                    network_code,
-                    &peer_node_id,
-                    &self.unified_node_identity.node_id,
-                    peer_nonce,
-                    local_node_challenge_nonce,
-                    &peer_shared_secret,
-                );
-                let peer_proof: [u8; PQ_HANDSHAKE_PROOF_SIZE] =
-                    received_ready_message.pq_handshake_proof.as_slice().try_into().map_err(|_| {
-                        ProtocolError::OtherOwned(format!(
-                            "peer quantum-safe handshake proof must be exactly {PQ_HANDSHAKE_PROOF_SIZE} bytes"
-                        ))
-                    })?;
-                if peer_proof != expected_peer_proof {
-                    return Err(ProtocolError::OtherOwned("peer quantum-safe handshake proof verification failed".to_string()));
+                if received_ready_message.pq_ml_kem1024_ciphertext.len() == PQ_MLKEM1024_CIPHERTEXT_SIZE
+                    && received_ready_message.pq_handshake_proof.len() == PQ_HANDSHAKE_PROOF_SIZE
+                {
+                    match decapsulate_mlkem1024(
+                        &local_pq_ml_kem1024_private_key,
+                        received_ready_message.pq_ml_kem1024_ciphertext.as_slice(),
+                    ) {
+                        Ok(peer_shared_secret) => {
+                            let expected_peer_proof = compute_pq_handshake_proof(
+                                network_code,
+                                &peer_node_id,
+                                &self.unified_node_identity.node_id,
+                                peer_nonce,
+                                local_node_challenge_nonce,
+                                &peer_shared_secret,
+                            );
+                            let peer_proof: [u8; PQ_HANDSHAKE_PROOF_SIZE] =
+                                received_ready_message.pq_handshake_proof.as_slice().try_into().map_err(|_| {
+                                    ProtocolError::OtherOwned(format!(
+                                        "peer quantum-safe handshake proof must be exactly {PQ_HANDSHAKE_PROOF_SIZE} bytes"
+                                    ))
+                                })?;
+                            if peer_proof != expected_peer_proof {
+                                if require_quantum_ready {
+                                    return Err(ProtocolError::OtherOwned(
+                                        "peer quantum-safe handshake proof verification failed".to_string(),
+                                    ));
+                                }
+                                warn!(
+                                    "Peer {} PQ fallback: quantum-safe handshake proof verification failed; accepting classical ready-auth only",
+                                    router
+                                );
+                            }
+                        }
+                        Err(err) if require_quantum_ready => {
+                            return Err(ProtocolError::OtherOwned(format!("failed decapsulating peer ML-KEM-1024 payload: {err}")));
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Peer {} PQ fallback: failed decapsulating peer ML-KEM-1024 payload ({}); accepting classical ready-auth only",
+                                router, err
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1550,11 +1656,13 @@ impl ConnectionInitializer for FlowContext {
         if router.is_outbound() {
             address_manager.add_verified_address(router.net_address().into());
         }
+        address_manager.set_observed_services(router.net_address().into(), peer_version.services);
 
         if let Some(peer_ip_address) = peer_version.address {
             // Peer-advertised addresses are unauthenticated handshake hints and must not
             // be promoted to verified without an actual successful connection.
             address_manager.add_address(peer_ip_address);
+            address_manager.set_observed_services(peer_ip_address, peer_version.services);
         }
 
         // Note: we deliberately do not hold the handshake in memory so at this point receivers for handshake subscriptions

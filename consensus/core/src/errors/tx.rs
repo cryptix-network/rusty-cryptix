@@ -27,6 +27,9 @@ pub enum TxRuleError {
     #[error("payload length {0} exceeds max allowed {1}")]
     PayloadLengthAboveMax(usize, usize),
 
+    #[error("invalid cryptix atomic payload: {0}")]
+    InvalidAtomicPayload(String),
+
     #[error("transaction version {0} is unknown")]
     UnknownTxVersion(u16),
 

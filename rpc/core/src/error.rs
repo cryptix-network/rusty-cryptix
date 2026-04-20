@@ -59,6 +59,18 @@ pub enum RpcError {
     #[error("Method unavailable. Run the node with the --utxoindex argument.")]
     NoUtxoIndex,
 
+    #[error("ERR_STALE_CONTEXT")]
+    StaleContext,
+
+    #[error("Cryptix Atomic state unavailable: token index not ready")]
+    AtomicStateNotReady,
+
+    #[error("Cryptix Atomic state unavailable: token recovery in progress")]
+    AtomicStateRecovering,
+
+    #[error("Cryptix Atomic state unavailable: token state degraded")]
+    AtomicStateDegraded,
+
     #[error("Method unavailable. No connection manager is currently available.")]
     NoConnectionManager,
 

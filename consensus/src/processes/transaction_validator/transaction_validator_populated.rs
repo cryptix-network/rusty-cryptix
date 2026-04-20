@@ -1,11 +1,12 @@
 use crate::constants::{MAX_SOMPI, SEQUENCE_LOCK_TIME_DISABLED, SEQUENCE_LOCK_TIME_MASK};
+use blake2b_simd::Params as Blake2bParams;
 use cryptix_consensus_core::{
     hashing::sighash::SigHashReusedValues,
     mass::Kip9Version,
-    tx::{TransactionInput, VerifiableTransaction},
+    tx::{ScriptPublicKey, TransactionInput, VerifiableTransaction},
 };
 use cryptix_core::warn;
-use cryptix_txscript::{get_sig_op_count, TxScriptEngine};
+use cryptix_txscript::{get_sig_op_count, script_class::ScriptClass, TxScriptEngine};
 use cryptix_txscript_errors::TxScriptError;
 
 use super::{
@@ -35,6 +36,7 @@ impl TransactionValidator {
         mass_and_feerate_threshold: Option<(u64, f64)>,
     ) -> TxResult<u64> {
         self.check_transaction_coinbase_maturity(tx, pov_daa_score)?;
+        self.check_atomic_payload_context(tx, pov_daa_score)?;
         let total_in = self.check_transaction_input_amounts(tx)?;
         let total_out = Self::check_transaction_output_values(tx, total_in)?;
         let fee = total_in - total_out;
@@ -60,6 +62,43 @@ impl TransactionValidator {
             TxValidationFlags::SkipScriptChecks => {}
         }
         Ok(fee)
+    }
+
+    fn check_atomic_payload_context(&self, tx: &impl VerifiableTransaction, pov_daa_score: u64) -> TxResult<()> {
+        if pov_daa_score < self.payload_hf_activation_daa_score {
+            return Ok(());
+        }
+
+        let tx_ref = tx.tx();
+        if !tx_ref.subnetwork_id.is_payload() || tx_ref.payload.is_empty() {
+            return Ok(());
+        }
+
+        let payload = tx_ref.payload.as_slice();
+        if payload.len() < CAT_MAGIC.len() || payload[..CAT_MAGIC.len()] != CAT_MAGIC {
+            return Ok(());
+        }
+
+        let parsed_payload = parse_atomic_payload(payload).map_err(TxRuleError::InvalidAtomicPayload)?;
+        let Some(parsed_payload) = parsed_payload else {
+            return Ok(());
+        };
+        let auth_input_index = parsed_payload.auth_input_index;
+
+        let auth_input_index = auth_input_index as usize;
+        let (_, auth_entry) = tx.populated_inputs().nth(auth_input_index).ok_or_else(|| {
+            TxRuleError::InvalidAtomicPayload(format!(
+                "auth_input_index `{auth_input_index}` has no populated UTXO entry in contextual validation"
+            ))
+        })?;
+        if atomic_owner_id_from_script(&auth_entry.script_public_key).is_none() {
+            return Err(TxRuleError::InvalidAtomicPayload(
+                "auth input script public key is not a supported CAT owner authorization scheme (expected PubKey, PubKeyECDSA, or ScriptHash)"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     fn check_feerate_threshold(fee: u64, mass_and_feerate_threshold: Option<(u64, f64)>) -> TxResult<()> {
@@ -186,19 +225,248 @@ fn map_script_err(script_err: TxScriptError, input: &TransactionInput) -> TxRule
     }
 }
 
+pub(crate) const CAT_MAGIC: [u8; 3] = *b"CAT";
+const CAT_VERSION: u8 = 1;
+const CAT_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
+const OWNER_AUTH_SCHEME_PUBKEY: u8 = 0;
+const OWNER_AUTH_SCHEME_PUBKEY_ECDSA: u8 = 1;
+const OWNER_AUTH_SCHEME_SCRIPT_HASH: u8 = 2;
+const CAT_MAX_NAME_LEN: usize = 32;
+const CAT_MAX_SYMBOL_LEN: usize = 10;
+const CAT_MAX_METADATA_LEN: usize = 256;
+const CAT_MAX_DECIMALS: u8 = 18;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AtomicPayloadSupplyMode {
+    Uncapped,
+    Capped,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AtomicPayloadOp {
+    CreateAsset {
+        decimals: u8,
+        supply_mode: AtomicPayloadSupplyMode,
+        max_supply: u128,
+        mint_authority_owner_id: [u8; 32],
+        name: Vec<u8>,
+        symbol: Vec<u8>,
+        metadata: Vec<u8>,
+    },
+    Transfer {
+        asset_id: [u8; 32],
+        to_owner_id: [u8; 32],
+        amount: u128,
+    },
+    Mint {
+        asset_id: [u8; 32],
+        to_owner_id: [u8; 32],
+        amount: u128,
+    },
+    Burn {
+        asset_id: [u8; 32],
+        amount: u128,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParsedAtomicPayload {
+    pub auth_input_index: u16,
+    pub nonce: u64,
+    pub op: AtomicPayloadOp,
+}
+
+pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomicPayload>, String> {
+    if payload.len() < CAT_MAGIC.len() || payload[..CAT_MAGIC.len()] != CAT_MAGIC {
+        return Ok(None);
+    }
+
+    let mut cursor = 0usize;
+    let magic = take_bytes(payload, &mut cursor, CAT_MAGIC.len()).ok_or_else(|| "truncated CAT magic".to_string())?;
+    if magic != CAT_MAGIC {
+        return Err("invalid CAT magic".to_string());
+    }
+
+    let version = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT version".to_string())?;
+    if version != CAT_VERSION {
+        return Err(format!("unsupported CAT version `{version}`"));
+    }
+
+    let op = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT op".to_string())?;
+    if op > 3 {
+        return Err(format!("unsupported CAT op `{op}`"));
+    }
+
+    let flags = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT flags".to_string())?;
+    if flags != 0 {
+        return Err(format!("invalid CAT flags `{flags}`"));
+    }
+
+    let auth_input_index = take_u16_le(payload, &mut cursor).ok_or_else(|| "truncated CAT auth_input_index".to_string())?;
+    let nonce = take_u64_le(payload, &mut cursor).ok_or_else(|| "truncated CAT nonce".to_string())?;
+    if nonce == 0 {
+        return Err("nonce must be >= 1".to_string());
+    }
+
+    let op = match op {
+        0 => {
+            let decimals = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT decimals".to_string())?;
+            if decimals > CAT_MAX_DECIMALS {
+                return Err(format!("decimals `{decimals}` above max `{CAT_MAX_DECIMALS}`"));
+            }
+
+            let raw_supply_mode = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT supply mode".to_string())?;
+            let supply_mode = match raw_supply_mode {
+                0 => AtomicPayloadSupplyMode::Uncapped,
+                1 => AtomicPayloadSupplyMode::Capped,
+                _ => return Err(format!("invalid supply mode `{raw_supply_mode}`")),
+            };
+
+            let max_supply = take_u128_le(payload, &mut cursor).ok_or_else(|| "truncated CAT max_supply".to_string())?;
+            let mint_authority_owner_id = take_32(payload, &mut cursor).ok_or_else(|| "truncated CAT mint authority".to_string())?;
+            let name_len = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT name length".to_string())? as usize;
+            let symbol_len = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT symbol length".to_string())? as usize;
+            let metadata_len = take_u16_le(payload, &mut cursor).ok_or_else(|| "truncated CAT metadata length".to_string())? as usize;
+
+            if name_len > CAT_MAX_NAME_LEN || symbol_len > CAT_MAX_SYMBOL_LEN || metadata_len > CAT_MAX_METADATA_LEN {
+                return Err("string field exceeds allowed length".to_string());
+            }
+
+            let name = take_vec(payload, &mut cursor, name_len).ok_or_else(|| "truncated CAT name".to_string())?;
+            let symbol = take_vec(payload, &mut cursor, symbol_len).ok_or_else(|| "truncated CAT symbol".to_string())?;
+            let metadata = take_vec(payload, &mut cursor, metadata_len).ok_or_else(|| "truncated CAT metadata".to_string())?;
+
+            if std::str::from_utf8(&name).is_err() || std::str::from_utf8(&symbol).is_err() {
+                return Err("name/symbol must be valid utf-8".to_string());
+            }
+
+            match supply_mode {
+                AtomicPayloadSupplyMode::Capped if max_supply == 0 => {
+                    return Err("capped assets require non-zero max_supply".to_string())
+                }
+                AtomicPayloadSupplyMode::Uncapped if max_supply != 0 => {
+                    return Err("uncapped assets must encode max_supply=0".to_string())
+                }
+                _ => {}
+            }
+
+            AtomicPayloadOp::CreateAsset { decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata }
+        }
+        1 => {
+            let asset_id = take_32(payload, &mut cursor).ok_or_else(|| "truncated CAT asset_id".to_string())?;
+            let to_owner_id = take_32(payload, &mut cursor).ok_or_else(|| "truncated CAT to_owner_id".to_string())?;
+            let amount = take_u128_le(payload, &mut cursor).ok_or_else(|| "truncated CAT transfer amount".to_string())?;
+            if amount == 0 {
+                return Err("transfer amount must be non-zero".to_string());
+            }
+            AtomicPayloadOp::Transfer { asset_id, to_owner_id, amount }
+        }
+        2 => {
+            let asset_id = take_32(payload, &mut cursor).ok_or_else(|| "truncated CAT asset_id".to_string())?;
+            let to_owner_id = take_32(payload, &mut cursor).ok_or_else(|| "truncated CAT to_owner_id".to_string())?;
+            let amount = take_u128_le(payload, &mut cursor).ok_or_else(|| "truncated CAT mint amount".to_string())?;
+            if amount == 0 {
+                return Err("mint amount must be non-zero".to_string());
+            }
+            AtomicPayloadOp::Mint { asset_id, to_owner_id, amount }
+        }
+        3 => {
+            let asset_id = take_32(payload, &mut cursor).ok_or_else(|| "truncated CAT asset_id".to_string())?;
+            let amount = take_u128_le(payload, &mut cursor).ok_or_else(|| "truncated CAT burn amount".to_string())?;
+            if amount == 0 {
+                return Err("burn amount must be non-zero".to_string());
+            }
+            AtomicPayloadOp::Burn { asset_id, amount }
+        }
+        _ => unreachable!(),
+    };
+
+    if cursor != payload.len() {
+        return Err("unexpected trailing bytes".to_string());
+    }
+
+    Ok(Some(ParsedAtomicPayload { auth_input_index, nonce, op }))
+}
+
+pub(crate) fn atomic_owner_id_from_script(script_public_key: &ScriptPublicKey) -> Option<[u8; 32]> {
+    let (auth_scheme, canonical_pubkey_bytes) = canonical_atomic_owner_identity(script_public_key)?;
+    let pubkey_len = u16::try_from(canonical_pubkey_bytes.len()).ok()?;
+    let mut hasher = Blake2bParams::new().hash_length(32).to_state();
+    hasher.update(CAT_OWNER_DOMAIN);
+    hasher.update(&[auth_scheme]);
+    hasher.update(&pubkey_len.to_le_bytes());
+    hasher.update(canonical_pubkey_bytes);
+    let hash = hasher.finalize();
+    let mut owner_id = [0u8; 32];
+    owner_id.copy_from_slice(hash.as_bytes());
+    Some(owner_id)
+}
+
+fn canonical_atomic_owner_identity(script_public_key: &ScriptPublicKey) -> Option<(u8, &[u8])> {
+    let script_bytes = script_public_key.script();
+    match ScriptClass::from_script(script_public_key) {
+        ScriptClass::PubKey if script_bytes.len() == 34 => Some((OWNER_AUTH_SCHEME_PUBKEY, &script_bytes[1..33])),
+        ScriptClass::PubKeyECDSA if script_bytes.len() == 35 => Some((OWNER_AUTH_SCHEME_PUBKEY_ECDSA, &script_bytes[1..34])),
+        ScriptClass::ScriptHash if script_bytes.len() == 34 => Some((OWNER_AUTH_SCHEME_SCRIPT_HASH, &script_bytes[2..34])),
+        _ => None,
+    }
+}
+
+fn take_bytes<'a>(payload: &'a [u8], cursor: &mut usize, len: usize) -> Option<&'a [u8]> {
+    if *cursor + len > payload.len() {
+        return None;
+    }
+    let out = &payload[*cursor..*cursor + len];
+    *cursor += len;
+    Some(out)
+}
+
+fn take_u8(payload: &[u8], cursor: &mut usize) -> Option<u8> {
+    let out = *payload.get(*cursor)?;
+    *cursor += 1;
+    Some(out)
+}
+
+fn take_u16_le(payload: &[u8], cursor: &mut usize) -> Option<u16> {
+    let bytes = take_bytes(payload, cursor, 2)?;
+    Some(u16::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn take_u64_le(payload: &[u8], cursor: &mut usize) -> Option<u64> {
+    let bytes = take_bytes(payload, cursor, 8)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn take_u128_le(payload: &[u8], cursor: &mut usize) -> Option<u128> {
+    let bytes = take_bytes(payload, cursor, 16)?;
+    Some(u128::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn take_32(payload: &[u8], cursor: &mut usize) -> Option<[u8; 32]> {
+    let bytes = take_bytes(payload, cursor, 32)?;
+    Some(bytes.try_into().ok()?)
+}
+
+fn take_vec(payload: &[u8], cursor: &mut usize, len: usize) -> Option<Vec<u8>> {
+    Some(take_bytes(payload, cursor, len)?.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::errors::TxRuleError;
+    use super::TxValidationFlags;
     use core::str::FromStr;
-    use cryptix_consensus_core::sign::sign;
     use cryptix_consensus_core::subnets::SubnetworkId;
     use cryptix_consensus_core::tx::{MutableTransaction, PopulatedTransaction, ScriptVec, TransactionId, UtxoEntry};
     use cryptix_consensus_core::tx::{ScriptPublicKey, Transaction, TransactionInput, TransactionOutpoint, TransactionOutput};
+    use cryptix_consensus_core::{mass::MassCalculator, sign::sign};
+    use cryptix_txscript::caches::TxScriptCacheCounters;
     use cryptix_txscript_errors::TxScriptError;
     use itertools::Itertools;
     use secp256k1::Secp256k1;
     use smallvec::SmallVec;
     use std::iter::once;
+    use std::sync::Arc;
 
     use crate::{params::MAINNET_PARAMS, processes::transaction_validator::TransactionValidator};
 
@@ -710,5 +978,68 @@ mod tests {
         let populated_tx = signed_tx.as_verifiable();
         assert_eq!(tv.check_scripts(&populated_tx), Ok(()));
         assert_eq!(TransactionValidator::check_sig_op_counts(&populated_tx), Ok(()));
+    }
+
+    #[test]
+    fn check_atomic_payload_context_rejects_non_owner_auth_script_class() {
+        let params = MAINNET_PARAMS.clone();
+        let tv = TransactionValidator::new(
+            params.max_tx_inputs,
+            params.max_tx_outputs,
+            params.max_signature_script_len,
+            params.max_script_public_key_len,
+            params.ghostdag_k,
+            params.coinbase_payload_script_public_key_max_len,
+            params.coinbase_maturity,
+            Arc::<TxScriptCacheCounters>::default(),
+            MassCalculator::new(0, 0, 0, 0, 1),
+            u64::MAX,
+            0,
+            8192,
+        );
+
+        let prev_tx_id = TransactionId::from_str("880eb9819a31821d9d2399e2f35e2433b72637e393d71ecc9b8d0250f49153c3").unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"CAT");
+        payload.push(1); // version
+        payload.push(1); // transfer op
+        payload.push(0); // flags
+        payload.extend_from_slice(&0u16.to_le_bytes()); // auth_input_index
+        payload.extend_from_slice(&1u64.to_le_bytes()); // nonce
+        payload.extend_from_slice(&[1u8; 32]); // asset_id
+        payload.extend_from_slice(&[2u8; 32]); // to_owner_id
+        payload.extend_from_slice(&1u128.to_le_bytes()); // amount
+
+        let tx = Transaction::new(
+            0,
+            vec![TransactionInput {
+                previous_outpoint: TransactionOutpoint { transaction_id: prev_tx_id, index: 0 },
+                signature_script: vec![],
+                sequence: u64::MAX,
+                sig_op_count: 0,
+            }],
+            vec![TransactionOutput { value: 1000, script_public_key: ScriptPublicKey::new(0, SmallVec::from(vec![0x51])) }],
+            0,
+            cryptix_consensus_core::subnets::SUBNETWORK_ID_PAYLOAD,
+            0,
+            payload,
+        );
+        let populated_tx = PopulatedTransaction::new(
+            &tx,
+            vec![UtxoEntry {
+                amount: 2000,
+                script_public_key: ScriptPublicKey::new(0, SmallVec::from(vec![0x51])),
+                block_daa_score: 0,
+                is_coinbase: false,
+            }],
+        );
+
+        assert_eq!(
+            tv.validate_populated_transaction_and_get_fee(&populated_tx, 0, TxValidationFlags::SkipScriptChecks, None),
+            Err(TxRuleError::InvalidAtomicPayload(
+                "auth input script public key is not a supported CAT owner authorization scheme (expected PubKey, PubKeyECDSA, or ScriptHash)"
+                    .to_string()
+            ))
+        );
     }
 }

@@ -25,6 +25,11 @@ impl ProtocolConverter {
             time_offset: properties.time_offset,
             user_agent: properties.user_agent.clone(),
             advertised_protocol_version: properties.advertised_protocol_version,
+            advertised_services: properties.services,
+            is_hfa_fastchain: properties.hfa_enabled,
+            is_cryptix_atomic: properties.atomic_enabled,
+            is_strong_node_claims: properties.strong_node_claims_enabled,
+            is_archival: properties.archival_node,
             time_connected: peer.time_connected(),
             unified_node_id: properties.unified_node_id.map(|id| id.as_slice().to_hex()),
         }

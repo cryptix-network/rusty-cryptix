@@ -15,6 +15,7 @@ use crate::{
         },
         stores::{
             acceptance_data::{AcceptanceDataStoreReader, DbAcceptanceDataStore},
+            atomic_state::{AtomicConsensusState, AtomicStateStoreReader, DbAtomicStateStore},
             block_transactions::{BlockTransactionsStoreReader, DbBlockTransactionsStore},
             daa::DbDaaStore,
             depth::{DbDepthStore, DepthStoreReader},
@@ -42,7 +43,11 @@ use crate::{
     processes::{
         coinbase::CoinbaseManager,
         ghostdag::ordering::SortableBlock,
-        transaction_validator::{errors::TxResult, transaction_validator_populated::TxValidationFlags, TransactionValidator},
+        transaction_validator::{
+            errors::{TxResult, TxRuleError},
+            transaction_validator_populated::{atomic_owner_id_from_script, parse_atomic_payload, TxValidationFlags},
+            TransactionValidator,
+        },
         window::WindowManager,
     },
 };
@@ -56,7 +61,7 @@ use cryptix_consensus_core::{
     header::Header,
     merkle::calc_hash_merkle_root,
     pruning::PruningPointsList,
-    tx::{MutableTransaction, Transaction},
+    tx::{MutableTransaction, Transaction, VerifiableTransaction},
     utxo::{
         utxo_diff::UtxoDiff,
         utxo_view::{UtxoView, UtxoViewComposition},
@@ -85,7 +90,7 @@ use itertools::Itertools;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use rand::{seq::SliceRandom, Rng};
 use rayon::{
-    prelude::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator},
+    prelude::{IntoParallelRefMutIterator, ParallelIterator},
     ThreadPool,
 };
 use rocksdb::WriteBatch;
@@ -130,6 +135,7 @@ pub struct VirtualStateProcessor {
     pub(super) utxo_diffs_store: Arc<DbUtxoDiffsStore>,
     pub(super) utxo_multisets_store: Arc<DbUtxoMultisetsStore>,
     pub(super) acceptance_data_store: Arc<DbAcceptanceDataStore>,
+    pub(super) atomic_state_store: Arc<DbAtomicStateStore>,
     pub(super) virtual_stores: Arc<RwLock<VirtualStores>>,
     pub(super) pruning_utxoset_stores: Arc<RwLock<PruningUtxosetStores>>,
 
@@ -202,6 +208,7 @@ impl VirtualStateProcessor {
             utxo_diffs_store: storage.utxo_diffs_store.clone(),
             utxo_multisets_store: storage.utxo_multisets_store.clone(),
             acceptance_data_store: storage.acceptance_data_store.clone(),
+            atomic_state_store: storage.atomic_state_store.clone(),
             virtual_stores: storage.virtual_stores.clone(),
             pruning_utxoset_stores: storage.pruning_utxoset_stores.clone(),
             lkg_virtual_state: storage.lkg_virtual_state.clone(),
@@ -283,9 +290,17 @@ impl VirtualStateProcessor {
         drop(prune_guard);
         let prev_sink = prev_state.ghostdag_data.selected_parent;
         let mut accumulated_diff = prev_state.utxo_diff.clone().to_reversed();
+        let mut accumulated_atomic_state = prev_state.atomic_state.clone();
 
-        let (new_sink, virtual_parent_candidates) =
-            self.sink_search_algorithm(&virtual_read, &mut accumulated_diff, prev_sink, tips, finality_point, pruning_point);
+        let (new_sink, virtual_parent_candidates) = self.sink_search_algorithm(
+            &virtual_read,
+            &mut accumulated_diff,
+            &mut accumulated_atomic_state,
+            prev_sink,
+            tips,
+            finality_point,
+            pruning_point,
+        );
         let (virtual_parents, virtual_ghostdag_data) = self.pick_virtual_parents(new_sink, virtual_parent_candidates, pruning_point);
         assert_eq!(virtual_ghostdag_data.selected_parent, new_sink);
 
@@ -298,6 +313,7 @@ impl VirtualStateProcessor {
                 virtual_ghostdag_data,
                 sink_multiset,
                 &mut accumulated_diff,
+                accumulated_atomic_state,
                 &chain_path,
             )
             .expect("all possible rule errors are unexpected here");
@@ -349,12 +365,41 @@ impl VirtualStateProcessor {
         }
     }
 
+    fn load_block_atomic_state_or_default_before_hf(&self, block_hash: Hash) -> Option<AtomicConsensusState> {
+        match self.atomic_state_store.get(block_hash) {
+            Ok(state) => Some(state.as_ref().clone()),
+            Err(StoreError::KeyNotFound(_)) => {
+                let block_daa_score = self.headers_store.get_header(block_hash).unwrap().daa_score;
+                if self.transaction_validator.is_payload_hf_active(block_daa_score) {
+                    warn!(
+                        "missing persisted atomic consensus state for post-HF block `{block_hash}`; failing closed for this virtual resolve pass"
+                    );
+                    return None;
+                }
+                Some(AtomicConsensusState::default())
+            }
+            Err(err) => {
+                warn!(
+                    "failed reading atomic consensus state for block `{block_hash}`: {err}; failing closed for this virtual resolve pass"
+                );
+                None
+            }
+        }
+    }
+
     /// Calculates the UTXO state of `to` starting from the state of `from`.
     /// The provided `diff` is assumed to initially hold the UTXO diff of `from` from virtual.
     /// The function returns the top-most UTXO-valid block on `chain(to)` which is ideally
     /// `to` itself (with the exception of returning `from` if `to` is already known to be UTXO disqualified).
     /// When returning it is guaranteed that `diff` holds the diff of the returned block from virtual
-    fn calculate_utxo_state_relatively(&self, stores: &VirtualStores, diff: &mut UtxoDiff, from: Hash, to: Hash) -> Hash {
+    fn calculate_utxo_state_relatively(
+        &self,
+        stores: &VirtualStores,
+        diff: &mut UtxoDiff,
+        atomic_state: &mut AtomicConsensusState,
+        from: Hash,
+        to: Hash,
+    ) -> Hash {
         // Avoid reorging if disqualified status is already known
         if self.statuses_store.read().get(to).unwrap() == StatusDisqualifiedFromChain {
             return from;
@@ -376,6 +421,13 @@ impl VirtualStateProcessor {
 
         let split_point = split_point.expect("chain iterator was expected to reach the reorg split point");
         debug!("VIRTUAL PROCESSOR, found split point: {split_point}");
+        let Some(split_point_state) = self.load_block_atomic_state_or_default_before_hf(split_point) else {
+            warn!(
+                "cannot resolve virtual state because split point `{split_point}` has no usable atomic consensus state; keeping previous virtual sink"
+            );
+            return from;
+        };
+        *atomic_state = split_point_state;
 
         // A variable holding the most recent UTXO-valid block on `chain(to)` (note that it's maintained such
         // that 'diff' is always its UTXO diff from virtual)
@@ -392,47 +444,60 @@ impl VirtualStateProcessor {
                 continue;
             }
 
+            let mut needs_recompute = true;
             match self.utxo_diffs_store.get(current) {
                 Ok(mergeset_diff) => {
-                    diff.with_diff_in_place(mergeset_diff.deref()).unwrap();
-                    diff_point = current;
-                }
-                Err(StoreError::KeyNotFound(_)) => {
-                    if self.statuses_store.read().get(current).unwrap() == StatusDisqualifiedFromChain {
-                        // Current block is already known to be disqualified
-                        continue;
-                    }
-
-                    let header = self.headers_store.get_header(current).unwrap();
-                    let mergeset_data = self.ghostdag_primary_store.get_data(current).unwrap();
-                    let pov_daa_score = header.daa_score;
-
-                    let selected_parent_multiset_hash = self.utxo_multisets_store.get(selected_parent).unwrap();
-                    let selected_parent_utxo_view = (&stores.utxo_set).compose(&*diff);
-
-                    let mut ctx = UtxoProcessingContext::new(mergeset_data.into(), selected_parent_multiset_hash);
-
-                    self.calculate_utxo_state(&mut ctx, &selected_parent_utxo_view, pov_daa_score);
-                    let res = self.verify_expected_utxo_state(&mut ctx, &selected_parent_utxo_view, &header);
-
-                    if let Err(rule_error) = res {
-                        info!("Block {} is disqualified from virtual chain: {}", current, rule_error);
-                        self.statuses_store.write().set(current, StatusDisqualifiedFromChain).unwrap();
-                        chain_disqualified_counter += 1;
-                    } else {
-                        debug!("VIRTUAL PROCESSOR, UTXO validated for {current}");
-
-                        // Accumulate the diff
-                        diff.with_diff_in_place(&ctx.mergeset_diff).unwrap();
-                        // Update the diff point
+                    if let Some(current_atomic_state) = self.load_block_atomic_state_or_default_before_hf(current) {
+                        diff.with_diff_in_place(mergeset_diff.deref()).unwrap();
+                        *atomic_state = current_atomic_state;
                         diff_point = current;
-                        // Commit UTXO data for current chain block
-                        self.commit_utxo_state(current, ctx.mergeset_diff, ctx.multiset_hash, ctx.mergeset_acceptance_data);
-                        // Count the number of UTXO-processed chain blocks
-                        chain_block_counter += 1;
+                        needs_recompute = false;
+                    } else {
+                        warn!(
+                            "block `{current}` has cached UTXO diff but no usable atomic state; recomputing block UTXO/atomic state"
+                        );
                     }
                 }
+                Err(StoreError::KeyNotFound(_)) => {}
                 Err(err) => panic!("unexpected error {err}"),
+            }
+            if !needs_recompute {
+                continue;
+            }
+
+            if self.statuses_store.read().get(current).unwrap() == StatusDisqualifiedFromChain {
+                // Current block is already known to be disqualified
+                continue;
+            }
+
+            let header = self.headers_store.get_header(current).unwrap();
+            let mergeset_data = self.ghostdag_primary_store.get_data(current).unwrap();
+            let pov_daa_score = header.daa_score;
+
+            let selected_parent_multiset_hash = self.utxo_multisets_store.get(selected_parent).unwrap();
+            let selected_parent_utxo_view = (&stores.utxo_set).compose(&*diff);
+
+            let mut ctx = UtxoProcessingContext::new(mergeset_data.into(), selected_parent_multiset_hash, atomic_state.clone());
+
+            self.calculate_utxo_state(&mut ctx, &selected_parent_utxo_view, pov_daa_score);
+            let res = self.verify_expected_utxo_state(&mut ctx, &selected_parent_utxo_view, &header);
+
+            if let Err(rule_error) = res {
+                info!("Block {} is disqualified from virtual chain: {}", current, rule_error);
+                self.statuses_store.write().set(current, StatusDisqualifiedFromChain).unwrap();
+                chain_disqualified_counter += 1;
+            } else {
+                debug!("VIRTUAL PROCESSOR, UTXO validated for {current}");
+
+                // Accumulate the diff
+                diff.with_diff_in_place(&ctx.mergeset_diff).unwrap();
+                // Update the diff point
+                diff_point = current;
+                *atomic_state = ctx.atomic_state.clone();
+                // Commit UTXO data for current chain block
+                self.commit_utxo_state(current, ctx.mergeset_diff, ctx.multiset_hash, ctx.mergeset_acceptance_data, ctx.atomic_state);
+                // Count the number of UTXO-processed chain blocks
+                chain_block_counter += 1;
             }
         }
         // Report counters
@@ -444,11 +509,19 @@ impl VirtualStateProcessor {
         diff_point
     }
 
-    fn commit_utxo_state(&self, current: Hash, mergeset_diff: UtxoDiff, multiset: MuHash, acceptance_data: AcceptanceData) {
+    fn commit_utxo_state(
+        &self,
+        current: Hash,
+        mergeset_diff: UtxoDiff,
+        multiset: MuHash,
+        acceptance_data: AcceptanceData,
+        atomic_state: AtomicConsensusState,
+    ) {
         let mut batch = WriteBatch::default();
         self.utxo_diffs_store.insert_batch(&mut batch, current, Arc::new(mergeset_diff)).unwrap();
         self.utxo_multisets_store.insert_batch(&mut batch, current, multiset).unwrap();
         self.acceptance_data_store.insert_batch(&mut batch, current, Arc::new(acceptance_data)).unwrap();
+        self.atomic_state_store.insert_batch(&mut batch, current, Arc::new(atomic_state)).unwrap();
         let write_guard = self.statuses_store.set_batch(&mut batch, current, StatusUTXOValid).unwrap();
         self.db.write(batch).unwrap();
         // Calling the drops explicitly after the batch is written in order to avoid possible errors.
@@ -462,6 +535,7 @@ impl VirtualStateProcessor {
         virtual_ghostdag_data: GhostdagData,
         selected_parent_multiset: MuHash,
         accumulated_diff: &mut UtxoDiff,
+        selected_parent_atomic_state: AtomicConsensusState,
         chain_path: &ChainPath,
     ) -> Result<Arc<VirtualState>, RuleError> {
         let new_virtual_state = self.calculate_virtual_state(
@@ -470,6 +544,7 @@ impl VirtualStateProcessor {
             virtual_ghostdag_data,
             selected_parent_multiset,
             accumulated_diff,
+            selected_parent_atomic_state,
         )?;
         self.commit_virtual_state(virtual_read, new_virtual_state.clone(), accumulated_diff, chain_path);
         Ok(new_virtual_state)
@@ -482,9 +557,11 @@ impl VirtualStateProcessor {
         virtual_ghostdag_data: GhostdagData,
         selected_parent_multiset: MuHash,
         accumulated_diff: &mut UtxoDiff,
+        selected_parent_atomic_state: AtomicConsensusState,
     ) -> Result<Arc<VirtualState>, RuleError> {
         let selected_parent_utxo_view = (&virtual_stores.utxo_set).compose(&*accumulated_diff);
-        let mut ctx = UtxoProcessingContext::new((&virtual_ghostdag_data).into(), selected_parent_multiset);
+        let mut ctx =
+            UtxoProcessingContext::new((&virtual_ghostdag_data).into(), selected_parent_multiset, selected_parent_atomic_state);
 
         // Calc virtual DAA score, difficulty bits and past median time
         let virtual_daa_window = self.window_manager.block_daa_window(&virtual_ghostdag_data)?;
@@ -508,6 +585,7 @@ impl VirtualStateProcessor {
             ctx.accepted_tx_ids,
             ctx.mergeset_rewards,
             virtual_daa_window.mergeset_non_daa,
+            ctx.atomic_state,
             virtual_ghostdag_data,
         )))
     }
@@ -560,6 +638,7 @@ impl VirtualStateProcessor {
         &self,
         stores: &VirtualStores,
         diff: &mut UtxoDiff,
+        atomic_state: &mut AtomicConsensusState,
         prev_sink: Hash,
         tips: Vec<Hash>,
         finality_point: Hash,
@@ -582,7 +661,7 @@ impl VirtualStateProcessor {
         loop {
             let candidate = heap.pop().expect("valid sink must exist").hash;
             if self.reachability_service.is_chain_ancestor_of(finality_point, candidate) {
-                diff_point = self.calculate_utxo_state_relatively(stores, diff, diff_point, candidate);
+                diff_point = self.calculate_utxo_state_relatively(stores, diff, atomic_state, diff_point, candidate);
                 if diff_point == candidate {
                     // This indicates that candidate has valid UTXO state and that `diff` represents its diff from virtual
 
@@ -761,6 +840,27 @@ impl VirtualStateProcessor {
     fn validate_mempool_transaction_impl(
         &self,
         mutable_tx: &mut MutableTransaction,
+        virtual_state: &VirtualState,
+        virtual_utxo_view: &impl UtxoView,
+        virtual_daa_score: u64,
+        virtual_past_median_time: u64,
+        args: &TransactionValidationArgs,
+    ) -> TxResult<()> {
+        self.validate_mempool_transaction_without_atomic(
+            mutable_tx,
+            virtual_utxo_view,
+            virtual_daa_score,
+            virtual_past_median_time,
+            args,
+        )?;
+        let mut atomic_state = virtual_state.atomic_state.clone();
+        self.validate_and_apply_atomic_state_transition(&mutable_tx.as_verifiable(), virtual_daa_score, &mut atomic_state)?;
+        Ok(())
+    }
+
+    fn validate_mempool_transaction_without_atomic(
+        &self,
+        mutable_tx: &mut MutableTransaction,
         virtual_utxo_view: &impl UtxoView,
         virtual_daa_score: u64,
         virtual_past_median_time: u64,
@@ -772,13 +872,54 @@ impl VirtualStateProcessor {
         Ok(())
     }
 
+    fn extract_mempool_atomic_order_key(
+        &self,
+        mutable_tx: &MutableTransaction,
+        virtual_daa_score: u64,
+    ) -> TxResult<Option<([u8; 32], u64, [u8; 32])>> {
+        if !self.transaction_validator.is_payload_hf_active(virtual_daa_score) {
+            return Ok(None);
+        }
+
+        let tx_ref = &mutable_tx.tx;
+        if !tx_ref.subnetwork_id.is_payload() || tx_ref.payload.is_empty() {
+            return Ok(None);
+        }
+
+        let Some(parsed_payload) = parse_atomic_payload(tx_ref.payload.as_slice()).map_err(TxRuleError::InvalidAtomicPayload)? else {
+            return Ok(None);
+        };
+
+        let auth_input_index = parsed_payload.auth_input_index as usize;
+        let verifiable = mutable_tx.as_verifiable();
+        let (_, auth_entry) = verifiable.populated_inputs().nth(auth_input_index).ok_or_else(|| {
+            TxRuleError::InvalidAtomicPayload(format!(
+                "auth_input_index `{auth_input_index}` has no populated UTXO entry in contextual validation"
+            ))
+        })?;
+        let owner_id = atomic_owner_id_from_script(&auth_entry.script_public_key).ok_or_else(|| {
+            TxRuleError::InvalidAtomicPayload(
+                "auth input script public key is not a supported CAT owner authorization scheme (expected PubKey, PubKeyECDSA, or ScriptHash)"
+                    .to_string(),
+            )
+        })?;
+        Ok(Some((owner_id, parsed_payload.nonce, tx_ref.id().as_bytes())))
+    }
+
     pub fn validate_mempool_transaction(&self, mutable_tx: &mut MutableTransaction, args: &TransactionValidationArgs) -> TxResult<()> {
         let virtual_read = self.virtual_stores.read();
         let virtual_state = virtual_read.state.get().unwrap();
         let virtual_utxo_view = &virtual_read.utxo_set;
         let virtual_daa_score = virtual_state.daa_score;
         let virtual_past_median_time = virtual_state.past_median_time;
-        self.validate_mempool_transaction_impl(mutable_tx, virtual_utxo_view, virtual_daa_score, virtual_past_median_time, args)
+        self.validate_mempool_transaction_impl(
+            mutable_tx,
+            &virtual_state,
+            virtual_utxo_view,
+            virtual_daa_score,
+            virtual_past_median_time,
+            args,
+        )
     }
 
     pub fn validate_mempool_transactions_in_parallel(
@@ -792,11 +933,11 @@ impl VirtualStateProcessor {
         let virtual_daa_score = virtual_state.daa_score;
         let virtual_past_median_time = virtual_state.past_median_time;
 
-        self.thread_pool.install(|| {
+        let mut results = self.thread_pool.install(|| {
             mutable_txs
                 .par_iter_mut()
                 .map(|mtx| {
-                    self.validate_mempool_transaction_impl(
+                    self.validate_mempool_transaction_without_atomic(
                         mtx,
                         &virtual_utxo_view,
                         virtual_daa_score,
@@ -805,7 +946,38 @@ impl VirtualStateProcessor {
                     )
                 })
                 .collect::<Vec<TxResult<()>>>()
-        })
+        });
+
+        // Enforce CAT nonce/state transitions deterministically so results do not
+        // depend on caller-provided slice order.
+        let mut ordered_atomic_indices = Vec::new();
+        for (idx, mtx) in mutable_txs.iter().enumerate() {
+            if results[idx].is_err() {
+                continue;
+            }
+            match self.extract_mempool_atomic_order_key(mtx, virtual_daa_score) {
+                Ok(Some((owner_id, nonce, txid_bytes))) => {
+                    ordered_atomic_indices.push((owner_id, nonce, txid_bytes, idx));
+                }
+                Ok(None) => {}
+                Err(err) => results[idx] = Err(err),
+            }
+        }
+        ordered_atomic_indices.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)).then(a.3.cmp(&b.3)));
+
+        let mut atomic_state = virtual_state.atomic_state.clone();
+        for (_, _, _, idx) in ordered_atomic_indices.into_iter() {
+            if results[idx].is_err() {
+                continue;
+            }
+            let mtx = &mut mutable_txs[idx];
+            if let Err(err) =
+                self.validate_and_apply_atomic_state_transition(&mtx.as_verifiable(), virtual_daa_score, &mut atomic_state)
+            {
+                results[idx] = Err(err);
+            }
+        }
+        results
     }
 
     fn populate_mempool_transaction_impl(
@@ -839,24 +1011,28 @@ impl VirtualStateProcessor {
         txs: &[Transaction],
         virtual_state: &VirtualState,
         utxo_view: &V,
+        atomic_state: &mut AtomicConsensusState,
     ) -> Vec<TxResult<u64>> {
-        self.thread_pool
-            .install(|| txs.par_iter().map(|tx| self.validate_block_template_transaction(tx, virtual_state, &utxo_view)).collect())
+        txs.iter()
+            .map(|tx| {
+                let validated = self.validate_block_template_transaction(tx, virtual_state, utxo_view)?;
+                self.validate_and_apply_atomic_state_transition(&validated, virtual_state.daa_score, atomic_state)?;
+                Ok(validated.calculated_fee)
+            })
+            .collect()
     }
 
-    fn validate_block_template_transaction(
+    fn validate_block_template_transaction<'a>(
         &self,
-        tx: &Transaction,
+        tx: &'a Transaction,
         virtual_state: &VirtualState,
         utxo_view: &impl UtxoView,
-    ) -> TxResult<u64> {
+    ) -> TxResult<ValidatedTransaction<'a>> {
         // No need to validate the transaction in isolation since we rely on the mining manager to submit transactions
         // which were previously validated through `validate_mempool_transaction_and_populate`, hence we only perform
         // in-context validations
         self.transaction_validator.utxo_free_tx_validation(tx, virtual_state.daa_score, virtual_state.past_median_time)?;
-        let ValidatedTransaction { calculated_fee, .. } =
-            self.validate_transaction_in_utxo_context(tx, utxo_view, virtual_state.daa_score, TxValidationFlags::Full)?;
-        Ok(calculated_fee)
+        self.validate_transaction_in_utxo_context(tx, utxo_view, virtual_state.daa_score, TxValidationFlags::Full)
     }
 
     pub fn build_block_template(
@@ -877,9 +1053,15 @@ impl VirtualStateProcessor {
         let virtual_read = self.virtual_stores.read();
         let virtual_state = virtual_read.state.get().unwrap();
         let virtual_utxo_view = &virtual_read.utxo_set;
+        let mut template_atomic_state = virtual_state.atomic_state.clone();
 
         let mut invalid_transactions = HashMap::new();
-        let results = self.validate_block_template_transactions_in_parallel(&txs, &virtual_state, &virtual_utxo_view);
+        let results = self.validate_block_template_transactions_in_parallel(
+            &txs,
+            &virtual_state,
+            &virtual_utxo_view,
+            &mut template_atomic_state,
+        );
         for (tx, res) in txs.iter().zip(results) {
             match res {
                 Err(e) => {
@@ -900,8 +1082,12 @@ impl VirtualStateProcessor {
         while has_rejections {
             has_rejections = false;
             let next_batch = tx_selector.select_transactions(); // Note that once next_batch is empty the loop will exit
-            let next_batch_results =
-                self.validate_block_template_transactions_in_parallel(&next_batch, &virtual_state, &virtual_utxo_view);
+            let next_batch_results = self.validate_block_template_transactions_in_parallel(
+                &next_batch,
+                &virtual_state,
+                &virtual_utxo_view,
+                &mut template_atomic_state,
+            );
             for (tx, res) in next_batch.into_iter().zip(next_batch_results) {
                 match res {
                     Err(e) => {
@@ -940,9 +1126,19 @@ impl VirtualStateProcessor {
     ) -> Result<(), RuleError> {
         // Search for invalid transactions
         let mut invalid_transactions = HashMap::new();
+        let mut atomic_state = virtual_state.atomic_state.clone();
         for tx in txs.iter() {
-            if let Err(e) = self.validate_block_template_transaction(tx, virtual_state, utxo_view) {
-                invalid_transactions.insert(tx.id(), e);
+            match self.validate_block_template_transaction(tx, virtual_state, utxo_view) {
+                Ok(validated) => {
+                    if let Err(e) =
+                        self.validate_and_apply_atomic_state_transition(&validated, virtual_state.daa_score, &mut atomic_state)
+                    {
+                        invalid_transactions.insert(tx.id(), e);
+                    }
+                }
+                Err(e) => {
+                    invalid_transactions.insert(tx.id(), e);
+                }
             }
         }
         if !invalid_transactions.is_empty() {
@@ -1036,7 +1232,13 @@ impl VirtualStateProcessor {
     /// Note that pruning point-related stores are initialized by `init`
     pub fn process_genesis(self: &Arc<Self>) {
         // Write the UTXO state of genesis
-        self.commit_utxo_state(self.genesis.hash, UtxoDiff::default(), MuHash::new(), AcceptanceData::default());
+        self.commit_utxo_state(
+            self.genesis.hash,
+            UtxoDiff::default(),
+            MuHash::new(),
+            AcceptanceData::default(),
+            AtomicConsensusState::default(),
+        );
 
         // Init the virtual selected chain store
         let mut batch = WriteBatch::default();
@@ -1116,6 +1318,21 @@ impl VirtualStateProcessor {
             drop(statuses_write);
         }
 
+        let pruning_point_atomic_state = match self.atomic_state_store.get(new_pruning_point) {
+            Ok(state) => state.as_ref().clone(),
+            Err(StoreError::KeyNotFound(_)) => {
+                if self.transaction_validator.is_payload_hf_active(new_pruning_point_header.daa_score) {
+                    return Err(PruningImportError::NewPruningPointMissingAtomicState(new_pruning_point));
+                }
+                AtomicConsensusState::default()
+            }
+            Err(err) => {
+                return Err(PruningImportError::AtomicStateStoreError(format!(
+                    "failed reading pruning-point atomic state for `{new_pruning_point}`: {err}"
+                )));
+            }
+        };
+
         // Calculate the virtual state, treating the pruning point as the only virtual parent
         let virtual_parents = vec![new_pruning_point];
         let virtual_ghostdag_data = self.ghostdag_manager.ghostdag(&virtual_parents);
@@ -1126,6 +1343,7 @@ impl VirtualStateProcessor {
             virtual_ghostdag_data,
             imported_utxo_multiset.clone(),
             &mut UtxoDiff::default(),
+            pruning_point_atomic_state,
             &ChainPath::default(),
         )?;
 

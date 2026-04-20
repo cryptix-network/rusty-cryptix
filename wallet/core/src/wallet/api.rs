@@ -8,15 +8,67 @@ use crate::result::Result;
 use crate::storage::interface::TransactionRangeResult;
 use crate::storage::Binding;
 use crate::tx::Fees;
-use workflow_core::channel::Receiver;
+use workflow_core::{
+    channel::{DuplexChannel, Sender},
+    task::spawn,
+};
 
 #[async_trait]
 impl WalletApi for super::Wallet {
-    async fn register_notifications(self: Arc<Self>, _channel: Receiver<WalletNotification>) -> Result<u64> {
-        todo!()
+    async fn register_notifications(self: Arc<Self>, channel: Sender<WalletNotification>) -> Result<u64> {
+        let channel_id = self.inner.next_notification_relay_id.fetch_add(1, Ordering::SeqCst);
+        let relay_ctl = DuplexChannel::oneshot();
+
+        self.inner.notification_relays.lock().unwrap().insert(channel_id, super::NotificationRelay { task_ctl: relay_ctl.clone() });
+
+        let events = self.multiplexer().channel();
+        let relay_ctl_receiver = relay_ctl.request.receiver.clone();
+        let relay_ctl_sender = relay_ctl.response.sender.clone();
+        let this = self.clone();
+        spawn(async move {
+            loop {
+                select! {
+                    _ = relay_ctl_receiver.recv().fuse() => {
+                        break;
+                    },
+                    msg = events.receiver.recv().fuse() => {
+                        match msg {
+                            Ok(event) => {
+                                let notification = WalletNotification {
+                                    kind: event.kind(),
+                                    event_json: serde_json::to_string(event.as_ref()).unwrap_or_else(|_| "{}".to_string()),
+                                };
+                                if channel.send(notification).await.is_err() {
+                                    break;
+                                }
+                            },
+                            Err(_) => {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            this.inner.notification_relays.lock().unwrap().remove(&channel_id);
+            let _ = relay_ctl_sender.send(()).await;
+        });
+
+        Ok(channel_id)
     }
-    async fn unregister_notifications(self: Arc<Self>, _channel_id: u64) -> Result<()> {
-        todo!()
+
+    async fn unregister_notifications(self: Arc<Self>, channel_id: u64) -> Result<()> {
+        let relay = self
+            .inner
+            .notification_relays
+            .lock()
+            .unwrap()
+            .remove(&channel_id)
+            .ok_or_else(|| Error::Custom(format!("wallet notification channel id `{channel_id}` is not registered")))?;
+
+        relay.task_ctl.signal(()).await.map_err(|err| Error::Custom(format!("wallet notification channel shutdown failed: {err}")))?;
+
+        Ok(())
     }
 
     async fn get_status_call(self: Arc<Self>, request: GetStatusRequest) -> Result<GetStatusResponse> {
@@ -377,8 +429,16 @@ impl WalletApi for super::Wallet {
     }
 
     async fn accounts_send_call(self: Arc<Self>, request: AccountsSendRequest) -> Result<AccountsSendResponse> {
-        let AccountsSendRequest { account_id, wallet_secret, payment_secret, destination, priority_fee_sompi, payload, fast_path } =
-            request;
+        let AccountsSendRequest {
+            account_id,
+            sender_address,
+            wallet_secret,
+            payment_secret,
+            destination,
+            priority_fee_sompi,
+            payload,
+            fast_path,
+        } = request;
 
         let guard = self.guard();
         let guard = guard.lock().await;
@@ -398,7 +458,17 @@ impl WalletApi for super::Wallet {
             }
         });
         let (generator_summary, transaction_ids, fast_summary) = account
-            .send(destination, priority_fee_sompi, payload, fast_submit, wallet_secret, payment_secret, &abortable, None)
+            .send(
+                destination,
+                priority_fee_sompi,
+                payload,
+                sender_address,
+                fast_submit,
+                wallet_secret,
+                payment_secret,
+                &abortable,
+                None,
+            )
             .await?;
 
         Ok(AccountsSendResponse {
@@ -446,7 +516,7 @@ impl WalletApi for super::Wallet {
     }
 
     async fn accounts_estimate_call(self: Arc<Self>, request: AccountsEstimateRequest) -> Result<AccountsEstimateResponse> {
-        let AccountsEstimateRequest { account_id, destination, priority_fee_sompi, payload } = request;
+        let AccountsEstimateRequest { account_id, sender_address, destination, priority_fee_sompi, payload } = request;
 
         let guard = self.guard();
         let guard = guard.lock().await;
@@ -465,7 +535,7 @@ impl WalletApi for super::Wallet {
 
         let abortable = Abortable::new();
         self.inner.estimation_abortables.lock().unwrap().insert(account_id, abortable.clone());
-        let result = account.estimate(destination, priority_fee_sompi, payload, &abortable).await;
+        let result = account.estimate(destination, priority_fee_sompi, payload, sender_address, &abortable).await;
         self.inner.estimation_abortables.lock().unwrap().remove(&account_id);
 
         Ok(AccountsEstimateResponse { generator_summary: result? })
@@ -483,16 +553,23 @@ impl WalletApi for super::Wallet {
         let TransactionRangeResult { transactions, total } =
             store.load_range(&binding, &network_id, filter, start as usize..end as usize).await?;
         let current_daa_score = self.current_daa_score();
-        let transactions = transactions
-            .into_iter()
-            .map(|record| {
-                let mut record = (*record).clone();
-                record.refresh_payload_availability(current_daa_score);
-                Arc::new(record)
-            })
-            .collect::<Vec<_>>();
+        let mut resolved = Vec::with_capacity(transactions.len());
+        for record in transactions.into_iter() {
+            let mut record = (*record).clone();
+            record.refresh_payload_availability(current_daa_score);
 
-        Ok(TransactionsDataGetResponse { transactions, total, account_id, start })
+            // Refresh records with missing embedded tx data at query time so payload
+            // availability can recover from "missing" once the tx is resolvable.
+            if !record.has_embedded_transaction() {
+                if let Ok(enriched) = self.enrich_record_transaction(&record).await {
+                    record = enriched;
+                }
+            }
+
+            resolved.push(Arc::new(record));
+        }
+
+        Ok(TransactionsDataGetResponse { transactions: resolved, total, account_id, start })
     }
 
     async fn transactions_replace_note_call(

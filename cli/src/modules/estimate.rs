@@ -12,18 +12,27 @@ impl Estimate {
         let account = ctx.wallet().account()?;
 
         if argv.is_empty() {
-            tprintln!(ctx, "usage: estimate <amount> [<priority fee>]");
+            tprintln!(ctx, "usage: estimate <amount> [priority fee] [senderAddress] [payloadHex]");
             return Ok(());
         }
 
         let amount_sompi = try_parse_required_nonzero_cryptix_as_sompi_u64(argv.first())?;
         let priority_fee_sompi = try_parse_optional_cryptix_as_sompi_i64(argv.get(1))?.unwrap_or(0);
+        let sender_address = argv.get(2).map(|value| Address::try_from(value.as_str())).transpose()?;
+        let payload = argv
+            .get(3)
+            .map(|value| {
+                let normalized = value.strip_prefix("0x").unwrap_or(value.as_str());
+                hex::decode(normalized)
+                    .map_err(|err| Error::Custom(format!("payloadHex must be valid hex (optional 0x prefix is allowed): {err}")))
+            })
+            .transpose()?;
         let abortable = Abortable::default();
 
         // just use any address for an estimate (change address)
         let change_address = account.change_address()?;
         let destination = PaymentDestination::PaymentOutputs(PaymentOutputs::from((change_address.clone(), amount_sompi)));
-        let estimate = account.estimate(destination, priority_fee_sompi.into(), None, &abortable).await?;
+        let estimate = account.estimate(destination, priority_fee_sompi.into(), payload, sender_address, &abortable).await?;
 
         tprintln!(ctx, "Estimate - {estimate}");
 

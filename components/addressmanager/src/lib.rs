@@ -2,7 +2,13 @@ mod port_mapping_extender;
 mod stores;
 extern crate self as address_manager;
 
-use std::{collections::HashSet, iter, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    iter,
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 
 use address_manager::port_mapping_extender::Extender;
 use cryptix_consensus_core::config::Config;
@@ -54,6 +60,7 @@ pub enum UpnpError {
 pub struct AddressManager {
     banned_address_store: DbBannedAddressesStore,
     address_store: address_store_with_cache::Store,
+    observed_services: HashMap<NetAddress, u64>,
     config: Arc<Config>,
     local_net_addresses: Vec<NetAddress>,
     datacenter_mode: bool,
@@ -69,6 +76,7 @@ impl AddressManager {
         let mut instance = Self {
             banned_address_store: DbBannedAddressesStore::new(db.clone(), CachePolicy::Count(MAX_ADDRESSES)),
             address_store: address_store_with_cache::new(db),
+            observed_services: HashMap::new(),
             local_net_addresses: Vec::new(),
             config,
             datacenter_mode,
@@ -289,6 +297,7 @@ impl AddressManager {
         // We mark `connection_failed_count` as 0 only after first success.
         // Addresses learned from gossip are unverified until a successful handshake.
         self.address_store.set(address, 1, verified);
+        self.prune_observed_services();
     }
 
     pub fn mark_connection_failure(&mut self, address: NetAddress) {
@@ -299,6 +308,7 @@ impl AddressManager {
         let new_count = self.address_store.get(address).connection_failed_count + 1;
         if new_count > MAX_CONNECTION_FAILED_COUNT {
             self.address_store.remove(address);
+            self.observed_services.remove(&address);
         } else {
             let verified = self.address_store.get(address).verified;
             self.address_store.set(address, new_count, verified);
@@ -325,9 +335,50 @@ impl AddressManager {
         self.address_store.iterate_prioritized_random_addresses(exceptions)
     }
 
+    pub fn iterate_prioritized_random_addresses_with_service_preference(
+        &self,
+        exceptions: HashSet<NetAddress>,
+        preferred_service_mask: u64,
+    ) -> impl ExactSizeIterator<Item = NetAddress> {
+        let ordered = self.address_store.iterate_prioritized_random_addresses(exceptions).collect::<Vec<_>>();
+        if preferred_service_mask == 0 || ordered.is_empty() {
+            return ordered.into_iter();
+        }
+
+        let mut preferred = Vec::with_capacity(ordered.len());
+        let mut fallback = Vec::with_capacity(ordered.len());
+        for address in ordered {
+            let has_preferred =
+                self.observed_services.get(&address).map(|services| (services & preferred_service_mask) != 0).unwrap_or(false);
+            if has_preferred {
+                preferred.push(address);
+            } else {
+                fallback.push(address);
+            }
+        }
+        preferred.extend(fallback);
+        preferred.into_iter()
+    }
+
+    pub fn set_observed_services(&mut self, address: NetAddress, services: u64) {
+        if self.address_store.has(address) {
+            self.observed_services.insert(address, services);
+            self.prune_observed_services();
+        }
+    }
+
+    pub fn observed_services(&self, address: NetAddress) -> Option<u64> {
+        self.observed_services.get(&address).copied()
+    }
+
     pub fn ban(&mut self, ip: IpAddress) {
         self.banned_address_store.set(ip.into(), ConnectionBanTimestamp(unix_now())).unwrap();
         self.address_store.remove_by_ip(ip.into());
+        self.observed_services.retain(|address, _| address.ip != ip);
+    }
+
+    fn prune_observed_services(&mut self) {
+        self.observed_services.retain(|address, _| self.address_store.has(*address));
     }
 
     pub fn unban(&mut self, ip: IpAddress) {

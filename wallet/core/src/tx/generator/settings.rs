@@ -62,16 +62,37 @@ impl GeneratorSettings {
         final_transaction_destination: PaymentDestination,
         final_priority_fee: Fees,
         final_transaction_payload: Option<Vec<u8>>,
+        sender_address: Option<Address>,
     ) -> Result<Self> {
         validate_wallet_payload(final_transaction_payload.as_deref())?;
 
         let network_id = account.utxo_context().processor().network_id()?;
-        let change_address = account.change_address()?;
+        let (change_address, priority_utxo_entries, utxo_iterator) = if let Some(sender_address) = sender_address {
+            let sender_utxos = {
+                let context = account.utxo_context().context();
+                context.mature.iter().filter(|entry| entry.address().as_ref() == Some(&sender_address)).cloned().collect::<Vec<_>>()
+            };
+            if sender_utxos.is_empty() {
+                return Err(Error::custom(format!(
+                    "senderAddress {sender_address} has no spendable mature UTXOs in the selected account"
+                )));
+            }
+
+            // senderAddress is strict: only UTXOs from the selected sender are allowed as inputs.
+            let sender_utxo_iterator: Box<dyn Iterator<Item = UtxoEntryReference> + Send + Sync + 'static> =
+                Box::new(sender_utxos.into_iter());
+            (sender_address, None, sender_utxo_iterator)
+        } else {
+            (
+                account.change_address()?,
+                None,
+                Box::new(UtxoIterator::new(account.utxo_context()))
+                    as Box<dyn Iterator<Item = UtxoEntryReference> + Send + Sync + 'static>,
+            )
+        };
         let multiplexer = account.wallet().multiplexer().clone();
         let sig_op_count = account.sig_op_count();
         let minimum_signatures = account.minimum_signatures();
-
-        let utxo_iterator = UtxoIterator::new(account.utxo_context());
 
         let settings = GeneratorSettings {
             network_id,
@@ -79,9 +100,9 @@ impl GeneratorSettings {
             sig_op_count,
             minimum_signatures,
             change_address,
-            utxo_iterator: Box::new(utxo_iterator),
+            utxo_iterator,
             source_utxo_context: Some(account.utxo_context().clone()),
-            priority_utxo_entries: None,
+            priority_utxo_entries,
 
             final_transaction_priority_fee: final_priority_fee,
             final_transaction_destination,

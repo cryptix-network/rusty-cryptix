@@ -1,6 +1,8 @@
 use std::{fs, path::PathBuf, process::exit, sync::Arc, time::Duration};
 
+use crate::atomic_bootstrap::AtomicBootstrapService;
 use async_channel::unbounded;
+use cryptix_atomicindex::service::AtomicTokenService;
 use cryptix_consensus_core::{
     config::ConfigBuilder,
     errors::config::{ConfigError, ConfigResult},
@@ -32,7 +34,7 @@ use cryptix_mining::{
     monitor::MiningMonitor,
     MiningCounters,
 };
-use cryptix_p2p_flows::{flow_context::FlowContext, service::P2pService};
+use cryptix_p2p_flows::{flow_context::FlowContext, node_identity::load_or_create_identity, service::P2pService};
 
 use cryptix_perf_monitor::{builder::Builder as PerfMonitorBuilder, counters::CountersSnapshot};
 use cryptix_utxoindex::{api::UtxoIndexProxy, UtxoIndex};
@@ -52,6 +54,7 @@ use crate::args::Args;
 const DEFAULT_DATA_DIR: &str = "datadir";
 const CONSENSUS_DB: &str = "consensus";
 const UTXOINDEX_DB: &str = "utxoindex";
+const ATOMIC_DB: &str = "atomic";
 const META_DB: &str = "meta";
 const META_DB_FILE_LIMIT: i32 = 5;
 const DEFAULT_LOG_DIR: &str = "logs";
@@ -255,23 +258,38 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     info!("{} v{}", env!("CARGO_PKG_NAME"), git::with_short_hash(version()));
     if args.hfa {
         info!(
-            "Fastchain HWA: ENABLED (runtime fast rail feature is active for this node process, cpu low-water ratio: {:.2}, drift window: {} ms, normal microblock interval: {} ms)",
+            "Fastchain HWA: ENABLED; cpu low-water ratio: {:.2}, drift window: {} ms, normal microblock interval: {} ms",
             args.hfa_cpu,
             args.hfa_drift_ms,
             args.hfa_microblock_interval_ms_normal
         );
     }
     if args.datacenter {
-        info!("Datacenter mode: ENABLED (private/unroutable peer addresses are filtered by address manager)");
+        info!("Datacenter mode: ENABLED; private/unroutable peer addresses are filtered by address manager");
     }
     info!("Tx relay broadcast interval: {} ms", args.tx_relay_broadcast_interval_ms);
     info!("Payload HF activation DAA score: {}", config.params.payload_hf_activation_daa_score);
+    info!("Cryptix Atomic Token v1: ENABLED");
+    info!("Cryptix Atomic bootstrap worker: ENABLED; configured peer overrides: {}", args.atomic_bootstrap_peers.len());
+    let bootstrap_attestation_policy = if args.atomic_bootstrap_required_manifest_signatures == 0 {
+        "quorum-only".to_string()
+    } else {
+        format!("quorum + >= {} trusted manifest signatures", args.atomic_bootstrap_required_manifest_signatures)
+    };
+    info!("Cryptix Atomic bootstrap attestation policy: {}", bootstrap_attestation_policy);
+    let bootstrap_source_policy = if config.net.is_mainnet() {
+        if args.atomic_bootstrap_allow_peer_fallback {
+            "mainnet strict seed policy; peer-only fallback enabled by explicit operator flag".to_string()
+        } else {
+            "mainnet strict seed policy; peer-only fallback disabled".to_string()
+        }
+    } else {
+        "non-mainnet policy; peer-majority fallback allowed".to_string()
+    };
+    info!("Cryptix Atomic bootstrap source policy: {}", bootstrap_source_policy);
     info!("Strong-Node claimant overlay: ENABLED");
-    info!("Auto-ban: {} (default strike threshold: 5, ban duration: 3h)", if args.autoban { "ENABLED" } else { "DISABLED" });
-    info!(
-        "Banserver sync: {} (fixed endpoint: https://antifraud.cryptix-network.org/api/v1/antifraud/snapshot)",
-        if args.banserver { "ENABLED" } else { "DISABLED" }
-    );
+    info!("Auto-ban: {}; default strike threshold: 5, ban duration: 3h", if args.autoban { "ENABLED" } else { "DISABLED" });
+    info!("Banserver sync: {}", if args.banserver { "ENABLED" } else { "DISABLED" });
 
     assert!(!db_dir.to_str().unwrap().is_empty());
     info!("Application directory: {}", app_dir.display());
@@ -287,6 +305,7 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
 
     let consensus_db_dir = db_dir.join(CONSENSUS_DB);
     let utxoindex_db_dir = db_dir.join(UTXOINDEX_DB);
+    let atomic_db_dir = db_dir.join(ATOMIC_DB);
     let meta_db_dir = db_dir.join(META_DB);
 
     let mut is_db_reset_needed = args.reset_db;
@@ -306,6 +325,8 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         info!("Utxoindex Data directory {}", utxoindex_db_dir.display());
         fs::create_dir_all(utxoindex_db_dir.as_path()).unwrap();
     }
+    info!("Cryptix Atomic Data directory {}", atomic_db_dir.display());
+    fs::create_dir_all(atomic_db_dir.as_path()).unwrap();
 
     // DB used for addresses store and for multi-consensus management
     let mut meta_db = cryptix_database::prelude::ConnBuilder::default()
@@ -377,6 +398,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         if args.utxoindex {
             fs::create_dir_all(utxoindex_db_dir.as_path()).unwrap();
         }
+        fs::create_dir_all(atomic_db_dir.as_path()).unwrap();
 
         // Reopen the DB
         meta_db = cryptix_database::prelude::ConnBuilder::default()
@@ -449,6 +471,24 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
     let system_info = SystemInfo::default();
 
     let notify_service = Arc::new(NotifyService::new(notification_root.clone(), notification_recv, subscription_context.clone()));
+    let local_unified_node_identity = load_or_create_identity(&db_dir, &config.network_name()).unwrap_or_else(|err| {
+        eprintln!("{err}");
+        exit(1);
+    });
+    let atomic_token_service = Arc::new(
+        AtomicTokenService::new(
+            &notify_service.notifier(),
+            consensus_manager.clone(),
+            config.clone(),
+            atomic_db_dir.clone(),
+            None,
+            local_unified_node_identity.node_id,
+        )
+        .unwrap_or_else(|err| {
+            eprintln!("{err}");
+            exit(1);
+        }),
+    );
     let index_service: Option<Arc<IndexService>> = if args.utxoindex {
         // Use only a single thread for none-consensus databases
         let utxoindex_db = cryptix_database::prelude::ConnBuilder::default()
@@ -494,6 +534,26 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
             exit(1);
         }),
     );
+    let configured_atomic_bootstrap_peers =
+        args.atomic_bootstrap_peers.iter().map(|peer| peer.normalize(config.default_rpc_port())).collect::<Vec<_>>();
+    let trusted_atomic_bootstrap_manifest_pubkeys = args.atomic_bootstrap_trusted_manifest_pubkeys.clone();
+    let required_atomic_bootstrap_manifest_signatures = args.atomic_bootstrap_required_manifest_signatures;
+    let atomic_bootstrap_service = Arc::new(
+        AtomicBootstrapService::new(
+            atomic_token_service.clone(),
+            flow_context.clone(),
+            configured_atomic_bootstrap_peers.clone(),
+            60,
+            atomic_db_dir.clone(),
+            trusted_atomic_bootstrap_manifest_pubkeys,
+            required_atomic_bootstrap_manifest_signatures,
+            args.atomic_bootstrap_allow_peer_fallback,
+        )
+        .unwrap_or_else(|err| {
+            eprintln!("{err}");
+            exit(1);
+        }),
+    );
     let p2p_service = Arc::new(P2pService::new(
         flow_context.clone(),
         connect_peers,
@@ -520,6 +580,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         flow_context,
         subscription_context,
         index_service.as_ref().map(|x| x.utxoindex().unwrap()),
+        atomic_token_service.clone(),
         config.clone(),
         core.clone(),
         processing_counters,
@@ -549,6 +610,8 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
     let async_runtime = Arc::new(AsyncRuntime::new(args.async_threads));
     async_runtime.register(tick_service);
     async_runtime.register(notify_service);
+    async_runtime.register(atomic_token_service);
+    async_runtime.register(atomic_bootstrap_service);
     if let Some(index_service) = index_service {
         async_runtime.register(index_service)
     };

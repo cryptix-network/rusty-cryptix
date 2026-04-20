@@ -41,6 +41,8 @@ pub struct Config {
     // TODO: move non-consensus parameters like utxoindex to a higher scoped Config
     /// Enable the UTXO index
     pub utxoindex: bool,
+    /// Unsafe/testing-only override: allow Atomic snapshot export/import without finality depth sanity check.
+    pub atomic_unsafe_skip_snapshot_finality_check: bool,
 
     /// Enable RPC commands which affect the state of the node
     pub unsafe_rpc: bool,
@@ -86,6 +88,7 @@ impl Config {
             is_archival: false,
             enable_sanity_checks: false,
             utxoindex: false,
+            atomic_unsafe_skip_snapshot_finality_check: false,
             unsafe_rpc: false,
             enable_unsynced_mining: false,
             enable_mainnet_mining: false,

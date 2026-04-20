@@ -1,5 +1,6 @@
 use crate::protowire::{
     cryptixd_response::Payload, BlockAddedNotificationMessage, CryptixdResponse, NewBlockTemplateNotificationMessage, RpcNotifyCommand,
+    TokenEventsChangedNotificationMessage,
 };
 use crate::protowire::{
     FinalityConflictNotificationMessage, FinalityConflictResolvedNotificationMessage, NotifyPruningPointUtxoSetOverrideRequestMessage,
@@ -34,6 +35,7 @@ from!(item: &cryptix_rpc_core::Notification, Payload, {
         Notification::PruningPointUtxoSetOverride(ref notification) => {
             Payload::PruningPointUtxoSetOverrideNotification(notification.into())
         }
+        Notification::TokenEventsChanged(ref notification) => Payload::TokenEventsChangedNotification(notification.into()),
     }
 });
 
@@ -73,6 +75,10 @@ from!(item: &cryptix_rpc_core::VirtualDaaScoreChangedNotification, VirtualDaaSco
 });
 
 from!(&cryptix_rpc_core::PruningPointUtxoSetOverrideNotification, PruningPointUtxoSetOverrideNotificationMessage);
+
+from!(item: &cryptix_rpc_core::TokenEventsChangedNotification, TokenEventsChangedNotificationMessage, {
+    Self { from_sequence: item.from_sequence, to_sequence: item.to_sequence, event_count: item.event_count }
+});
 
 from!(item: Command, RpcNotifyCommand, {
     match item {
@@ -117,6 +123,7 @@ try_from!(item: &Payload, cryptix_rpc_core::Notification, {
         Payload::PruningPointUtxoSetOverrideNotification(ref notification) => {
             Notification::PruningPointUtxoSetOverride(notification.try_into()?)
         }
+        Payload::TokenEventsChangedNotification(ref notification) => Notification::TokenEventsChanged(notification.try_into()?),
         _ => Err(RpcError::UnsupportedFeature)?,
     }
 });
@@ -170,6 +177,10 @@ try_from!(item: &VirtualDaaScoreChangedNotificationMessage, cryptix_rpc_core::Vi
 });
 
 try_from!(&PruningPointUtxoSetOverrideNotificationMessage, cryptix_rpc_core::PruningPointUtxoSetOverrideNotification);
+
+try_from!(item: &TokenEventsChangedNotificationMessage, cryptix_rpc_core::TokenEventsChangedNotification, {
+    Self { from_sequence: item.from_sequence, to_sequence: item.to_sequence, event_count: item.event_count }
+});
 
 from!(item: RpcNotifyCommand, Command, {
     match item {

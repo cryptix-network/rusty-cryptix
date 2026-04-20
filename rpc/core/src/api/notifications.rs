@@ -44,6 +44,9 @@ pub enum Notification {
 
     #[display(fmt = "NewBlockTemplate notification")]
     NewBlockTemplate(NewBlockTemplateNotification),
+
+    #[display(fmt = "TokenEventsChanged notification: sequences {}..{}, events {}", "_0.from_sequence", "_0.to_sequence", "_0.event_count")]
+    TokenEventsChanged(TokenEventsChangedNotification),
 }
 }
 
@@ -60,6 +63,7 @@ impl Notification {
             Notification::VirtualDaaScoreChanged(v) => to_value(&v),
             Notification::SinkBlueScoreChanged(v) => to_value(&v),
             Notification::VirtualChainChanged(v) => to_value(&v),
+            Notification::TokenEventsChanged(v) => to_value(&v),
         }
     }
 }
@@ -153,6 +157,10 @@ impl Serializer for Notification {
                 store!(u16, &8, writer)?;
                 serialize!(NewBlockTemplateNotification, notification, writer)?;
             }
+            Notification::TokenEventsChanged(notification) => {
+                store!(u16, &9, writer)?;
+                serialize!(TokenEventsChangedNotification, notification, writer)?;
+            }
         }
         Ok(())
     }
@@ -197,6 +205,10 @@ impl Deserializer for Notification {
             8 => {
                 let notification = deserialize!(NewBlockTemplateNotification, reader)?;
                 Ok(Notification::NewBlockTemplate(notification))
+            }
+            9 => {
+                let notification = deserialize!(TokenEventsChangedNotification, reader)?;
+                Ok(Notification::TokenEventsChanged(notification))
             }
             _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid variant")),
         }

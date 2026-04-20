@@ -1,0 +1,29 @@
+[package]
+name = "cryptix-atomicindex"
+description = "Cryptix Atomic Token index and execution service"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+include.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-channel.workspace = true
+blake2b_simd.workspace = true
+bincode.workspace = true
+borsh.workspace = true
+cryptix-consensus-core.workspace = true
+cryptix-consensus-notify.workspace = true
+cryptix-consensusmanager.workspace = true
+cryptix-core.workspace = true
+cryptix-notify.workspace = true
+cryptix-txscript.workspace = true
+cryptix-utils.workspace = true
+hex.workspace = true
+log.workspace = true
+secp256k1.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
