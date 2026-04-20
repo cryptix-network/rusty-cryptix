@@ -125,6 +125,7 @@ const TX_ENRICH_LOOKBACK_MIN_HEADERS: u64 = 256;
 const TX_ENRICH_LOOKBACK_MAX_HEADERS: u64 = 8192;
 const TX_ENRICH_DAA_WINDOW: u64 = 16;
 const TX_ENRICH_MAX_CANDIDATE_BLOCKS: usize = 64;
+const TX_ENRICH_MAX_MERGESET_BLOCKS_PER_CANDIDATE: usize = 256;
 
 impl Default for Wallet {
     fn default() -> Self {
@@ -1111,10 +1112,36 @@ impl Wallet {
         }
 
         for block_hash in candidate_hashes.into_iter().take(TX_ENRICH_MAX_CANDIDATE_BLOCKS) {
+            if let Some(transaction) = self.find_transaction_in_block_or_mergeset(block_hash, target_txid).await {
+                return Some(transaction);
+            }
+        }
+
+        None
+    }
+
+    async fn find_transaction_in_block_or_mergeset(
+        &self,
+        candidate_block_hash: cryptix_hashes::Hash,
+        target_txid: TransactionId,
+    ) -> Option<cryptix_consensus_core::tx::Transaction> {
+        let mut pending = vec![candidate_block_hash];
+        let mut visited = HashSet::new();
+        let mut scanned_blocks = 0usize;
+
+        while let Some(block_hash) = pending.pop() {
+            if scanned_blocks >= TX_ENRICH_MAX_MERGESET_BLOCKS_PER_CANDIDATE {
+                break;
+            }
+            if !visited.insert(block_hash) {
+                continue;
+            }
+
             let block = match self.rpc_api().get_block(block_hash, true).await {
                 Ok(block) => block,
                 Err(_) => continue,
             };
+            scanned_blocks = scanned_blocks.saturating_add(1);
 
             for rpc_transaction in block.transactions.into_iter() {
                 let Ok(transaction) = cryptix_consensus_core::tx::Transaction::try_from(rpc_transaction) else {
@@ -1123,6 +1150,22 @@ impl Wallet {
 
                 if transaction.id() == target_txid {
                     return Some(transaction);
+                }
+            }
+
+            if let Some(verbose_data) = block.verbose_data {
+                for merged_hash in verbose_data
+                    .merge_set_blues_hashes
+                    .into_iter()
+                    .chain(verbose_data.merge_set_reds_hashes.into_iter())
+                {
+                    if visited.contains(&merged_hash) {
+                        continue;
+                    }
+                    if pending.len().saturating_add(scanned_blocks) >= TX_ENRICH_MAX_MERGESET_BLOCKS_PER_CANDIDATE {
+                        break;
+                    }
+                    pending.push(merged_hash);
                 }
             }
         }
