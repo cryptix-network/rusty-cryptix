@@ -42,6 +42,12 @@ struct ConfirmedTransactionCacheEntry {
     transaction: Arc<Transaction>,
 }
 
+#[derive(Clone, Default)]
+struct DecodedRpcBlockCacheEntry {
+    transactions: Vec<Transaction>,
+    merge_set_hashes: Vec<RpcHash>,
+}
+
 pub struct Inner {
     /// Coinbase UTXOs in stasis
     stasis: DashMap<UtxoEntryId, PendingUtxoEntryReference>,
@@ -449,23 +455,14 @@ impl UtxoProcessor {
             self.inner.confirmed_transactions.retain(|_, entry| !removed_block_hashes.contains(&entry.accepting_block_hash));
         }
 
+        let mut decoded_block_cache = HashMap::<RpcHash, DecodedRpcBlockCacheEntry>::new();
         for accepted in notification.accepted_transaction_ids.iter() {
             if accepted.accepted_transaction_ids.is_empty() {
                 continue;
             }
 
-            let block = self.rpc_api().get_block(accepted.accepting_block_hash, true).await?;
-            let mut block_transactions = HashMap::with_capacity(block.transactions.len());
-            for rpc_transaction in block.transactions.iter() {
-                match Transaction::try_from(rpc_transaction.clone()) {
-                    Ok(transaction) => {
-                        block_transactions.insert(transaction.id(), transaction);
-                    }
-                    Err(err) => {
-                        log_warn!("unable to decode confirmed block transaction for payload cache: {err}");
-                    }
-                }
-            }
+            let block_transactions =
+                self.collect_accepting_block_transactions(accepted.accepting_block_hash, &mut decoded_block_cache).await?;
 
             for txid in accepted.accepted_transaction_ids.iter() {
                 if let Some(transaction) = block_transactions.get(txid) {
@@ -481,6 +478,78 @@ impl UtxoProcessor {
         }
 
         Ok(())
+    }
+
+    async fn decode_rpc_block_cached(
+        &self,
+        block_hash: RpcHash,
+        cache: &mut HashMap<RpcHash, DecodedRpcBlockCacheEntry>,
+    ) -> Result<DecodedRpcBlockCacheEntry> {
+        if let Some(entry) = cache.get(&block_hash) {
+            return Ok(entry.clone());
+        }
+
+        let block = self.rpc_api().get_block(block_hash, true).await?;
+        let mut transactions = Vec::with_capacity(block.transactions.len());
+        for rpc_transaction in block.transactions.into_iter() {
+            match Transaction::try_from(rpc_transaction) {
+                Ok(transaction) => {
+                    transactions.push(transaction);
+                }
+                Err(err) => {
+                    log_warn!("unable to decode confirmed block transaction for payload cache: {err}");
+                }
+            }
+        }
+
+        let mut merge_set_hashes = Vec::new();
+        if let Some(verbose_data) = block.verbose_data {
+            merge_set_hashes.extend(verbose_data.merge_set_blues_hashes.iter().copied());
+            merge_set_hashes.extend(verbose_data.merge_set_reds_hashes.iter().copied());
+        }
+
+        let entry = DecodedRpcBlockCacheEntry { transactions, merge_set_hashes };
+        cache.insert(block_hash, entry.clone());
+        Ok(entry)
+    }
+
+    async fn collect_accepting_block_transactions(
+        &self,
+        accepting_block_hash: RpcHash,
+        cache: &mut HashMap<RpcHash, DecodedRpcBlockCacheEntry>,
+    ) -> Result<HashMap<TransactionId, Transaction>> {
+        let mut collected = HashMap::<TransactionId, Transaction>::new();
+        let mut visited_blocks = HashSet::<RpcHash>::new();
+        let mut pending_blocks = vec![accepting_block_hash];
+
+        while let Some(block_hash) = pending_blocks.pop() {
+            if !visited_blocks.insert(block_hash) {
+                continue;
+            }
+
+            let decoded = match self.decode_rpc_block_cached(block_hash, cache).await {
+                Ok(decoded) => decoded,
+                Err(err) => {
+                    if block_hash == accepting_block_hash {
+                        return Err(err);
+                    }
+                    log_warn!("unable to load mergeset block {block_hash}: {err}");
+                    continue;
+                }
+            };
+
+            for transaction in decoded.transactions.into_iter() {
+                collected.entry(transaction.id()).or_insert(transaction);
+            }
+
+            for merged_hash in decoded.merge_set_hashes.into_iter() {
+                if !visited_blocks.contains(&merged_hash) {
+                    pending_blocks.push(merged_hash);
+                }
+            }
+        }
+
+        Ok(collected)
     }
 
     pub fn is_connected(&self) -> bool {
