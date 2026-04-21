@@ -518,37 +518,16 @@ impl UtxoProcessor {
         accepting_block_hash: RpcHash,
         cache: &mut HashMap<RpcHash, DecodedRpcBlockCacheEntry>,
     ) -> Result<HashMap<TransactionId, Transaction>> {
+        // Keep VirtualChainChanged handling responsive.
+        // Expanding full mergesets here can stall the notification loop and delay
+        // Pending/Maturity/Daa updates under load. We cache accepting-block
+        // transactions only; missing payload attachments are recovered later via
+        // on-demand enrichment paths.
+        let decoded = self.decode_rpc_block_cached(accepting_block_hash, cache).await?;
         let mut collected = HashMap::<TransactionId, Transaction>::new();
-        let mut visited_blocks = HashSet::<RpcHash>::new();
-        let mut pending_blocks = vec![accepting_block_hash];
-
-        while let Some(block_hash) = pending_blocks.pop() {
-            if !visited_blocks.insert(block_hash) {
-                continue;
-            }
-
-            let decoded = match self.decode_rpc_block_cached(block_hash, cache).await {
-                Ok(decoded) => decoded,
-                Err(err) => {
-                    if block_hash == accepting_block_hash {
-                        return Err(err);
-                    }
-                    log_warn!("unable to load mergeset block {block_hash}: {err}");
-                    continue;
-                }
-            };
-
-            for transaction in decoded.transactions.into_iter() {
-                collected.entry(transaction.id()).or_insert(transaction);
-            }
-
-            for merged_hash in decoded.merge_set_hashes.into_iter() {
-                if !visited_blocks.contains(&merged_hash) {
-                    pending_blocks.push(merged_hash);
-                }
-            }
+        for transaction in decoded.transactions.into_iter() {
+            collected.entry(transaction.id()).or_insert(transaction);
         }
-
         Ok(collected)
     }
 

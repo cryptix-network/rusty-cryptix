@@ -562,7 +562,7 @@ impl WalletApi for super::Wallet {
             // Refresh records with missing embedded tx data at query time so payload
             // availability can recover from "missing" once the tx is resolvable.
             if !record.has_embedded_transaction() {
-                if let Ok(enriched) = self.enrich_record_transaction(&record).await {
+                if let Ok(enriched) = self.enrich_record_transaction(&record, true).await {
                     if enriched.has_embedded_transaction() {
                         records_to_persist.push(enriched.clone());
                     }

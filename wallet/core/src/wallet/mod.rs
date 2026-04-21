@@ -1028,7 +1028,7 @@ impl Wallet {
     }
 
     pub(crate) async fn handle_discovery(&self, record: TransactionRecord) -> Result<()> {
-        let record = self.enrich_record_transaction(&record).await?;
+        let record = self.enrich_record_transaction(&record, true).await?;
         if !self.should_persist_record_after_messenger_dedup(&record).await {
             return Ok(());
         }
@@ -1173,7 +1173,7 @@ impl Wallet {
         None
     }
 
-    async fn resolve_record_transaction(&self, record: &TransactionRecord) -> Option<cryptix_consensus_core::tx::Transaction> {
+    async fn resolve_record_transaction(&self, record: &TransactionRecord, allow_chain_lookup: bool) -> Option<cryptix_consensus_core::tx::Transaction> {
         if let Some(transaction) = self.utxo_processor().confirmed_transaction(record.id()) {
             return Some(transaction);
         }
@@ -1184,17 +1184,21 @@ impl Wallet {
             }
         }
 
-        self.resolve_record_transaction_from_chain(record).await
+        if allow_chain_lookup {
+            self.resolve_record_transaction_from_chain(record).await
+        } else {
+            None
+        }
     }
 
-    async fn enrich_record_transaction(&self, record: &TransactionRecord) -> Result<TransactionRecord> {
+    async fn enrich_record_transaction(&self, record: &TransactionRecord, allow_chain_lookup: bool) -> Result<TransactionRecord> {
         let mut enriched = record.clone();
         if !Self::needs_transaction_enrichment(&enriched) {
             enriched.refresh_payload_availability(self.current_daa_score());
             return Ok(enriched);
         }
 
-        if let Some(transaction) = self.resolve_record_transaction(&enriched).await {
+        if let Some(transaction) = self.resolve_record_transaction(&enriched, allow_chain_lookup).await {
             let _ = enriched.try_attach_transaction(transaction);
         }
 
@@ -1248,7 +1252,8 @@ impl Wallet {
     async fn handle_event(self: &Arc<Self>, event: Box<Events>) -> Result<Option<Events>> {
         match &*event {
             Events::Pending { record } | Events::Maturity { record } => {
-                let enriched_record = self.enrich_record_transaction(record).await?;
+                // Keep realtime notifications responsive: avoid heavy chain lookups on live events.
+                let enriched_record = self.enrich_record_transaction(record, false).await?;
                 if enriched_record.is_change() {
                     return Ok(None);
                 }
@@ -1267,7 +1272,7 @@ impl Wallet {
                 Ok(Some(normalized))
             }
             Events::Reorg { record } => {
-                let enriched_record = self.enrich_record_transaction(record).await?;
+                let enriched_record = self.enrich_record_transaction(record, true).await?;
                 self.mark_messenger_detached(&enriched_record).await;
                 if enriched_record.is_change() {
                     return Ok(None);
