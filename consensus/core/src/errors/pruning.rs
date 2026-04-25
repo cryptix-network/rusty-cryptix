@@ -60,6 +60,9 @@ pub enum PruningImportError {
     #[error("the imported multiset hash was expected to be {0} and was actually {1}")]
     ImportedMultisetHashMismatch(Hash, Hash),
 
+    #[error("the imported state commitment was expected to be {0} and was actually {1}")]
+    ImportedStateCommitmentMismatch(Hash, Hash),
+
     #[error("pruning import data lead to validation rule error")]
     PruningImportRuleError(#[from] RuleError),
 

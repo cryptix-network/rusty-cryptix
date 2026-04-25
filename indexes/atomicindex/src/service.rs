@@ -32,8 +32,6 @@ use cryptix_core::{
 };
 use cryptix_notify::{connection::ChannelType, listener::ListenerLifespan, scope::VirtualChainChangedScope};
 use cryptix_utils::{channel::Channel, triggers::SingleTrigger};
-use hex::decode as hex_decode;
-use secp256k1::{Keypair, Message as SecpMessage, XOnlyPublicKey, SECP256K1};
 use std::{
     collections::HashMap,
     fs::File,
@@ -58,7 +56,6 @@ const TOKEN_REPLAY_OVERLAP_SIMNET: usize = 120_000;
 const TOKEN_HISTORY_RETENTION_SLACK_BLOCKS: usize = 2048;
 const SNAPSHOT_MANIFEST_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_SNAPSHOT_MANIFEST_V1";
 const SNAPSHOT_ID_DOMAIN: &[u8] = b"CAT_SNAPSHOT_ID_V1";
-const SNAPSHOT_MANIFEST_SIGNATURE_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_MANIFEST_SIG_V1";
 const SNAPSHOT_CHUNK_SIZE_DEFAULT: usize = 1024 * 1024;
 const SNAPSHOT_CHUNK_SIZE_MAX: usize = 4 * 1024 * 1024;
 pub const MAX_BOOTSTRAP_SNAPSHOT_FILE_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -137,12 +134,6 @@ pub struct ScSnapshotManifestPayload {
     pub snapshot_id: String,
     pub manifest_bytes: Vec<u8>,
     pub signatures: Vec<ScSnapshotManifestSignature>,
-}
-
-#[derive(Clone, Debug)]
-struct ManifestSigner {
-    secret_key: [u8; 32],
-    signer_pubkey: XOnlyPublicKey,
 }
 
 struct AtomicTokenProcessor {
@@ -312,7 +303,6 @@ pub struct AtomicTokenService {
     atomic_data_dir: PathBuf,
     snapshot_store_dir: PathBuf,
     snapshot_refresh_lock: Mutex<()>,
-    manifest_signer: Option<ManifestSigner>,
     network_id: String,
     protocol_version: u16,
     node_identity: [u8; 32],
@@ -324,7 +314,6 @@ impl AtomicTokenService {
         consensus_manager: Arc<ConsensusManager>,
         config: Arc<Config>,
         atomic_data_dir: PathBuf,
-        manifest_signing_key: Option<String>,
         node_identity: [u8; 32],
     ) -> AtomicTokenResult<Self> {
         validate_startup_constraints(config.as_ref())?;
@@ -332,7 +321,6 @@ impl AtomicTokenService {
         let expected_finality_depth = token_finality_depth_for_network_type(config.params.net.network_type());
         let replay_overlap = token_replay_overlap_for_network_type(config.params.net.network_type());
         let max_retained_blocks = max_retained_blocks(expected_finality_depth, replay_overlap);
-        let manifest_signer = parse_manifest_signer(manifest_signing_key.as_deref())?;
 
         let network_id = config.params.network_name();
         std::fs::create_dir_all(&atomic_data_dir)
@@ -363,13 +351,6 @@ impl AtomicTokenService {
         if config.atomic_unsafe_skip_snapshot_finality_check {
             warn!("[{IDENT}] UNSAFE: snapshot finality depth sanity check is disabled by configuration");
         }
-        if let Some(signer) = manifest_signer.as_ref() {
-            info!(
-                "[{IDENT}] Cryptix Atomic bootstrap manifest signing enabled (signer xonly pubkey: {})",
-                to_hex(&signer.signer_pubkey.serialize())
-            );
-        }
-
         Ok(Self {
             recv_channel: consensus_notify_channel.receiver(),
             processor: Arc::new(AtomicTokenProcessor::new(consensus_manager, max_retained_blocks, state, state_path)),
@@ -382,7 +363,6 @@ impl AtomicTokenService {
             atomic_data_dir,
             snapshot_store_dir,
             snapshot_refresh_lock: Default::default(),
-            manifest_signer,
             network_id,
             protocol_version: TOKEN_PROTOCOL_VERSION,
             node_identity,
@@ -659,9 +639,11 @@ impl AtomicTokenService {
         self.ensure_bootstrap_serving_ready().await?;
 
         let entry = resolve_snapshot_catalog_entry(&self.snapshot_store_dir, snapshot_id, self.protocol_version, &self.network_id)?;
-        let signature = sign_snapshot_manifest(self.manifest_signer.as_ref(), &entry.manifest_bytes)?;
-        let signatures = signature.into_iter().collect();
-        Ok(ScSnapshotManifestPayload { snapshot_id: entry.snapshot_id_hex, manifest_bytes: entry.manifest_bytes, signatures })
+        Ok(ScSnapshotManifestPayload {
+            snapshot_id: entry.snapshot_id_hex,
+            manifest_bytes: entry.manifest_bytes,
+            signatures: Vec::new(),
+        })
     }
 
     pub async fn get_sc_snapshot_chunk(
@@ -1325,66 +1307,6 @@ fn snapshot_id_from_manifest(manifest_bytes: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(digest.as_bytes());
     out
-}
-
-fn manifest_signature_message(snapshot_id: [u8; 32]) -> AtomicTokenResult<SecpMessage> {
-    let mut hasher = Blake2bParams::new().hash_length(32).to_state();
-    hasher.update(SNAPSHOT_MANIFEST_SIGNATURE_DOMAIN);
-    hasher.update(&snapshot_id);
-    let digest = hasher.finalize();
-    let mut digest_bytes = [0u8; 32];
-    digest_bytes.copy_from_slice(digest.as_bytes());
-    SecpMessage::from_digest_slice(&digest_bytes)
-        .map_err(|e| AtomicTokenError::Processing(format!("failed preparing bootstrap manifest signature message digest: {e}")))
-}
-
-fn parse_manifest_signer(signing_key_hex: Option<&str>) -> AtomicTokenResult<Option<ManifestSigner>> {
-    let Some(signing_key_hex) = signing_key_hex else {
-        return Ok(None);
-    };
-
-    let signing_key_hex = signing_key_hex.trim();
-    if signing_key_hex.is_empty() {
-        return Ok(None);
-    }
-
-    let decoded = hex_decode(signing_key_hex).map_err(|e| {
-        AtomicTokenError::Processing(format!(
-            "invalid SC bootstrap manifest signing key hex: expected 32-byte secret key hex string ({e})"
-        ))
-    })?;
-    if decoded.len() != 32 {
-        return Err(AtomicTokenError::Processing(format!(
-            "invalid SC bootstrap manifest signing key length: expected 32 bytes, got {}",
-            decoded.len()
-        )));
-    }
-    let mut secret_key = [0u8; 32];
-    secret_key.copy_from_slice(&decoded);
-    let keypair = Keypair::from_seckey_slice(SECP256K1, &secret_key)
-        .map_err(|e| AtomicTokenError::Processing(format!("invalid SC bootstrap manifest signing key value: {e}")))?;
-    let (signer_pubkey, _parity) = XOnlyPublicKey::from_keypair(&keypair);
-
-    Ok(Some(ManifestSigner { secret_key, signer_pubkey }))
-}
-
-fn sign_snapshot_manifest(
-    signer: Option<&ManifestSigner>,
-    manifest_bytes: &[u8],
-) -> AtomicTokenResult<Option<ScSnapshotManifestSignature>> {
-    let Some(signer) = signer else {
-        return Ok(None);
-    };
-
-    let snapshot_id = snapshot_id_from_manifest(manifest_bytes);
-    let message = manifest_signature_message(snapshot_id)?;
-    let keypair = Keypair::from_seckey_slice(SECP256K1, &signer.secret_key)
-        .map_err(|e| AtomicTokenError::Processing(format!("failed loading manifest signing keypair for bootstrap signing: {e}")))?;
-    let signature = keypair.sign_schnorr(message);
-    let mut signature_bytes = [0u8; 64];
-    signature_bytes.copy_from_slice(signature.as_ref());
-
-    Ok(Some(ScSnapshotManifestSignature { signer_pubkey: signer.signer_pubkey.serialize(), signature: signature_bytes }))
 }
 
 fn to_hex(bytes: &[u8]) -> String {

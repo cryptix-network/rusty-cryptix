@@ -384,9 +384,7 @@ impl IbdFlow {
     ) -> Result<Option<cryptix_consensus_core::pruning::PruningPointAtomicState>, ProtocolError> {
         let Some(state_hash) = pkg.atomic_state_hash else {
             if proof_pruning_point_daa_score >= self.ctx.config.params.payload_hf_activation_daa_score {
-                return Err(ProtocolError::Other(
-                    "post-HF pruning-point trusted data is missing atomic consensus state hash",
-                ));
+                return Err(ProtocolError::Other("post-HF pruning-point trusted data is missing atomic consensus state hash"));
             }
             return Ok(None);
         };

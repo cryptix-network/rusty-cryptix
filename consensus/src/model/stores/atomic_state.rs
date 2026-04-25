@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 const ATOMIC_CONSENSUS_STATE_MAGIC: &[u8; 8] = b"CATCS001";
 const ATOMIC_CONSENSUS_STATE_HASH_DOMAIN: &[u8] = b"cryptix-atomic-consensus-state-v1";
+const ATOMIC_STATE_COMMITMENT_DOMAIN: &[u8] = b"cryptix-utxo-atomic-state-commitment-v1";
 const ATOMIC_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
 const OWNER_AUTH_SCHEME_PUBKEY: u8 = 0;
 const OWNER_AUTH_SCHEME_PUBKEY_ECDSA: u8 = 1;
@@ -156,6 +157,25 @@ impl AtomicConsensusState {
         let mut out = [0u8; 32];
         out.copy_from_slice(digest.as_bytes());
         out
+    }
+
+    pub fn header_commitment(utxo_commitment: Hash, atomic_state_hash: [u8; 32], payload_hf_active: bool) -> Hash {
+        if !payload_hf_active {
+            return utxo_commitment;
+        }
+
+        let mut hasher = Blake2bParams::new().hash_length(32).to_state();
+        hasher.update(ATOMIC_STATE_COMMITMENT_DOMAIN);
+        hasher.update(&utxo_commitment.as_bytes());
+        hasher.update(&atomic_state_hash);
+        let digest = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(digest.as_bytes());
+        Hash::from_bytes(out)
+    }
+
+    pub fn header_commitment_for_state(&self, utxo_commitment: Hash, payload_hf_active: bool) -> Hash {
+        Self::header_commitment(utxo_commitment, self.canonical_hash(), payload_hf_active)
     }
 
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, String> {
@@ -698,6 +718,20 @@ mod tests {
 
     fn hash(byte: u8) -> Hash {
         Hash::from_bytes([byte; 32])
+    }
+
+    #[test]
+    fn header_commitment_is_legacy_before_hf_and_binds_atomic_state_after_hf() {
+        let utxo_commitment = hash(1);
+        let atomic_hash_a = [2u8; 32];
+        let atomic_hash_b = [3u8; 32];
+
+        assert_eq!(AtomicConsensusState::header_commitment(utxo_commitment, atomic_hash_a, false), utxo_commitment);
+
+        let commitment_a = AtomicConsensusState::header_commitment(utxo_commitment, atomic_hash_a, true);
+        let commitment_b = AtomicConsensusState::header_commitment(utxo_commitment, atomic_hash_b, true);
+        assert_ne!(commitment_a, utxo_commitment);
+        assert_ne!(commitment_a, commitment_b);
     }
 
     #[test]

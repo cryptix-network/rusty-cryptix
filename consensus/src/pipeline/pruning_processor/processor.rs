@@ -8,6 +8,7 @@ use crate::{
     model::{
         services::reachability::{MTReachabilityService, ReachabilityService},
         stores::{
+            atomic_state::{AtomicConsensusState, AtomicStateStoreReader},
             ghostdag::{CompactGhostdagData, GhostdagStoreReader},
             headers::HeaderStoreReader,
             past_pruning_points::PastPruningPointsStoreReader,
@@ -34,7 +35,7 @@ use cryptix_consensus_core::{
 };
 use cryptix_consensusmanager::SessionLock;
 use cryptix_core::{debug, info, warn};
-use cryptix_database::prelude::{BatchDbWriter, MemoryWriter, StoreResultExtensions, DB};
+use cryptix_database::prelude::{BatchDbWriter, MemoryWriter, StoreError, StoreResultExtensions, DB};
 use cryptix_hashes::Hash;
 use cryptix_muhash::MuHash;
 use cryptix_utils::iter::IterExtensions;
@@ -222,22 +223,33 @@ impl PruningProcessor {
         drop(pruning_utxoset_write);
 
         if self.config.enable_sanity_checks {
-            info!("Performing a sanity check that the new UTXO set has the expected UTXO commitment");
+            info!("Performing a sanity check that the new UTXO/Atomic state has the expected commitment");
             self.assert_utxo_commitment(new_pruning_point);
         }
         true
     }
 
     fn assert_utxo_commitment(&self, pruning_point: Hash) {
-        info!("Verifying the new pruning point UTXO commitment (sanity test)");
-        let commitment = self.headers_store.get_header(pruning_point).unwrap().utxo_commitment;
+        info!("Verifying the new pruning point state commitment (sanity test)");
+        let header = self.headers_store.get_header(pruning_point).unwrap();
         let mut multiset = MuHash::new();
         let pruning_utxoset_read = self.pruning_utxoset_stores.read();
         for (outpoint, entry) in pruning_utxoset_read.utxo_set.iterator().map(|r| r.unwrap()) {
             multiset.add_utxo(&outpoint, &entry);
         }
-        assert_eq!(multiset.finalize(), commitment, "Updated pruning point utxo set does not match the header utxo commitment");
-        info!("Pruning point UTXO commitment was verified correctly (sanity test)");
+        let utxo_commitment = multiset.finalize();
+        let payload_hf_active = header.daa_score >= self.config.params.payload_hf_activation_daa_score;
+        let atomic_state = match self.atomic_state_store.get(pruning_point) {
+            Ok(state) => state,
+            Err(StoreError::KeyNotFound(_)) if !payload_hf_active => Arc::new(AtomicConsensusState::default()),
+            Err(err) => panic!("Updated pruning point atomic state is unavailable for sanity check: {err}"),
+        };
+        let expected_commitment = atomic_state.header_commitment_for_state(utxo_commitment, payload_hf_active);
+        assert_eq!(
+            expected_commitment, header.utxo_commitment,
+            "Updated pruning point state commitment does not match the header commitment"
+        );
+        info!("Pruning point state commitment was verified correctly (sanity test)");
     }
 
     fn prune(&self, new_pruning_point: Hash) {

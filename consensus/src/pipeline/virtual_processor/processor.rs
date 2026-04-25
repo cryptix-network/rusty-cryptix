@@ -1201,6 +1201,9 @@ impl VirtualStateProcessor {
 
         let accepted_id_merkle_root = cryptix_merkle::calc_merkle_root(virtual_state.accepted_tx_ids.iter().copied());
         let utxo_commitment = virtual_state.multiset.clone().finalize();
+        let state_commitment = virtual_state
+            .atomic_state
+            .header_commitment_for_state(utxo_commitment, self.transaction_validator.is_payload_hf_active(virtual_state.daa_score));
         // Past median time is the exclusive lower bound for valid block time, so we increase by 1 to get the valid min
         let min_block_time = virtual_state.past_median_time + 1;
         let header = Header::new_finalized(
@@ -1208,7 +1211,7 @@ impl VirtualStateProcessor {
             parents_by_level,
             hash_merkle_root,
             accepted_id_merkle_root,
-            utxo_commitment,
+            state_commitment,
             u64::max(min_block_time, unix_now()),
             virtual_state.bits,
             0,
@@ -1284,11 +1287,28 @@ impl VirtualStateProcessor {
     ) -> PruningImportResult<()> {
         info!("Importing the UTXO set of the pruning point {}", new_pruning_point);
         let new_pruning_point_header = self.headers_store.get_header(new_pruning_point).unwrap();
+        let payload_hf_active = self.transaction_validator.is_payload_hf_active(new_pruning_point_header.daa_score);
+        let pruning_point_atomic_state = match self.atomic_state_store.get(new_pruning_point) {
+            Ok(state) => state.as_ref().clone(),
+            Err(StoreError::KeyNotFound(_)) => {
+                if payload_hf_active {
+                    return Err(PruningImportError::NewPruningPointMissingAtomicState(new_pruning_point));
+                }
+                AtomicConsensusState::default()
+            }
+            Err(err) => {
+                return Err(PruningImportError::AtomicStateStoreError(format!(
+                    "failed reading pruning-point atomic state for `{new_pruning_point}`: {err}"
+                )));
+            }
+        };
         let imported_utxo_multiset_hash = imported_utxo_multiset.finalize();
-        if imported_utxo_multiset_hash != new_pruning_point_header.utxo_commitment {
-            return Err(PruningImportError::ImportedMultisetHashMismatch(
+        let imported_state_commitment =
+            pruning_point_atomic_state.header_commitment_for_state(imported_utxo_multiset_hash, payload_hf_active);
+        if imported_state_commitment != new_pruning_point_header.utxo_commitment {
+            return Err(PruningImportError::ImportedStateCommitmentMismatch(
                 new_pruning_point_header.utxo_commitment,
-                imported_utxo_multiset_hash,
+                imported_state_commitment,
             ));
         }
 
@@ -1337,21 +1357,6 @@ impl VirtualStateProcessor {
             self.db.write(batch).unwrap();
             drop(statuses_write);
         }
-
-        let pruning_point_atomic_state = match self.atomic_state_store.get(new_pruning_point) {
-            Ok(state) => state.as_ref().clone(),
-            Err(StoreError::KeyNotFound(_)) => {
-                if self.transaction_validator.is_payload_hf_active(new_pruning_point_header.daa_score) {
-                    return Err(PruningImportError::NewPruningPointMissingAtomicState(new_pruning_point));
-                }
-                AtomicConsensusState::default()
-            }
-            Err(err) => {
-                return Err(PruningImportError::AtomicStateStoreError(format!(
-                    "failed reading pruning-point atomic state for `{new_pruning_point}`: {err}"
-                )));
-            }
-        };
 
         // Calculate the virtual state, treating the pruning point as the only virtual parent
         let virtual_parents = vec![new_pruning_point];

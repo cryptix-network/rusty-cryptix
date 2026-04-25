@@ -15,11 +15,10 @@ use cryptix_grpc_client::GrpcClient;
 use cryptix_p2p_flows::flow_context::{AtomicStateQuorumVerifier, FlowContext};
 use cryptix_rpc_core::{
     api::rpc::RpcApi,
-    model::message::{GetConsensusAtomicStateHashRequest, GetScSnapshotChunkRequest, RpcScBootstrapSource, RpcScManifestSignature},
+    model::message::{GetConsensusAtomicStateHashRequest, GetScSnapshotChunkRequest, RpcScBootstrapSource},
 };
 use cryptix_utils::triggers::SingleTrigger;
 use hex::{decode as hex_decode, encode as hex_encode};
-use secp256k1::{schnorr::Signature as SchnorrSignature, Message as SecpMessage, XOnlyPublicKey};
 use std::{
     collections::{HashMap, HashSet},
     io::Write,
@@ -36,7 +35,6 @@ use tokio::{
 const SERVICE_IDENT: &str = "atomic-bootstrap-service";
 const SNAPSHOT_MANIFEST_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_SNAPSHOT_MANIFEST_V1";
 const SNAPSHOT_ID_DOMAIN: &[u8] = b"CAT_SNAPSHOT_ID_V1";
-const SNAPSHOT_MANIFEST_SIGNATURE_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_MANIFEST_SIG_V1";
 const MAX_REMOTE_SOURCES: usize = 64;
 const RPC_CALL_TIMEOUT: Duration = Duration::from_secs(15);
 const SOURCE_FAILURE_THRESHOLD: u32 = 3;
@@ -46,7 +44,6 @@ pub(crate) const ATOMIC_BOOTSTRAP_REQUIRED_NON_SEED_SOURCES: usize = 2;
 pub(crate) const ATOMIC_BOOTSTRAP_REQUIRED_TOTAL_SOURCES: usize =
     ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES + ATOMIC_BOOTSTRAP_REQUIRED_NON_SEED_SOURCES;
 const MAX_MANIFEST_HEX_LEN: usize = 4 * 1024 * 1024;
-const MAX_MANIFEST_SIGNATURES_PER_RESPONSE: usize = 64;
 const MAX_ALLOWED_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
 const MAX_SNAPSHOT_FILE_SIZE_BYTES: u64 = MAX_BOOTSTRAP_SNAPSHOT_FILE_SIZE_BYTES;
 const MAX_REPLAY_FILE_SIZE_BYTES: u64 = MAX_BOOTSTRAP_REPLAY_WINDOW_SIZE_BYTES;
@@ -143,8 +140,6 @@ pub struct AtomicBootstrapService {
     last_health_audit: Mutex<Option<Instant>>,
     bootstrap_attempt_lock: Mutex<()>,
     source_penalties: Mutex<HashMap<String, SourcePenalty>>,
-    trusted_manifest_pubkeys: HashMap<[u8; 32], XOnlyPublicKey>,
-    required_manifest_signatures: usize,
     allow_peer_majority_fallback_override: bool,
     shutdown: SingleTrigger,
 }
@@ -157,19 +152,9 @@ impl AtomicBootstrapService {
         disable_dns_seed_sources: bool,
         retry_interval_sec: u64,
         atomic_data_dir: PathBuf,
-        trusted_manifest_pubkeys: Vec<String>,
-        required_manifest_signatures: usize,
         allow_peer_majority_fallback_override: bool,
     ) -> Result<Self, String> {
         let retry_interval_sec = retry_interval_sec.max(5);
-        let trusted_manifest_pubkeys = parse_trusted_manifest_pubkeys(trusted_manifest_pubkeys)?;
-        if required_manifest_signatures == 0 {
-            info!("[atomic-bootstrap] manifest signature attestation disabled; using quorum-only bootstrap policy");
-        } else if trusted_manifest_pubkeys.is_empty() {
-            warn!(
-                "[atomic-bootstrap] manifest signature quorum configured but no trusted manifest pubkeys provided; bootstrap will fail closed"
-            );
-        }
         if flow_context.config.net.is_mainnet() {
             if disable_dns_seed_sources {
                 warn!(
@@ -191,28 +176,9 @@ impl AtomicBootstrapService {
             last_health_audit: Default::default(),
             bootstrap_attempt_lock: Default::default(),
             source_penalties: Default::default(),
-            trusted_manifest_pubkeys,
-            required_manifest_signatures,
             allow_peer_majority_fallback_override,
             shutdown: Default::default(),
         })
-    }
-
-    fn required_manifest_signatures_for_bootstrap(&self) -> Result<usize, String> {
-        if self.required_manifest_signatures == 0 {
-            return Ok(0);
-        }
-        if self.trusted_manifest_pubkeys.is_empty() {
-            return Err("manifest signature quorum is enabled but no trusted manifest pubkeys are configured".to_string());
-        }
-        if self.required_manifest_signatures > self.trusted_manifest_pubkeys.len() {
-            return Err(format!(
-                "invalid bootstrap signer quorum: required {} signatures but only {} trusted pubkeys configured",
-                self.required_manifest_signatures,
-                self.trusted_manifest_pubkeys.len()
-            ));
-        }
-        Ok(self.required_manifest_signatures)
     }
 
     fn snapshot_quorum_policy(&self) -> SnapshotQuorumPolicy {
@@ -429,7 +395,6 @@ impl AtomicBootstrapService {
         sources: Vec<SourceClient>,
         protocol_version: u32,
         network_id: &str,
-        required_manifest_signatures: usize,
     ) -> Result<Option<BootstrapSelection>, String> {
         let source_count = sources.len();
         let quorum_policy = self.snapshot_quorum_policy();
@@ -451,28 +416,21 @@ impl AtomicBootstrapService {
             );
         }
 
-        let manifest_bytes = match self
-            .fetch_manifest_bytes_with_quorum(
-                &mut selected_sources,
-                &selected_snapshot_id,
-                required_votes,
-                required_manifest_signatures,
-            )
-            .await
-        {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                for source in selected_sources {
-                    let _ = source.client.disconnect().await;
+        let manifest_bytes =
+            match self.fetch_manifest_bytes_with_quorum(&mut selected_sources, &selected_snapshot_id, required_votes).await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    for source in selected_sources {
+                        let _ = source.client.disconnect().await;
+                    }
+                    trace!(
+                        "[atomic-bootstrap] healthy-state audit skipped: manifest quorum unavailable for snapshot {}: {}",
+                        selected_snapshot_id,
+                        err
+                    );
+                    return Ok(None);
                 }
-                trace!(
-                    "[atomic-bootstrap] healthy-state audit skipped: manifest quorum unavailable for snapshot {}: {}",
-                    selected_snapshot_id,
-                    err
-                );
-                return Ok(None);
-            }
-        };
+            };
 
         let manifest = match SnapshotManifestV1::try_from_slice(&manifest_bytes) {
             Ok(manifest) => manifest,
@@ -556,14 +514,11 @@ impl AtomicBootstrapService {
         protocol_version: u32,
         network_id: &str,
         selection: BootstrapSelection,
-        required_manifest_signatures: usize,
     ) -> Result<bool, String> {
         let BootstrapSelection { snapshot_id, mut sources, required_votes, policy_description: _ } = selection;
 
         let bootstrap_result: Result<bool, String> = async {
-            let manifest_bytes = self
-                .fetch_manifest_bytes_with_quorum(&mut sources, &snapshot_id, required_votes, required_manifest_signatures)
-                .await?;
+            let manifest_bytes = self.fetch_manifest_bytes_with_quorum(&mut sources, &snapshot_id, required_votes).await?;
             let manifest = SnapshotManifestV1::try_from_slice(&manifest_bytes)
                 .map_err(|err| format!("snapshot manifest decode failed: {err}"))?;
 
@@ -638,10 +593,7 @@ impl AtomicBootstrapService {
         }
 
         if should_audit_healthy_state {
-            let required_manifest_signatures = self.required_manifest_signatures_for_bootstrap()?;
-            let Some(selection) =
-                self.audit_healthy_state_with_sources(sources, protocol_version, &network_id, required_manifest_signatures).await?
-            else {
+            let Some(selection) = self.audit_healthy_state_with_sources(sources, protocol_version, &network_id).await? else {
                 return Ok(false);
             };
 
@@ -650,7 +602,7 @@ impl AtomicBootstrapService {
                 selection.snapshot_id, selection.policy_description
             );
 
-            match self.run_verified_bootstrap(protocol_version, &network_id, selection, required_manifest_signatures).await {
+            match self.run_verified_bootstrap(protocol_version, &network_id, selection).await {
                 Ok(applied) => {
                     if applied {
                         info!("[atomic-bootstrap] verified recovery bootstrap completed after divergence detection");
@@ -668,7 +620,6 @@ impl AtomicBootstrapService {
             }
         }
 
-        let required_manifest_signatures = self.required_manifest_signatures_for_bootstrap()?;
         let quorum_policy = self.snapshot_quorum_policy();
 
         let source_count = sources.len();
@@ -690,7 +641,6 @@ impl AtomicBootstrapService {
             protocol_version,
             &network_id,
             BootstrapSelection { snapshot_id: selected_snapshot_id, sources: selected_sources, required_votes, policy_description },
-            required_manifest_signatures,
         )
         .await
     }
@@ -787,12 +737,10 @@ impl AtomicBootstrapService {
         sources: &mut [SourceClient],
         snapshot_id: &str,
         required_votes: usize,
-        required_manifest_signatures: usize,
     ) -> Result<Vec<u8>, String> {
         struct ManifestVote {
             manifest_bytes: Vec<u8>,
             vote_count: usize,
-            signer_pubkeys: HashSet<[u8; 32]>,
         }
 
         let mut votes: HashMap<[u8; 32], ManifestVote> = HashMap::new();
@@ -847,40 +795,11 @@ impl AtomicBootstrapService {
                 );
                 continue;
             }
-            if response.manifest_signatures.len() > MAX_MANIFEST_SIGNATURES_PER_RESPONSE {
-                self.record_source_failure(&source.endpoint).await;
-                last_error = format!(
-                    "{}: too many manifest signatures in response (max {}, got {})",
-                    source.endpoint,
-                    MAX_MANIFEST_SIGNATURES_PER_RESPONSE,
-                    response.manifest_signatures.len()
-                );
-                continue;
-            }
-
-            let manifest_signers = if required_manifest_signatures > 0 {
-                match self.collect_valid_manifest_signers(&manifest_bytes, &response.manifest_signatures) {
-                    Ok(signers) => signers,
-                    Err(err) => {
-                        self.record_source_failure(&source.endpoint).await;
-                        last_error = format!("{}: invalid manifest signature payload: {err}", source.endpoint);
-                        continue;
-                    }
-                }
-            } else {
-                HashSet::new()
-            };
-
             self.record_source_success(&source.endpoint).await;
             valid_responses += 1;
             let vote_key = hash_chunk_bytes(&manifest_bytes);
-            let vote = votes.entry(vote_key).or_insert_with(|| ManifestVote {
-                manifest_bytes: manifest_bytes.clone(),
-                vote_count: 0,
-                signer_pubkeys: HashSet::new(),
-            });
+            let vote = votes.entry(vote_key).or_insert_with(|| ManifestVote { manifest_bytes: manifest_bytes.clone(), vote_count: 0 });
             vote.vote_count += 1;
-            vote.signer_pubkeys.extend(manifest_signers);
         }
 
         if votes.is_empty() {
@@ -892,17 +811,10 @@ impl AtomicBootstrapService {
 
         let (_vote_hash, winning_vote) = vote_entries.remove(0);
         let vote_count = winning_vote.vote_count;
-        let signer_count = winning_vote.signer_pubkeys.len();
         if valid_responses < required_votes || vote_count < required_votes {
             return Err(format!(
                 "manifest quorum not reached for snapshot `{snapshot_id}` (required votes: {}, responses: {}, winning votes: {})",
                 required_votes, valid_responses, vote_count
-            ));
-        }
-        if required_manifest_signatures > 0 && signer_count < required_manifest_signatures {
-            return Err(format!(
-                "manifest signature quorum not reached for snapshot `{snapshot_id}` (required signatures: {}, valid trusted signer attestations: {})",
-                required_manifest_signatures, signer_count
             ));
         }
         if valid_responses > vote_count {
@@ -911,72 +823,8 @@ impl AtomicBootstrapService {
                 snapshot_id, vote_count, valid_responses
             );
         }
-        if signer_count > 0 {
-            trace!(
-                "[atomic-bootstrap] manifest signature attestations for snapshot {}: {} distinct trusted signers",
-                snapshot_id,
-                signer_count
-            );
-        }
 
         Ok(winning_vote.manifest_bytes)
-    }
-
-    fn collect_valid_manifest_signers(
-        &self,
-        manifest_bytes: &[u8],
-        signatures: &[RpcScManifestSignature],
-    ) -> Result<HashSet<[u8; 32]>, String> {
-        if self.trusted_manifest_pubkeys.is_empty() || signatures.is_empty() {
-            return Ok(HashSet::new());
-        }
-
-        let message = manifest_signature_message(snapshot_id_from_manifest(manifest_bytes))?;
-        let mut signers = HashSet::new();
-        for signature in signatures {
-            if let Some(signer_pubkey) = self.verify_manifest_signature(&message, signature)? {
-                signers.insert(signer_pubkey);
-            }
-        }
-        Ok(signers)
-    }
-
-    fn verify_manifest_signature(
-        &self,
-        message: &SecpMessage,
-        signature: &RpcScManifestSignature,
-    ) -> Result<Option<[u8; 32]>, String> {
-        let signer_pubkey_bytes = hex_decode(&signature.signer_pubkey_hex)
-            .map_err(|err| format!("invalid signer pubkey hex `{}`: {err}", signature.signer_pubkey_hex))?;
-        if signer_pubkey_bytes.len() != 32 {
-            return Err(format!(
-                "invalid signer pubkey length for `{}`: expected 32 bytes, got {}",
-                signature.signer_pubkey_hex,
-                signer_pubkey_bytes.len()
-            ));
-        }
-        let mut signer_pubkey = [0u8; 32];
-        signer_pubkey.copy_from_slice(&signer_pubkey_bytes);
-
-        let Some(trusted_pubkey) = self.trusted_manifest_pubkeys.get(&signer_pubkey) else {
-            return Ok(None);
-        };
-
-        let signature_bytes = hex_decode(&signature.signature_hex)
-            .map_err(|err| format!("invalid signature hex for trusted signer `{}`: {err}", signature.signer_pubkey_hex))?;
-        if signature_bytes.len() != 64 {
-            return Err(format!(
-                "invalid signature length for trusted signer `{}`: expected 64 bytes, got {}",
-                signature.signer_pubkey_hex,
-                signature_bytes.len()
-            ));
-        }
-        let schnorr_signature = SchnorrSignature::from_slice(&signature_bytes)
-            .map_err(|err| format!("invalid Schnorr signature for trusted signer `{}`: {err}", signature.signer_pubkey_hex))?;
-        schnorr_signature
-            .verify(message, trusted_pubkey)
-            .map_err(|err| format!("signature verification failed for trusted signer `{}`: {err}", signature.signer_pubkey_hex))?;
-        Ok(Some(signer_pubkey))
     }
 
     fn validate_manifest_sanity(&self, manifest: &SnapshotManifestV1) -> Result<(), String> {
@@ -1588,41 +1436,6 @@ fn snapshot_id_from_manifest(manifest_bytes: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(digest.as_bytes());
     out
-}
-
-fn manifest_signature_message(snapshot_id: [u8; 32]) -> Result<SecpMessage, String> {
-    let mut hasher = Blake2bParams::new().hash_length(32).to_state();
-    hasher.update(SNAPSHOT_MANIFEST_SIGNATURE_DOMAIN);
-    hasher.update(&snapshot_id);
-    let digest = hasher.finalize();
-    let mut digest_bytes = [0u8; 32];
-    digest_bytes.copy_from_slice(digest.as_bytes());
-    SecpMessage::from_digest_slice(&digest_bytes).map_err(|err| format!("invalid manifest signature message digest: {err}"))
-}
-
-fn parse_trusted_manifest_pubkeys(keys: Vec<String>) -> Result<HashMap<[u8; 32], XOnlyPublicKey>, String> {
-    let mut out = HashMap::new();
-    for key in keys {
-        let normalized = key.trim();
-        if normalized.is_empty() {
-            continue;
-        }
-
-        let key_bytes = hex_decode(normalized).map_err(|err| format!("invalid trusted manifest pubkey hex `{normalized}`: {err}"))?;
-        if key_bytes.len() != 32 {
-            return Err(format!(
-                "invalid trusted manifest pubkey length for `{normalized}`: expected 32 bytes, got {}",
-                key_bytes.len()
-            ));
-        }
-
-        let mut key_arr = [0u8; 32];
-        key_arr.copy_from_slice(&key_bytes);
-        let key_obj = XOnlyPublicKey::from_slice(&key_arr)
-            .map_err(|err| format!("invalid trusted manifest x-only pubkey `{normalized}`: {err}"))?;
-        out.insert(key_arr, key_obj);
-    }
-    Ok(out)
 }
 
 fn decode_hash32_hex(value: &str) -> Result<[u8; 32], String> {

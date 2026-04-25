@@ -57,8 +57,6 @@ pub struct Args {
     #[serde_as(as = "Vec<DisplayFromStr>")]
     #[serde(rename = "atomic-bootstrap-peer")]
     pub atomic_bootstrap_peers: Vec<ContextualNetAddress>,
-    pub atomic_bootstrap_trusted_manifest_pubkeys: Vec<String>,
-    pub atomic_bootstrap_required_manifest_signatures: usize,
     pub atomic_bootstrap_allow_peer_fallback: bool,
     pub reset_db: bool,
     #[serde(rename = "outpeers")]
@@ -124,8 +122,6 @@ impl Default for Args {
             utxoindex: false,
             atomic_unsafe_skip_snapshot_finality_check: false,
             atomic_bootstrap_peers: vec![],
-            atomic_bootstrap_trusted_manifest_pubkeys: vec![],
-            atomic_bootstrap_required_manifest_signatures: 0,
             atomic_bootstrap_allow_peer_fallback: false,
             reset_db: false,
             outbound_target: 8,
@@ -389,23 +385,6 @@ pub fn cli() -> Command {
                 .help("Add a Cryptix Atomic bootstrap gRPC peer endpoint override for snapshot discovery/fetch."),
         )
         .arg(
-            Arg::new("atomic-bootstrap-trusted-manifest-pubkey")
-                .long("atomic-bootstrap-trusted-manifest-pubkey")
-                .value_name("XONLY_PUBKEY_HEX")
-                .action(ArgAction::Append)
-                .require_equals(true)
-                .value_parser(clap::value_parser!(String))
-                .help("Add a trusted x-only Schnorr pubkey for Cryptix Atomic bootstrap manifest signature attestations."),
-        )
-        .arg(
-            Arg::new("atomic-bootstrap-required-manifest-signatures")
-                .long("atomic-bootstrap-required-manifest-signatures")
-                .value_name("N")
-                .require_equals(true)
-                .value_parser(clap::value_parser!(usize))
-                .help("Require at least N trusted manifest signatures for Cryptix Atomic bootstrap (0 disables signature attestation)."),
-        )
-        .arg(
             Arg::new("atomic-bootstrap-allow-peer-fallback")
                 .long("atomic-bootstrap-allow-peer-fallback")
                 .action(ArgAction::SetTrue)
@@ -630,16 +609,6 @@ impl Args {
                 &m,
                 "atomic-bootstrap-peer",
                 defaults.atomic_bootstrap_peers,
-            ),
-            atomic_bootstrap_trusted_manifest_pubkeys: arg_match_many_unwrap_or::<String>(
-                &m,
-                "atomic-bootstrap-trusted-manifest-pubkey",
-                defaults.atomic_bootstrap_trusted_manifest_pubkeys,
-            ),
-            atomic_bootstrap_required_manifest_signatures: arg_match_unwrap_or::<usize>(
-                &m,
-                "atomic-bootstrap-required-manifest-signatures",
-                defaults.atomic_bootstrap_required_manifest_signatures,
             ),
             atomic_bootstrap_allow_peer_fallback: arg_match_unwrap_or::<bool>(
                 &m,

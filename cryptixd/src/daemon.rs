@@ -1,4 +1,10 @@
-use std::{fs, path::PathBuf, process::exit, sync::Arc, time::Duration};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    process::exit,
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::atomic_bootstrap::{
     AtomicBootstrapService, ATOMIC_BOOTSTRAP_REQUIRED_NON_SEED_SOURCES, ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES,
@@ -176,6 +182,30 @@ pub fn get_log_dir(args: &Args) -> Option<String> {
     log_dir
 }
 
+fn database_reset_paths(db_dir: &Path) -> Vec<PathBuf> {
+    vec![db_dir.to_path_buf()]
+}
+
+fn database_reset_paths_exist(db_dir: &Path) -> bool {
+    database_reset_paths(db_dir).iter().any(|path| path.exists())
+}
+
+fn remove_database_reset_state(db_dir: &Path) -> io::Result<()> {
+    for path in database_reset_paths(db_dir) {
+        remove_path_if_exists(&path)?;
+    }
+    Ok(())
+}
+
+fn remove_path_if_exists(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 impl Runtime {
     pub fn from_args(args: &Args) -> Self {
         let log_dir = get_log_dir(args);
@@ -275,12 +305,7 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
         "Cryptix Atomic bootstrap quorum: default requires >= {} seed source(s) + >= {} independent peer/non-seed source(s)",
         ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES, ATOMIC_BOOTSTRAP_REQUIRED_NON_SEED_SOURCES
     );
-    let bootstrap_attestation_policy = if args.atomic_bootstrap_required_manifest_signatures == 0 {
-        "quorum-only".to_string()
-    } else {
-        format!("quorum + >= {} trusted manifest signatures", args.atomic_bootstrap_required_manifest_signatures)
-    };
-    info!("Cryptix Atomic bootstrap attestation policy: {}", bootstrap_attestation_policy);
+    info!("Cryptix Atomic bootstrap attestation policy: seed/peer quorum; manifests are not signer-attested");
     let bootstrap_source_policy = if config.net.is_mainnet() {
         if args.disable_dns_seeding {
             "mainnet DNS seed bootstrap disabled by --nodnsseed; Atomic bootstrap will use peer-majority from manual/configured peers only"
@@ -321,12 +346,12 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     let mut is_db_reset_needed = args.reset_db;
 
     // Reset Condition: User explicitly requested a reset
-    if is_db_reset_needed && db_dir.exists() {
+    if is_db_reset_needed && database_reset_paths_exist(&db_dir) {
         let msg = "Reset DB was requested -- this means the current databases will be fully deleted,
 do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confirm all interactive questions)";
         get_user_approval_or_exit(msg, args.yes);
-        info!("Deleting databases");
-        fs::remove_dir_all(&db_dir).unwrap();
+        info!("Deleting databases and node runtime state");
+        remove_database_reset_state(&db_dir).unwrap();
     }
 
     fs::create_dir_all(consensus_db_dir.as_path()).unwrap();
@@ -399,7 +424,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         drop(meta_db);
 
         // Delete
-        fs::remove_dir_all(db_dir.clone()).unwrap();
+        remove_database_reset_state(&db_dir).unwrap();
 
         // Recreate the empty folders
         fs::create_dir_all(consensus_db_dir.as_path()).unwrap();
@@ -491,7 +516,6 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
             consensus_manager.clone(),
             config.clone(),
             atomic_db_dir.clone(),
-            None,
             local_unified_node_identity.node_id,
         )
         .unwrap_or_else(|err| {
@@ -546,8 +570,6 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
     );
     let configured_atomic_bootstrap_peers =
         args.atomic_bootstrap_peers.iter().map(|peer| peer.normalize(config.default_rpc_port())).collect::<Vec<_>>();
-    let trusted_atomic_bootstrap_manifest_pubkeys = args.atomic_bootstrap_trusted_manifest_pubkeys.clone();
-    let required_atomic_bootstrap_manifest_signatures = args.atomic_bootstrap_required_manifest_signatures;
     let atomic_bootstrap_service = Arc::new(
         AtomicBootstrapService::new(
             atomic_token_service.clone(),
@@ -556,8 +578,6 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
             args.disable_dns_seeding,
             60,
             atomic_db_dir.clone(),
-            trusted_atomic_bootstrap_manifest_pubkeys,
-            required_atomic_bootstrap_manifest_signatures,
             args.atomic_bootstrap_allow_peer_fallback,
         )
         .unwrap_or_else(|err| {
@@ -667,4 +687,48 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
     core.bind(async_runtime);
 
     (core, rpc_core_service)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_database_reset_state_removes_node_runtime_dirs() {
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("cryptixd-reset-state-test-{}-{unique}", std::process::id()));
+        let network_dir = root.join("cryptix-mainnet");
+        let db_dir = network_dir.join(DEFAULT_DATA_DIR);
+        let log_dir = network_dir.join(DEFAULT_LOG_DIR);
+
+        for path in [
+            db_dir.join(CONSENSUS_DB),
+            db_dir.join(META_DB),
+            db_dir.join(ATOMIC_DB),
+            db_dir.join("strong-nodes"),
+            db_dir.join("strong-node-claims"),
+            db_dir.join("antifraud"),
+        ] {
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("state"), b"state").unwrap();
+        }
+        fs::create_dir_all(&log_dir).unwrap();
+
+        remove_database_reset_state(&db_dir).unwrap();
+
+        assert!(!db_dir.exists(), "expected {} to be removed", db_dir.display());
+        for path in [
+            db_dir.join(CONSENSUS_DB),
+            db_dir.join(META_DB),
+            db_dir.join(ATOMIC_DB),
+            db_dir.join("strong-nodes"),
+            db_dir.join("strong-node-claims"),
+            db_dir.join("antifraud"),
+        ] {
+            assert!(!path.exists(), "expected {} to be removed with datadir", path.display());
+        }
+        assert!(log_dir.exists(), "reset should not remove logs");
+
+        let _ = fs::remove_dir_all(root);
+    }
 }

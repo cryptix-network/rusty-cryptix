@@ -335,7 +335,7 @@ impl VirtualStateProcessor {
 
     /// Verify that the current block fully respects its own UTXO view. We define a block as
     /// UTXO valid if all the following conditions hold:
-    ///     1. The block header includes the expected `utxo_commitment`.
+    ///     1. The block header includes the expected state commitment in `utxo_commitment`.
     ///     2. The block header includes the expected `accepted_id_merkle_root`.
     ///     3. The block coinbase transaction rewards the mergeset blocks correctly.
     ///     4. All non-coinbase block transactions are valid against its own UTXO view.
@@ -345,8 +345,12 @@ impl VirtualStateProcessor {
         selected_parent_utxo_view: &V,
         header: &Header,
     ) -> BlockProcessResult<()> {
-        // Verify header UTXO commitment
-        let expected_commitment = ctx.multiset_hash.finalize();
+        // Verify header state commitment. Before the payload HF this is the raw UTXO commitment;
+        // after the HF it commits to both UTXO and Atomic consensus state.
+        let utxo_commitment = ctx.multiset_hash.finalize();
+        let expected_commitment = ctx
+            .atomic_state
+            .header_commitment_for_state(utxo_commitment, self.transaction_validator.is_payload_hf_active(header.daa_score));
         if expected_commitment != header.utxo_commitment {
             return Err(BadUTXOCommitment(header.hash, header.utxo_commitment, expected_commitment));
         }
