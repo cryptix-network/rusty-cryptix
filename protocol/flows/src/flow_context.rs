@@ -85,6 +85,8 @@ const MIN_PRE_HARD_FORK_PROTOCOL_VERSION: u32 = 5;
 const QUANTUM_HANDSHAKE_STATE_UNKNOWN: u8 = 0;
 const QUANTUM_HANDSHAKE_STATE_LEGACY: u8 = 1;
 const QUANTUM_HANDSHAKE_STATE_ENFORCED: u8 = 2;
+const BLOCK_PRODUCER_CLAIM_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
+const BLOCK_PRODUCER_CLAIM_WAIT_INTERVAL: Duration = Duration::from_millis(50);
 
 #[async_trait]
 pub trait AtomicStateQuorumVerifier: Send + Sync {
@@ -763,6 +765,60 @@ impl FlowContext {
         self.strong_node_claims_engine.should_advertise_service_bit(self.is_payload_hf_active())
     }
 
+    pub fn has_valid_block_producer_claim(&self, block_hash: Hash) -> bool {
+        if !self.is_strong_node_claims_p2p_enabled() {
+            return true;
+        }
+        self.strong_node_claims_engine
+            .claim_node_ids_for_block(block_hash)
+            .into_iter()
+            .any(|node_id| !self.is_claim_node_id_banned(&node_id))
+    }
+
+    pub async fn wait_for_valid_block_producer_claim(&self, block_hash: Hash) -> bool {
+        if !self.is_strong_node_claims_p2p_enabled() {
+            return true;
+        }
+        let start = Instant::now();
+        loop {
+            if self.has_valid_block_producer_claim(block_hash) {
+                return true;
+            }
+            if start.elapsed() >= BLOCK_PRODUCER_CLAIM_WAIT_TIMEOUT {
+                return false;
+            }
+            tokio::time::sleep(BLOCK_PRODUCER_CLAIM_WAIT_INTERVAL).await;
+        }
+    }
+
+    pub fn block_producer_claims_for_hash(&self, block_hash: Hash) -> Vec<BlockProducerClaimV1Message> {
+        if !self.is_strong_node_claims_p2p_enabled() {
+            return Vec::new();
+        }
+        self.strong_node_claims_engine
+            .claim_messages_for_block(block_hash)
+            .into_iter()
+            .filter(|message| {
+                Self::claim_message_node_id(message).map(|node_id| !self.is_claim_node_id_banned(&node_id)).unwrap_or(false)
+            })
+            .collect()
+    }
+
+    pub async fn broadcast_block_producer_claims_for_hash(&self, block_hash: Hash) {
+        for message in self.block_producer_claims_for_hash(block_hash) {
+            self.broadcast_block_producer_claim(message, None).await;
+        }
+    }
+
+    fn claim_message_node_id(message: &BlockProducerClaimV1Message) -> Option<[u8; 32]> {
+        let pubkey: [u8; 32] = message.node_pubkey_xonly.as_slice().try_into().ok()?;
+        Some(compute_node_id(&pubkey))
+    }
+
+    fn is_claim_node_id_banned(&self, node_id: &[u8; 32]) -> bool {
+        self.connection_manager().map(|cm| cm.is_unified_node_id_banned(node_id)).unwrap_or(false)
+    }
+
     pub fn consensus(&self) -> ConsensusInstance {
         self.consensus_manager.consensus()
     }
@@ -912,13 +968,13 @@ impl FlowContext {
             warn!("Validation failed for block {}: {}", hash, err);
             return Err(err)?;
         }
-        // Broadcast as soon as the block has been validated and inserted into the DAG
+        // Advertise the local claim before the block inv so post-HF peers can verify a valid node-ID sponsor first.
+        self.broadcast_local_block_producer_claim(hash).await;
         self.broadcast_to_unrestricted_peers(make_message!(Payload::InvRelayBlock, InvRelayBlockMessage { hash: Some(hash.into()) }))
             .await;
 
         self.on_new_block(consensus, Default::default(), block, virtual_state_task).await;
         self.log_block_event(BlockLogEvent::Submit(hash));
-        self.broadcast_local_block_producer_claim(hash).await;
 
         Ok(())
     }

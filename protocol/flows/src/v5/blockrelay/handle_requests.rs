@@ -43,6 +43,9 @@ impl HandleRelayBlockRequests {
 
             for hash in hashes {
                 let block = session.async_get_block(hash).await?;
+                for claim in self.ctx.block_producer_claims_for_hash(hash) {
+                    self.router.enqueue(make_message!(Payload::BlockProducerClaimV1, claim)).await?;
+                }
                 self.router.enqueue(make_response!(Payload::Block, (&block).into(), request_id)).await?;
                 debug!("relayed block with hash {} to peer {}", hash, self.router);
             }
@@ -53,6 +56,9 @@ impl HandleRelayBlockRequests {
         let sink = self.ctx.consensus().unguarded_session().async_get_sink().await;
         if sink == self.ctx.config.genesis.hash {
             return Ok(());
+        }
+        for claim in self.ctx.block_producer_claims_for_hash(sink) {
+            self.router.enqueue(make_message!(Payload::BlockProducerClaimV1, claim)).await?;
         }
         self.router.enqueue(make_message!(Payload::InvRelayBlock, InvRelayBlockMessage { hash: Some(sink.into()) })).await?;
         Ok(())

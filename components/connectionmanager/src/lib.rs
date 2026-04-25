@@ -70,6 +70,7 @@ pub struct ConnectionManager {
     force_next_iteration: UnboundedSender<()>,
     shutdown_signal: SingleTrigger,
     banserver_enabled: bool,
+    anti_fraud_allow_peer_fallback: bool,
     banserver_primary_url: String,
     banserver_secondary_url: String,
     anti_fraud_network: AntiFraudNetwork,
@@ -105,6 +106,7 @@ enum SeedServerFailureAction {
     RetrySoon,
     EnablePeerFallback,
     KeepPeerFallback,
+    HoldCurrent,
 }
 
 #[derive(Debug)]
@@ -258,6 +260,7 @@ impl ConnectionManager {
         default_port: u16,
         address_manager: Arc<ParkingLotMutex<AddressManager>>,
         banserver_enabled: bool,
+        anti_fraud_allow_peer_fallback: bool,
         network_name: String,
         anti_fraud_persist_base_dir: Option<PathBuf>,
     ) -> Arc<Self> {
@@ -278,6 +281,7 @@ impl ConnectionManager {
             dns_seeders,
             default_port,
             banserver_enabled,
+            anti_fraud_allow_peer_fallback,
             banserver_primary_url,
             banserver_secondary_url,
             anti_fraud_network,
@@ -714,7 +718,7 @@ impl ConnectionManager {
         if !state.runtime_enabled {
             return false;
         }
-        !self.banserver_enabled || state.peer_fallback_required
+        self.anti_fraud_allow_peer_fallback && (!self.banserver_enabled || state.peer_fallback_required)
     }
 
     pub fn should_retry_seed_server_snapshot_validation(&self) -> bool {
@@ -784,7 +788,7 @@ impl ConnectionManager {
         peer_key: PeerKey,
         envelope: AntiFraudSnapshotEnvelope,
     ) -> Result<IngestPeerSnapshotResult, String> {
-        if !self.is_antifraud_runtime_enabled() {
+        if !self.should_request_peer_snapshots() {
             return Ok(IngestPeerSnapshotResult { applied: false, root_hash: ANTI_FRAUD_ZERO_HASH });
         }
 
@@ -924,7 +928,13 @@ impl ConnectionManager {
         self.log_antifraud_runtime_state(reason);
     }
 
-    fn apply_seed_server_failure_state(state: &mut AntiFraudState) -> SeedServerFailureAction {
+    fn apply_seed_server_failure_state(state: &mut AntiFraudState, allow_peer_fallback: bool) -> SeedServerFailureAction {
+        if !allow_peer_fallback {
+            state.seed_server_retry_pending = false;
+            state.peer_fallback_required = false;
+            return SeedServerFailureAction::HoldCurrent;
+        }
+
         if !state.runtime_enabled {
             state.runtime_enabled = true;
         }
@@ -948,7 +958,7 @@ impl ConnectionManager {
         let (action, was_enabled, enabled) = {
             let mut state = self.anti_fraud_state.lock();
             let was_enabled = state.runtime_enabled;
-            let action = Self::apply_seed_server_failure_state(&mut state);
+            let action = Self::apply_seed_server_failure_state(&mut state, self.anti_fraud_allow_peer_fallback);
             (action, was_enabled, state.runtime_enabled)
         };
         Self::log_antifraud_runtime_transition(was_enabled, enabled, "seed-server refresh failure fallback logic");
@@ -965,13 +975,22 @@ impl ConnectionManager {
                 reason,
                 BANSERVER_CONSISTENCY_RETRY_INTERVAL.as_secs()
             ),
+            SeedServerFailureAction::HoldCurrent => {
+                warn!("Banserver refresh failed: {}. Peer fallback disabled by policy; keeping current AntiFraud state.", reason)
+            }
         }
         self.log_antifraud_runtime_state(reason);
     }
 
     async fn refresh_banserver_bans(self: Arc<Self>) {
         if !self.banserver_enabled {
-            self.ensure_peer_only_antifraud_runtime("banserver disabled by configuration; peer snapshot fallback only");
+            if self.anti_fraud_allow_peer_fallback {
+                self.ensure_peer_only_antifraud_runtime(
+                    "banserver disabled by configuration; peer snapshot fallback enabled by operator policy",
+                );
+            } else {
+                self.log_antifraud_runtime_state("banserver disabled by configuration; peer fallback disabled by policy");
+            }
             return;
         }
 
@@ -2067,15 +2086,32 @@ mod tests {
     #[test]
     fn seed_server_failure_state_transitions_retry_then_peer_fallback() {
         let mut state = AntiFraudState::default();
-        assert_eq!(ConnectionManager::apply_seed_server_failure_state(&mut state), SeedServerFailureAction::RetrySoon);
+        assert_eq!(ConnectionManager::apply_seed_server_failure_state(&mut state, true), SeedServerFailureAction::RetrySoon);
         assert!(state.runtime_enabled);
         assert!(state.seed_server_retry_pending);
         assert!(!state.peer_fallback_required);
 
-        assert_eq!(ConnectionManager::apply_seed_server_failure_state(&mut state), SeedServerFailureAction::EnablePeerFallback);
+        assert_eq!(ConnectionManager::apply_seed_server_failure_state(&mut state, true), SeedServerFailureAction::EnablePeerFallback);
         assert!(state.runtime_enabled);
         assert!(!state.seed_server_retry_pending);
         assert!(state.peer_fallback_required);
+    }
+
+    #[test]
+    fn seed_server_failure_state_holds_current_when_peer_fallback_disabled() {
+        let mut state = AntiFraudState::default();
+        assert_eq!(ConnectionManager::apply_seed_server_failure_state(&mut state, false), SeedServerFailureAction::HoldCurrent);
+        assert!(!state.runtime_enabled);
+        assert!(!state.seed_server_retry_pending);
+        assert!(!state.peer_fallback_required);
+
+        state.runtime_enabled = true;
+        state.seed_server_retry_pending = true;
+        state.peer_fallback_required = true;
+        assert_eq!(ConnectionManager::apply_seed_server_failure_state(&mut state, false), SeedServerFailureAction::HoldCurrent);
+        assert!(state.runtime_enabled);
+        assert!(!state.seed_server_retry_pending);
+        assert!(!state.peer_fallback_required);
     }
 
     #[test]
@@ -2089,7 +2125,7 @@ mod tests {
             seed_server_retry_pending: true,
         };
 
-        assert_eq!(ConnectionManager::apply_seed_server_failure_state(&mut state), SeedServerFailureAction::KeepPeerFallback);
+        assert_eq!(ConnectionManager::apply_seed_server_failure_state(&mut state, true), SeedServerFailureAction::KeepPeerFallback);
         assert!(state.runtime_enabled);
         assert!(state.peer_fallback_required);
         assert!(!state.seed_server_retry_pending);

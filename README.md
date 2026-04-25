@@ -32,7 +32,6 @@ Feedback and contributions are always welcome.
 | `--enable-unsynced-mining` | switch | `false` | Accept RPC block submits while unsynced (testing-oriented). |
 | `--enable-mainnet-mining` | switch | `true` (deprecated flag) | Backward-compatible flag; mainnet mining is enabled by default. |
 | `--utxoindex` | switch | `false` | Enable UTXO index. |
-| `--atomic-bootstrap-peer=<IP[:PORT]>` | address (repeatable) | empty | gRPC peer override used for Atomic snapshot bootstrap discovery/fetch. |
 | `--atomic-bootstrap-allow-peer-fallback` | switch | `false` | On mainnet, allow peer-only Atomic bootstrap fallback when no seed source is reachable. This is also implied when `--nodnsseed` disables Atomic DNS seed sources. |
 | `--max-tracked-addresses=<N>` | integer | `0` | Preallocated max addresses for UTXO change tracking. |
 | `--testnet` | switch | `false` | Use testnet. |
@@ -53,12 +52,13 @@ Feedback and contributions are always welcome.
 | `--hfa-drift-ms=<MS>` | integer | `5000` | HFA clock drift window in milliseconds for fast-intent admission. |
 | `--hfa-microblock-interval-ms-normal=<MS>` | integer | `50` | HFA microblock interval in milliseconds while in normal mode. |
 | `--no-hfa` | switch | `false` | Force-disable HFA (overrides config). |
-| `--autoban` | switch | `true` | Enable automatic banning of repeatedly misbehaving peers. |
-| `--no-autoban` | switch | `false` | Disable automatic banning of repeatedly misbehaving peers (overrides config). |
+| `--autoban` | switch | `false` | Enable automatic banning of repeatedly misbehaving peers. |
+| `--no-autoban` | switch | `false` | Force-disable automatic banning of repeatedly misbehaving peers (overrides config). |
 | `--banserver` | switch | `true` | Enable remote ban list synchronization from the antifraud banserver. |
 | `--no-banserver` | switch | `false` | Disable remote ban list synchronization from the antifraud banserver (overrides config). |
+| `--antifraud-allow-peer-fallback` | switch | `false` | Allow peer snapshot fallback for AntiFraud when seed endpoints are unavailable. This is also implied by `--nodnsseed`. |
 | `--disable-upnp` | switch | `false` | Disable UPnP. |
-| `--nodnsseed` | switch | `false` | Disable DNS peer seeding. This also disables Atomic bootstrap DNS seed sources; on mainnet, Atomic bootstrap will then use peer-majority mode from manual/configured peers only. |
+| `--nodnsseed` | switch | `false` | Disable DNS peer seeding. This also disables Atomic bootstrap DNS seed sources and allows Atomic/AntiFraud peer-majority mode from manual/configured peers only. |
 | `--nogrpc` | switch | `false` | Disable gRPC server. |
 | `--ram-scale=<FACTOR>` | float | `1.0` | Scale memory-bound internal limits. |
 | `--num-prealloc-utxos=<N>` | integer | none | Devnet preallocation count (`devnet-prealloc` feature only). |
@@ -284,14 +284,6 @@ The framework is compatible with all major desktop and mobile browsers.
   # or with UTXO-index enabled (needed when using wallets)
   cargo run --release --bin cryptixd -- --utxoindex
   ```
-  **Atomic bootstrap peer pinning (optional)**
-
-  ```bash
-  cargo run --release --bin cryptixd -- \
-    --atomic-bootstrap-peer=203.0.113.10:19201 \
-    --atomic-bootstrap-peer=203.0.113.11:19201
-  ```
-
   **Start a testnet node**
 
   ```bash
@@ -326,7 +318,7 @@ perf-metrics = true
 tx-relay-broadcast-interval-ms = 250
 appdir = "some-dir"
 hfa-microblock-interval-ms-normal = 50
-autoban = true
+autoban = false
 banserver = true
 addpeer = ["10.0.0.1", "1.2.3.4"]
   ```
@@ -337,7 +329,8 @@ cargo run --release --bin cryptixd -- --help
   ```
 
   Auto-ban defaults:
-  - enabled by default (`autoban = true`)
+  - disabled by default (`autoban = false`)
+  - enable explicitly with `--autoban` or `autoban = true`
   - ban threshold: 5 strikes
   - ban duration: 3 hours
   - inbound connection rate-limiter
@@ -345,9 +338,9 @@ cargo run --release --bin cryptixd -- --help
 
   Banserver sync defaults:
   - enabled by default (`banserver = true`)
-  - startup fetch + periodic refresh every 20 minutes
-  - `--no-banserver` disables endpoint fetches and uses peer snapshot fallback only
-  - fail-open: server/network/payload errors are ignored safely and do not crash node operation
+  - startup fetch + periodic refresh every 10 minutes
+  - `--no-banserver` disables endpoint fetches; peer snapshot fallback requires `--antifraud-allow-peer-fallback` or `--nodnsseed`
+  - fail-open: server/network/payload errors keep the current AntiFraud state and do not crash node operation
 </details>
 
 <details>

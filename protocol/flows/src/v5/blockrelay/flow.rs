@@ -136,6 +136,13 @@ impl HandleRelayInvsFlow {
                 continue;
             }
 
+            if !self.ctx.wait_for_valid_block_producer_claim(inv.hash).await {
+                return Err(ProtocolError::MisbehavingPeer(format!(
+                    "relay block {} missing valid strong-node block producer claim",
+                    inv.hash
+                )));
+            }
+
             // We keep the request scope alive until consensus processes the block
             let Some((block, request_scope)) = self.request_block(inv.hash, self.msg_route.id()).await? else {
                 debug!("Relay block {} was already requested from another peer, continuing...", inv.hash);
@@ -205,13 +212,18 @@ impl HandleRelayInvsFlow {
             // The only mining rule which permanently excludes a block is the merge depth bound
             // (as opposed to "max parents" and "mergeset size limit" rules)
             if broadcast {
-                let msgs = ancestor_batch
-                    .blocks
-                    .iter()
-                    .map(|b| make_message!(Payload::InvRelayBlock, InvRelayBlockMessage { hash: Some(b.hash().into()) }))
-                    .collect();
-                self.ctx.broadcast_many_to_unrestricted_peers(msgs).await;
+                for block in &ancestor_batch.blocks {
+                    let hash = block.hash();
+                    self.ctx.broadcast_block_producer_claims_for_hash(hash).await;
+                    self.ctx
+                        .broadcast_to_unrestricted_peers(make_message!(
+                            Payload::InvRelayBlock,
+                            InvRelayBlockMessage { hash: Some(hash.into()) }
+                        ))
+                        .await;
+                }
 
+                self.ctx.broadcast_block_producer_claims_for_hash(inv.hash).await;
                 self.ctx
                     .broadcast_to_unrestricted_peers(make_message!(
                         Payload::InvRelayBlock,

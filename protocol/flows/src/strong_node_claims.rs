@@ -286,6 +286,25 @@ impl StrongNodeClaimsEngine {
         }
     }
 
+    pub fn claim_node_ids_for_block(&self, block_hash: Hash) -> Vec<[u8; 32]> {
+        let state = self.state.lock();
+        collect_valid_claim_records_for_block(&state, self.network_code, block_hash).into_iter().map(|record| record.node_id).collect()
+    }
+
+    pub fn claim_messages_for_block(&self, block_hash: Hash) -> Vec<BlockProducerClaimV1Message> {
+        let state = self.state.lock();
+        collect_valid_claim_records_for_block(&state, self.network_code, block_hash)
+            .into_iter()
+            .map(|record| BlockProducerClaimV1Message {
+                schema_version: CLAIM_SCHEMA_VERSION,
+                network: self.network_code as u32,
+                block_hash: record.block_hash.as_bytes().to_vec(),
+                node_pubkey_xonly: record.pubkey_xonly.to_vec(),
+                signature: record.signature.to_vec(),
+            })
+            .collect()
+    }
+
     pub fn best_effort_flush(&self) {
         let mut state = self.state.lock();
         let _ = persist_state_if_dirty(&self.claims_dir, &mut state);
@@ -323,6 +342,45 @@ fn validate_claim_message(
     signature.verify(&secp_message, &pubkey).map_err(|_| "claim signature verification failed".to_string())?;
 
     Ok(ClaimRecord { block_hash, node_id, pubkey_xonly, signature: *signature.as_ref(), claim_id, received_at_ms: now_ms })
+}
+
+fn claim_record_is_valid(record: &ClaimRecord, expected_network_code: u8) -> bool {
+    if *blake3::hash(&record.pubkey_xonly).as_bytes() != record.node_id {
+        return false;
+    }
+    let expected_claim_id = compute_claim_id(expected_network_code, &record.block_hash, &record.node_id);
+    if expected_claim_id != record.claim_id {
+        return false;
+    }
+    let Ok(secp_message) = SecpMessage::from_digest_slice(&record.claim_id) else {
+        return false;
+    };
+    let Ok(pubkey) = XOnlyPublicKey::from_slice(&record.pubkey_xonly) else {
+        return false;
+    };
+    let Ok(signature) = SchnorrSignature::from_slice(&record.signature) else {
+        return false;
+    };
+    signature.verify(&secp_message, &pubkey).is_ok()
+}
+
+fn collect_valid_claim_records_for_block(state: &EngineState, network_code: u8, block_hash: Hash) -> Vec<ClaimRecord> {
+    let mut by_node = BTreeMap::<[u8; 32], ClaimRecord>::new();
+    if let Some(records) = state.recent_claims_by_block.get(&block_hash) {
+        for record in records.values() {
+            if claim_record_is_valid(record, network_code) {
+                by_node.entry(record.node_id).or_insert_with(|| record.clone());
+            }
+        }
+    }
+    if let Some(records) = state.pending_unknown_claims.get(&block_hash) {
+        for record in records {
+            if claim_record_is_valid(record, network_code) {
+                by_node.entry(record.node_id).or_insert_with(|| record.clone());
+            }
+        }
+    }
+    by_node.into_values().collect()
 }
 
 fn compute_claim_id(network_code: u8, block_hash: &Hash, node_id: &[u8; 32]) -> [u8; 32] {
@@ -678,6 +736,11 @@ mod tests {
         assert!(engine.snapshot(true).entries.is_empty(), "pending claim should not impact score before promotion");
 
         let block_hash = Hash::from_bytes(decode_hex_32("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").unwrap());
+        assert_eq!(engine.claim_node_ids_for_block(block_hash).len(), 1, "pending claim should be discoverable for relay gating");
+        let pending_messages = engine.claim_messages_for_block(block_hash);
+        assert_eq!(pending_messages.len(), 1, "pending claim should be reconstructable for relay forwarding");
+        assert_eq!(pending_messages[0].signature, claim.signature);
+
         let mut path = ChainPath::default();
         path.added.push(block_hash);
         engine.apply_chain_path_update(path, block_hash, true);
@@ -686,11 +749,13 @@ mod tests {
         let snapshot = engine.snapshot(true);
         assert_eq!(snapshot.entries.len(), 1, "expected one scored entry after promotion");
         assert_eq!(snapshot.entries[0].claimed_blocks, 1, "expected one claimed block after promotion");
+        assert_eq!(engine.claim_node_ids_for_block(block_hash).len(), 1, "promoted claim should remain discoverable");
 
         let reloaded = StrongNodeClaimsEngine::new(true, "mainnet", &temp_dir);
         let reloaded_snapshot = reloaded.snapshot(true);
         assert_eq!(reloaded_snapshot.entries.len(), 1, "expected one scored entry after reload");
         assert_eq!(reloaded_snapshot.entries[0].claimed_blocks, 1, "expected one claimed block after reload");
+        assert_eq!(reloaded.claim_node_ids_for_block(block_hash).len(), 1, "persisted claim should be discoverable after reload");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

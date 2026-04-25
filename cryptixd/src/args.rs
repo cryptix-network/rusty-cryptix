@@ -90,6 +90,7 @@ pub struct Args {
     pub hfa_microblock_interval_ms_normal: u64,
     pub autoban: bool,
     pub banserver: bool,
+    pub antifraud_allow_peer_fallback: bool,
     // Deprecated and ignored: banserver endpoint is fixed in code.
     pub banserver_url: Option<String>,
     pub coinbase_maturity_override: Option<u64>,
@@ -155,8 +156,9 @@ impl Default for Args {
             hfa_cpu: 0.7,
             hfa_drift_ms: 5_000,
             hfa_microblock_interval_ms_normal: 50,
-            autoban: true,
+            autoban: false,
             banserver: true,
+            antifraud_allow_peer_fallback: false,
             banserver_url: None,
             coinbase_maturity_override: None,
             payload_hf_activation_daa_score: None,
@@ -482,7 +484,7 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
                 .long("autoban")
                 .action(ArgAction::SetTrue)
                 .conflicts_with("no-autoban")
-                .help("Enable automatic banning of repeatedly misbehaving peers (default: enabled)."),
+                .help("Enable automatic banning of repeatedly misbehaving peers (default: disabled)."),
         )
         .arg(
             Arg::new("no-autoban")
@@ -504,6 +506,12 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
                 .action(ArgAction::SetTrue)
                 .conflicts_with("banserver")
                 .help("Disable remote ban list synchronization from the antifraud banserver (overrides config)."),
+        )
+        .arg(
+            Arg::new("antifraud-allow-peer-fallback")
+                .long("antifraud-allow-peer-fallback")
+                .action(ArgAction::SetTrue)
+                .help("Allow peer snapshot fallback for AntiFraud when seed endpoints are unavailable; also implied by --nodnsseed."),
         )
         .arg(arg!(--"disable-upnp" "Disable upnp"))
         .arg(arg!(--"nodnsseed" "Disable DNS seeding for peers"))
@@ -644,6 +652,11 @@ impl Args {
             ),
             autoban: autoban_enabled,
             banserver: banserver_enabled,
+            antifraud_allow_peer_fallback: arg_match_unwrap_or::<bool>(
+                &m,
+                "antifraud-allow-peer-fallback",
+                defaults.antifraud_allow_peer_fallback,
+            ),
             banserver_url: defaults.banserver_url,
             coinbase_maturity_override: m
                 .get_one::<u64>("coinbase-maturity-override")

@@ -16,7 +16,7 @@ const STRONG_NODES_DIR: &str = "strong-nodes";
 const NODE_IDENTITY_FILE: &str = "node_identity.json";
 const NODE_POW_DOMAIN_TAG: &[u8] = b"cryptix-node-id-pow-v1";
 const NODE_AUTH_DOMAIN_TAG: &[u8] = b"cryptix-node-id-auth-v1";
-const MAINNET_NODE_POW_DIFFICULTY: u8 = 24;
+const MAINNET_NODE_POW_DIFFICULTY: u8 = 28;
 const TESTNET_DEVNET_NODE_POW_DIFFICULTY: u8 = 22;
 const SIMNET_NODE_POW_DIFFICULTY: u8 = 8;
 
@@ -367,9 +367,13 @@ mod tests {
 
     #[test]
     fn pow_difficulty_constants_are_locked() {
-        assert_eq!(MAINNET_NODE_POW_DIFFICULTY, 24);
+        assert_eq!(MAINNET_NODE_POW_DIFFICULTY, 28);
         assert_eq!(TESTNET_DEVNET_NODE_POW_DIFFICULTY, 22);
         assert_eq!(SIMNET_NODE_POW_DIFFICULTY, 8);
+        assert_eq!(node_pow_difficulty(0), Some(28));
+        assert_eq!(node_pow_difficulty(1), Some(22));
+        assert_eq!(node_pow_difficulty(2), Some(22));
+        assert_eq!(node_pow_difficulty(3), Some(8));
     }
 
     #[test]
@@ -379,15 +383,15 @@ mod tests {
                 0u8,
                 "6d6caac248af96f6afa7f904f550253a0f3ef3f5aa2fe6838a95b216691468e2",
                 "1b393963bd75edc656dbc0207e35416c509d27a2bf83119c4b4f916bedbab3a2",
-                35392942u64,
-                "000000b2f399876eaed4de3156fe4aafa1b451e1a1ea2b3fa245e310dc9022ad",
+                113177214u64,
+                "0000000f81607dd40401712821bd7e18c5d94c859212aea1cbe76cfc254f2093",
             ),
             (
                 0u8,
                 "5f7117a78150fe2ef97db7cfc83bd57b2e2c0d0dd25eaf467a4a1c2a45ce1486",
                 "53240c1f9d4506e30994f69fbbf8feb97f3d2e0d89330cf76207b41fef73d994",
-                13829020u64,
-                "000000e250482b9640b31048b25776572deb49e45de48217938b2003ee4ef731",
+                72946937u64,
+                "000000015dfb1322b693fbb2332fa02b8b41e565159ce457b391038c2b5f8bad",
             ),
             (
                 1u8,
