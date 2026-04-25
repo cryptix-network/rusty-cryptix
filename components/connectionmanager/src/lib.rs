@@ -1573,6 +1573,26 @@ impl ConnectionManager {
         })
     }
 
+    fn parse_persisted_ip_entry(raw: &str) -> Option<Vec<u8>> {
+        Self::parse_ip_string_to_entry(raw).or_else(|| Self::decode_hex(raw).and_then(|entry| Self::normalize_ip_entry(&entry)))
+    }
+
+    fn ip_entry_to_string(entry: &[u8]) -> Option<String> {
+        let normalized = Self::normalize_ip_entry(entry)?;
+        match normalized.first().copied()? {
+            4 if normalized.len() == 5 => {
+                let ip = std::net::Ipv4Addr::new(normalized[1], normalized[2], normalized[3], normalized[4]);
+                Some(ip.to_string())
+            }
+            6 if normalized.len() == 17 => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&normalized[1..17]);
+                Some(std::net::Ipv6Addr::from(octets).to_string())
+            }
+            _ => None,
+        }
+    }
+
     fn parse_node_id_hex(raw: &str) -> Option<[u8; 32]> {
         let candidate = raw.trim();
         if candidate.len() != BANSERVER_NODE_ID_HEX_LEN {
@@ -1755,7 +1775,7 @@ impl ConnectionManager {
             .banned_ips
             .iter()
             .enumerate()
-            .map(|(index, raw)| Self::decode_hex(raw).ok_or_else(|| format!("invalid banned_ips[{index}] hex entry")))
+            .map(|(index, raw)| Self::parse_persisted_ip_entry(raw).ok_or_else(|| format!("invalid banned_ips[{index}] entry")))
             .collect::<std::result::Result<Vec<_>, _>>()
         {
             Ok(entries) => entries,
@@ -1910,7 +1930,11 @@ impl From<&AntiFraudSnapshot> for PersistedSnapshotV1 {
             generated_at_ms: value.generated_at_ms,
             signing_key_id: value.signing_key_id,
             antifraud_enabled: value.antifraud_enabled,
-            banned_ips: value.banned_ip_entries.iter().map(|entry| ConnectionManager::encode_hex(entry)).collect(),
+            banned_ips: value
+                .banned_ip_entries
+                .iter()
+                .map(|entry| ConnectionManager::ip_entry_to_string(entry).unwrap_or_else(|| ConnectionManager::encode_hex(entry)))
+                .collect(),
             banned_node_ids: value.banned_node_id_entries.iter().map(|entry| ConnectionManager::encode_hex(entry)).collect(),
             signature: ConnectionManager::encode_hex(&value.signature),
         }
@@ -1976,6 +2000,24 @@ mod tests {
         let invalid = json!({"antifraud_enabled": "true"});
         let err = ConnectionManager::read_antifraud_enabled(&invalid).expect_err("string flag must be rejected");
         assert!(err.contains("strict boolean"));
+    }
+
+    #[test]
+    fn persisted_ip_entries_accept_readable_and_legacy_hex() {
+        let expected = vec![4, 51, 79, 215, 200];
+
+        assert_eq!(ConnectionManager::parse_persisted_ip_entry("51.79.215.200").unwrap(), expected);
+        assert_eq!(ConnectionManager::parse_persisted_ip_entry("04334fd7c8").unwrap(), expected);
+        assert_eq!(ConnectionManager::ip_entry_to_string(&expected).unwrap(), "51.79.215.200");
+    }
+
+    #[test]
+    fn persisted_snapshot_writes_readable_ip_strings() {
+        let parsed = ConnectionManager::parse_banserver_payload(build_seed_payload()).expect("payload should parse");
+        let persisted = PersistedSnapshotV1::from(&parsed.snapshot);
+
+        assert_eq!(persisted.banned_ips, vec!["127.0.0.1".to_string()]);
+        assert_eq!(persisted.banned_node_ids, vec!["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string()]);
     }
 
     #[test]

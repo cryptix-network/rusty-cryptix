@@ -720,6 +720,105 @@ mod tests {
         Hash::from_bytes([byte; 32])
     }
 
+    fn u128_from_words(hi: u64, lo: u64) -> u128 {
+        ((hi as u128) << 64) | lo as u128
+    }
+
+    fn atomic_interop_vector_state() -> AtomicConsensusState {
+        let standard_asset_id = [0x10; 32];
+        let liquidity_asset_id = [0x20; 32];
+
+        let standard_total = u128_from_words(0x0100, 12_345);
+        let standard_balance_a = u128_from_words(0x0080, 1_000);
+        let standard_balance_b = standard_total - standard_balance_a;
+
+        let liquidity_total = u128_from_words(0x8000, 333);
+        let liquidity_remaining = u128_from_words(0x8000, 999_667);
+        let liquidity_max_supply = liquidity_total + liquidity_remaining;
+
+        let fee_recipient_payload_a = vec![0x01; 32];
+        let fee_recipient_payload_b = vec![0x02; 32];
+        let fee_recipient_owner_a =
+            atomic_owner_id_from_address_components(0, &fee_recipient_payload_a).expect("valid recipient owner A");
+        let fee_recipient_owner_b =
+            atomic_owner_id_from_address_components(0, &fee_recipient_payload_b).expect("valid recipient owner B");
+
+        let standard_asset = AtomicAssetState {
+            asset_class: AtomicAssetClass::Standard,
+            mint_authority_owner_id: owner(0xA1),
+            supply_mode: AtomicSupplyMode::Capped,
+            max_supply: u128_from_words(0x0200, 9_999),
+            total_supply: standard_total,
+            liquidity: None,
+        };
+        let liquidity_asset = AtomicAssetState {
+            asset_class: AtomicAssetClass::Liquidity,
+            mint_authority_owner_id: [0; 32],
+            supply_mode: AtomicSupplyMode::Capped,
+            max_supply: liquidity_max_supply,
+            total_supply: liquidity_total,
+            liquidity: Some(AtomicLiquidityPoolState {
+                pool_nonce: 17,
+                remaining_pool_supply: liquidity_remaining,
+                curve_reserve_sompi: 123_456_789,
+                unclaimed_fee_total_sompi: 30,
+                fee_bps: 250,
+                fee_recipients: vec![
+                    AtomicLiquidityFeeRecipientState {
+                        owner_id: fee_recipient_owner_a,
+                        address_version: 0,
+                        address_payload: fee_recipient_payload_a,
+                        unclaimed_sompi: 10,
+                    },
+                    AtomicLiquidityFeeRecipientState {
+                        owner_id: fee_recipient_owner_b,
+                        address_version: 0,
+                        address_payload: fee_recipient_payload_b,
+                        unclaimed_sompi: 20,
+                    },
+                ],
+                vault_outpoint: TransactionOutpoint::new(hash(0x77), 3),
+                vault_value_sompi: 123_456_819,
+            }),
+        };
+
+        let mut state = AtomicConsensusState::default();
+        state.next_nonces.insert(owner(0x61), 3);
+        state.next_nonces.insert(owner(0x60), 99);
+        state.assets.insert(liquidity_asset_id, liquidity_asset);
+        state.assets.insert(standard_asset_id, standard_asset);
+        state.balances.insert(AtomicBalanceKey { asset_id: standard_asset_id, owner_id: owner(0xB1) }, standard_balance_b);
+        state.balances.insert(AtomicBalanceKey { asset_id: liquidity_asset_id, owner_id: owner(0xC0) }, liquidity_total);
+        state.balances.insert(AtomicBalanceKey { asset_id: standard_asset_id, owner_id: owner(0xB0) }, standard_balance_a);
+        state.anchor_counts.insert(owner(0x51), 2);
+        state.anchor_counts.insert(owner(0x50), 9);
+        state.rebuild_liquidity_vault_outpoint_index();
+        state
+    }
+
+    fn atomic_interop_vector_json() -> serde_json::Value {
+        let state = atomic_interop_vector_state();
+        state.validate_normalized().expect("interop vector state must be normalized");
+        let canonical_bytes = state.to_canonical_bytes();
+        let state_hash = state.canonical_hash();
+        let raw_utxo_commitment = hash(0x31);
+        let pre_hf_commitment = AtomicConsensusState::header_commitment(raw_utxo_commitment, state_hash, false);
+        let post_hf_commitment = AtomicConsensusState::header_commitment(raw_utxo_commitment, state_hash, true);
+
+        let decoded = AtomicConsensusState::from_canonical_bytes(&canonical_bytes).expect("canonical state should decode");
+        decoded.validate_normalized().expect("decoded interop vector state must be normalized");
+        assert_eq!(decoded.to_canonical_bytes(), canonical_bytes);
+
+        serde_json::json!({
+            "name": "cryptix-atomic-consensus-state-interop-v1",
+            "state_canonical_hex": faster_hex::hex_string(&canonical_bytes),
+            "state_hash_hex": faster_hex::hex_string(&state_hash),
+            "raw_utxo_commitment_hex": raw_utxo_commitment.to_string(),
+            "header_commitment_pre_hf_hex": pre_hf_commitment.to_string(),
+            "header_commitment_post_hf_hex": post_hf_commitment.to_string()
+        })
+    }
+
     #[test]
     fn header_commitment_is_legacy_before_hf_and_binds_atomic_state_after_hf() {
         let utxo_commitment = hash(1);
@@ -802,5 +901,21 @@ mod tests {
         decoded.validate_normalized().expect("decoded state should be normalized");
         assert_eq!(decoded.to_canonical_bytes(), left.to_canonical_bytes());
         assert_eq!(decoded.liquidity_vault_outpoints.get(&TransactionOutpoint::new(hash(9), 1)), Some(&asset_b));
+    }
+
+    #[test]
+    fn atomic_consensus_state_interop_vector_matches_fixture() {
+        let fixture_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("docs").join("atomic_consensus_state_interop_v1.json");
+        let actual = atomic_interop_vector_json();
+        if std::env::var_os("CRYPTIX_WRITE_ATOMIC_INTEROP_VECTOR").is_some() {
+            let json = serde_json::to_string_pretty(&actual).expect("serialize interop vector");
+            std::fs::write(&fixture_path, format!("{json}\n")).expect("write interop vector fixture");
+            return;
+        }
+
+        let expected_bytes = std::fs::read(&fixture_path).expect("read interop vector fixture");
+        let expected: serde_json::Value = serde_json::from_slice(&expected_bytes).expect("parse interop vector fixture");
+        assert_eq!(actual, expected);
     }
 }
