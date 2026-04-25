@@ -306,6 +306,7 @@ impl RpcApi for GrpcClient {
     route!(get_sc_snapshot_chunk_call, GetScSnapshotChunk);
     route!(get_sc_replay_window_chunk_call, GetScReplayWindowChunk);
     route!(get_sc_snapshot_head_call, GetScSnapshotHead);
+    route!(get_consensus_atomic_state_hash_call, GetConsensusAtomicStateHash);
 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Notification API

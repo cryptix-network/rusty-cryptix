@@ -21,12 +21,12 @@ use cryptix_consensus_core::{
         pruning::{PruningImportError, PruningImportResult},
     },
     header::Header,
-    pruning::{PruningPointProof, PruningPointTrustedData},
+    pruning::{PruningPointAtomicState, PruningPointProof, PruningPointTrustedData},
     trusted::{TrustedBlock, TrustedGhostdagData, TrustedHeader},
     BlockHashMap, BlockHashSet, BlockLevel, HashMapCustomHasher, KType,
 };
-use cryptix_core::{debug, info, trace};
-use cryptix_database::prelude::{CachePolicy, ConnBuilder, StoreResultEmptyTuple, StoreResultExtensions};
+use cryptix_core::{debug, info, trace, warn};
+use cryptix_database::prelude::{CachePolicy, ConnBuilder, StoreError, StoreResultEmptyTuple, StoreResultExtensions};
 use cryptix_hashes::Hash;
 use cryptix_pow::calc_block_level;
 use cryptix_utils::{binary_heap::BinaryHeapExtensions, vec::VecExtensions};
@@ -40,6 +40,7 @@ use crate::{
     model::{
         services::reachability::{MTReachabilityService, ReachabilityService},
         stores::{
+            atomic_state::{AtomicConsensusState, AtomicStateStoreReader, DbAtomicStateStore},
             depth::DbDepthStore,
             ghostdag::{DbGhostdagStore, GhostdagData, GhostdagStore, GhostdagStoreReader},
             headers::{DbHeadersStore, HeaderStore, HeaderStoreReader},
@@ -104,6 +105,7 @@ pub struct PruningProofManager {
     headers_selected_tip_store: Arc<RwLock<DbHeadersSelectedTipStore>>,
     depth_store: Arc<DbDepthStore>,
     selected_chain_store: Arc<RwLock<DbSelectedChainStore>>,
+    atomic_state_store: Arc<DbAtomicStateStore>,
 
     ghostdag_managers: Arc<Vec<DbGhostdagManager>>,
     traversal_manager: DbDagTraversalManager,
@@ -153,6 +155,7 @@ impl PruningProofManager {
             body_tips_store: storage.body_tips_store.clone(),
             headers_selected_tip_store: storage.headers_selected_tip_store.clone(),
             selected_chain_store: storage.selected_chain_store.clone(),
+            atomic_state_store: storage.atomic_state_store.clone(),
             depth_store: storage.depth_store.clone(),
 
             ghostdag_managers,
@@ -905,10 +908,29 @@ impl PruningProofManager {
             }
         }
 
+        let atomic_state = match self.atomic_state_store.get(pruning_point) {
+            Ok(state) => {
+                if let Err(err) = state.validate_normalized() {
+                    warn!("pruning-point atomic state for `{pruning_point}` is not normalized while building trusted data: {err}");
+                    None
+                } else {
+                    let serialized_state = state.to_canonical_bytes();
+                    let state_hash = AtomicConsensusState::hash_canonical_bytes(&serialized_state);
+                    Some(PruningPointAtomicState { serialized_state, state_hash })
+                }
+            }
+            Err(StoreError::KeyNotFound(_)) => None,
+            Err(err) => {
+                warn!("failed reading pruning-point atomic state for `{pruning_point}` while building trusted data: {err}");
+                None
+            }
+        };
+
         PruningPointTrustedData {
             anticone,
             daa_window_blocks: daa_window_blocks.into_values().collect_vec(),
             ghostdag_blocks: ghostdag_blocks.into_iter().map(|(hash, ghostdag)| TrustedGhostdagData { hash, ghostdag }).collect_vec(),
+            atomic_state,
         }
     }
 

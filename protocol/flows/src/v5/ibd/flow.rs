@@ -1,7 +1,7 @@
 use crate::{
     flow_context::FlowContext,
     v5::{
-        ibd::{HeadersChunkStream, TrustedEntryStream},
+        ibd::{receive_trusted_atomic_state_chunks, HeadersChunkStream, TrustedEntryStream},
         Flow,
     },
 };
@@ -160,6 +160,15 @@ impl IbdFlow {
             n => info!("IBD post processing: unorphaned {} blocks ...{}", n, unorphaned_hashes.last().unwrap()),
         }
 
+        match self.ctx.repair_atomic_index_once().await {
+            Ok(true) => info!("IBD post processing: verified AtomicIndex snapshot repair completed"),
+            Ok(false) => {}
+            Err(err) => warn!(
+                "IBD post processing: verified AtomicIndex snapshot repair is not available yet ({}); bootstrap service will retry",
+                err
+            ),
+        }
+
         Ok(())
     }
 
@@ -240,7 +249,9 @@ impl IbdFlow {
         // The proof is validated in the context of current consensus
         let proof = consensus.clone().spawn_blocking(move |c| c.validate_pruning_proof(&proof).map(|()| proof)).await?;
 
-        let proof_pruning_point = proof[0].last().expect("was just ensured by validation").hash;
+        let proof_pruning_point_header = proof[0].last().expect("was just ensured by validation");
+        let proof_pruning_point = proof_pruning_point_header.hash;
+        let proof_pruning_point_daa_score = proof_pruning_point_header.daa_score;
 
         if proof_pruning_point == self.ctx.config.genesis.hash {
             return Err(ProtocolError::Other("the proof pruning point is the genesis block"));
@@ -274,8 +285,10 @@ impl IbdFlow {
         }
 
         let msg = dequeue_with_timeout!(self.incoming_route, Payload::TrustedData)?;
-        let pkg: TrustedDataPackage = msg.try_into()?;
+        let mut pkg: TrustedDataPackage = msg.try_into()?;
         debug!("received trusted data with {} daa entries and {} ghostdag entries", pkg.daa_window.len(), pkg.ghostdag_window.len());
+        let pruning_point_atomic_state =
+            self.receive_pruning_point_atomic_state(&mut pkg, proof_pruning_point, proof_pruning_point_daa_score).await?;
 
         let mut entry_stream = TrustedEntryStream::new(&self.router, &mut self.incoming_route);
         let Some(pruning_point_entry) = entry_stream.next().await? else {
@@ -354,7 +367,55 @@ impl IbdFlow {
             staging.validate_and_insert_trusted_block(tb).virtual_state_task.await?;
         }
         info!("Done processing trusted blocks");
+
+        if let Some(atomic_state) = pruning_point_atomic_state {
+            staging.clone().spawn_blocking(move |c| c.import_pruning_point_atomic_state(proof_pruning_point, atomic_state)).await?;
+            debug!("Imported pruning point atomic consensus state");
+        }
+
         Ok(proof_pruning_point)
+    }
+
+    async fn receive_pruning_point_atomic_state(
+        &mut self,
+        pkg: &mut TrustedDataPackage,
+        proof_pruning_point: Hash,
+        proof_pruning_point_daa_score: u64,
+    ) -> Result<Option<cryptix_consensus_core::pruning::PruningPointAtomicState>, ProtocolError> {
+        let Some(state_hash) = pkg.atomic_state_hash else {
+            if proof_pruning_point_daa_score >= self.ctx.config.params.payload_hf_activation_daa_score {
+                return Err(ProtocolError::Other(
+                    "post-HF pruning-point trusted data is missing atomic consensus state hash",
+                ));
+            }
+            return Ok(None);
+        };
+
+        self.ctx
+            .verify_consensus_atomic_state_hash_quorum(proof_pruning_point, state_hash)
+            .await
+            .map_err(|err| ProtocolError::OtherOwned(format!("pruning-point atomic state quorum verification failed: {err}")))?;
+
+        if let Some(inline_state) = pkg.atomic_state.take() {
+            if inline_state.state_hash != state_hash {
+                return Err(ProtocolError::Other("inline pruning-point atomic state hash metadata mismatch"));
+            }
+            return Ok(Some(inline_state));
+        }
+
+        if pkg.has_chunked_atomic_state() {
+            let atomic_state = receive_trusted_atomic_state_chunks(
+                &self.router,
+                &mut self.incoming_route,
+                state_hash,
+                pkg.atomic_state_byte_length,
+                pkg.atomic_state_chunk_count,
+            )
+            .await?;
+            return Ok(Some(atomic_state));
+        }
+
+        Err(ProtocolError::Other("invalid pruning-point atomic state transfer metadata"))
     }
 
     async fn sync_headers(

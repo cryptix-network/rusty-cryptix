@@ -2735,6 +2735,20 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         Ok(GetScSnapshotHeadResponse { head, context })
     }
 
+    async fn get_consensus_atomic_state_hash_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetConsensusAtomicStateHashRequest,
+    ) -> RpcResult<GetConsensusAtomicStateHashResponse> {
+        let session = self.consensus_manager.consensus().session().await;
+        let state_hash = session
+            .async_get_atomic_state_hash(request.block_hash)
+            .await
+            .map_err(|err| RpcError::General(format!("failed reading consensus atomic state hash: {err}")))?
+            .map(|hash| hash.as_slice().to_hex());
+        Ok(GetConsensusAtomicStateHashResponse { state_hash })
+    }
+
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Notification API
 

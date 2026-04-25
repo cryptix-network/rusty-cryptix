@@ -565,6 +565,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
             exit(1);
         }),
     );
+    flow_context.set_atomic_state_quorum_verifier(atomic_bootstrap_service.clone());
     let p2p_service = Arc::new(P2pService::new(
         flow_context.clone(),
         connect_peers,

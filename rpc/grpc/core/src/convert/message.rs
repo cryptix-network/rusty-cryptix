@@ -1030,6 +1030,16 @@ from!(item: RpcResult<&cryptix_rpc_core::GetScSnapshotHeadResponse>, protowire::
         error: None,
     }
 });
+from!(
+    item: &cryptix_rpc_core::GetConsensusAtomicStateHashRequest,
+    protowire::GetConsensusAtomicStateHashRequestMessage,
+    { Self { block_hash: item.block_hash.to_string() } }
+);
+from!(
+    item: RpcResult<&cryptix_rpc_core::GetConsensusAtomicStateHashResponse>,
+    protowire::GetConsensusAtomicStateHashResponseMessage,
+    { Self { state_hash: item.state_hash.clone(), error: None } }
+);
 
 from!(item: &cryptix_rpc_core::NotifyUtxosChangedRequest, protowire::NotifyUtxosChangedRequestMessage, {
     Self { addresses: item.addresses.iter().map(|x| x.into()).collect(), command: item.command.into() }
@@ -2152,6 +2162,14 @@ try_from!(item: &protowire::GetScSnapshotHeadResponseMessage, RpcResult<cryptix_
             .try_into()?,
     }
 });
+try_from!(item: &protowire::GetConsensusAtomicStateHashRequestMessage, cryptix_rpc_core::GetConsensusAtomicStateHashRequest, {
+    Self { block_hash: RpcHash::from_str(&item.block_hash)? }
+});
+try_from!(
+    item: &protowire::GetConsensusAtomicStateHashResponseMessage,
+    RpcResult<cryptix_rpc_core::GetConsensusAtomicStateHashResponse>,
+    { Self { state_hash: item.state_hash.clone() } }
+);
 
 try_from!(item: &protowire::NotifyUtxosChangedRequestMessage, cryptix_rpc_core::NotifyUtxosChangedRequest, {
     Self {

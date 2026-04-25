@@ -560,6 +560,10 @@ impl PruningProcessor {
             ref_data.ghostdag_blocks.iter().map(|gd| gd.hash).collect::<BlockHashSet>(),
             built_data.ghostdag_blocks.iter().map(|gd| gd.hash).collect::<BlockHashSet>()
         );
+        assert_eq!(
+            ref_data.atomic_state.as_ref().map(|state| state.state_hash),
+            built_data.atomic_state.as_ref().map(|state| state.state_hash)
+        );
         info!("Trusted data was rebuilt successfully following pruning");
     }
 }

@@ -44,6 +44,7 @@ cryptix-utxoindex.workspace = true
 cryptix-wrpc-server.workspace = true
 
 async-channel.workspace = true
+async-trait.workspace = true
 blake2b_simd.workspace = true
 borsh.workspace = true
 cfg-if.workspace = true

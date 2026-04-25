@@ -1384,6 +1384,15 @@ message GetScSnapshotHeadResponseMessage {
   RPCError error = 1000;
 }
 
+message GetConsensusAtomicStateHashRequestMessage {
+  string blockHash = 1;
+}
+
+message GetConsensusAtomicStateHashResponseMessage {
+  optional string stateHash = 1;
+  RPCError error = 1000;
+}
+
 message GetDaaScoreTimestampEstimateRequestMessage {
   repeated uint64 daaScores = 1;
 }

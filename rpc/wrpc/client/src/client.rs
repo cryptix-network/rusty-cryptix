@@ -664,6 +664,7 @@ impl RpcApi for CryptixRpcClient {
             GetScSnapshotChunk,
             GetScReplayWindowChunk,
             GetScSnapshotHead,
+            GetConsensusAtomicStateHash,
             GetSyncStatus,
             GetSystemInfo,
             GetUtxosByAddresses,

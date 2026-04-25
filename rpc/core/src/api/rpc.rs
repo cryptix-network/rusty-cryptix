@@ -289,6 +289,20 @@ pub trait RpcApi: Sync + Send + AnySync {
         Err(crate::RpcError::NotImplemented)
     }
 
+    async fn get_consensus_atomic_state_hash(
+        &self,
+        request: GetConsensusAtomicStateHashRequest,
+    ) -> RpcResult<GetConsensusAtomicStateHashResponse> {
+        self.get_consensus_atomic_state_hash_call(None, request).await
+    }
+    async fn get_consensus_atomic_state_hash_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetConsensusAtomicStateHashRequest,
+    ) -> RpcResult<GetConsensusAtomicStateHashResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
     async fn get_token_assets(&self, request: GetTokenAssetsRequest) -> RpcResult<GetTokenAssetsResponse> {
         self.get_token_assets_call(None, request).await
     }

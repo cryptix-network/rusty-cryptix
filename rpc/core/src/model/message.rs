@@ -4471,6 +4471,50 @@ impl Deserializer for GetScSnapshotHeadResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GetConsensusAtomicStateHashRequest {
+    pub block_hash: RpcHash,
+}
+
+impl Serializer for GetConsensusAtomicStateHashRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcHash, &self.block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetConsensusAtomicStateHashRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let block_hash = load!(RpcHash, reader)?;
+        Ok(Self { block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetConsensusAtomicStateHashResponse {
+    pub state_hash: Option<String>,
+}
+
+impl Serializer for GetConsensusAtomicStateHashResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Option<String>, &self.state_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetConsensusAtomicStateHashResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let state_hash = load!(Option<String>, reader)?;
+        Ok(Self { state_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GetDaaScoreTimestampEstimateRequest {
     pub daa_scores: Vec<u64>,
 }

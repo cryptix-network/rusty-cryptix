@@ -52,6 +52,8 @@ pub enum CryptixdMessagePayloadType {
     RequestAntiFraudSnapshotV1,
     AntiFraudSnapshotV1,
     BlockProducerClaimV1,
+    TrustedAtomicStateChunk,
+    RequestNextPruningPointAtomicStateChunk,
 }
 
 impl From<&CryptixdMessagePayload> for CryptixdMessagePayloadType {
@@ -114,6 +116,10 @@ impl From<&CryptixdMessagePayload> for CryptixdMessagePayloadType {
             CryptixdMessagePayload::RequestAntiFraudSnapshotV1(_) => CryptixdMessagePayloadType::RequestAntiFraudSnapshotV1,
             CryptixdMessagePayload::AntiFraudSnapshotV1(_) => CryptixdMessagePayloadType::AntiFraudSnapshotV1,
             CryptixdMessagePayload::BlockProducerClaimV1(_) => CryptixdMessagePayloadType::BlockProducerClaimV1,
+            CryptixdMessagePayload::TrustedAtomicStateChunk(_) => CryptixdMessagePayloadType::TrustedAtomicStateChunk,
+            CryptixdMessagePayload::RequestNextPruningPointAtomicStateChunk(_) => {
+                CryptixdMessagePayloadType::RequestNextPruningPointAtomicStateChunk
+            }
         }
     }
 }

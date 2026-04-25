@@ -15,7 +15,7 @@ use crate::{
         },
         stores::{
             acceptance_data::{AcceptanceDataStoreReader, DbAcceptanceDataStore},
-            atomic_state::{AtomicConsensusState, AtomicStateStoreReader, DbAtomicStateStore},
+            atomic_state::{AtomicConsensusState, AtomicStateStore, AtomicStateStoreReader, DbAtomicStateStore},
             block_transactions::{BlockTransactionsStoreReader, DbBlockTransactionsStore},
             daa::DbDaaStore,
             depth::{DbDepthStore, DepthStoreReader},
@@ -58,9 +58,10 @@ use cryptix_consensus_core::{
     blockstatus::BlockStatus::{StatusDisqualifiedFromChain, StatusUTXOValid},
     coinbase::MinerData,
     config::genesis::GenesisBlock,
+    errors::consensus::{ConsensusError, ConsensusResult},
     header::Header,
     merkle::calc_hash_merkle_root,
-    pruning::PruningPointsList,
+    pruning::{PruningPointAtomicState, PruningPointsList},
     tx::{MutableTransaction, Transaction, VerifiableTransaction},
     utxo::{
         utxo_diff::UtxoDiff,
@@ -1367,6 +1368,67 @@ impl VirtualStateProcessor {
         )?;
 
         Ok(())
+    }
+
+    pub fn import_pruning_point_atomic_state(
+        &self,
+        new_pruning_point: Hash,
+        imported_atomic_state: PruningPointAtomicState,
+    ) -> PruningImportResult<()> {
+        let expected_hash = imported_atomic_state.state_hash;
+        let computed_hash = AtomicConsensusState::hash_canonical_bytes(&imported_atomic_state.serialized_state);
+        if computed_hash != expected_hash {
+            return Err(PruningImportError::AtomicStateStoreError(format!(
+                "imported pruning-point atomic state hash mismatch for `{new_pruning_point}`"
+            )));
+        }
+
+        let decoded_state = AtomicConsensusState::from_canonical_bytes(&imported_atomic_state.serialized_state).map_err(|err| {
+            PruningImportError::AtomicStateStoreError(format!(
+                "failed decoding pruning-point atomic state for `{new_pruning_point}`: {err}"
+            ))
+        })?;
+        decoded_state.validate_normalized().map_err(|err| {
+            PruningImportError::AtomicStateStoreError(format!(
+                "imported pruning-point atomic state for `{new_pruning_point}` is not normalized: {err}"
+            ))
+        })?;
+
+        let decoded_hash = decoded_state.canonical_hash();
+        if decoded_hash != expected_hash {
+            return Err(PruningImportError::AtomicStateStoreError(format!(
+                "decoded pruning-point atomic state hash mismatch for `{new_pruning_point}`"
+            )));
+        }
+
+        match self.atomic_state_store.get(new_pruning_point) {
+            Ok(existing_state) => {
+                if existing_state.canonical_hash() != expected_hash {
+                    return Err(PruningImportError::AtomicStateStoreError(format!(
+                        "existing pruning-point atomic state for `{new_pruning_point}` differs from imported state"
+                    )));
+                }
+                Ok(())
+            }
+            Err(StoreError::KeyNotFound(_)) => {
+                self.atomic_state_store.insert(new_pruning_point, Arc::new(decoded_state)).map_err(|err| {
+                    PruningImportError::AtomicStateStoreError(format!(
+                        "failed writing pruning-point atomic state for `{new_pruning_point}`: {err}"
+                    ))
+                })
+            }
+            Err(err) => Err(PruningImportError::AtomicStateStoreError(format!(
+                "failed reading pruning-point atomic state for `{new_pruning_point}`: {err}"
+            ))),
+        }
+    }
+
+    pub fn get_atomic_state_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {
+        match self.atomic_state_store.get(block_hash) {
+            Ok(state) => Ok(Some(state.canonical_hash())),
+            Err(StoreError::KeyNotFound(_)) => Ok(None),
+            Err(_) => Err(ConsensusError::General("failed reading atomic consensus state")),
+        }
     }
 
     pub fn are_pruning_points_violating_finality(&self, pp_list: PruningPointsList) -> bool {

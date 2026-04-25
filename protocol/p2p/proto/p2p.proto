@@ -316,6 +316,21 @@ message BlockWithTrustedDataV4Message {
 message TrustedDataMessage {
   repeated DaaBlockV4 daaWindow = 1; // TODO: rename to `trustedSubDag` once v5 is obsolete
   repeated BlockGhostdagDataHashPair ghostdagData = 2; // TODO: remove once v5 is obsolete
+  bytes atomicConsensusState = 3;
+  bytes atomicConsensusStateHash = 4;
+  uint64 atomicConsensusStateByteLength = 5;
+  uint64 atomicConsensusStateChunkCount = 6;
+}
+
+message TrustedAtomicStateChunkMessage {
+  bytes stateHash = 1;
+  uint64 chunkIndex = 2;
+  uint64 totalChunks = 3;
+  uint64 totalBytes = 4;
+  bytes chunk = 5;
+}
+
+message RequestNextPruningPointAtomicStateChunkMessage {
 }
 
 message RequestFastIntentsMessage {

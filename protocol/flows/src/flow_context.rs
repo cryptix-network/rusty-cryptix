@@ -77,13 +77,23 @@ use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use uuid::Uuid;
 
 /// The P2P protocol version. Currently the only one supported.
-const PROTOCOL_VERSION: u32 = 8;
-const PRE_HARD_FORK_PROTOCOL_VERSION: u32 = 7;
-const LEGACY_PROTOCOL_VERSION: u32 = 6;
+const PROTOCOL_VERSION: u32 = 9;
+const PRE_HARD_FORK_PROTOCOL_VERSION: u32 = 8;
+const LEGACY_PROTOCOL_VERSION: u32 = 7;
+const OLDER_LEGACY_PROTOCOL_VERSION: u32 = 6;
 const MIN_PRE_HARD_FORK_PROTOCOL_VERSION: u32 = 5;
 const QUANTUM_HANDSHAKE_STATE_UNKNOWN: u8 = 0;
 const QUANTUM_HANDSHAKE_STATE_LEGACY: u8 = 1;
 const QUANTUM_HANDSHAKE_STATE_ENFORCED: u8 = 2;
+
+#[async_trait]
+pub trait AtomicStateQuorumVerifier: Send + Sync {
+    async fn verify_consensus_atomic_state_hash(&self, block_hash: Hash, state_hash: [u8; 32]) -> Result<(), String>;
+
+    async fn repair_atomic_index_once(&self) -> Result<bool, String> {
+        Ok(false)
+    }
+}
 
 /// See `check_orphan_resolution_range`
 const BASELINE_ORPHAN_RESOLUTION_RANGE: u32 = 5;
@@ -296,6 +306,7 @@ pub struct FlowContextInner {
     misbehaving_peer_scores: Mutex<HashMap<MisbehaviorIdentity, MisbehaviorRecord>>,
     inbound_connection_rate_limit: Mutex<HashMap<IpAddr, InboundConnectionRateLimitRecord>>,
     hfa_bridge: RwLock<Option<Arc<dyn HfaP2pBridge>>>,
+    atomic_state_quorum_verifier: RwLock<Option<Arc<dyn AtomicStateQuorumVerifier>>>,
     strong_node_claims_engine: Arc<StrongNodeClaimsEngine>,
     mining_manager: MiningManagerProxy,
     pub(crate) tick_service: Arc<TickService>,
@@ -442,6 +453,7 @@ impl FlowContext {
                 misbehaving_peer_scores: Default::default(),
                 inbound_connection_rate_limit: Default::default(),
                 hfa_bridge: Default::default(),
+                atomic_state_quorum_verifier: Default::default(),
                 strong_node_claims_engine,
                 mining_manager,
                 tick_service,
@@ -670,6 +682,30 @@ impl FlowContext {
 
     pub fn hfa_bridge(&self) -> Option<Arc<dyn HfaP2pBridge>> {
         self.hfa_bridge.read().clone()
+    }
+
+    pub fn set_atomic_state_quorum_verifier(&self, verifier: Arc<dyn AtomicStateQuorumVerifier>) {
+        self.atomic_state_quorum_verifier.write().replace(verifier);
+    }
+
+    pub async fn verify_consensus_atomic_state_hash_quorum(&self, block_hash: Hash, state_hash: [u8; 32]) -> Result<(), String> {
+        let verifier = self.atomic_state_quorum_verifier.read().clone();
+        match verifier {
+            Some(verifier) => verifier.verify_consensus_atomic_state_hash(block_hash, state_hash).await,
+            None if self.config.net.is_mainnet() => {
+                Err("atomic consensus state quorum verifier is not configured; refusing mainnet pruning-point atomic state import"
+                    .to_string())
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub async fn repair_atomic_index_once(&self) -> Result<bool, String> {
+        let verifier = self.atomic_state_quorum_verifier.read().clone();
+        match verifier {
+            Some(verifier) => verifier.repair_atomic_index_once().await,
+            None => Ok(false),
+        }
     }
 
     pub fn is_hfa_p2p_enabled(&self) -> bool {
@@ -1440,6 +1476,9 @@ impl ConnectionInitializer for FlowContext {
             }
             LEGACY_PROTOCOL_VERSION if !enforce_hardfork_core => {
                 (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), LEGACY_PROTOCOL_VERSION)
+            }
+            OLDER_LEGACY_PROTOCOL_VERSION if !enforce_hardfork_core => {
+                (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), OLDER_LEGACY_PROTOCOL_VERSION)
             }
             MIN_PRE_HARD_FORK_PROTOCOL_VERSION if !enforce_hardfork_core => (
                 v5::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),

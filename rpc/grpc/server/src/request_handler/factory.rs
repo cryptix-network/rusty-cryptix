@@ -110,6 +110,7 @@ impl Factory {
                 GetScSnapshotChunk,
                 GetScReplayWindowChunk,
                 GetScSnapshotHead,
+                GetConsensusAtomicStateHash,
                 NotifyBlockAdded,
                 NotifyNewBlockTemplate,
                 NotifyFinalityConflict,

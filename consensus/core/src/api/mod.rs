@@ -17,7 +17,7 @@ use crate::{
         tx::TxResult,
     },
     header::Header,
-    pruning::{PruningPointProof, PruningPointTrustedData, PruningPointsList},
+    pruning::{PruningPointAtomicState, PruningPointProof, PruningPointTrustedData, PruningPointsList},
     trusted::{ExternalGhostdagData, TrustedBlock},
     tx::{MutableTransaction, Transaction, TransactionOutpoint, UtxoEntry},
     utxo::utxo_diff::UtxoDiff,
@@ -217,6 +217,18 @@ pub trait ConsensusApi: Send + Sync {
     }
 
     fn append_imported_pruning_point_utxos(&self, utxoset_chunk: &[(TransactionOutpoint, UtxoEntry)], current_multiset: &mut MuHash) {
+        unimplemented!()
+    }
+
+    fn import_pruning_point_atomic_state(
+        &self,
+        new_pruning_point: Hash,
+        atomic_state: PruningPointAtomicState,
+    ) -> PruningImportResult<()> {
+        unimplemented!()
+    }
+
+    fn get_atomic_state_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {
         unimplemented!()
     }
 

@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use blake2b_simd::Params as Blake2bParams;
 use borsh::BorshDeserialize;
 use cryptix_atomicindex::{
@@ -11,10 +12,10 @@ use cryptix_core::{
     trace, warn,
 };
 use cryptix_grpc_client::GrpcClient;
-use cryptix_p2p_flows::flow_context::FlowContext;
+use cryptix_p2p_flows::flow_context::{AtomicStateQuorumVerifier, FlowContext};
 use cryptix_rpc_core::{
     api::rpc::RpcApi,
-    model::message::{GetScSnapshotChunkRequest, RpcScBootstrapSource, RpcScManifestSignature},
+    model::message::{GetConsensusAtomicStateHashRequest, GetScSnapshotChunkRequest, RpcScBootstrapSource, RpcScManifestSignature},
 };
 use cryptix_utils::triggers::SingleTrigger;
 use hex::{decode as hex_decode, encode as hex_encode};
@@ -140,6 +141,7 @@ pub struct AtomicBootstrapService {
     atomic_data_dir: PathBuf,
     retry_interval: Duration,
     last_health_audit: Mutex<Option<Instant>>,
+    bootstrap_attempt_lock: Mutex<()>,
     source_penalties: Mutex<HashMap<String, SourcePenalty>>,
     trusted_manifest_pubkeys: HashMap<[u8; 32], XOnlyPublicKey>,
     required_manifest_signatures: usize,
@@ -187,6 +189,7 @@ impl AtomicBootstrapService {
             atomic_data_dir,
             retry_interval: Duration::from_secs(retry_interval_sec),
             last_health_audit: Default::default(),
+            bootstrap_attempt_lock: Default::default(),
             source_penalties: Default::default(),
             trusted_manifest_pubkeys,
             required_manifest_signatures,
@@ -329,6 +332,96 @@ impl AtomicBootstrapService {
         }
 
         sources
+    }
+
+    async fn verify_consensus_atomic_state_hash_quorum(
+        &self,
+        block_hash: BlockHash,
+        expected_state_hash: [u8; 32],
+    ) -> Result<(), String> {
+        let protocol_version = self.atomic_token_service.protocol_version() as u32;
+        let network_id = self.atomic_token_service.network_id().to_string();
+        let expected_state_hash_hex = hex_encode(expected_state_hash);
+        let sources = self.collect_compatible_sources(protocol_version, &network_id).await;
+        if sources.is_empty() {
+            return Err(self.no_sources_reason());
+        }
+
+        let mut evidence = Vec::new();
+        for source in sources {
+            let endpoint = source.endpoint.clone();
+            let source_identity = source.source_identity.clone();
+            let kind = source.kind;
+            let at_daa_score = source.head.at_daa_score;
+            let response = timeout(
+                RPC_CALL_TIMEOUT,
+                source.client.get_consensus_atomic_state_hash(GetConsensusAtomicStateHashRequest { block_hash }),
+            )
+            .await;
+
+            match response {
+                Ok(Ok(response)) => match response.state_hash {
+                    Some(state_hash_hex) => match decode_hash32_hex(&state_hash_hex) {
+                        Ok(state_hash) => evidence.push(SnapshotSupportEvidence {
+                            source_identity,
+                            snapshot_id: hex_encode(state_hash),
+                            kind,
+                            at_daa_score,
+                            at_block_hash: block_hash.to_string(),
+                        }),
+                        Err(err) => {
+                            self.record_source_failure(&endpoint).await;
+                            trace!(
+                                "[atomic-bootstrap] getConsensusAtomicStateHash from {} returned invalid hash for {}: {}",
+                                endpoint,
+                                block_hash,
+                                err
+                            );
+                        }
+                    },
+                    None => {
+                        trace!("[atomic-bootstrap] getConsensusAtomicStateHash from {} had no state for {}", endpoint, block_hash);
+                    }
+                },
+                Ok(Err(err)) => {
+                    self.record_source_failure(&endpoint).await;
+                    trace!("[atomic-bootstrap] getConsensusAtomicStateHash failed on {}: {err}", endpoint);
+                }
+                Err(_) => {
+                    self.record_source_failure(&endpoint).await;
+                    trace!("[atomic-bootstrap] getConsensusAtomicStateHash timeout on {}", endpoint);
+                }
+            }
+
+            let _ = source.client.disconnect().await;
+        }
+
+        if evidence.is_empty() {
+            return Err(format!("no compatible bootstrap source reported consensus atomic state for `{block_hash}`"));
+        }
+
+        let quorum_policy = self.snapshot_quorum_policy();
+        let decision = select_snapshot_quorum(
+            evidence,
+            quorum_policy.allow_peer_majority_fallback,
+            quorum_policy.require_seed_confirmed_if_any_seed,
+        )
+        .map_err(|err| format!("atomic consensus state hash quorum unavailable for `{block_hash}`: {err}"))?;
+
+        if decision.snapshot_id != expected_state_hash_hex {
+            return Err(format!(
+                "atomic consensus state hash quorum selected `{}`, expected `{}` for `{}` using {}",
+                decision.snapshot_id, expected_state_hash_hex, block_hash, decision.policy_description
+            ));
+        }
+
+        trace!(
+            "[atomic-bootstrap] verified consensus atomic state hash {} for {} using {}",
+            expected_state_hash_hex,
+            block_hash,
+            decision.policy_description
+        );
+        Ok(())
     }
 
     async fn audit_healthy_state_with_sources(
@@ -519,6 +612,11 @@ impl AtomicBootstrapService {
     }
 
     async fn try_bootstrap_once(&self) -> Result<bool, String> {
+        let _attempt_guard = self.bootstrap_attempt_lock.lock().await;
+        self.try_bootstrap_once_inner().await
+    }
+
+    async fn try_bootstrap_once_inner(&self) -> Result<bool, String> {
         let health = self.atomic_token_service.get_health().await;
         let healthy_state = health.runtime_state == AtomicTokenRuntimeState::Healthy;
         let should_audit_healthy_state = if healthy_state { self.should_run_health_audit().await } else { false };
@@ -1120,6 +1218,17 @@ impl AtomicBootstrapService {
         if entry.failures >= SOURCE_FAILURE_THRESHOLD {
             entry.blocked_until = Some(Instant::now() + SOURCE_BLOCK_DURATION);
         }
+    }
+}
+
+#[async_trait]
+impl AtomicStateQuorumVerifier for AtomicBootstrapService {
+    async fn verify_consensus_atomic_state_hash(&self, block_hash: BlockHash, state_hash: [u8; 32]) -> Result<(), String> {
+        self.verify_consensus_atomic_state_hash_quorum(block_hash, state_hash).await
+    }
+
+    async fn repair_atomic_index_once(&self) -> Result<bool, String> {
+        self.try_bootstrap_once().await
     }
 }
 

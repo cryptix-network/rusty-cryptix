@@ -116,6 +116,7 @@ pub enum CryptixdPayloadOps {
     GetScSnapshotChunk,
     GetScReplayWindowChunk,
     GetScSnapshotHead,
+    GetConsensusAtomicStateHash,
 
     // Subscription commands for starting/stopping notifications
     NotifyBlockAdded,

@@ -56,6 +56,7 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, hfa_capable: bool, strong
                 CryptixdMessagePayloadType::IbdChainBlockLocator,
                 CryptixdMessagePayloadType::IbdBlock,
                 CryptixdMessagePayloadType::TrustedData,
+                CryptixdMessagePayloadType::TrustedAtomicStateChunk,
                 CryptixdMessagePayloadType::PruningPoints,
                 CryptixdMessagePayloadType::PruningPointProof,
                 CryptixdMessagePayloadType::UnexpectedPruningPoint,
@@ -110,6 +111,7 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, hfa_capable: bool, strong
             router.clone(),
             router.subscribe(vec![
                 CryptixdMessagePayloadType::RequestPruningPointAndItsAnticone,
+                CryptixdMessagePayloadType::RequestNextPruningPointAtomicStateChunk,
                 CryptixdMessagePayloadType::RequestNextPruningPointAndItsAnticoneBlocks,
             ]),
         )),

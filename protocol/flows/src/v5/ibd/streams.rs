@@ -5,16 +5,20 @@
 use cryptix_consensus_core::{
     errors::consensus::ConsensusError,
     header::Header,
+    pruning::PruningPointAtomicState,
     tx::{TransactionOutpoint, UtxoEntry},
 };
 use cryptix_core::{debug, info};
 use cryptix_p2p_lib::{
     common::{ProtocolError, DEFAULT_TIMEOUT},
-    convert::model::trusted::TrustedDataEntry,
+    convert::model::trusted::{
+        trusted_atomic_state_chunk_count, TrustedAtomicStateChunk, TrustedDataEntry, MAX_TRUSTED_ATOMIC_STATE_BYTES,
+        MAX_TRUSTED_ATOMIC_STATE_CHUNKS, TRUSTED_ATOMIC_STATE_CHUNK_SIZE,
+    },
     make_message,
     pb::{
         cryptixd_message::Payload, RequestNextHeadersMessage, RequestNextPruningPointAndItsAnticoneBlocksMessage,
-        RequestNextPruningPointUtxoSetChunkMessage,
+        RequestNextPruningPointAtomicStateChunkMessage, RequestNextPruningPointUtxoSetChunkMessage,
     },
     IncomingRoute, Router,
 };
@@ -22,6 +26,149 @@ use std::sync::Arc;
 use tokio::time::timeout;
 
 pub const IBD_BATCH_SIZE: usize = 99;
+
+pub async fn receive_trusted_atomic_state_chunks(
+    router: &Router,
+    incoming_route: &mut IncomingRoute,
+    state_hash: [u8; 32],
+    total_bytes: u64,
+    total_chunks: u64,
+) -> Result<PruningPointAtomicState, ProtocolError> {
+    validate_trusted_atomic_state_metadata(total_bytes, total_chunks)?;
+    let initial_capacity = usize::try_from(total_bytes.min(TRUSTED_ATOMIC_STATE_CHUNK_SIZE as u64))
+        .map_err(|_| ProtocolError::OtherOwned(format!("atomic state size {} does not fit this platform", total_bytes)))?;
+    let mut serialized_state = Vec::with_capacity(initial_capacity);
+
+    for expected_chunk_index in 0..total_chunks {
+        let msg = match timeout(DEFAULT_TIMEOUT, incoming_route.recv()).await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => return Err(ProtocolError::ConnectionClosed),
+            Err(_) => return Err(ProtocolError::Timeout(DEFAULT_TIMEOUT)),
+        };
+        let chunk: TrustedAtomicStateChunk = match msg.payload {
+            Some(Payload::TrustedAtomicStateChunk(payload)) => payload.try_into()?,
+            _ => {
+                return Err(ProtocolError::UnexpectedMessage(
+                    stringify!(Payload::TrustedAtomicStateChunk),
+                    msg.payload.as_ref().map(|v| v.into()),
+                ))
+            }
+        };
+
+        validate_trusted_atomic_state_chunk(
+            &chunk,
+            state_hash,
+            expected_chunk_index,
+            total_chunks,
+            total_bytes,
+            serialized_state.len(),
+        )?;
+        serialized_state.extend_from_slice(&chunk.chunk);
+
+        let downloaded_chunks = expected_chunk_index + 1;
+        if downloaded_chunks % IBD_BATCH_SIZE as u64 == 0 && downloaded_chunks < total_chunks {
+            info!("Downloaded {} pruning point atomic state chunks", downloaded_chunks);
+            router
+                .enqueue(make_message!(
+                    Payload::RequestNextPruningPointAtomicStateChunk,
+                    RequestNextPruningPointAtomicStateChunkMessage {}
+                ))
+                .await?;
+        }
+    }
+
+    if serialized_state.len() as u64 != total_bytes {
+        return Err(ProtocolError::OtherOwned(format!(
+            "pruning-point atomic state size mismatch: expected {}, got {}",
+            total_bytes,
+            serialized_state.len()
+        )));
+    }
+    info!("Finished receiving pruning point atomic consensus state: {} bytes in {} chunks", total_bytes, total_chunks);
+    Ok(PruningPointAtomicState { serialized_state, state_hash })
+}
+
+fn validate_trusted_atomic_state_metadata(total_bytes: u64, total_chunks: u64) -> Result<(), ProtocolError> {
+    if total_bytes == 0 || total_chunks == 0 {
+        return Err(ProtocolError::Other("chunked pruning-point atomic state must declare non-zero bytes and chunks"));
+    }
+    if total_bytes > MAX_TRUSTED_ATOMIC_STATE_BYTES {
+        return Err(ProtocolError::OtherOwned(format!(
+            "chunked pruning-point atomic state size {} exceeds transfer limit {}",
+            total_bytes, MAX_TRUSTED_ATOMIC_STATE_BYTES
+        )));
+    }
+    if total_chunks > MAX_TRUSTED_ATOMIC_STATE_CHUNKS {
+        return Err(ProtocolError::OtherOwned(format!(
+            "chunked pruning-point atomic state chunk count {} exceeds transfer limit {}",
+            total_chunks, MAX_TRUSTED_ATOMIC_STATE_CHUNKS
+        )));
+    }
+    let expected_chunks = trusted_atomic_state_chunk_count(total_bytes);
+    if total_chunks != expected_chunks {
+        return Err(ProtocolError::OtherOwned(format!(
+            "chunked pruning-point atomic state metadata mismatch: expected {} chunk(s) for {} bytes, got {}",
+            expected_chunks, total_bytes, total_chunks
+        )));
+    }
+    Ok(())
+}
+
+fn validate_trusted_atomic_state_chunk(
+    chunk: &TrustedAtomicStateChunk,
+    state_hash: [u8; 32],
+    expected_chunk_index: u64,
+    total_chunks: u64,
+    total_bytes: u64,
+    assembled_len: usize,
+) -> Result<(), ProtocolError> {
+    if chunk.state_hash != state_hash {
+        return Err(ProtocolError::Other("pruning-point atomic state chunk hash label mismatch"));
+    }
+    if chunk.chunk_index != expected_chunk_index {
+        return Err(ProtocolError::OtherOwned(format!(
+            "unexpected pruning-point atomic state chunk index: expected {}, got {}",
+            expected_chunk_index, chunk.chunk_index
+        )));
+    }
+    if chunk.total_chunks != total_chunks || chunk.total_bytes != total_bytes {
+        return Err(ProtocolError::Other("pruning-point atomic state chunk metadata changed mid-stream"));
+    }
+    if chunk.chunk.is_empty() {
+        return Err(ProtocolError::Other("pruning-point atomic state chunk must not be empty"));
+    }
+    if chunk.chunk.len() > TRUSTED_ATOMIC_STATE_CHUNK_SIZE {
+        return Err(ProtocolError::OtherOwned(format!(
+            "pruning-point atomic state chunk {} size {} exceeds max {}",
+            expected_chunk_index,
+            chunk.chunk.len(),
+            TRUSTED_ATOMIC_STATE_CHUNK_SIZE
+        )));
+    }
+
+    let assembled_len =
+        u64::try_from(assembled_len).map_err(|_| ProtocolError::Other("assembled atomic state length does not fit u64"))?;
+    let remaining = total_bytes.saturating_sub(assembled_len);
+    if chunk.chunk.len() as u64 > remaining {
+        return Err(ProtocolError::OtherOwned(format!(
+            "pruning-point atomic state chunk {} size {} exceeds remaining {} bytes",
+            expected_chunk_index,
+            chunk.chunk.len(),
+            remaining
+        )));
+    }
+    let expected_len = remaining.min(TRUSTED_ATOMIC_STATE_CHUNK_SIZE as u64) as usize;
+    if chunk.chunk.len() != expected_len {
+        return Err(ProtocolError::OtherOwned(format!(
+            "pruning-point atomic state chunk {} invalid size: expected {}, got {}",
+            expected_chunk_index,
+            expected_len,
+            chunk.chunk.len()
+        )));
+    }
+
+    Ok(())
+}
 
 pub struct TrustedEntryStream<'a, 'b> {
     router: &'a Router,

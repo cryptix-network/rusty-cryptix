@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
-use cryptix_consensus_core::BlockHashMap;
+use cryptix_consensus_core::{pruning::PruningPointAtomicState, BlockHashMap};
 use cryptix_p2p_lib::{
     common::ProtocolError,
+    convert::model::trusted::{
+        trusted_atomic_state_chunk_count, TrustedAtomicStateChunk, MAX_TRUSTED_ATOMIC_STATE_BYTES, TRUSTED_ATOMIC_STATE_CHUNK_SIZE,
+    },
     dequeue, dequeue_with_request_id, make_response,
     pb::{
         self, cryptixd_message::Payload, BlockWithTrustedDataV4Message, DoneBlocksWithTrustedDataMessage, PruningPointsMessage,
@@ -58,16 +61,41 @@ impl PruningPointAndItsAnticoneRequestsFlow {
             let pp_anticone = &trusted_data.anticone;
             let daa_window = &trusted_data.daa_window_blocks;
             let ghostdag_data = &trusted_data.ghostdag_blocks;
+            let atomic_state = trusted_data.atomic_state.as_ref();
+            let (atomic_consensus_state_hash, atomic_consensus_state_byte_length, atomic_consensus_state_chunk_count) =
+                match atomic_state {
+                    Some(state) => {
+                        let byte_length = state.serialized_state.len() as u64;
+                        if byte_length == 0 {
+                            return Err(ProtocolError::Other("pruning-point atomic state must not be empty"));
+                        }
+                        if byte_length > MAX_TRUSTED_ATOMIC_STATE_BYTES {
+                            return Err(ProtocolError::OtherOwned(format!(
+                                "pruning-point atomic state size {} exceeds transfer limit {}",
+                                byte_length, MAX_TRUSTED_ATOMIC_STATE_BYTES
+                            )));
+                        }
+                        (state.state_hash.to_vec(), byte_length, trusted_atomic_state_chunk_count(byte_length))
+                    }
+                    None => (Vec::new(), 0, 0),
+                };
             self.router
                 .enqueue(make_response!(
                     Payload::TrustedData,
                     TrustedDataMessage {
                         daa_window: daa_window.iter().map(|daa_block| daa_block.into()).collect_vec(),
-                        ghostdag_data: ghostdag_data.iter().map(|gd| gd.into()).collect_vec()
+                        ghostdag_data: ghostdag_data.iter().map(|gd| gd.into()).collect_vec(),
+                        atomic_consensus_state: Vec::new(),
+                        atomic_consensus_state_hash,
+                        atomic_consensus_state_byte_length,
+                        atomic_consensus_state_chunk_count,
                     },
                     request_id
                 ))
                 .await?;
+            if let Some(state) = atomic_state {
+                self.send_atomic_state_chunks(state, request_id).await?;
+            }
 
             let daa_window_hash_to_index =
                 BlockHashMap::from_iter(daa_window.iter().enumerate().map(|(i, trusted_header)| (trusted_header.header.hash, i)));
@@ -113,5 +141,22 @@ impl PruningPointAndItsAnticoneRequestsFlow {
                 .await?;
             debug!("Finished sending pruning point anticone")
         }
+    }
+
+    async fn send_atomic_state_chunks(&mut self, state: &PruningPointAtomicState, request_id: u32) -> Result<(), ProtocolError> {
+        let total_bytes = state.serialized_state.len() as u64;
+        let total_chunks = trusted_atomic_state_chunk_count(total_bytes);
+        for (chunk_index, chunk) in state.serialized_state.chunks(TRUSTED_ATOMIC_STATE_CHUNK_SIZE).enumerate() {
+            let chunk_index = chunk_index as u64;
+            let chunk_msg: pb::TrustedAtomicStateChunkMessage =
+                TrustedAtomicStateChunk::new(state.state_hash, chunk_index, total_chunks, total_bytes, chunk.to_vec()).into();
+            self.router.enqueue(make_response!(Payload::TrustedAtomicStateChunk, chunk_msg, request_id)).await?;
+
+            if (chunk_index + 1) % IBD_BATCH_SIZE as u64 == 0 && chunk_index + 1 < total_chunks {
+                dequeue!(self.incoming_route, Payload::RequestNextPruningPointAtomicStateChunk)?;
+            }
+        }
+        debug!("Finished sending pruning point atomic state in {} chunks", total_chunks);
+        Ok(())
     }
 }

@@ -1051,6 +1051,19 @@ async fn sanity_test() {
                 })
             }
 
+            CryptixdPayloadOps::GetConsensusAtomicStateHash => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_consensus_atomic_state_hash_call(
+                            None,
+                            GetConsensusAtomicStateHashRequest { block_hash: SIMNET_GENESIS.hash },
+                        )
+                        .await;
+                    assert!(result.is_ok());
+                })
+            }
+
             CryptixdPayloadOps::NotifyBlockAdded => {
                 let rpc_client = client.clone();
                 let id = listener_id;

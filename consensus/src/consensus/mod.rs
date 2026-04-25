@@ -65,7 +65,7 @@ use cryptix_consensus_core::{
     merkle::calc_hash_merkle_root,
     muhash::MuHashExtensions,
     network::NetworkType,
-    pruning::{PruningPointProof, PruningPointTrustedData, PruningPointsList},
+    pruning::{PruningPointAtomicState, PruningPointProof, PruningPointTrustedData, PruningPointsList},
     trusted::{ExternalGhostdagData, TrustedBlock},
     tx::{MutableTransaction, Transaction, TransactionOutpoint, UtxoEntry},
     utxo::utxo_diff::UtxoDiff,
@@ -756,6 +756,18 @@ impl ConsensusApi for Consensus {
         for (outpoint, entry) in utxoset_chunk {
             current_multiset.add_utxo(outpoint, entry);
         }
+    }
+
+    fn import_pruning_point_atomic_state(
+        &self,
+        new_pruning_point: Hash,
+        atomic_state: PruningPointAtomicState,
+    ) -> PruningImportResult<()> {
+        self.virtual_processor.import_pruning_point_atomic_state(new_pruning_point, atomic_state)
+    }
+
+    fn get_atomic_state_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {
+        self.virtual_processor.get_atomic_state_hash(block_hash)
     }
 
     fn import_pruning_point_utxo_set(&self, new_pruning_point: Hash, imported_utxo_multiset: MuHash) -> PruningImportResult<()> {

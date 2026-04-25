@@ -354,6 +354,10 @@ impl ConsensusSessionOwned {
         self.clone().spawn_blocking(|c| c.get_pruning_point_anticone_and_trusted_data()).await
     }
 
+    pub async fn async_get_atomic_state_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {
+        self.clone().spawn_blocking(move |c| c.get_atomic_state_hash(block_hash)).await
+    }
+
     pub async fn async_get_block(&self, hash: Hash) -> ConsensusResult<Block> {
         self.clone().spawn_blocking(move |c| c.get_block(hash)).await
     }

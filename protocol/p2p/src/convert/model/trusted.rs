@@ -6,22 +6,68 @@
 use cryptix_consensus_core::{
     block::Block,
     blockhash::ORIGIN,
+    pruning::PruningPointAtomicState,
     trusted::{TrustedBlock, TrustedGhostdagData, TrustedHeader},
     BlockHashMap, BlockHashSet, HashMapCustomHasher,
 };
 
 use crate::common::ProtocolError;
 
+pub const TRUSTED_ATOMIC_STATE_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+// The pruning-point atomic consensus state is assembled in memory during IBD.
+// Keep this bounded separately from AtomicIndex snapshot bootstrap data.
+pub const MAX_TRUSTED_ATOMIC_STATE_CHUNKS: u64 = 256;
+pub const MAX_TRUSTED_ATOMIC_STATE_BYTES: u64 = TRUSTED_ATOMIC_STATE_CHUNK_SIZE as u64 * MAX_TRUSTED_ATOMIC_STATE_CHUNKS;
+
+pub fn trusted_atomic_state_chunk_count(byte_length: u64) -> u64 {
+    if byte_length == 0 {
+        0
+    } else {
+        ((byte_length - 1) / TRUSTED_ATOMIC_STATE_CHUNK_SIZE as u64) + 1
+    }
+}
+
 /// A package of *semi-trusted data* used by a syncing node in order to build
 /// the sub-DAG in the anticone and in the recent past of the synced pruning point
 pub struct TrustedDataPackage {
     pub daa_window: Vec<TrustedHeader>,
     pub ghostdag_window: Vec<TrustedGhostdagData>,
+    pub atomic_state: Option<PruningPointAtomicState>,
+    pub atomic_state_hash: Option<[u8; 32]>,
+    pub atomic_state_byte_length: u64,
+    pub atomic_state_chunk_count: u64,
 }
 
 impl TrustedDataPackage {
-    pub fn new(daa_window: Vec<TrustedHeader>, ghostdag_window: Vec<TrustedGhostdagData>) -> Self {
-        Self { daa_window, ghostdag_window }
+    pub fn new(
+        daa_window: Vec<TrustedHeader>,
+        ghostdag_window: Vec<TrustedGhostdagData>,
+        atomic_state: Option<PruningPointAtomicState>,
+    ) -> Self {
+        let atomic_state_hash = atomic_state.as_ref().map(|state| state.state_hash);
+        let atomic_state_byte_length = atomic_state.as_ref().map(|state| state.serialized_state.len() as u64).unwrap_or_default();
+        Self { daa_window, ghostdag_window, atomic_state, atomic_state_hash, atomic_state_byte_length, atomic_state_chunk_count: 0 }
+    }
+
+    pub fn new_chunked(
+        daa_window: Vec<TrustedHeader>,
+        ghostdag_window: Vec<TrustedGhostdagData>,
+        atomic_state_hash: [u8; 32],
+        atomic_state_byte_length: u64,
+        atomic_state_chunk_count: u64,
+    ) -> Self {
+        Self {
+            daa_window,
+            ghostdag_window,
+            atomic_state: None,
+            atomic_state_hash: Some(atomic_state_hash),
+            atomic_state_byte_length,
+            atomic_state_chunk_count,
+        }
+    }
+
+    pub fn has_chunked_atomic_state(&self) -> bool {
+        self.atomic_state.is_none() && self.atomic_state_hash.is_some() && self.atomic_state_chunk_count > 0
     }
 
     /// Returns the trusted set -- a sub-DAG in the anti-future of the pruning point which contains
@@ -72,6 +118,21 @@ impl TrustedDataPackage {
         blocks.sort_by(|a, b| a.block.header.blue_work.cmp(&b.block.header.blue_work));
 
         Ok(blocks)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedAtomicStateChunk {
+    pub state_hash: [u8; 32],
+    pub chunk_index: u64,
+    pub total_chunks: u64,
+    pub total_bytes: u64,
+    pub chunk: Vec<u8>,
+}
+
+impl TrustedAtomicStateChunk {
+    pub fn new(state_hash: [u8; 32], chunk_index: u64, total_chunks: u64, total_bytes: u64, chunk: Vec<u8>) -> Self {
+        Self { state_hash, chunk_index, total_chunks, total_bytes, chunk }
     }
 }
 

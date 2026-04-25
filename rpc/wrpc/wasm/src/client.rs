@@ -1078,6 +1078,8 @@ build_wrpc_wasm_bindgen_interface!(
         GetScSnapshotChunk,
         /// Returns a chunk of a replay-window package.
         GetScReplayWindowChunk,
+        /// Returns the consensus Atomic state hash for an exact block hash.
+        GetConsensusAtomicStateHash,
         /// Retrieves unspent transaction outputs (UTXOs) associated with
         /// specific addresses.
         /// Returned information: List of UTXOs.

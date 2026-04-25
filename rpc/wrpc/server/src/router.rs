@@ -90,6 +90,7 @@ impl Router {
                 GetScSnapshotChunk,
                 GetScReplayWindowChunk,
                 GetScSnapshotHead,
+                GetConsensusAtomicStateHash,
                 GetSyncStatus,
                 GetSystemInfo,
                 GetUtxosByAddresses,

@@ -95,6 +95,7 @@ message CryptixdRequest {
     GetLiquidityFeeStateRequestMessage getLiquidityFeeStateRequest = 1168;
     GetLiquidityClaimPreviewRequestMessage getLiquidityClaimPreviewRequest = 1170;
     GetLiquidityHoldersRequestMessage getLiquidityHoldersRequest = 1172;
+    GetConsensusAtomicStateHashRequestMessage getConsensusAtomicStateHashRequest = 1174;
   }
 }
 
@@ -191,6 +192,7 @@ message CryptixdResponse {
     GetLiquidityFeeStateResponseMessage getLiquidityFeeStateResponse = 1169;
     GetLiquidityClaimPreviewResponseMessage getLiquidityClaimPreviewResponse = 1171;
     GetLiquidityHoldersResponseMessage getLiquidityHoldersResponse = 1173;
+    GetConsensusAtomicStateHashResponseMessage getConsensusAtomicStateHashResponse = 1175;
   }
 }
 
