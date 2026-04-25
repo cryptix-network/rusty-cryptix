@@ -986,25 +986,17 @@ mod tests {
         let mut receive_addresses = Vec::with_capacity(20);
         let mut change_addresses = Vec::with_capacity(20);
         for index in 0..20 {
-            let receive_mainnet = PubkeyDerivationManagerV0::create_address(
-                &hd_wallet.derive_receive_pubkey(index).unwrap(),
-                Prefix::Mainnet,
-                false,
-            )
-            .unwrap();
-            receive_addresses.push(
-                Address::new(Prefix::Testnet, receive_mainnet.version, receive_mainnet.payload.as_slice()).to_string(),
-            );
+            let receive_mainnet =
+                PubkeyDerivationManagerV0::create_address(&hd_wallet.derive_receive_pubkey(index).unwrap(), Prefix::Mainnet, false)
+                    .unwrap();
+            receive_addresses
+                .push(Address::new(Prefix::Testnet, receive_mainnet.version, receive_mainnet.payload.as_slice()).to_string());
 
-            let change_mainnet = PubkeyDerivationManagerV0::create_address(
-                &hd_wallet.derive_change_pubkey(index).unwrap(),
-                Prefix::Mainnet,
-                false,
-            )
-            .unwrap();
-            change_addresses.push(
-                Address::new(Prefix::Testnet, change_mainnet.version, change_mainnet.payload.as_slice()).to_string(),
-            );
+            let change_mainnet =
+                PubkeyDerivationManagerV0::create_address(&hd_wallet.derive_change_pubkey(index).unwrap(), Prefix::Mainnet, false)
+                    .unwrap();
+            change_addresses
+                .push(Address::new(Prefix::Testnet, change_mainnet.version, change_mainnet.payload.as_slice()).to_string());
         }
 
         for index in 0..20 {

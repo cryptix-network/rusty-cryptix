@@ -5,7 +5,10 @@ use crate::{
         RuleError::{BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadUTXOCommitment, InvalidTransactionsInUtxoContext},
     },
     model::stores::{
-        atomic_state::{AtomicAssetState, AtomicBalanceKey, AtomicConsensusState, AtomicSupplyMode},
+        atomic_state::{
+            AtomicAssetClass, AtomicAssetState, AtomicBalanceKey, AtomicConsensusState, AtomicLiquidityFeeRecipientState,
+            AtomicLiquidityPoolState, AtomicSupplyMode,
+        },
         block_transactions::BlockTransactionsStoreReader,
         daa::DaaStoreReader,
         ghostdag::GhostdagData,
@@ -13,7 +16,8 @@ use crate::{
     processes::transaction_validator::{
         errors::{TxResult, TxRuleError},
         transaction_validator_populated::{
-            atomic_owner_id_from_script, parse_atomic_payload, AtomicPayloadOp, AtomicPayloadSupplyMode, TxValidationFlags,
+            atomic_owner_id_from_address_components, atomic_owner_id_from_script, parse_atomic_payload, AtomicPayloadOp,
+            AtomicPayloadRecipientAddress, AtomicPayloadSupplyMode, TxValidationFlags,
         },
     },
 };
@@ -25,7 +29,10 @@ use cryptix_consensus_core::{
     header::Header,
     mass::Kip9Version,
     muhash::MuHashExtensions,
-    tx::{MutableTransaction, PopulatedTransaction, Transaction, TransactionId, ValidatedTransaction, VerifiableTransaction},
+    tx::{
+        MutableTransaction, PopulatedTransaction, Transaction, TransactionId, TransactionOutpoint, ValidatedTransaction,
+        VerifiableTransaction,
+    },
     utxo::{
         utxo_diff::UtxoDiff,
         utxo_view::{UtxoView, UtxoViewComposition},
@@ -34,7 +41,9 @@ use cryptix_consensus_core::{
 };
 use cryptix_core::{info, trace};
 use cryptix_hashes::Hash;
+use cryptix_math::Uint256;
 use cryptix_muhash::MuHash;
+use cryptix_txscript::script_class::ScriptClass;
 use cryptix_utils::refs::Refs;
 
 use rayon::prelude::*;
@@ -43,6 +52,171 @@ use std::{
     iter::once,
     ops::Deref,
 };
+
+// Allow dust-sized redemptions so the final outstanding liquidity tokens can always exit.
+const LIQUIDITY_MIN_PAYOUT_SOMPI: u64 = 1;
+const CURVE_FLOOR_TOKEN: u128 = 1;
+
+#[derive(Clone, Copy, Debug)]
+struct VaultTransition {
+    input_value: u64,
+    output_index: u32,
+    output_value: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        atomic_op_allows_liquidity_vault_output, validate_curve_reserve_against_outstanding_supply,
+        validate_liquidity_claim_authorization, AtomicPayloadOp,
+    };
+
+    #[test]
+    fn liquidity_reserve_must_exist_while_tokens_remain_outstanding() {
+        assert!(validate_curve_reserve_against_outstanding_supply([0x11; 32], 1, 0).is_err());
+        assert!(validate_curve_reserve_against_outstanding_supply([0x11; 32], 0, 0).is_ok());
+        assert!(validate_curve_reserve_against_outstanding_supply([0x11; 32], 5, 1).is_ok());
+    }
+
+    #[test]
+    fn liquidity_claims_require_matching_recipient_owner() {
+        assert!(validate_liquidity_claim_authorization([0x22; 32], [0x22; 32]).is_ok());
+        assert!(validate_liquidity_claim_authorization([0x22; 32], [0x33; 32]).is_err());
+    }
+
+    #[test]
+    fn only_liquidity_ops_may_create_vault_outputs() {
+        assert!(!atomic_op_allows_liquidity_vault_output(&AtomicPayloadOp::Transfer {
+            asset_id: [0x44; 32],
+            to_owner_id: [0x55; 32],
+            amount: 1,
+        }));
+        assert!(atomic_op_allows_liquidity_vault_output(&AtomicPayloadOp::BuyLiquidityExactIn {
+            asset_id: [0x44; 32],
+            expected_pool_nonce: 1,
+            cpay_in_sompi: 1,
+            min_token_out: 1,
+        }));
+    }
+}
+
+fn calculate_trade_fee(amount: u64, fee_bps: u16) -> TxResult<u64> {
+    let fee = (u128::from(amount))
+        .checked_mul(u128::from(fee_bps))
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("fee multiplication overflow".to_string()))?
+        / 10_000u128;
+    u64::try_from(fee).map_err(|_| TxRuleError::InvalidAtomicPayload("fee does not fit into u64".to_string()))
+}
+
+fn cpmm_buy(remaining_pool_supply: u128, curve_reserve_sompi: u64, cpay_net_in: u64) -> TxResult<(u128, u128, u64)> {
+    let y_before = remaining_pool_supply
+        .checked_add(CURVE_FLOOR_TOKEN)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM y_before overflow".to_string()))?;
+    let x_before = curve_reserve_sompi;
+    let x_after =
+        x_before.checked_add(cpay_net_in).ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM x_after overflow".to_string()))?;
+    if x_after == 0 {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM buy x_after cannot be zero".to_string()));
+    }
+
+    let k = Uint256::from_u64(x_before) * Uint256::from_u128(y_before);
+    let y_after_u256 = ceil_div_u256(k, Uint256::from_u64(x_after));
+    let y_after = u128::try_from(y_after_u256)
+        .map_err(|_| TxRuleError::InvalidAtomicPayload("CPMM buy y_after conversion overflow".to_string()))?;
+    if y_after == 0 {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM buy y_after cannot be zero".to_string()));
+    }
+    if y_after > y_before {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM buy would increase y_after".to_string()));
+    }
+
+    let token_out =
+        y_before.checked_sub(y_after).ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM buy token_out underflow".to_string()))?;
+    if token_out == 0 {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM buy produced zero token_out".to_string()));
+    }
+    let new_remaining_pool_supply = y_after
+        .checked_sub(CURVE_FLOOR_TOKEN)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM buy remaining supply underflow".to_string()))?;
+
+    Ok((token_out, new_remaining_pool_supply, x_after))
+}
+
+fn cpmm_sell(remaining_pool_supply: u128, curve_reserve_sompi: u64, token_in: u128) -> TxResult<(u64, u128, u64)> {
+    let y_before = remaining_pool_supply
+        .checked_add(CURVE_FLOOR_TOKEN)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM y_before overflow".to_string()))?;
+    let y_after =
+        y_before.checked_add(token_in).ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM y_after overflow".to_string()))?;
+    if y_after == 0 {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM sell y_after cannot be zero".to_string()));
+    }
+
+    let x_before = curve_reserve_sompi;
+    let k = Uint256::from_u64(x_before) * Uint256::from_u128(y_before);
+    let x_after_u256 = k / Uint256::from_u128(y_after);
+    let x_after_u128 = u128::try_from(x_after_u256)
+        .map_err(|_| TxRuleError::InvalidAtomicPayload("CPMM sell x_after conversion overflow".to_string()))?;
+    let x_after = u64::try_from(x_after_u128)
+        .map_err(|_| TxRuleError::InvalidAtomicPayload("CPMM sell x_after does not fit u64".to_string()))?;
+    if x_after > x_before {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM sell x_after exceeds x_before".to_string()));
+    }
+
+    let gross_out =
+        x_before.checked_sub(x_after).ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM sell gross_out underflow".to_string()))?;
+    if gross_out == 0 {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM sell produced zero gross_out".to_string()));
+    }
+    let new_remaining_pool_supply = remaining_pool_supply
+        .checked_add(token_in)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM sell remaining supply overflow".to_string()))?;
+    Ok((gross_out, new_remaining_pool_supply, x_after))
+}
+
+fn ceil_div_u256(numerator: Uint256, denominator: Uint256) -> Uint256 {
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    if remainder.is_zero() {
+        quotient
+    } else {
+        quotient + Uint256::from_u64(1)
+    }
+}
+
+fn atomic_op_allows_liquidity_vault_output(op: &AtomicPayloadOp) -> bool {
+    matches!(
+        op,
+        AtomicPayloadOp::CreateLiquidityAsset { .. }
+            | AtomicPayloadOp::BuyLiquidityExactIn { .. }
+            | AtomicPayloadOp::SellLiquidityExactIn { .. }
+            | AtomicPayloadOp::ClaimLiquidityFees { .. }
+    )
+}
+
+fn validate_liquidity_claim_authorization(claimant_owner_id: [u8; 32], recipient_owner_id: [u8; 32]) -> TxResult<()> {
+    if claimant_owner_id == recipient_owner_id {
+        Ok(())
+    } else {
+        Err(TxRuleError::InvalidAtomicPayload("claim caller is not the configured liquidity fee recipient".to_string()))
+    }
+}
+
+fn validate_curve_reserve_against_outstanding_supply(
+    asset_id: [u8; 32],
+    total_supply: u128,
+    curve_reserve_sompi: u64,
+) -> TxResult<()> {
+    if total_supply > 0 && curve_reserve_sompi == 0 {
+        Err(TxRuleError::InvalidAtomicPayload(format!(
+            "curve reserve exhausted for liquidity asset `{}` while `{}` tokens remain outstanding",
+            faster_hex::hex_string(&asset_id),
+            total_supply
+        )))
+    } else {
+        Ok(())
+    }
+}
 
 /// A context for processing the UTXO state of a block with respect to its selected parent.
 /// Note this can also be the virtual block.
@@ -283,12 +457,29 @@ impl VirtualStateProcessor {
         let payload_hf_active = self.transaction_validator.is_payload_hf_active(pov_daa_score);
 
         let tx_ref = tx.tx();
+        let liquidity_vault_output_count = tx_ref
+            .outputs
+            .iter()
+            .filter(|output| matches!(ScriptClass::from_script(&output.script_public_key), ScriptClass::LiquidityVault))
+            .count();
+        let spent_vault_inputs = self.collect_spent_liquidity_vault_inputs(tx, atomic_state)?;
+
         if !payload_hf_active || !tx_ref.subnetwork_id.is_payload() || tx_ref.payload.is_empty() {
+            if !spent_vault_inputs.is_empty() || liquidity_vault_output_count > 0 {
+                return Err(TxRuleError::InvalidAtomicPayload(
+                    "reserved LiquidityVault scripts require a CAT liquidity payload".to_string(),
+                ));
+            }
             self.apply_anchor_deltas_to_atomic_state(tx, atomic_state);
             return Ok(());
         }
 
         let Some(parsed_payload) = parse_atomic_payload(tx_ref.payload.as_slice()).map_err(TxRuleError::InvalidAtomicPayload)? else {
+            if !spent_vault_inputs.is_empty() || liquidity_vault_output_count > 0 {
+                return Err(TxRuleError::InvalidAtomicPayload(
+                    "reserved LiquidityVault scripts require a CAT liquidity payload".to_string(),
+                ));
+            }
             self.apply_anchor_deltas_to_atomic_state(tx, atomic_state);
             return Ok(());
         };
@@ -304,8 +495,29 @@ impl VirtualStateProcessor {
             )));
         }
 
+        if !spent_vault_inputs.is_empty() {
+            match &parsed_payload.op {
+                AtomicPayloadOp::BuyLiquidityExactIn { .. }
+                | AtomicPayloadOp::SellLiquidityExactIn { .. }
+                | AtomicPayloadOp::ClaimLiquidityFees { .. } => {}
+                _ => {
+                    return Err(TxRuleError::InvalidAtomicPayload(
+                        "spending a LiquidityVault input is only valid for buy/sell/claim liquidity ops".to_string(),
+                    ))
+                }
+            }
+        }
+        if liquidity_vault_output_count > 0 && !atomic_op_allows_liquidity_vault_output(&parsed_payload.op) {
+            return Err(TxRuleError::InvalidAtomicPayload(
+                "creating a LiquidityVault output is only valid for create/buy/sell/claim liquidity ops".to_string(),
+            ));
+        }
+        if matches!(parsed_payload.op, AtomicPayloadOp::CreateLiquidityAsset { .. }) && !spent_vault_inputs.is_empty() {
+            return Err(TxRuleError::InvalidAtomicPayload("create-liquidity must not spend any LiquidityVault input".to_string()));
+        }
+
         self.validate_replacement_anchor(tx, owner_id, atomic_state)?;
-        self.apply_atomic_op_to_state(tx.tx().id().as_bytes(), owner_id, parsed_payload.op, atomic_state)?;
+        self.apply_atomic_op_to_state(tx, tx.tx().id().as_bytes(), owner_id, parsed_payload.op, atomic_state)?;
 
         let Some(next_nonce) = expected_nonce.checked_add(1) else {
             return Err(TxRuleError::InvalidAtomicPayload(format!(
@@ -395,6 +607,7 @@ impl VirtualStateProcessor {
 
     fn apply_atomic_op_to_state(
         &self,
+        tx: &impl VerifiableTransaction,
         tx_id_bytes: [u8; 32],
         owner_id: [u8; 32],
         op: AtomicPayloadOp,
@@ -421,9 +634,167 @@ impl VirtualStateProcessor {
                     AtomicPayloadSupplyMode::Uncapped => AtomicSupplyMode::Uncapped,
                     AtomicPayloadSupplyMode::Capped => AtomicSupplyMode::Capped,
                 };
-                atomic_state
-                    .assets
-                    .insert(asset_id, AtomicAssetState { mint_authority_owner_id, supply_mode, max_supply, total_supply: 0 });
+                self.insert_atomic_asset_state(
+                    atomic_state,
+                    asset_id,
+                    AtomicAssetState {
+                        asset_class: AtomicAssetClass::Standard,
+                        mint_authority_owner_id,
+                        supply_mode,
+                        max_supply,
+                        total_supply: 0,
+                        liquidity: None,
+                    },
+                )?;
+            }
+            AtomicPayloadOp::CreateAssetWithMint {
+                decimals: _,
+                supply_mode,
+                max_supply,
+                mint_authority_owner_id,
+                name: _,
+                symbol: _,
+                metadata: _,
+                initial_mint_amount,
+                initial_mint_to_owner_id,
+            } => {
+                let asset_id = tx_id_bytes;
+                if atomic_state.assets.contains_key(&asset_id) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "asset `{}` already exists",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+                let supply_mode = match supply_mode {
+                    AtomicPayloadSupplyMode::Uncapped => AtomicSupplyMode::Uncapped,
+                    AtomicPayloadSupplyMode::Capped => AtomicSupplyMode::Capped,
+                };
+                let mut total_supply = 0u128;
+                if initial_mint_amount > 0 {
+                    if matches!(supply_mode, AtomicSupplyMode::Capped) && initial_mint_amount > max_supply {
+                        return Err(TxRuleError::InvalidAtomicPayload(format!(
+                            "initial mint exceeds cap for asset `{}`",
+                            faster_hex::hex_string(&asset_id)
+                        )));
+                    }
+                    let receiver_key = AtomicBalanceKey { asset_id, owner_id: initial_mint_to_owner_id };
+                    let receiver_balance = atomic_state.balances.get(&receiver_key).copied().unwrap_or(0);
+                    let receiver_after = receiver_balance.checked_add(initial_mint_amount).ok_or_else(|| {
+                        TxRuleError::InvalidAtomicPayload(format!(
+                            "balance overflow while create-and-mint asset `{}`",
+                            faster_hex::hex_string(&asset_id)
+                        ))
+                    })?;
+                    atomic_state.balances.insert(receiver_key, receiver_after);
+                    total_supply = initial_mint_amount;
+                }
+                self.insert_atomic_asset_state(
+                    atomic_state,
+                    asset_id,
+                    AtomicAssetState {
+                        asset_class: AtomicAssetClass::Standard,
+                        mint_authority_owner_id,
+                        supply_mode,
+                        max_supply,
+                        total_supply,
+                        liquidity: None,
+                    },
+                )?;
+            }
+            AtomicPayloadOp::CreateLiquidityAsset {
+                decimals: _,
+                max_supply,
+                name: _,
+                symbol: _,
+                metadata: _,
+                seed_reserve_sompi,
+                fee_bps,
+                recipients,
+                launch_buy_sompi,
+                launch_buy_min_token_out,
+            } => {
+                let asset_id = tx_id_bytes;
+                if atomic_state.assets.contains_key(&asset_id) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "asset `{}` already exists",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+                if seed_reserve_sompi == 0 {
+                    return Err(TxRuleError::InvalidAtomicPayload("liquidity asset seed_reserve_sompi must be > 0".to_string()));
+                }
+                let (vault_output_index, vault_output_value) = self.resolve_create_liquidity_vault_output(tx)?;
+                let expected_vault_value = seed_reserve_sompi
+                    .checked_add(launch_buy_sompi)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("vault value overflow on create".to_string()))?;
+                if vault_output_value != expected_vault_value {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "create liquidity vault output mismatch: expected `{expected_vault_value}`, got `{vault_output_value}`"
+                    )));
+                }
+
+                let mut fee_recipients = self.build_fee_recipient_state(recipients)?;
+                if fee_bps > 0 && fee_recipients.is_empty() {
+                    return Err(TxRuleError::InvalidAtomicPayload("fee_bps > 0 requires at least one recipient".to_string()));
+                }
+
+                let mut remaining_pool_supply = max_supply;
+                let mut curve_reserve_sompi = seed_reserve_sompi;
+                let mut unclaimed_fee_total_sompi = 0u64;
+                let mut total_supply = 0u128;
+
+                if launch_buy_sompi > 0 {
+                    let fee_trade = calculate_trade_fee(launch_buy_sompi, fee_bps)?;
+                    let launch_buy_net = launch_buy_sompi
+                        .checked_sub(fee_trade)
+                        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("launch buy fee underflow".to_string()))?;
+                    let (token_out, new_remaining_pool_supply, new_curve_reserve_sompi) =
+                        cpmm_buy(remaining_pool_supply, curve_reserve_sompi, launch_buy_net)?;
+                    if token_out < launch_buy_min_token_out {
+                        return Err(TxRuleError::InvalidAtomicPayload(format!(
+                            "launch buy min_token_out violated: expected at least `{}`, got `{}`",
+                            launch_buy_min_token_out, token_out
+                        )));
+                    }
+                    if token_out == 0 {
+                        return Err(TxRuleError::InvalidAtomicPayload("launch buy produced zero token_out".to_string()));
+                    }
+                    remaining_pool_supply = new_remaining_pool_supply;
+                    curve_reserve_sompi = new_curve_reserve_sompi;
+                    self.apply_fee_to_pool(&mut fee_recipients, &mut unclaimed_fee_total_sompi, fee_trade)?;
+                    total_supply = token_out;
+
+                    let receiver_key = AtomicBalanceKey { asset_id, owner_id };
+                    let receiver_balance = atomic_state.balances.get(&receiver_key).copied().unwrap_or(0);
+                    let receiver_after = receiver_balance.checked_add(token_out).ok_or_else(|| {
+                        TxRuleError::InvalidAtomicPayload(format!(
+                            "balance overflow while launch-buy minting liquidity asset `{}`",
+                            faster_hex::hex_string(&asset_id)
+                        ))
+                    })?;
+                    atomic_state.balances.insert(receiver_key, receiver_after);
+                }
+
+                let vault_outpoint = TransactionOutpoint::new(tx.tx().id(), vault_output_index);
+                let asset = AtomicAssetState {
+                    asset_class: AtomicAssetClass::Liquidity,
+                    mint_authority_owner_id: [0u8; 32],
+                    supply_mode: AtomicSupplyMode::Capped,
+                    max_supply,
+                    total_supply,
+                    liquidity: Some(AtomicLiquidityPoolState {
+                        pool_nonce: 1,
+                        remaining_pool_supply,
+                        curve_reserve_sompi,
+                        unclaimed_fee_total_sompi,
+                        fee_bps,
+                        fee_recipients,
+                        vault_outpoint,
+                        vault_value_sompi: vault_output_value,
+                    }),
+                };
+                self.validate_liquidity_invariants(asset_id, &asset)?;
+                self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
             }
             AtomicPayloadOp::Transfer { asset_id, to_owner_id, amount } => {
                 if !atomic_state.assets.contains_key(&asset_id) {
@@ -471,6 +842,12 @@ impl VirtualStateProcessor {
                 let mut asset = atomic_state.assets.get(&asset_id).cloned().ok_or_else(|| {
                     TxRuleError::InvalidAtomicPayload(format!("mint references unknown asset `{}`", faster_hex::hex_string(&asset_id)))
                 })?;
+                if matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "legacy mint is invalid for liquidity asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
                 if asset.mint_authority_owner_id != owner_id {
                     return Err(TxRuleError::InvalidAtomicPayload(format!(
                         "owner `{}` is not mint authority for asset `{}`",
@@ -504,13 +881,19 @@ impl VirtualStateProcessor {
                 })?;
 
                 asset.total_supply = new_total_supply;
-                atomic_state.assets.insert(asset_id, asset);
+                self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
                 atomic_state.balances.insert(receiver_key, receiver_after);
             }
             AtomicPayloadOp::Burn { asset_id, amount } => {
                 let mut asset = atomic_state.assets.get(&asset_id).cloned().ok_or_else(|| {
                     TxRuleError::InvalidAtomicPayload(format!("burn references unknown asset `{}`", faster_hex::hex_string(&asset_id)))
                 })?;
+                if matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "legacy burn is invalid for liquidity asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
                 let sender_key = AtomicBalanceKey { asset_id, owner_id };
                 let sender_balance = atomic_state.balances.get(&sender_key).copied().unwrap_or(0);
 
@@ -528,12 +911,577 @@ impl VirtualStateProcessor {
                 })?;
 
                 asset.total_supply = supply_after;
-                atomic_state.assets.insert(asset_id, asset);
+                self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
                 if sender_after == 0 {
                     atomic_state.balances.remove(&sender_key);
                 } else {
                     atomic_state.balances.insert(sender_key, sender_after);
                 }
+            }
+            AtomicPayloadOp::BuyLiquidityExactIn { asset_id, expected_pool_nonce, cpay_in_sompi, min_token_out } => {
+                let mut asset = atomic_state.assets.get(&asset_id).cloned().ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!("buy references unknown asset `{}`", faster_hex::hex_string(&asset_id)))
+                })?;
+                if !matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "buy is only valid for liquidity assets (`{}` is standard)",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+                let mut pool = asset.liquidity.clone().ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "liquidity state missing for asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                if pool.pool_nonce != expected_pool_nonce {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "stale liquidity nonce for asset `{}`: expected `{}`, got `{}`",
+                        faster_hex::hex_string(&asset_id),
+                        pool.pool_nonce,
+                        expected_pool_nonce
+                    )));
+                }
+
+                let vault_transition = self.resolve_liquidity_vault_transition(tx, pool.vault_outpoint)?;
+                let vault_delta = vault_transition
+                    .output_value
+                    .checked_sub(vault_transition.input_value)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("buy requires vault_value to increase".to_string()))?;
+                if vault_delta != cpay_in_sompi {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "buy vault delta mismatch: expected `{}`, got `{}`",
+                        cpay_in_sompi, vault_delta
+                    )));
+                }
+
+                let fee_trade = calculate_trade_fee(cpay_in_sompi, pool.fee_bps)?;
+                let net_in = cpay_in_sompi
+                    .checked_sub(fee_trade)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("buy fee underflow".to_string()))?;
+                let (token_out, new_remaining_pool_supply, new_curve_reserve_sompi) =
+                    cpmm_buy(pool.remaining_pool_supply, pool.curve_reserve_sompi, net_in)?;
+                if token_out < min_token_out {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "buy min_token_out violated: expected at least `{}`, got `{}`",
+                        min_token_out, token_out
+                    )));
+                }
+                if token_out == 0 {
+                    return Err(TxRuleError::InvalidAtomicPayload("buy produced zero token_out".to_string()));
+                }
+
+                pool.remaining_pool_supply = new_remaining_pool_supply;
+                pool.curve_reserve_sompi = new_curve_reserve_sompi;
+                self.apply_fee_to_pool(&mut pool.fee_recipients, &mut pool.unclaimed_fee_total_sompi, fee_trade)?;
+                pool.vault_outpoint = TransactionOutpoint::new(tx.tx().id(), vault_transition.output_index);
+                pool.vault_value_sompi = vault_transition.output_value;
+                pool.pool_nonce = pool
+                    .pool_nonce
+                    .checked_add(1)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("pool nonce overflow".to_string()))?;
+
+                let receiver_key = AtomicBalanceKey { asset_id, owner_id };
+                let receiver_balance = atomic_state.balances.get(&receiver_key).copied().unwrap_or(0);
+                let receiver_after = receiver_balance.checked_add(token_out).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "receiver balance overflow while buying liquidity asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                atomic_state.balances.insert(receiver_key, receiver_after);
+                asset.total_supply = asset.total_supply.checked_add(token_out).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "total_supply overflow while buying liquidity asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                asset.liquidity = Some(pool);
+                self.validate_liquidity_invariants(asset_id, &asset)?;
+                self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
+            }
+            AtomicPayloadOp::SellLiquidityExactIn {
+                asset_id,
+                expected_pool_nonce,
+                token_in,
+                min_cpay_out_sompi,
+                cpay_receive_output_index,
+            } => {
+                let mut asset = atomic_state.assets.get(&asset_id).cloned().ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!("sell references unknown asset `{}`", faster_hex::hex_string(&asset_id)))
+                })?;
+                if !matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "sell is only valid for liquidity assets (`{}` is standard)",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+                let mut pool = asset.liquidity.clone().ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "liquidity state missing for asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                if pool.pool_nonce != expected_pool_nonce {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "stale liquidity nonce for asset `{}`: expected `{}`, got `{}`",
+                        faster_hex::hex_string(&asset_id),
+                        pool.pool_nonce,
+                        expected_pool_nonce
+                    )));
+                }
+                let sender_key = AtomicBalanceKey { asset_id, owner_id };
+                let sender_balance = atomic_state.balances.get(&sender_key).copied().unwrap_or(0);
+                let sender_after = sender_balance.checked_sub(token_in).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "insufficient balance for sell in liquidity asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                let supply_after = asset.total_supply.checked_sub(token_in).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "total_supply underflow while selling liquidity asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+
+                let (gross_out, new_remaining_pool_supply, new_curve_reserve_sompi) =
+                    cpmm_sell(pool.remaining_pool_supply, pool.curve_reserve_sompi, token_in)?;
+                let fee_trade = calculate_trade_fee(gross_out, pool.fee_bps)?;
+                let cpay_out = gross_out
+                    .checked_sub(fee_trade)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("sell fee underflow".to_string()))?;
+                if cpay_out == 0 {
+                    return Err(TxRuleError::InvalidAtomicPayload("sell produced zero cpay_out".to_string()));
+                }
+                if cpay_out < min_cpay_out_sompi {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "sell min_cpay_out violated: expected at least `{}`, got `{}`",
+                        min_cpay_out_sompi, cpay_out
+                    )));
+                }
+                if cpay_out < LIQUIDITY_MIN_PAYOUT_SOMPI {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "sell payout `{}` below liquidity_min_payout_sompi `{}`",
+                        cpay_out, LIQUIDITY_MIN_PAYOUT_SOMPI
+                    )));
+                }
+                validate_curve_reserve_against_outstanding_supply(asset_id, supply_after, new_curve_reserve_sompi)?;
+
+                self.validate_payout_output(tx, cpay_receive_output_index, cpay_out, None)?;
+                let vault_transition = self.resolve_liquidity_vault_transition(tx, pool.vault_outpoint)?;
+                let vault_delta = vault_transition
+                    .input_value
+                    .checked_sub(vault_transition.output_value)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("sell requires vault_value to decrease".to_string()))?;
+                if vault_delta != cpay_out {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "sell vault delta mismatch: expected `{}`, got `{}`",
+                        cpay_out, vault_delta
+                    )));
+                }
+
+                pool.remaining_pool_supply = new_remaining_pool_supply;
+                pool.curve_reserve_sompi = new_curve_reserve_sompi;
+                self.apply_fee_to_pool(&mut pool.fee_recipients, &mut pool.unclaimed_fee_total_sompi, fee_trade)?;
+                pool.vault_outpoint = TransactionOutpoint::new(tx.tx().id(), vault_transition.output_index);
+                pool.vault_value_sompi = vault_transition.output_value;
+                pool.pool_nonce = pool
+                    .pool_nonce
+                    .checked_add(1)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("pool nonce overflow".to_string()))?;
+
+                if sender_after == 0 {
+                    atomic_state.balances.remove(&sender_key);
+                } else {
+                    atomic_state.balances.insert(sender_key, sender_after);
+                }
+
+                asset.total_supply = supply_after;
+                asset.liquidity = Some(pool);
+                self.validate_liquidity_invariants(asset_id, &asset)?;
+                self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
+            }
+            AtomicPayloadOp::ClaimLiquidityFees {
+                asset_id,
+                expected_pool_nonce,
+                recipient_index,
+                claim_amount_sompi,
+                claim_receive_output_index,
+            } => {
+                let mut asset = atomic_state.assets.get(&asset_id).cloned().ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "claim references unknown asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                if !matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "claim is only valid for liquidity assets (`{}` is standard)",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+                let mut pool = asset.liquidity.clone().ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "liquidity state missing for asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                if pool.pool_nonce != expected_pool_nonce {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "stale liquidity nonce for asset `{}`: expected `{}`, got `{}`",
+                        faster_hex::hex_string(&asset_id),
+                        pool.pool_nonce,
+                        expected_pool_nonce
+                    )));
+                }
+                if claim_amount_sompi < LIQUIDITY_MIN_PAYOUT_SOMPI {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "claim amount `{}` below liquidity_min_payout_sompi `{}`",
+                        claim_amount_sompi, LIQUIDITY_MIN_PAYOUT_SOMPI
+                    )));
+                }
+                let recipient_index = usize::from(recipient_index);
+                if recipient_index >= pool.fee_recipients.len() {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!("claim recipient_index `{recipient_index}` out of range")));
+                }
+                let recipient_owner_id = pool.fee_recipients[recipient_index].owner_id;
+                let recipient_unclaimed = pool.fee_recipients[recipient_index].unclaimed_sompi;
+                if recipient_unclaimed < claim_amount_sompi {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "claim amount `{}` exceeds unclaimed recipient fees `{}`",
+                        claim_amount_sompi, recipient_unclaimed
+                    )));
+                }
+                validate_liquidity_claim_authorization(owner_id, recipient_owner_id)?;
+
+                self.validate_payout_output(tx, claim_receive_output_index, claim_amount_sompi, Some(recipient_owner_id))?;
+                let vault_transition = self.resolve_liquidity_vault_transition(tx, pool.vault_outpoint)?;
+                let vault_delta = vault_transition
+                    .input_value
+                    .checked_sub(vault_transition.output_value)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("claim requires vault_value to decrease".to_string()))?;
+                if vault_delta != claim_amount_sompi {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "claim vault delta mismatch: expected `{}`, got `{}`",
+                        claim_amount_sompi, vault_delta
+                    )));
+                }
+
+                pool.fee_recipients[recipient_index].unclaimed_sompi = recipient_unclaimed - claim_amount_sompi;
+                pool.unclaimed_fee_total_sompi = pool
+                    .unclaimed_fee_total_sompi
+                    .checked_sub(claim_amount_sompi)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("claim unclaimed_fee_total underflow".to_string()))?;
+                pool.vault_outpoint = TransactionOutpoint::new(tx.tx().id(), vault_transition.output_index);
+                pool.vault_value_sompi = vault_transition.output_value;
+                pool.pool_nonce = pool
+                    .pool_nonce
+                    .checked_add(1)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("pool nonce overflow".to_string()))?;
+
+                asset.liquidity = Some(pool);
+                self.validate_liquidity_invariants(asset_id, &asset)?;
+                self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_atomic_asset_state(
+        &self,
+        atomic_state: &mut AtomicConsensusState,
+        asset_id: [u8; 32],
+        asset: AtomicAssetState,
+    ) -> TxResult<()> {
+        if let Some(previous_asset) = atomic_state.assets.insert(asset_id, asset.clone()) {
+            if let Some(previous_pool) = previous_asset.liquidity.as_ref() {
+                atomic_state.liquidity_vault_outpoints.remove(&previous_pool.vault_outpoint);
+            }
+        }
+
+        if matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
+            let pool = asset.liquidity.as_ref().ok_or_else(|| {
+                TxRuleError::InvalidAtomicPayload(format!("liquidity state missing for asset `{}`", faster_hex::hex_string(&asset_id)))
+            })?;
+            if let Some(previous_asset_id) = atomic_state.liquidity_vault_outpoints.insert(pool.vault_outpoint, asset_id) {
+                if previous_asset_id != asset_id {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "multiple liquidity assets share vault outpoint `{}`",
+                        pool.vault_outpoint
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn collect_spent_liquidity_vault_inputs(
+        &self,
+        tx: &impl VerifiableTransaction,
+        atomic_state: &AtomicConsensusState,
+    ) -> TxResult<Vec<([u8; 32], TransactionOutpoint)>> {
+        let mut spent = Vec::new();
+        for (input, entry) in tx.populated_inputs() {
+            if !matches!(ScriptClass::from_script(&entry.script_public_key), ScriptClass::LiquidityVault) {
+                continue;
+            }
+            let Some(asset_id) = self.find_liquidity_asset_by_vault_outpoint(atomic_state, input.previous_outpoint)? else {
+                return Err(TxRuleError::InvalidAtomicPayload(format!(
+                    "unknown LiquidityVault input outpoint `{}`",
+                    input.previous_outpoint,
+                )));
+            };
+            spent.push((asset_id, input.previous_outpoint));
+        }
+        Ok(spent)
+    }
+
+    fn find_liquidity_asset_by_vault_outpoint(
+        &self,
+        atomic_state: &AtomicConsensusState,
+        outpoint: TransactionOutpoint,
+    ) -> TxResult<Option<[u8; 32]>> {
+        if let Some(asset_id) = atomic_state.liquidity_vault_outpoints.get(&outpoint).copied() {
+            let asset = atomic_state.assets.get(&asset_id).ok_or_else(|| {
+                TxRuleError::InvalidAtomicPayload(format!(
+                    "liquidity vault index references missing asset `{}`",
+                    faster_hex::hex_string(&asset_id)
+                ))
+            })?;
+            let pool = asset.liquidity.as_ref().ok_or_else(|| {
+                TxRuleError::InvalidAtomicPayload(format!(
+                    "liquidity vault index references asset `{}` without liquidity state",
+                    faster_hex::hex_string(&asset_id)
+                ))
+            })?;
+            if !matches!(asset.asset_class, AtomicAssetClass::Liquidity) || pool.vault_outpoint != outpoint {
+                return Err(TxRuleError::InvalidAtomicPayload(format!("liquidity vault index mismatch for outpoint `{}`", outpoint)));
+            }
+            return Ok(Some(asset_id));
+        }
+
+        let mut matched = None;
+        for (asset_id, asset) in atomic_state.assets.iter() {
+            let Some(pool) = asset.liquidity.as_ref() else {
+                continue;
+            };
+            if !matches!(asset.asset_class, AtomicAssetClass::Liquidity) || pool.vault_outpoint != outpoint {
+                continue;
+            }
+            if matched.replace(*asset_id).is_some() {
+                return Err(TxRuleError::InvalidAtomicPayload(format!(
+                    "multiple liquidity assets share vault outpoint `{}`",
+                    outpoint
+                )));
+            }
+        }
+        Ok(matched)
+    }
+
+    fn resolve_create_liquidity_vault_output(&self, tx: &impl VerifiableTransaction) -> TxResult<(u32, u64)> {
+        for (_, entry) in tx.populated_inputs() {
+            if matches!(ScriptClass::from_script(&entry.script_public_key), ScriptClass::LiquidityVault) {
+                return Err(TxRuleError::InvalidAtomicPayload("create-liquidity must not spend any LiquidityVault input".to_string()));
+            }
+        }
+
+        let mut found: Option<(u32, u64)> = None;
+        for (index, output) in tx.tx().outputs.iter().enumerate() {
+            if !matches!(ScriptClass::from_script(&output.script_public_key), ScriptClass::LiquidityVault) {
+                continue;
+            }
+            let out_index =
+                u32::try_from(index).map_err(|_| TxRuleError::InvalidAtomicPayload("vault output index overflow".to_string()))?;
+            if found.is_some() {
+                return Err(TxRuleError::InvalidAtomicPayload(
+                    "create-liquidity must have exactly one LiquidityVault output".to_string(),
+                ));
+            }
+            found = Some((out_index, output.value));
+        }
+        found.ok_or_else(|| {
+            TxRuleError::InvalidAtomicPayload("create-liquidity must have exactly one LiquidityVault output".to_string())
+        })
+    }
+
+    fn resolve_liquidity_vault_transition(
+        &self,
+        tx: &impl VerifiableTransaction,
+        expected_vault_outpoint: TransactionOutpoint,
+    ) -> TxResult<VaultTransition> {
+        let mut input_value = None;
+        for (input, entry) in tx.populated_inputs() {
+            if !matches!(ScriptClass::from_script(&entry.script_public_key), ScriptClass::LiquidityVault) {
+                continue;
+            }
+            if input_value.is_some() {
+                return Err(TxRuleError::InvalidAtomicPayload(
+                    "liquidity transition must have exactly one LiquidityVault input".to_string(),
+                ));
+            }
+            if input.previous_outpoint != expected_vault_outpoint {
+                return Err(TxRuleError::InvalidAtomicPayload(format!(
+                    "liquidity vault outpoint mismatch: expected `{}`, got `{}`",
+                    expected_vault_outpoint, input.previous_outpoint
+                )));
+            }
+            input_value = Some(entry.amount);
+        }
+        let input_value = input_value.ok_or_else(|| {
+            TxRuleError::InvalidAtomicPayload("liquidity transition must have exactly one LiquidityVault input".to_string())
+        })?;
+
+        let mut output = None;
+        for (index, tx_output) in tx.tx().outputs.iter().enumerate() {
+            if !matches!(ScriptClass::from_script(&tx_output.script_public_key), ScriptClass::LiquidityVault) {
+                continue;
+            }
+            if output.is_some() {
+                return Err(TxRuleError::InvalidAtomicPayload(
+                    "liquidity transition must have exactly one LiquidityVault output".to_string(),
+                ));
+            }
+            let out_index =
+                u32::try_from(index).map_err(|_| TxRuleError::InvalidAtomicPayload("vault output index overflow".to_string()))?;
+            output = Some((out_index, tx_output.value));
+        }
+        let (output_index, output_value) = output.ok_or_else(|| {
+            TxRuleError::InvalidAtomicPayload("liquidity transition must have exactly one LiquidityVault output".to_string())
+        })?;
+
+        Ok(VaultTransition { input_value, output_index, output_value })
+    }
+
+    fn build_fee_recipient_state(
+        &self,
+        recipients: Vec<AtomicPayloadRecipientAddress>,
+    ) -> TxResult<Vec<AtomicLiquidityFeeRecipientState>> {
+        let mut out = Vec::with_capacity(recipients.len());
+        for recipient in recipients {
+            let owner_id = atomic_owner_id_from_address_components(recipient.address_version, &recipient.address_payload)
+                .ok_or_else(|| TxRuleError::InvalidAtomicPayload("invalid liquidity fee recipient address encoding".to_string()))?;
+            out.push(AtomicLiquidityFeeRecipientState {
+                owner_id,
+                address_version: recipient.address_version,
+                address_payload: recipient.address_payload,
+                unclaimed_sompi: 0,
+            });
+        }
+        Ok(out)
+    }
+
+    fn apply_fee_to_pool(
+        &self,
+        recipients: &mut [AtomicLiquidityFeeRecipientState],
+        unclaimed_fee_total_sompi: &mut u64,
+        fee_trade: u64,
+    ) -> TxResult<()> {
+        if fee_trade == 0 {
+            return Ok(());
+        }
+        *unclaimed_fee_total_sompi = unclaimed_fee_total_sompi
+            .checked_add(fee_trade)
+            .ok_or_else(|| TxRuleError::InvalidAtomicPayload("unclaimed_fee_total overflow".to_string()))?;
+        match recipients.len() {
+            0 => Err(TxRuleError::InvalidAtomicPayload("fee_trade > 0 but no fee recipients are configured".to_string())),
+            1 => {
+                recipients[0].unclaimed_sompi = recipients[0]
+                    .unclaimed_sompi
+                    .checked_add(fee_trade)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("recipient fee overflow".to_string()))?;
+                Ok(())
+            }
+            2 => {
+                let fee0 = fee_trade / 2;
+                let fee1 = fee_trade - fee0;
+                recipients[0].unclaimed_sompi = recipients[0]
+                    .unclaimed_sompi
+                    .checked_add(fee0)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("recipient0 fee overflow".to_string()))?;
+                recipients[1].unclaimed_sompi = recipients[1]
+                    .unclaimed_sompi
+                    .checked_add(fee1)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("recipient1 fee overflow".to_string()))?;
+                Ok(())
+            }
+            _ => Err(TxRuleError::InvalidAtomicPayload("invalid recipient count in liquidity pool state".to_string())),
+        }
+    }
+
+    fn validate_liquidity_invariants(&self, asset_id: [u8; 32], asset: &AtomicAssetState) -> TxResult<()> {
+        if !matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
+            return Ok(());
+        }
+        let pool = asset.liquidity.as_ref().ok_or_else(|| {
+            TxRuleError::InvalidAtomicPayload(format!("liquidity state missing for asset `{}`", faster_hex::hex_string(&asset_id)))
+        })?;
+        if !matches!(asset.supply_mode, AtomicSupplyMode::Capped) {
+            return Err(TxRuleError::InvalidAtomicPayload("liquidity assets must always use capped supply mode".to_string()));
+        }
+        validate_curve_reserve_against_outstanding_supply(asset_id, asset.total_supply, pool.curve_reserve_sompi)?;
+        let expected_vault = pool
+            .curve_reserve_sompi
+            .checked_add(pool.unclaimed_fee_total_sompi)
+            .ok_or_else(|| TxRuleError::InvalidAtomicPayload("vault invariant overflow".to_string()))?;
+        if pool.vault_value_sompi != expected_vault {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "vault invariant violation for asset `{}`: vault_value `{}` != reserve `{}` + fees `{}`",
+                faster_hex::hex_string(&asset_id),
+                pool.vault_value_sompi,
+                pool.curve_reserve_sompi,
+                pool.unclaimed_fee_total_sompi
+            )));
+        }
+        let expected_total = asset
+            .total_supply
+            .checked_add(pool.remaining_pool_supply)
+            .ok_or_else(|| TxRuleError::InvalidAtomicPayload("supply invariant overflow".to_string()))?;
+        if expected_total != asset.max_supply {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "supply invariant violation for asset `{}`: total `{}` + remaining `{}` != max `{}`",
+                faster_hex::hex_string(&asset_id),
+                asset.total_supply,
+                pool.remaining_pool_supply,
+                asset.max_supply
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_payout_output(
+        &self,
+        tx: &impl VerifiableTransaction,
+        output_index: u16,
+        expected_value: u64,
+        expected_owner_id: Option<[u8; 32]>,
+    ) -> TxResult<()> {
+        let output = tx
+            .tx()
+            .outputs
+            .get(output_index as usize)
+            .ok_or_else(|| TxRuleError::InvalidAtomicPayload(format!("payout output index `{}` out of range", output_index)))?;
+        if output.value != expected_value {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "payout output value mismatch at index `{}`: expected `{}`, got `{}`",
+                output_index, expected_value, output.value
+            )));
+        }
+        let class = ScriptClass::from_script(&output.script_public_key);
+        if !matches!(class, ScriptClass::PubKey | ScriptClass::PubKeyECDSA | ScriptClass::ScriptHash) {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "payout script class `{}` at index `{}` is not allowed",
+                class, output_index
+            )));
+        }
+        if let Some(owner_id) = expected_owner_id {
+            let output_owner_id = atomic_owner_id_from_script(&output.script_public_key)
+                .ok_or_else(|| TxRuleError::InvalidAtomicPayload("payout output owner id cannot be derived".to_string()))?;
+            if output_owner_id != owner_id {
+                return Err(TxRuleError::InvalidAtomicPayload(
+                    "payout output owner does not match configured fee recipient".to_string(),
+                ));
             }
         }
         Ok(())

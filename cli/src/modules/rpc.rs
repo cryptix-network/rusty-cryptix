@@ -1,12 +1,15 @@
 use crate::imports::*;
 use convert_case::{Case, Casing};
 use cryptix_rpc_core::api::ops::RpcApiOps;
+use std::collections::BTreeMap;
 
 #[derive(Default, Handler)]
 #[help("Execute RPC commands against the connected Cryptix node")]
 pub struct Rpc;
 
 impl Rpc {
+    const TOKEN_OWNER_BALANCES_PAGE_LIMIT: u32 = 512;
+
     fn sanitize_terminal_output(input: &str) -> String {
         let mut out = String::with_capacity(input.len());
         let bytes = input.as_bytes();
@@ -86,6 +89,108 @@ impl Rpc {
         }
 
         let op_str = argv.remove(0);
+
+        if matches!(op_str.as_str(), "get-token-balances-by-addresses" | "token-balances-by-addresses") {
+            if argv.is_empty() {
+                return Err(Error::custom("Usage: rpc get-token-balances-by-addresses <address> [address2 ...]"));
+            }
+
+            let mut unique_addresses: Vec<String> = Vec::with_capacity(argv.len());
+            let mut seen = std::collections::HashSet::new();
+            for raw in argv {
+                let address = Address::try_from(raw.as_str())?.to_string();
+                if seen.insert(address.clone()) {
+                    unique_addresses.push(address);
+                }
+            }
+
+            let mut aggregated: BTreeMap<String, u128> = BTreeMap::new();
+            let mut asset_labels: HashMap<String, String> = HashMap::new();
+
+            tprintln!(ctx, "Token balances by address:");
+            for address in unique_addresses {
+                let owner_response = rpc
+                    .get_token_owner_id_by_address_call(
+                        None,
+                        GetTokenOwnerIdByAddressRequest { address: address.clone(), at_block_hash: None },
+                    )
+                    .await?;
+
+                let Some(owner_id) = owner_response.owner_id else {
+                    let reason = owner_response.reason.unwrap_or_else(|| "owner id not derivable".to_string());
+                    tprintln!(ctx, "  {address}: skipped ({reason})");
+                    continue;
+                };
+
+                tprintln!(ctx, "  {address} -> owner {}", style(owner_id.as_str()).dim());
+
+                let mut offset = 0u32;
+                let mut printed_any = false;
+                loop {
+                    let response = rpc
+                        .get_token_balances_by_owner_call(
+                            None,
+                            GetTokenBalancesByOwnerRequest {
+                                owner_id: owner_id.clone(),
+                                offset,
+                                limit: Self::TOKEN_OWNER_BALANCES_PAGE_LIMIT,
+                                include_assets: true,
+                                at_block_hash: None,
+                            },
+                        )
+                        .await?;
+
+                    if response.balances.is_empty() {
+                        if !printed_any {
+                            tprintln!(ctx, "    (no token balances)");
+                        }
+                        break;
+                    }
+
+                    let page_len = response.balances.len() as u32;
+                    for balance in response.balances {
+                        let amount = balance.balance.parse::<u128>().map_err(|err| {
+                            Error::custom(format!(
+                                "Invalid token balance `{}` for asset `{}`: {err}",
+                                balance.balance, balance.asset_id
+                            ))
+                        })?;
+
+                        let asset_id = balance.asset_id.clone();
+                        if let Some(asset) = balance.asset {
+                            let label =
+                                if asset.symbol.is_empty() { asset_id.clone() } else { format!("{} ({asset_id})", asset.symbol) };
+                            asset_labels.insert(asset_id.clone(), label);
+                        } else {
+                            asset_labels.entry(asset_id.clone()).or_insert_with(|| asset_id.clone());
+                        }
+
+                        *aggregated.entry(asset_id.clone()).or_insert(0) += amount;
+                        let label = asset_labels.get(&asset_id).cloned().unwrap_or(asset_id.clone());
+                        tprintln!(ctx, "    {label}: {}", balance.balance);
+                        printed_any = true;
+                    }
+
+                    offset = offset.saturating_add(page_len);
+                    if u64::from(offset) >= response.total {
+                        break;
+                    }
+                }
+            }
+
+            tprintln!(ctx);
+            tprintln!(ctx, "Aggregated token totals:");
+            if aggregated.is_empty() {
+                tprintln!(ctx, "  (none)");
+            } else {
+                for (asset_id, total) in aggregated {
+                    let label = asset_labels.get(&asset_id).cloned().unwrap_or(asset_id);
+                    tprintln!(ctx, "  {label}: {total}");
+                }
+            }
+
+            return Ok(());
+        }
 
         let sanitize = regex::Regex::new(r"\s*rpc\s+\S+\s+").unwrap();
         let _args = sanitize.replace(cmd, "").trim().to_string();
@@ -543,6 +648,8 @@ impl Rpc {
 
         tprintln!(ctx);
         tprintln!(ctx, "Please note that not all listed RPC methods are currently implemented");
+        tprintln!(ctx, "Custom helper commands:");
+        tprintln!(ctx, "  rpc get-token-balances-by-addresses <address> [address2 ...]");
         tprintln!(ctx);
 
         Ok(())

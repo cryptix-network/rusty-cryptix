@@ -1058,6 +1058,16 @@ build_wrpc_wasm_bindgen_interface!(
         GetTokenHolders,
         /// Returns owner id derivation result for an address if the script class is supported.
         GetTokenOwnerIdByAddress,
+        /// Returns liquidity pool state for a liquidity asset.
+        GetLiquidityPoolState,
+        /// Returns exact-in quote for liquidity buy/sell.
+        GetLiquidityQuote,
+        /// Returns liquidity fee accrual state.
+        GetLiquidityFeeState,
+        /// Returns liquidity fee claim preview for a recipient address.
+        GetLiquidityClaimPreview,
+        /// Returns paginated liquidity holders for a liquidity asset.
+        GetLiquidityHolders,
         /// Exports Cryptix Atomic snapshot to a file path.
         ExportTokenSnapshot,
         /// Imports Cryptix Atomic snapshot from a file path.

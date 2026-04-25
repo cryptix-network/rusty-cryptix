@@ -339,6 +339,64 @@ pub trait RpcApi: Sync + Send + AnySync {
         Err(crate::RpcError::NotImplemented)
     }
 
+    async fn get_liquidity_pool_state(&self, request: GetLiquidityPoolStateRequest) -> RpcResult<GetLiquidityPoolStateResponse> {
+        self.get_liquidity_pool_state_call(None, request).await
+    }
+    async fn get_liquidity_pool_state_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetLiquidityPoolStateRequest,
+    ) -> RpcResult<GetLiquidityPoolStateResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_liquidity_quote(&self, request: GetLiquidityQuoteRequest) -> RpcResult<GetLiquidityQuoteResponse> {
+        self.get_liquidity_quote_call(None, request).await
+    }
+    async fn get_liquidity_quote_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetLiquidityQuoteRequest,
+    ) -> RpcResult<GetLiquidityQuoteResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_liquidity_fee_state(&self, request: GetLiquidityFeeStateRequest) -> RpcResult<GetLiquidityFeeStateResponse> {
+        self.get_liquidity_fee_state_call(None, request).await
+    }
+    async fn get_liquidity_fee_state_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetLiquidityFeeStateRequest,
+    ) -> RpcResult<GetLiquidityFeeStateResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_liquidity_claim_preview(
+        &self,
+        request: GetLiquidityClaimPreviewRequest,
+    ) -> RpcResult<GetLiquidityClaimPreviewResponse> {
+        self.get_liquidity_claim_preview_call(None, request).await
+    }
+    async fn get_liquidity_claim_preview_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetLiquidityClaimPreviewRequest,
+    ) -> RpcResult<GetLiquidityClaimPreviewResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_liquidity_holders(&self, request: GetLiquidityHoldersRequest) -> RpcResult<GetLiquidityHoldersResponse> {
+        self.get_liquidity_holders_call(None, request).await
+    }
+    async fn get_liquidity_holders_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetLiquidityHoldersRequest,
+    ) -> RpcResult<GetLiquidityHoldersResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
     // ---
 
     /// Requests the network the node is currently running against.

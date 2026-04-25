@@ -1,6 +1,8 @@
 use std::{fs, path::PathBuf, process::exit, sync::Arc, time::Duration};
 
-use crate::atomic_bootstrap::AtomicBootstrapService;
+use crate::atomic_bootstrap::{
+    AtomicBootstrapService, ATOMIC_BOOTSTRAP_REQUIRED_NON_SEED_SOURCES, ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES,
+};
 use async_channel::unbounded;
 use cryptix_atomicindex::service::AtomicTokenService;
 use cryptix_consensus_core::{
@@ -259,9 +261,7 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     if args.hfa {
         info!(
             "Fastchain HWA: ENABLED; cpu low-water ratio: {:.2}, drift window: {} ms, normal microblock interval: {} ms",
-            args.hfa_cpu,
-            args.hfa_drift_ms,
-            args.hfa_microblock_interval_ms_normal
+            args.hfa_cpu, args.hfa_drift_ms, args.hfa_microblock_interval_ms_normal
         );
     }
     if args.datacenter {
@@ -271,6 +271,10 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     info!("Payload HF activation DAA score: {}", config.params.payload_hf_activation_daa_score);
     info!("Cryptix Atomic Token v1: ENABLED");
     info!("Cryptix Atomic bootstrap worker: ENABLED; configured peer overrides: {}", args.atomic_bootstrap_peers.len());
+    info!(
+        "Cryptix Atomic bootstrap quorum: default requires >= {} seed source(s) + >= {} independent peer/non-seed source(s)",
+        ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES, ATOMIC_BOOTSTRAP_REQUIRED_NON_SEED_SOURCES
+    );
     let bootstrap_attestation_policy = if args.atomic_bootstrap_required_manifest_signatures == 0 {
         "quorum-only".to_string()
     } else {
@@ -278,7 +282,10 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     };
     info!("Cryptix Atomic bootstrap attestation policy: {}", bootstrap_attestation_policy);
     let bootstrap_source_policy = if config.net.is_mainnet() {
-        if args.atomic_bootstrap_allow_peer_fallback {
+        if args.disable_dns_seeding {
+            "mainnet DNS seed bootstrap disabled by --nodnsseed; Atomic bootstrap will use peer-majority from manual/configured peers only"
+                .to_string()
+        } else if args.atomic_bootstrap_allow_peer_fallback {
             "mainnet strict seed policy; peer-only fallback enabled by explicit operator flag".to_string()
         } else {
             "mainnet strict seed policy; peer-only fallback disabled".to_string()
@@ -287,6 +294,9 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
         "non-mainnet policy; peer-majority fallback allowed".to_string()
     };
     info!("Cryptix Atomic bootstrap source policy: {}", bootstrap_source_policy);
+    if args.disable_dns_seeding {
+        info!("Cryptix Atomic bootstrap DNS seed sources: DISABLED");
+    }
     info!("Strong-Node claimant overlay: ENABLED");
     info!("Auto-ban: {}; default strike threshold: 5, ban duration: 3h", if args.autoban { "ENABLED" } else { "DISABLED" });
     info!("Banserver sync: {}", if args.banserver { "ENABLED" } else { "DISABLED" });
@@ -543,6 +553,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
             atomic_token_service.clone(),
             flow_context.clone(),
             configured_atomic_bootstrap_peers.clone(),
+            args.disable_dns_seeding,
             60,
             atomic_db_dir.clone(),
             trusted_atomic_bootstrap_manifest_pubkeys,

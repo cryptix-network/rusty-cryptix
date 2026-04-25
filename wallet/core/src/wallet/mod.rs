@@ -1085,7 +1085,10 @@ impl Wallet {
             .clamp(TX_ENRICH_LOOKBACK_MIN_HEADERS, TX_ENRICH_LOOKBACK_MAX_HEADERS)
     }
 
-    async fn resolve_record_transaction_from_chain(&self, record: &TransactionRecord) -> Option<cryptix_consensus_core::tx::Transaction> {
+    async fn resolve_record_transaction_from_chain(
+        &self,
+        record: &TransactionRecord,
+    ) -> Option<cryptix_consensus_core::tx::Transaction> {
         let target_txid = *record.id();
         let target_block_daa_score = record.block_daa_score();
         let header_limit = self.transaction_enrichment_header_limit(target_block_daa_score);
@@ -1154,10 +1157,8 @@ impl Wallet {
             }
 
             if let Some(verbose_data) = block.verbose_data {
-                for merged_hash in verbose_data
-                    .merge_set_blues_hashes
-                    .into_iter()
-                    .chain(verbose_data.merge_set_reds_hashes.into_iter())
+                for merged_hash in
+                    verbose_data.merge_set_blues_hashes.into_iter().chain(verbose_data.merge_set_reds_hashes.into_iter())
                 {
                     if visited.contains(&merged_hash) {
                         continue;
@@ -1173,7 +1174,11 @@ impl Wallet {
         None
     }
 
-    async fn resolve_record_transaction(&self, record: &TransactionRecord, allow_chain_lookup: bool) -> Option<cryptix_consensus_core::tx::Transaction> {
+    async fn resolve_record_transaction(
+        &self,
+        record: &TransactionRecord,
+        allow_chain_lookup: bool,
+    ) -> Option<cryptix_consensus_core::tx::Transaction> {
         if let Some(transaction) = self.utxo_processor().confirmed_transaction(record.id()) {
             return Some(transaction);
         }

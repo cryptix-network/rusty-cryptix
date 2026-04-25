@@ -18,6 +18,7 @@ use cryptix_database::prelude::ConnBuilder;
 use std::future::Future;
 use std::{sync::Arc, thread::JoinHandle};
 
+use crate::model::stores::atomic_state::AtomicConsensusState;
 use crate::pipeline::virtual_processor::test_block_builder::TestBlockBuilder;
 use crate::processes::window::WindowManager;
 use crate::{
@@ -27,8 +28,12 @@ use crate::{
     model::{
         services::reachability::MTReachabilityService,
         stores::{
-            ghostdag::DbGhostdagStore, headers::HeaderStoreReader, pruning::PruningStoreReader, reachability::DbReachabilityStore,
-            virtual_state::VirtualStores, DB,
+            ghostdag::DbGhostdagStore,
+            headers::HeaderStoreReader,
+            pruning::PruningStoreReader,
+            reachability::DbReachabilityStore,
+            virtual_state::{VirtualStateStoreReader, VirtualStores},
+            DB,
         },
     },
     params::Params,
@@ -114,6 +119,10 @@ impl TestConsensus {
 
     pub fn params(&self) -> &Params {
         &self.params
+    }
+
+    pub fn virtual_atomic_state(&self) -> AtomicConsensusState {
+        self.consensus.virtual_stores.read().state.get().unwrap().atomic_state.clone()
     }
 
     pub fn build_header_with_parents(&self, hash: Hash, parents: Vec<Hash>) -> Header {

@@ -684,6 +684,29 @@ from!(item: &cryptix_rpc_core::RpcTokenOwnerBalance, protowire::RpcTokenOwnerBal
 from!(item: &cryptix_rpc_core::RpcTokenHolder, protowire::RpcTokenHolderMessage, {
     Self { owner_id: item.owner_id.clone(), balance: item.balance.clone() }
 });
+from!(item: &cryptix_rpc_core::RpcLiquidityFeeRecipient, protowire::RpcLiquidityFeeRecipientMessage, {
+    Self { owner_id: item.owner_id.clone(), address: item.address.clone(), unclaimed_sompi: item.unclaimed_sompi.clone() }
+});
+from!(item: &cryptix_rpc_core::RpcLiquidityPoolState, protowire::RpcLiquidityPoolStateMessage, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        pool_nonce: item.pool_nonce,
+        fee_bps: item.fee_bps,
+        max_supply: item.max_supply.clone(),
+        total_supply: item.total_supply.clone(),
+        circulating_supply: item.circulating_supply.clone(),
+        remaining_pool_supply: item.remaining_pool_supply.clone(),
+        curve_reserve_sompi: item.curve_reserve_sompi.clone(),
+        unclaimed_fee_total_sompi: item.unclaimed_fee_total_sompi.clone(),
+        vault_value_sompi: item.vault_value_sompi.clone(),
+        vault_txid: item.vault_txid.to_string(),
+        vault_output_index: item.vault_output_index,
+        fee_recipients: item.fee_recipients.iter().map(Into::into).collect(),
+    }
+});
+from!(item: &cryptix_rpc_core::RpcLiquidityHolder, protowire::RpcLiquidityHolderMessage, {
+    Self { address: item.address.clone(), owner_id: item.owner_id.clone(), balance: item.balance.clone() }
+});
 from!(item: &cryptix_rpc_core::SimulateTokenOpRequest, protowire::SimulateTokenOpRequestMessage, {
     Self {
         payload_hex: item.payload_hex.clone(),
@@ -825,6 +848,87 @@ from!(item: RpcResult<&cryptix_rpc_core::GetTokenOwnerIdByAddressResponse>, prot
     Self {
         owner_id: item.owner_id.clone(),
         reason: item.reason.clone(),
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::GetLiquidityPoolStateRequest, protowire::GetLiquidityPoolStateRequestMessage, {
+    Self { asset_id: item.asset_id.clone(), at_block_hash: item.at_block_hash.map(|hash| hash.to_string()) }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetLiquidityPoolStateResponse>, protowire::GetLiquidityPoolStateResponseMessage, {
+    Self {
+        pool: item.pool.as_ref().map(Into::into),
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::GetLiquidityQuoteRequest, protowire::GetLiquidityQuoteRequestMessage, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        side: item.side,
+        exact_in_amount: item.exact_in_amount.clone(),
+        at_block_hash: item.at_block_hash.map(|hash| hash.to_string()),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetLiquidityQuoteResponse>, protowire::GetLiquidityQuoteResponseMessage, {
+    Self {
+        side: item.side,
+        exact_in_amount: item.exact_in_amount.clone(),
+        fee_amount_sompi: item.fee_amount_sompi.clone(),
+        net_in_amount: item.net_in_amount.clone(),
+        amount_out: item.amount_out.clone(),
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::GetLiquidityFeeStateRequest, protowire::GetLiquidityFeeStateRequestMessage, {
+    Self { asset_id: item.asset_id.clone(), at_block_hash: item.at_block_hash.map(|hash| hash.to_string()) }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetLiquidityFeeStateResponse>, protowire::GetLiquidityFeeStateResponseMessage, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        fee_bps: item.fee_bps,
+        total_unclaimed_sompi: item.total_unclaimed_sompi.clone(),
+        recipients: item.recipients.iter().map(Into::into).collect(),
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::GetLiquidityClaimPreviewRequest, protowire::GetLiquidityClaimPreviewRequestMessage, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        recipient_address: item.recipient_address.clone(),
+        at_block_hash: item.at_block_hash.map(|hash| hash.to_string()),
+    }
+});
+from!(
+    item: RpcResult<&cryptix_rpc_core::GetLiquidityClaimPreviewResponse>,
+    protowire::GetLiquidityClaimPreviewResponseMessage,
+    {
+        Self {
+            recipient_address: item.recipient_address.clone(),
+            owner_id: item.owner_id.clone(),
+            claimable_amount_sompi: item.claimable_amount_sompi.clone(),
+            min_payout_sompi: item.min_payout_sompi.clone(),
+            claimable_now: item.claimable_now,
+            reason: item.reason.clone(),
+            context: Some((&item.context).into()),
+            error: None,
+        }
+    }
+);
+from!(item: &cryptix_rpc_core::GetLiquidityHoldersRequest, protowire::GetLiquidityHoldersRequestMessage, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        offset: item.offset,
+        limit: item.limit,
+        at_block_hash: item.at_block_hash.map(|hash| hash.to_string()),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetLiquidityHoldersResponse>, protowire::GetLiquidityHoldersResponseMessage, {
+    Self {
+        holders: item.holders.iter().map(Into::into).collect(),
+        total: item.total,
         context: Some((&item.context).into()),
         error: None,
     }
@@ -1553,6 +1657,33 @@ try_from!(item: &protowire::RpcTokenOwnerBalanceMessage, cryptix_rpc_core::RpcTo
 try_from!(item: &protowire::RpcTokenHolderMessage, cryptix_rpc_core::RpcTokenHolder, {
     Self { owner_id: item.owner_id.clone(), balance: item.balance.clone() }
 });
+try_from!(item: &protowire::RpcLiquidityFeeRecipientMessage, cryptix_rpc_core::RpcLiquidityFeeRecipient, {
+    Self { owner_id: item.owner_id.clone(), address: item.address.clone(), unclaimed_sompi: item.unclaimed_sompi.clone() }
+});
+try_from!(item: &protowire::RpcLiquidityPoolStateMessage, cryptix_rpc_core::RpcLiquidityPoolState, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        pool_nonce: item.pool_nonce,
+        fee_bps: item.fee_bps,
+        max_supply: item.max_supply.clone(),
+        total_supply: item.total_supply.clone(),
+        circulating_supply: item.circulating_supply.clone(),
+        remaining_pool_supply: item.remaining_pool_supply.clone(),
+        curve_reserve_sompi: item.curve_reserve_sompi.clone(),
+        unclaimed_fee_total_sompi: item.unclaimed_fee_total_sompi.clone(),
+        vault_value_sompi: item.vault_value_sompi.clone(),
+        vault_txid: RpcHash::from_str(&item.vault_txid)?,
+        vault_output_index: item.vault_output_index,
+        fee_recipients: item
+            .fee_recipients
+            .iter()
+            .map(|recipient| recipient.try_into())
+            .collect::<RpcResult<Vec<_>>>()?,
+    }
+});
+try_from!(item: &protowire::RpcLiquidityHolderMessage, cryptix_rpc_core::RpcLiquidityHolder, {
+    Self { address: item.address.clone(), owner_id: item.owner_id.clone(), balance: item.balance.clone() }
+});
 try_from!(item: &protowire::SimulateTokenOpRequestMessage, cryptix_rpc_core::SimulateTokenOpRequest, {
     Self {
         payload_hex: item.payload_hex.clone(),
@@ -1774,6 +1905,108 @@ try_from!(
         }
     }
 );
+try_from!(item: &protowire::GetLiquidityPoolStateRequestMessage, cryptix_rpc_core::GetLiquidityPoolStateRequest, {
+    Self { asset_id: item.asset_id.clone(), at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()? }
+});
+try_from!(item: &protowire::GetLiquidityPoolStateResponseMessage, RpcResult<cryptix_rpc_core::GetLiquidityPoolStateResponse>, {
+    Self {
+        pool: item.pool.as_ref().map(|pool| pool.try_into()).transpose()?,
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetLiquidityPoolStateResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetLiquidityQuoteRequestMessage, cryptix_rpc_core::GetLiquidityQuoteRequest, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        side: item.side,
+        exact_in_amount: item.exact_in_amount.clone(),
+        at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+    }
+});
+try_from!(item: &protowire::GetLiquidityQuoteResponseMessage, RpcResult<cryptix_rpc_core::GetLiquidityQuoteResponse>, {
+    Self {
+        side: item.side,
+        exact_in_amount: item.exact_in_amount.clone(),
+        fee_amount_sompi: item.fee_amount_sompi.clone(),
+        net_in_amount: item.net_in_amount.clone(),
+        amount_out: item.amount_out.clone(),
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetLiquidityQuoteResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetLiquidityFeeStateRequestMessage, cryptix_rpc_core::GetLiquidityFeeStateRequest, {
+    Self { asset_id: item.asset_id.clone(), at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()? }
+});
+try_from!(item: &protowire::GetLiquidityFeeStateResponseMessage, RpcResult<cryptix_rpc_core::GetLiquidityFeeStateResponse>, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        fee_bps: item.fee_bps,
+        total_unclaimed_sompi: item.total_unclaimed_sompi.clone(),
+        recipients: item
+            .recipients
+            .iter()
+            .map(|recipient| recipient.try_into())
+            .collect::<RpcResult<Vec<_>>>()?,
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetLiquidityFeeStateResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetLiquidityClaimPreviewRequestMessage, cryptix_rpc_core::GetLiquidityClaimPreviewRequest, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        recipient_address: item.recipient_address.clone(),
+        at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+    }
+});
+try_from!(
+    item: &protowire::GetLiquidityClaimPreviewResponseMessage,
+    RpcResult<cryptix_rpc_core::GetLiquidityClaimPreviewResponse>,
+    {
+        Self {
+            recipient_address: item.recipient_address.clone(),
+            owner_id: item.owner_id.clone(),
+            claimable_amount_sompi: item.claimable_amount_sompi.clone(),
+            min_payout_sompi: item.min_payout_sompi.clone(),
+            claimable_now: item.claimable_now,
+            reason: item.reason.clone(),
+            context: item
+                .context
+                .as_ref()
+                .ok_or_else(|| {
+                    RpcError::MissingRpcFieldError("GetLiquidityClaimPreviewResponseMessage".to_string(), "context".to_string())
+                })?
+                .try_into()?,
+        }
+    }
+);
+try_from!(item: &protowire::GetLiquidityHoldersRequestMessage, cryptix_rpc_core::GetLiquidityHoldersRequest, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        offset: item.offset,
+        limit: item.limit,
+        at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+    }
+});
+try_from!(item: &protowire::GetLiquidityHoldersResponseMessage, RpcResult<cryptix_rpc_core::GetLiquidityHoldersResponse>, {
+    Self {
+        holders: item.holders.iter().map(|holder| holder.try_into()).collect::<RpcResult<Vec<_>>>()?,
+        total: item.total,
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetLiquidityHoldersResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
 try_from!(item: &protowire::ExportTokenSnapshotRequestMessage, cryptix_rpc_core::ExportTokenSnapshotRequest, {
     Self { path: item.path.clone() }
 });

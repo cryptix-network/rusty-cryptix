@@ -1173,6 +1173,107 @@ message GetTokenOwnerIdByAddressResponseMessage {
   RPCError error = 1000;
 }
 
+message RpcLiquidityFeeRecipientMessage {
+  string ownerId = 1;
+  string address = 2;
+  string unclaimedSompi = 3;
+}
+
+message RpcLiquidityPoolStateMessage {
+  string assetId = 1;
+  uint64 poolNonce = 2;
+  uint32 feeBps = 3;
+  string maxSupply = 4;
+  string totalSupply = 5;
+  string circulatingSupply = 6;
+  string remainingPoolSupply = 7;
+  string curveReserveSompi = 8;
+  string unclaimedFeeTotalSompi = 9;
+  string vaultValueSompi = 10;
+  string vaultTxid = 11;
+  uint32 vaultOutputIndex = 12;
+  repeated RpcLiquidityFeeRecipientMessage feeRecipients = 13;
+}
+
+message GetLiquidityPoolStateRequestMessage {
+  string assetId = 1;
+  optional string atBlockHash = 2;
+}
+
+message GetLiquidityPoolStateResponseMessage {
+  optional RpcLiquidityPoolStateMessage pool = 1;
+  RpcTokenContextMessage context = 2;
+  RPCError error = 1000;
+}
+
+message GetLiquidityQuoteRequestMessage {
+  string assetId = 1;
+  uint32 side = 2;
+  string exactInAmount = 3;
+  optional string atBlockHash = 4;
+}
+
+message GetLiquidityQuoteResponseMessage {
+  uint32 side = 1;
+  string exactInAmount = 2;
+  string feeAmountSompi = 3;
+  string netInAmount = 4;
+  string amountOut = 5;
+  RpcTokenContextMessage context = 6;
+  RPCError error = 1000;
+}
+
+message GetLiquidityFeeStateRequestMessage {
+  string assetId = 1;
+  optional string atBlockHash = 2;
+}
+
+message GetLiquidityFeeStateResponseMessage {
+  string assetId = 1;
+  uint32 feeBps = 2;
+  string totalUnclaimedSompi = 3;
+  repeated RpcLiquidityFeeRecipientMessage recipients = 4;
+  RpcTokenContextMessage context = 5;
+  RPCError error = 1000;
+}
+
+message GetLiquidityClaimPreviewRequestMessage {
+  string assetId = 1;
+  string recipientAddress = 2;
+  optional string atBlockHash = 3;
+}
+
+message GetLiquidityClaimPreviewResponseMessage {
+  string recipientAddress = 1;
+  optional string ownerId = 2;
+  string claimableAmountSompi = 3;
+  string minPayoutSompi = 4;
+  bool claimableNow = 5;
+  optional string reason = 6;
+  RpcTokenContextMessage context = 7;
+  RPCError error = 1000;
+}
+
+message RpcLiquidityHolderMessage {
+  optional string address = 1;
+  string ownerId = 2;
+  string balance = 3;
+}
+
+message GetLiquidityHoldersRequestMessage {
+  string assetId = 1;
+  uint32 offset = 2;
+  uint32 limit = 3;
+  optional string atBlockHash = 4;
+}
+
+message GetLiquidityHoldersResponseMessage {
+  repeated RpcLiquidityHolderMessage holders = 1;
+  uint64 total = 2;
+  RpcTokenContextMessage context = 3;
+  RPCError error = 1000;
+}
+
 message ExportTokenSnapshotRequestMessage {
   string path = 1;
 }

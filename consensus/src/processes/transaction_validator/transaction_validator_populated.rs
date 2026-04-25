@@ -235,6 +235,9 @@ const CAT_MAX_NAME_LEN: usize = 32;
 const CAT_MAX_SYMBOL_LEN: usize = 10;
 const CAT_MAX_METADATA_LEN: usize = 256;
 const CAT_MAX_DECIMALS: u8 = 18;
+const CAT_MAX_LIQUIDITY_RECIPIENTS: usize = 2;
+const CAT_MIN_LIQUIDITY_FEE_BPS: u16 = 10;
+const CAT_MAX_LIQUIDITY_FEE_BPS: u16 = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AtomicPayloadSupplyMode {
@@ -267,6 +270,55 @@ pub(crate) enum AtomicPayloadOp {
         asset_id: [u8; 32],
         amount: u128,
     },
+    CreateAssetWithMint {
+        decimals: u8,
+        supply_mode: AtomicPayloadSupplyMode,
+        max_supply: u128,
+        mint_authority_owner_id: [u8; 32],
+        name: Vec<u8>,
+        symbol: Vec<u8>,
+        metadata: Vec<u8>,
+        initial_mint_amount: u128,
+        initial_mint_to_owner_id: [u8; 32],
+    },
+    CreateLiquidityAsset {
+        decimals: u8,
+        max_supply: u128,
+        name: Vec<u8>,
+        symbol: Vec<u8>,
+        metadata: Vec<u8>,
+        seed_reserve_sompi: u64,
+        fee_bps: u16,
+        recipients: Vec<AtomicPayloadRecipientAddress>,
+        launch_buy_sompi: u64,
+        launch_buy_min_token_out: u128,
+    },
+    BuyLiquidityExactIn {
+        asset_id: [u8; 32],
+        expected_pool_nonce: u64,
+        cpay_in_sompi: u64,
+        min_token_out: u128,
+    },
+    SellLiquidityExactIn {
+        asset_id: [u8; 32],
+        expected_pool_nonce: u64,
+        token_in: u128,
+        min_cpay_out_sompi: u64,
+        cpay_receive_output_index: u16,
+    },
+    ClaimLiquidityFees {
+        asset_id: [u8; 32],
+        expected_pool_nonce: u64,
+        recipient_index: u8,
+        claim_amount_sompi: u64,
+        claim_receive_output_index: u16,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AtomicPayloadRecipientAddress {
+    pub address_version: u8,
+    pub address_payload: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -293,7 +345,7 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
     }
 
     let op = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT op".to_string())?;
-    if op > 3 {
+    if op > 8 {
         return Err(format!("unsupported CAT op `{op}`"));
     }
 
@@ -378,6 +430,171 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
             }
             AtomicPayloadOp::Burn { asset_id, amount }
         }
+        4 => {
+            let (decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata) =
+                parse_create_asset_common(payload, &mut cursor)?;
+            let initial_mint_amount =
+                take_u128_le(payload, &mut cursor).ok_or_else(|| "truncated CAT initial mint amount".to_string())?;
+            let initial_mint_to_owner_id =
+                take_32(payload, &mut cursor).ok_or_else(|| "truncated CAT initial mint owner id".to_string())?;
+            if initial_mint_amount == 0 && initial_mint_to_owner_id != [0u8; 32] {
+                return Err("initial_mint_to_owner_id must be zero when initial_mint_amount is zero".to_string());
+            }
+            if initial_mint_amount > 0 && initial_mint_to_owner_id == [0u8; 32] {
+                return Err("initial_mint_to_owner_id must be non-zero when initial_mint_amount is non-zero".to_string());
+            }
+            AtomicPayloadOp::CreateAssetWithMint {
+                decimals,
+                supply_mode,
+                max_supply,
+                mint_authority_owner_id,
+                name,
+                symbol,
+                metadata,
+                initial_mint_amount,
+                initial_mint_to_owner_id,
+            }
+        }
+        5 => {
+            let decimals = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT decimals".to_string())?;
+            if decimals > CAT_MAX_DECIMALS {
+                return Err(format!("decimals `{decimals}` above max `{CAT_MAX_DECIMALS}`"));
+            }
+            let max_supply = take_u128_le(payload, &mut cursor).ok_or_else(|| "truncated CAT max_supply".to_string())?;
+            if max_supply == 0 {
+                return Err("liquidity asset max_supply must be non-zero".to_string());
+            }
+            let name_len = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT name length".to_string())? as usize;
+            let symbol_len = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT symbol length".to_string())? as usize;
+            let metadata_len = take_u16_le(payload, &mut cursor).ok_or_else(|| "truncated CAT metadata length".to_string())? as usize;
+            if name_len > CAT_MAX_NAME_LEN || symbol_len > CAT_MAX_SYMBOL_LEN || metadata_len > CAT_MAX_METADATA_LEN {
+                return Err("string field exceeds allowed length".to_string());
+            }
+            let name = take_vec(payload, &mut cursor, name_len).ok_or_else(|| "truncated CAT name".to_string())?;
+            let symbol = take_vec(payload, &mut cursor, symbol_len).ok_or_else(|| "truncated CAT symbol".to_string())?;
+            let metadata = take_vec(payload, &mut cursor, metadata_len).ok_or_else(|| "truncated CAT metadata".to_string())?;
+            if std::str::from_utf8(&name).is_err() || std::str::from_utf8(&symbol).is_err() {
+                return Err("name/symbol must be valid utf-8".to_string());
+            }
+
+            let seed_reserve_sompi = take_u64_le(payload, &mut cursor).ok_or_else(|| "truncated CAT seed reserve".to_string())?;
+            let fee_bps = take_u16_le(payload, &mut cursor).ok_or_else(|| "truncated CAT fee bps".to_string())?;
+            if !(fee_bps == 0 || (CAT_MIN_LIQUIDITY_FEE_BPS..=CAT_MAX_LIQUIDITY_FEE_BPS).contains(&fee_bps)) {
+                return Err(format!(
+                    "fee_bps must be 0 or in {}..={}, got `{}`",
+                    CAT_MIN_LIQUIDITY_FEE_BPS, CAT_MAX_LIQUIDITY_FEE_BPS, fee_bps
+                ));
+            }
+            let recipient_count = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT recipient count".to_string())? as usize;
+            if recipient_count > CAT_MAX_LIQUIDITY_RECIPIENTS {
+                return Err(format!("recipient_count above max `{CAT_MAX_LIQUIDITY_RECIPIENTS}`"));
+            }
+            if fee_bps == 0 && recipient_count != 0 {
+                return Err("recipient_count must be 0 when fee_bps is 0".to_string());
+            }
+            if fee_bps > 0 && !(1..=CAT_MAX_LIQUIDITY_RECIPIENTS).contains(&recipient_count) {
+                return Err("recipient_count must be 1 or 2 when fee_bps > 0".to_string());
+            }
+            let mut recipients = Vec::with_capacity(recipient_count);
+            for _ in 0..recipient_count {
+                recipients.push(parse_recipient_address(payload, &mut cursor)?);
+            }
+            if recipients.len() == 2 {
+                if recipients[0] == recipients[1] {
+                    return Err("duplicate liquidity recipients are not allowed".to_string());
+                }
+                if recipient_order_key(&recipients[0]) > recipient_order_key(&recipients[1]) {
+                    return Err("liquidity recipients must be canonically sorted".to_string());
+                }
+            }
+
+            let launch_buy_sompi = take_u64_le(payload, &mut cursor).ok_or_else(|| "truncated CAT launch buy sompi".to_string())?;
+            let launch_buy_min_token_out =
+                take_u128_le(payload, &mut cursor).ok_or_else(|| "truncated CAT launch buy min token out".to_string())?;
+            if launch_buy_sompi == 0 && launch_buy_min_token_out != 0 {
+                return Err("launch_buy_min_token_out must be 0 when launch_buy_sompi is 0".to_string());
+            }
+            if launch_buy_sompi > 0 && launch_buy_min_token_out == 0 {
+                return Err("launch_buy_min_token_out must be >0 when launch_buy_sompi is >0".to_string());
+            }
+
+            AtomicPayloadOp::CreateLiquidityAsset {
+                decimals,
+                max_supply,
+                name,
+                symbol,
+                metadata,
+                seed_reserve_sompi,
+                fee_bps,
+                recipients,
+                launch_buy_sompi,
+                launch_buy_min_token_out,
+            }
+        }
+        6 => {
+            let asset_id = take_32(payload, &mut cursor).ok_or_else(|| "truncated CAT asset_id".to_string())?;
+            let expected_pool_nonce =
+                take_u64_le(payload, &mut cursor).ok_or_else(|| "truncated CAT expected_pool_nonce".to_string())?;
+            if expected_pool_nonce == 0 {
+                return Err("buy expected_pool_nonce must be >= 1".to_string());
+            }
+            let cpay_in_sompi = take_u64_le(payload, &mut cursor).ok_or_else(|| "truncated CAT cpay in".to_string())?;
+            let min_token_out = take_u128_le(payload, &mut cursor).ok_or_else(|| "truncated CAT min token out".to_string())?;
+            if cpay_in_sompi == 0 {
+                return Err("buy cpay_in_sompi must be >0".to_string());
+            }
+            if min_token_out == 0 {
+                return Err("buy min_token_out must be >0".to_string());
+            }
+            AtomicPayloadOp::BuyLiquidityExactIn { asset_id, expected_pool_nonce, cpay_in_sompi, min_token_out }
+        }
+        7 => {
+            let asset_id = take_32(payload, &mut cursor).ok_or_else(|| "truncated CAT asset_id".to_string())?;
+            let expected_pool_nonce =
+                take_u64_le(payload, &mut cursor).ok_or_else(|| "truncated CAT expected_pool_nonce".to_string())?;
+            if expected_pool_nonce == 0 {
+                return Err("sell expected_pool_nonce must be >= 1".to_string());
+            }
+            let token_in = take_u128_le(payload, &mut cursor).ok_or_else(|| "truncated CAT token_in".to_string())?;
+            let min_cpay_out_sompi = take_u64_le(payload, &mut cursor).ok_or_else(|| "truncated CAT min cpay out".to_string())?;
+            let cpay_receive_output_index =
+                take_u16_le(payload, &mut cursor).ok_or_else(|| "truncated CAT cpay receive output index".to_string())?;
+            if token_in == 0 {
+                return Err("sell token_in must be >0".to_string());
+            }
+            if min_cpay_out_sompi == 0 {
+                return Err("sell min_cpay_out_sompi must be >0".to_string());
+            }
+            AtomicPayloadOp::SellLiquidityExactIn {
+                asset_id,
+                expected_pool_nonce,
+                token_in,
+                min_cpay_out_sompi,
+                cpay_receive_output_index,
+            }
+        }
+        8 => {
+            let asset_id = take_32(payload, &mut cursor).ok_or_else(|| "truncated CAT asset_id".to_string())?;
+            let expected_pool_nonce =
+                take_u64_le(payload, &mut cursor).ok_or_else(|| "truncated CAT expected_pool_nonce".to_string())?;
+            if expected_pool_nonce == 0 {
+                return Err("claim expected_pool_nonce must be >= 1".to_string());
+            }
+            let recipient_index = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT claim recipient index".to_string())?;
+            let claim_amount_sompi = take_u64_le(payload, &mut cursor).ok_or_else(|| "truncated CAT claim amount".to_string())?;
+            let claim_receive_output_index =
+                take_u16_le(payload, &mut cursor).ok_or_else(|| "truncated CAT claim receive output index".to_string())?;
+            if claim_amount_sompi == 0 {
+                return Err("claim amount must be >0".to_string());
+            }
+            AtomicPayloadOp::ClaimLiquidityFees {
+                asset_id,
+                expected_pool_nonce,
+                recipient_index,
+                claim_amount_sompi,
+                claim_receive_output_index,
+            }
+        }
         _ => unreachable!(),
     };
 
@@ -386,6 +603,59 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
     }
 
     Ok(Some(ParsedAtomicPayload { auth_input_index, nonce, op }))
+}
+
+fn parse_create_asset_common(
+    payload: &[u8],
+    cursor: &mut usize,
+) -> Result<(u8, AtomicPayloadSupplyMode, u128, [u8; 32], Vec<u8>, Vec<u8>, Vec<u8>), String> {
+    let decimals = take_u8(payload, cursor).ok_or_else(|| "truncated CAT decimals".to_string())?;
+    if decimals > CAT_MAX_DECIMALS {
+        return Err(format!("decimals `{decimals}` above max `{CAT_MAX_DECIMALS}`"));
+    }
+    let raw_supply_mode = take_u8(payload, cursor).ok_or_else(|| "truncated CAT supply mode".to_string())?;
+    let supply_mode = match raw_supply_mode {
+        0 => AtomicPayloadSupplyMode::Uncapped,
+        1 => AtomicPayloadSupplyMode::Capped,
+        _ => return Err(format!("invalid supply mode `{raw_supply_mode}`")),
+    };
+    let max_supply = take_u128_le(payload, cursor).ok_or_else(|| "truncated CAT max_supply".to_string())?;
+    let mint_authority_owner_id = take_32(payload, cursor).ok_or_else(|| "truncated CAT mint authority".to_string())?;
+    let name_len = take_u8(payload, cursor).ok_or_else(|| "truncated CAT name length".to_string())? as usize;
+    let symbol_len = take_u8(payload, cursor).ok_or_else(|| "truncated CAT symbol length".to_string())? as usize;
+    let metadata_len = take_u16_le(payload, cursor).ok_or_else(|| "truncated CAT metadata length".to_string())? as usize;
+    if name_len > CAT_MAX_NAME_LEN || symbol_len > CAT_MAX_SYMBOL_LEN || metadata_len > CAT_MAX_METADATA_LEN {
+        return Err("string field exceeds allowed length".to_string());
+    }
+    let name = take_vec(payload, cursor, name_len).ok_or_else(|| "truncated CAT name".to_string())?;
+    let symbol = take_vec(payload, cursor, symbol_len).ok_or_else(|| "truncated CAT symbol".to_string())?;
+    let metadata = take_vec(payload, cursor, metadata_len).ok_or_else(|| "truncated CAT metadata".to_string())?;
+    if std::str::from_utf8(&name).is_err() || std::str::from_utf8(&symbol).is_err() {
+        return Err("name/symbol must be valid utf-8".to_string());
+    }
+    match supply_mode {
+        AtomicPayloadSupplyMode::Capped if max_supply == 0 => return Err("capped assets require non-zero max_supply".to_string()),
+        AtomicPayloadSupplyMode::Uncapped if max_supply != 0 => return Err("uncapped assets must encode max_supply=0".to_string()),
+        _ => {}
+    }
+    Ok((decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata))
+}
+
+fn parse_recipient_address(payload: &[u8], cursor: &mut usize) -> Result<AtomicPayloadRecipientAddress, String> {
+    let address_version = take_u8(payload, cursor).ok_or_else(|| "truncated CAT recipient address version".to_string())?;
+    let expected_len = match address_version {
+        0 => 32usize,
+        1 => 33usize,
+        8 => 32usize,
+        _ => return Err(format!("unsupported recipient address_version `{address_version}`")),
+    };
+    let address_payload =
+        take_vec(payload, cursor, expected_len).ok_or_else(|| "truncated CAT recipient address payload".to_string())?;
+    Ok(AtomicPayloadRecipientAddress { address_version, address_payload })
+}
+
+fn recipient_order_key(recipient: &AtomicPayloadRecipientAddress) -> (u8, &[u8]) {
+    (recipient.address_version, recipient.address_payload.as_slice())
 }
 
 pub(crate) fn atomic_owner_id_from_script(script_public_key: &ScriptPublicKey) -> Option<[u8; 32]> {
@@ -402,12 +672,31 @@ pub(crate) fn atomic_owner_id_from_script(script_public_key: &ScriptPublicKey) -
     Some(owner_id)
 }
 
+pub(crate) fn atomic_owner_id_from_address_components(address_version: u8, address_payload: &[u8]) -> Option<[u8; 32]> {
+    let auth_scheme = match address_version {
+        0 if address_payload.len() == 32 => OWNER_AUTH_SCHEME_PUBKEY,
+        1 if address_payload.len() == 33 => OWNER_AUTH_SCHEME_PUBKEY_ECDSA,
+        8 if address_payload.len() == 32 => OWNER_AUTH_SCHEME_SCRIPT_HASH,
+        _ => return None,
+    };
+    let pubkey_len = u16::try_from(address_payload.len()).ok()?;
+    let mut hasher = Blake2bParams::new().hash_length(32).to_state();
+    hasher.update(CAT_OWNER_DOMAIN);
+    hasher.update(&[auth_scheme]);
+    hasher.update(&pubkey_len.to_le_bytes());
+    hasher.update(address_payload);
+    let hash = hasher.finalize();
+    let mut owner_id = [0u8; 32];
+    owner_id.copy_from_slice(hash.as_bytes());
+    Some(owner_id)
+}
+
 fn canonical_atomic_owner_identity(script_public_key: &ScriptPublicKey) -> Option<(u8, &[u8])> {
     let script_bytes = script_public_key.script();
     match ScriptClass::from_script(script_public_key) {
         ScriptClass::PubKey if script_bytes.len() == 34 => Some((OWNER_AUTH_SCHEME_PUBKEY, &script_bytes[1..33])),
         ScriptClass::PubKeyECDSA if script_bytes.len() == 35 => Some((OWNER_AUTH_SCHEME_PUBKEY_ECDSA, &script_bytes[1..34])),
-        ScriptClass::ScriptHash if script_bytes.len() == 34 => Some((OWNER_AUTH_SCHEME_SCRIPT_HASH, &script_bytes[2..34])),
+        ScriptClass::ScriptHash if script_bytes.len() == 35 => Some((OWNER_AUTH_SCHEME_SCRIPT_HASH, &script_bytes[2..34])),
         _ => None,
     }
 }
@@ -469,6 +758,14 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{params::MAINNET_PARAMS, processes::transaction_validator::TransactionValidator};
+
+    #[test]
+    fn atomic_owner_id_accepts_standard_p2sh_script() {
+        let script_public_key = cryptix_txscript::pay_to_script_hash_script(&[0x51]);
+
+        assert_eq!(script_public_key.script().len(), 35);
+        assert!(super::atomic_owner_id_from_script(&script_public_key).is_some());
+    }
 
     #[test]
     fn check_signature_test() {

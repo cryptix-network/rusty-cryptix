@@ -1,8 +1,10 @@
 use crate::{
     error::{AtomicTokenError, AtomicTokenResult},
+    liquidity_math::{calculate_trade_fee, cpmm_buy, cpmm_sell, LiquidityMathError, LIQUIDITY_MIN_PAYOUT_SOMPI},
     payload::{
-        parse_atomic_token_payload, ApplyStatus, CreateAssetOp, EventType, MintOp, NoopReason, ParsedTokenPayload, SupplyMode,
-        TokenOp, TokenOpCode,
+        parse_atomic_token_payload, ApplyStatus, BuyLiquidityExactInOp, ClaimLiquidityFeesOp, CreateAssetOp, CreateAssetWithMintOp,
+        CreateLiquidityAssetOp, EventType, LiquidityRecipientAddress, MintOp, NoopReason, ParsedTokenPayload, SellLiquidityExactInOp,
+        SupplyMode, TokenOp, TokenOpCode,
     },
 };
 use blake2b_simd::Params as Blake2bParams;
@@ -31,6 +33,13 @@ const SECTION_ANCHOR_COUNTS: u8 = 0xD1;
 const CAT_EVENT_DOMAIN: &[u8] = b"CAT_EVT_V1";
 const CAT_EVENT_INSTANCE_DOMAIN: &[u8] = b"CAT_EVT_INSTANCE_V1";
 pub const SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VaultTransition {
+    input_value: u64,
+    output_index: u32,
+    output_value: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,6 +114,7 @@ pub struct AtomicTokenReadView {
     pub nonces: HashMap<[u8; 32], u64>,
     pub anchor_counts: HashMap<[u8; 32], u64>,
     pub processed_ops: HashMap<BlockHash, ProcessedOp>,
+    pub known_owner_addresses: HashMap<[u8; 32], LiquidityHolderAddressState>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -154,10 +164,49 @@ pub struct BalanceKey {
     pub owner_id: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum TokenAssetClass {
+    #[default]
+    Standard,
+    Liquidity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiquidityFeeRecipientState {
+    pub owner_id: [u8; 32],
+    pub address_version: u8,
+    pub address_payload: Vec<u8>,
+    pub unclaimed_sompi: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiquidityHolderAddressState {
+    pub address_version: u8,
+    pub address_payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiquidityPoolState {
+    pub pool_nonce: u64,
+    pub remaining_pool_supply: u128,
+    pub curve_reserve_sompi: u64,
+    pub unclaimed_fee_total_sompi: u64,
+    pub fee_bps: u16,
+    pub fee_recipients: Vec<LiquidityFeeRecipientState>,
+    pub vault_outpoint: TransactionOutpoint,
+    pub vault_value_sompi: u64,
+    #[serde(default)]
+    pub holder_addresses: HashMap<[u8; 32], LiquidityHolderAddressState>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenAsset {
     pub asset_id: [u8; 32],
     pub creator_owner_id: [u8; 32],
+    #[serde(default)]
+    pub asset_class: TokenAssetClass,
     pub mint_authority_owner_id: [u8; 32],
     pub decimals: u8,
     pub supply_mode: SupplyMode,
@@ -172,6 +221,8 @@ pub struct TokenAsset {
     pub created_daa_score: Option<u64>,
     #[serde(default)]
     pub created_at: Option<u64>,
+    #[serde(default)]
+    pub liquidity: Option<LiquidityPoolState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +296,34 @@ impl JournalBuilder {
 #[derive(Clone)]
 struct AuthContext {
     owner_id: [u8; 32],
+    address_version: u8,
+    address_payload: Vec<u8>,
+}
+
+fn token_op_allows_liquidity_vault_output(op: &TokenOp) -> bool {
+    matches!(
+        op,
+        TokenOp::CreateLiquidityAsset(_)
+            | TokenOp::BuyLiquidityExactIn(_)
+            | TokenOp::SellLiquidityExactIn(_)
+            | TokenOp::ClaimLiquidityFees(_)
+    )
+}
+
+fn validate_liquidity_claim_authorization(claimant_owner_id: [u8; 32], recipient_owner_id: [u8; 32]) -> Result<(), NoopReason> {
+    if claimant_owner_id == recipient_owner_id {
+        Ok(())
+    } else {
+        Err(NoopReason::BadAuthInput)
+    }
+}
+
+fn validate_curve_reserve_against_outstanding_supply(total_supply: u128, curve_reserve_sompi: u64) -> Result<(), NoopReason> {
+    if total_supply > 0 && curve_reserve_sompi == 0 {
+        Err(NoopReason::InternalMalformedAcceptance)
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,6 +386,12 @@ pub struct AtomicTokenState {
     pub events: Vec<TokenEvent>,
     #[serde(skip, default)]
     event_ids: HashSet<[u8; 32]>,
+    #[serde(skip, default)]
+    payload_hf_activation_daa_score: u64,
+    #[serde(skip, default)]
+    liquidity_vault_outpoints: HashMap<TransactionOutpoint, [u8; 32]>,
+    #[serde(skip, default)]
+    known_owner_addresses: HashMap<[u8; 32], LiquidityHolderAddressState>,
 }
 
 impl AtomicTokenState {
@@ -328,6 +413,82 @@ impl AtomicTokenState {
             next_event_sequence: 0,
             events: Default::default(),
             event_ids: Default::default(),
+            payload_hf_activation_daa_score: 0,
+            liquidity_vault_outpoints: Default::default(),
+            known_owner_addresses: Default::default(),
+        }
+    }
+
+    pub fn set_payload_hf_activation_daa_score(&mut self, daa_score: u64) {
+        self.payload_hf_activation_daa_score = daa_score;
+    }
+
+    pub fn rebuild_runtime_caches(&mut self) {
+        self.rebuild_liquidity_vault_outpoint_index();
+        self.rebuild_known_owner_address_cache();
+    }
+
+    fn rebuild_liquidity_vault_outpoint_index(&mut self) {
+        self.liquidity_vault_outpoints.clear();
+        for (asset_id, asset) in self.assets.iter() {
+            let Some(pool) = asset.liquidity.as_ref() else {
+                continue;
+            };
+            if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+                continue;
+            }
+            self.liquidity_vault_outpoints.insert(pool.vault_outpoint, *asset_id);
+        }
+    }
+
+    fn rebuild_known_owner_address_cache(&mut self) {
+        self.known_owner_addresses.clear();
+        let mut remembered = Vec::new();
+        for asset in self.assets.values() {
+            let Some(pool) = asset.liquidity.as_ref() else {
+                continue;
+            };
+            for recipient in pool.fee_recipients.iter() {
+                remembered.push((
+                    recipient.owner_id,
+                    LiquidityHolderAddressState {
+                        address_version: recipient.address_version,
+                        address_payload: recipient.address_payload.clone(),
+                    },
+                ));
+            }
+            for (owner_id, holder) in pool.holder_addresses.iter() {
+                remembered.push((*owner_id, holder.clone()));
+            }
+        }
+        for (owner_id, holder) in remembered {
+            self.known_owner_addresses.entry(owner_id).or_insert(holder);
+        }
+    }
+
+    fn remember_owner_address(&mut self, owner_id: [u8; 32], address_version: u8, address_payload: &[u8]) {
+        self.known_owner_addresses
+            .entry(owner_id)
+            .or_insert_with(|| LiquidityHolderAddressState { address_version, address_payload: address_payload.to_vec() });
+    }
+
+    fn set_asset_state(&mut self, asset_id: [u8; 32], asset: TokenAsset) {
+        if let Some(previous_asset) = self.assets.insert(asset_id, asset.clone()) {
+            if let Some(previous_pool) = previous_asset.liquidity.as_ref() {
+                self.liquidity_vault_outpoints.remove(&previous_pool.vault_outpoint);
+            }
+        }
+
+        if matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+            if let Some(pool) = asset.liquidity.as_ref() {
+                self.liquidity_vault_outpoints.insert(pool.vault_outpoint, asset_id);
+                for recipient in pool.fee_recipients.iter() {
+                    self.remember_owner_address(recipient.owner_id, recipient.address_version, recipient.address_payload.as_slice());
+                }
+                for (owner_id, holder) in pool.holder_addresses.iter() {
+                    self.remember_owner_address(*owner_id, holder.address_version, holder.address_payload.as_slice());
+                }
+            }
         }
     }
 
@@ -397,7 +558,13 @@ impl AtomicTokenState {
             let mut journal = JournalBuilder::default();
             if !normalized.conflicting_txids.is_empty() {
                 for (ordinal, tx_ref) in normalized.refs.into_iter().enumerate() {
-                    self.insert_internal_malformed_noop(accepting_block_hash, &tx_ref, ordinal as u32, &mut journal);
+                    self.insert_internal_malformed_noop(
+                        accepting_block_hash,
+                        accepting_header.daa_score,
+                        &tx_ref,
+                        ordinal as u32,
+                        &mut journal,
+                    );
                 }
                 let state_hash = self.compute_state_hash();
                 self.block_journals.insert(accepting_block_hash, journal.into_block_journal());
@@ -479,6 +646,7 @@ impl AtomicTokenState {
                 }
             }
         }
+        self.rebuild_liquidity_vault_outpoint_index();
 
         for change in journal.changed_balances.iter().rev() {
             match change.old_value {
@@ -621,6 +789,9 @@ impl AtomicTokenState {
         journal: &mut JournalBuilder,
     ) {
         let tx = &tx_ref.tx;
+        if accepting_block_daa_score < self.payload_hf_activation_daa_score {
+            return;
+        }
         if !tx.subnetwork_id.is_payload() || tx.payload.is_empty() {
             return;
         }
@@ -636,7 +807,6 @@ impl AtomicTokenState {
 
         match parsed {
             Ok(parsed) => {
-                let details = self.build_event_details(tx, &parsed, auth_inputs);
                 let result = self.execute_parsed_op(
                     tx,
                     &parsed,
@@ -647,7 +817,7 @@ impl AtomicTokenState {
                     journal,
                 );
                 match result {
-                    Ok(()) => self.insert_processed(
+                    Ok(details) => self.insert_processed(
                         tx.id(),
                         accepting_block_hash,
                         ApplyStatus::Applied,
@@ -661,6 +831,7 @@ impl AtomicTokenState {
                         // Accepted CAT ops that fail execution semantics indicate
                         // consensus/index divergence. Fail closed.
                         self.mark_degraded();
+                        let details = self.build_event_details(tx, &parsed, auth_inputs);
                         self.insert_processed(
                             tx.id(),
                             accepting_block_hash,
@@ -701,15 +872,35 @@ impl AtomicTokenState {
         accepting_block_daa_score: u64,
         accepting_block_time: u64,
         journal: &mut JournalBuilder,
-    ) -> Result<(), NoopReason> {
+    ) -> Result<TokenEventDetails, NoopReason> {
+        let spent_vault_inputs = self.collect_spent_liquidity_vault_inputs(tx, auth_inputs)?;
+        let liquidity_vault_output_count = tx
+            .outputs
+            .iter()
+            .filter(|output| matches!(ScriptClass::from_script(&output.script_public_key), ScriptClass::LiquidityVault))
+            .count();
         let auth_context = self.resolve_auth_context(tx, parsed.header.auth_input_index, auth_inputs)?;
         let owner_id = auth_context.owner_id;
+        self.remember_owner_address(owner_id, auth_context.address_version, auth_context.address_payload.as_slice());
         let expected_nonce = self.nonces.get(&owner_id).copied().unwrap_or(1);
         if parsed.header.nonce != expected_nonce {
             return Err(NoopReason::BadNonce);
         }
+        if !spent_vault_inputs.is_empty() {
+            match &parsed.op {
+                TokenOp::BuyLiquidityExactIn(_) | TokenOp::SellLiquidityExactIn(_) | TokenOp::ClaimLiquidityFees(_) => {}
+                _ => return Err(NoopReason::VaultInputCount),
+            }
+        }
+        if matches!(parsed.op, TokenOp::CreateLiquidityAsset(_)) && !spent_vault_inputs.is_empty() {
+            return Err(NoopReason::VaultInputCount);
+        }
+        if liquidity_vault_output_count > 0 && !token_op_allows_liquidity_vault_output(&parsed.op) {
+            return Err(NoopReason::VaultOutputCount);
+        }
         self.validate_replacement_anchor(tx, &auth_context, auth_inputs)?;
 
+        let mut details = self.build_event_details(tx, parsed, auth_inputs);
         match &parsed.op {
             TokenOp::CreateAsset(op) => self.execute_create_asset(
                 tx.id().as_bytes(),
@@ -720,14 +911,42 @@ impl AtomicTokenState {
                 accepting_block_time,
                 journal,
             )?,
+            TokenOp::CreateAssetWithMint(op) => self.execute_create_asset_with_mint(
+                tx.id().as_bytes(),
+                owner_id,
+                op,
+                accepting_block_hash,
+                accepting_block_daa_score,
+                accepting_block_time,
+                journal,
+            )?,
+            TokenOp::CreateLiquidityAsset(op) => {
+                let token_out = self.execute_create_liquidity_asset(
+                    tx,
+                    &auth_context,
+                    op,
+                    accepting_block_hash,
+                    accepting_block_daa_score,
+                    accepting_block_time,
+                    journal,
+                )?;
+                details.to_owner_id = (token_out > 0).then_some(owner_id);
+                details.amount = (token_out > 0).then_some(token_out);
+            }
             TokenOp::Transfer(op) => self.execute_transfer(owner_id, op.asset_id, op.to_owner_id, op.amount, journal)?,
             TokenOp::Mint(op) => self.execute_mint(owner_id, op, journal)?,
             TokenOp::Burn(op) => self.execute_burn(owner_id, op.asset_id, op.amount, journal)?,
+            TokenOp::BuyLiquidityExactIn(op) => {
+                let token_out = self.execute_buy_liquidity(tx, &auth_context, op, auth_inputs, journal)?;
+                details.amount = Some(token_out);
+            }
+            TokenOp::SellLiquidityExactIn(op) => self.execute_sell_liquidity(tx, owner_id, op, auth_inputs, journal)?,
+            TokenOp::ClaimLiquidityFees(op) => self.execute_claim_liquidity_fees(tx, owner_id, op, auth_inputs, journal)?,
         }
 
         self.record_nonce_before(owner_id, journal);
         self.nonces.insert(owner_id, expected_nonce + 1);
-        Ok(())
+        Ok(details)
     }
 
     fn validate_replacement_anchor(
@@ -829,11 +1048,12 @@ impl AtomicTokenState {
         }
 
         self.record_asset_before(txid_bytes, journal);
-        self.assets.insert(
+        self.set_asset_state(
             txid_bytes,
             TokenAsset {
                 asset_id: txid_bytes,
                 creator_owner_id,
+                asset_class: TokenAssetClass::Standard,
                 mint_authority_owner_id: op.mint_authority_owner_id,
                 decimals: op.decimals,
                 supply_mode: op.supply_mode,
@@ -845,8 +1065,45 @@ impl AtomicTokenState {
                 created_block_hash: Some(accepting_block_hash),
                 created_daa_score: Some(accepting_block_daa_score),
                 created_at: Some(accepting_block_time),
+                liquidity: None,
             },
         );
+        Ok(())
+    }
+
+    fn execute_create_asset_with_mint(
+        &mut self,
+        txid_bytes: [u8; 32],
+        creator_owner_id: [u8; 32],
+        op: &CreateAssetWithMintOp,
+        accepting_block_hash: BlockHash,
+        accepting_block_daa_score: u64,
+        accepting_block_time: u64,
+        journal: &mut JournalBuilder,
+    ) -> Result<(), NoopReason> {
+        let create = CreateAssetOp {
+            decimals: op.decimals,
+            supply_mode: op.supply_mode,
+            max_supply: op.max_supply,
+            mint_authority_owner_id: op.mint_authority_owner_id,
+            name: op.name.clone(),
+            symbol: op.symbol.clone(),
+            metadata: op.metadata.clone(),
+        };
+        self.execute_create_asset(
+            txid_bytes,
+            creator_owner_id,
+            &create,
+            accepting_block_hash,
+            accepting_block_daa_score,
+            accepting_block_time,
+            journal,
+        )?;
+
+        if op.initial_mint_amount > 0 {
+            let mint = MintOp { asset_id: txid_bytes, to_owner_id: op.initial_mint_to_owner_id, amount: op.initial_mint_amount };
+            self.execute_mint(op.mint_authority_owner_id, &mint, journal)?;
+        }
         Ok(())
     }
 
@@ -862,8 +1119,10 @@ impl AtomicTokenState {
             return Err(NoopReason::InvalidAmount);
         }
 
-        if !self.assets.contains_key(&asset_id) {
-            return Err(NoopReason::AssetNotFound);
+        let mut asset = self.assets.get(&asset_id).cloned().ok_or(NoopReason::AssetNotFound)?;
+        let is_liquidity_asset = matches!(asset.asset_class, TokenAssetClass::Liquidity);
+        if is_liquidity_asset {
+            self.validate_liquidity_invariants(&asset)?;
         }
 
         let from_key = BalanceKey { asset_id, owner_id: from_owner_id };
@@ -892,6 +1151,18 @@ impl AtomicTokenState {
         }
 
         self.balances.insert(to_key, receiver_after);
+        if is_liquidity_asset {
+            let mut asset_changed = false;
+            if let Some(pool) = asset.liquidity.as_mut() {
+                if sender_after == 0 && pool.holder_addresses.remove(&from_owner_id).is_some() {
+                    asset_changed = true;
+                }
+            }
+            if asset_changed {
+                self.record_asset_before(asset_id, journal);
+                self.set_asset_state(asset_id, asset);
+            }
+        }
         Ok(())
     }
 
@@ -901,6 +1172,9 @@ impl AtomicTokenState {
         }
 
         let mut asset = self.assets.get(&op.asset_id).cloned().ok_or(NoopReason::AssetNotFound)?;
+        if matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+            return Err(NoopReason::LegacyOpForLiquidityAsset);
+        }
         if asset.mint_authority_owner_id != sender_owner_id {
             return Err(NoopReason::UnauthorizedMint);
         }
@@ -918,7 +1192,7 @@ impl AtomicTokenState {
         self.record_balance_before(receiver_key, journal);
 
         asset.total_supply = new_total_supply;
-        self.assets.insert(op.asset_id, asset);
+        self.set_asset_state(op.asset_id, asset);
         self.balances.insert(receiver_key, receiver_after);
         Ok(())
     }
@@ -935,6 +1209,9 @@ impl AtomicTokenState {
         }
 
         let mut asset = self.assets.get(&asset_id).cloned().ok_or(NoopReason::AssetNotFound)?;
+        if matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+            return Err(NoopReason::LegacyOpForLiquidityAsset);
+        }
         let sender_key = BalanceKey { asset_id, owner_id: sender_owner_id };
         let sender_balance = self.balances.get(&sender_key).copied().unwrap_or(0);
 
@@ -945,11 +1222,500 @@ impl AtomicTokenState {
         self.record_balance_before(sender_key, journal);
 
         asset.total_supply = supply_after;
-        self.assets.insert(asset_id, asset);
+        self.set_asset_state(asset_id, asset);
         if sender_after == 0 {
             self.balances.remove(&sender_key);
         } else {
             self.balances.insert(sender_key, sender_after);
+        }
+        Ok(())
+    }
+
+    fn execute_create_liquidity_asset(
+        &mut self,
+        tx: &Transaction,
+        creator_auth: &AuthContext,
+        op: &CreateLiquidityAssetOp,
+        accepting_block_hash: BlockHash,
+        accepting_block_daa_score: u64,
+        accepting_block_time: u64,
+        journal: &mut JournalBuilder,
+    ) -> Result<u128, NoopReason> {
+        let creator_owner_id = creator_auth.owner_id;
+        let asset_id = tx.id().as_bytes();
+        if self.assets.contains_key(&asset_id) {
+            return Err(NoopReason::AssetAlreadyExists);
+        }
+        if op.seed_reserve_sompi == 0 {
+            return Err(NoopReason::InvalidAmount);
+        }
+
+        let (vault_output_index, vault_output_value) = self.resolve_create_liquidity_vault_output(tx)?;
+        let expected_vault_value = op.seed_reserve_sompi.checked_add(op.launch_buy_sompi).ok_or(NoopReason::SupplyOverflow)?;
+        if vault_output_value != expected_vault_value {
+            return Err(NoopReason::VaultOutpointMismatch);
+        }
+
+        let mut fee_recipients = self.build_fee_recipient_state(&op.recipients)?;
+        let mut remaining_pool_supply = op.max_supply;
+        let mut curve_reserve_sompi = op.seed_reserve_sompi;
+        let mut unclaimed_fee_total_sompi = 0u64;
+        let mut total_supply = 0u128;
+        let mut holder_addresses: HashMap<[u8; 32], LiquidityHolderAddressState> = HashMap::new();
+
+        if op.launch_buy_sompi > 0 {
+            let fee_trade = calculate_trade_fee(op.launch_buy_sompi, op.fee_bps).map_err(map_liquidity_math_error)?;
+            let launch_buy_net = op.launch_buy_sompi.checked_sub(fee_trade).ok_or(NoopReason::SupplyUnderflow)?;
+            let (token_out, new_remaining_pool_supply, new_curve_reserve_sompi) =
+                cpmm_buy(remaining_pool_supply, curve_reserve_sompi, launch_buy_net).map_err(map_liquidity_math_error)?;
+            if token_out < op.launch_buy_min_token_out {
+                return Err(NoopReason::MinOutViolation);
+            }
+            remaining_pool_supply = new_remaining_pool_supply;
+            curve_reserve_sompi = new_curve_reserve_sompi;
+            self.apply_fee_to_pool(&mut fee_recipients, &mut unclaimed_fee_total_sompi, fee_trade)?;
+            total_supply = token_out;
+
+            let receiver_key = BalanceKey { asset_id, owner_id: creator_owner_id };
+            self.record_balance_before(receiver_key, journal);
+            let receiver_balance = self.balances.get(&receiver_key).copied().unwrap_or(0);
+            let receiver_after = receiver_balance.checked_add(token_out).ok_or(NoopReason::BalanceOverflow)?;
+            self.balances.insert(receiver_key, receiver_after);
+            holder_addresses.insert(
+                creator_owner_id,
+                LiquidityHolderAddressState {
+                    address_version: creator_auth.address_version,
+                    address_payload: creator_auth.address_payload.clone(),
+                },
+            );
+        }
+
+        self.record_asset_before(asset_id, journal);
+        let asset = TokenAsset {
+            asset_id,
+            creator_owner_id,
+            asset_class: TokenAssetClass::Liquidity,
+            mint_authority_owner_id: [0u8; 32],
+            decimals: op.decimals,
+            supply_mode: SupplyMode::Capped,
+            max_supply: op.max_supply,
+            total_supply,
+            name: op.name.clone(),
+            symbol: op.symbol.clone(),
+            metadata: op.metadata.clone(),
+            created_block_hash: Some(accepting_block_hash),
+            created_daa_score: Some(accepting_block_daa_score),
+            created_at: Some(accepting_block_time),
+            liquidity: Some(LiquidityPoolState {
+                pool_nonce: 1,
+                remaining_pool_supply,
+                curve_reserve_sompi,
+                unclaimed_fee_total_sompi,
+                fee_bps: op.fee_bps,
+                fee_recipients,
+                vault_outpoint: TransactionOutpoint::new(tx.id(), vault_output_index),
+                vault_value_sompi: vault_output_value,
+                holder_addresses,
+            }),
+        };
+        self.validate_liquidity_invariants(&asset)?;
+        self.set_asset_state(asset_id, asset);
+        Ok(total_supply)
+    }
+
+    fn execute_buy_liquidity(
+        &mut self,
+        tx: &Transaction,
+        buyer_auth: &AuthContext,
+        op: &BuyLiquidityExactInOp,
+        auth_inputs: &HashMap<TransactionOutpoint, UtxoEntry>,
+        journal: &mut JournalBuilder,
+    ) -> Result<u128, NoopReason> {
+        let buyer_owner_id = buyer_auth.owner_id;
+        let mut asset = self.assets.get(&op.asset_id).cloned().ok_or(NoopReason::AssetNotFound)?;
+        if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+            return Err(NoopReason::LegacyOpForLiquidityAsset);
+        }
+        let mut pool = asset.liquidity.clone().ok_or(NoopReason::AssetNotFound)?;
+        if pool.pool_nonce != op.expected_pool_nonce {
+            return Err(NoopReason::NonceStale);
+        }
+        let vault_transition = self.resolve_liquidity_vault_transition(tx, auth_inputs, pool.vault_outpoint)?;
+        let vault_delta =
+            vault_transition.output_value.checked_sub(vault_transition.input_value).ok_or(NoopReason::SupplyUnderflow)?;
+        if vault_delta != op.cpay_in_sompi {
+            return Err(NoopReason::VaultOutpointMismatch);
+        }
+
+        let fee_trade = calculate_trade_fee(op.cpay_in_sompi, pool.fee_bps).map_err(map_liquidity_math_error)?;
+        let net_in = op.cpay_in_sompi.checked_sub(fee_trade).ok_or(NoopReason::SupplyUnderflow)?;
+        let (token_out, new_remaining_pool_supply, new_curve_reserve_sompi) =
+            cpmm_buy(pool.remaining_pool_supply, pool.curve_reserve_sompi, net_in).map_err(map_liquidity_math_error)?;
+        if token_out < op.min_token_out {
+            return Err(NoopReason::MinOutViolation);
+        }
+
+        self.record_asset_before(op.asset_id, journal);
+        let receiver_key = BalanceKey { asset_id: op.asset_id, owner_id: buyer_owner_id };
+        self.record_balance_before(receiver_key, journal);
+
+        pool.remaining_pool_supply = new_remaining_pool_supply;
+        pool.curve_reserve_sompi = new_curve_reserve_sompi;
+        self.apply_fee_to_pool(&mut pool.fee_recipients, &mut pool.unclaimed_fee_total_sompi, fee_trade)?;
+        pool.vault_outpoint = TransactionOutpoint::new(tx.id(), vault_transition.output_index);
+        pool.vault_value_sompi = vault_transition.output_value;
+        pool.pool_nonce = pool.pool_nonce.checked_add(1).ok_or(NoopReason::SupplyOverflow)?;
+        pool.holder_addresses.insert(
+            buyer_owner_id,
+            LiquidityHolderAddressState {
+                address_version: buyer_auth.address_version,
+                address_payload: buyer_auth.address_payload.clone(),
+            },
+        );
+
+        let receiver_balance = self.balances.get(&receiver_key).copied().unwrap_or(0);
+        let receiver_after = receiver_balance.checked_add(token_out).ok_or(NoopReason::BalanceOverflow)?;
+        self.balances.insert(receiver_key, receiver_after);
+
+        asset.total_supply = asset.total_supply.checked_add(token_out).ok_or(NoopReason::SupplyOverflow)?;
+        asset.liquidity = Some(pool);
+        self.validate_liquidity_invariants(&asset)?;
+        self.set_asset_state(op.asset_id, asset);
+        Ok(token_out)
+    }
+
+    fn execute_sell_liquidity(
+        &mut self,
+        tx: &Transaction,
+        seller_owner_id: [u8; 32],
+        op: &SellLiquidityExactInOp,
+        auth_inputs: &HashMap<TransactionOutpoint, UtxoEntry>,
+        journal: &mut JournalBuilder,
+    ) -> Result<(), NoopReason> {
+        let mut asset = self.assets.get(&op.asset_id).cloned().ok_or(NoopReason::AssetNotFound)?;
+        if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+            return Err(NoopReason::LegacyOpForLiquidityAsset);
+        }
+        let mut pool = asset.liquidity.clone().ok_or(NoopReason::AssetNotFound)?;
+        if pool.pool_nonce != op.expected_pool_nonce {
+            return Err(NoopReason::NonceStale);
+        }
+
+        let sender_key = BalanceKey { asset_id: op.asset_id, owner_id: seller_owner_id };
+        let sender_balance = self.balances.get(&sender_key).copied().unwrap_or(0);
+        let sender_after = sender_balance.checked_sub(op.token_in).ok_or(NoopReason::InsufficientBalance)?;
+        let supply_after = asset.total_supply.checked_sub(op.token_in).ok_or(NoopReason::SupplyUnderflow)?;
+
+        let (gross_out, new_remaining_pool_supply, new_curve_reserve_sompi) =
+            cpmm_sell(pool.remaining_pool_supply, pool.curve_reserve_sompi, op.token_in).map_err(map_liquidity_math_error)?;
+        let fee_trade = calculate_trade_fee(gross_out, pool.fee_bps).map_err(map_liquidity_math_error)?;
+        let cpay_out = gross_out.checked_sub(fee_trade).ok_or(NoopReason::SupplyUnderflow)?;
+        if cpay_out == 0 {
+            return Err(NoopReason::ZeroOutput);
+        }
+        if cpay_out < op.min_cpay_out_sompi {
+            return Err(NoopReason::MinOutViolation);
+        }
+        if cpay_out < LIQUIDITY_MIN_PAYOUT_SOMPI {
+            return Err(NoopReason::InvalidAmount);
+        }
+        validate_curve_reserve_against_outstanding_supply(supply_after, new_curve_reserve_sompi)?;
+
+        self.validate_payout_output(tx, op.cpay_receive_output_index, cpay_out, None)?;
+        let vault_transition = self.resolve_liquidity_vault_transition(tx, auth_inputs, pool.vault_outpoint)?;
+        let vault_delta =
+            vault_transition.input_value.checked_sub(vault_transition.output_value).ok_or(NoopReason::SupplyUnderflow)?;
+        if vault_delta != cpay_out {
+            return Err(NoopReason::VaultOutpointMismatch);
+        }
+
+        self.record_asset_before(op.asset_id, journal);
+        self.record_balance_before(sender_key, journal);
+
+        pool.remaining_pool_supply = new_remaining_pool_supply;
+        pool.curve_reserve_sompi = new_curve_reserve_sompi;
+        self.apply_fee_to_pool(&mut pool.fee_recipients, &mut pool.unclaimed_fee_total_sompi, fee_trade)?;
+        pool.vault_outpoint = TransactionOutpoint::new(tx.id(), vault_transition.output_index);
+        pool.vault_value_sompi = vault_transition.output_value;
+        pool.pool_nonce = pool.pool_nonce.checked_add(1).ok_or(NoopReason::SupplyOverflow)?;
+
+        if sender_after == 0 {
+            self.balances.remove(&sender_key);
+            pool.holder_addresses.remove(&seller_owner_id);
+        } else {
+            self.balances.insert(sender_key, sender_after);
+        }
+
+        asset.total_supply = supply_after;
+        asset.liquidity = Some(pool);
+        self.validate_liquidity_invariants(&asset)?;
+        self.set_asset_state(op.asset_id, asset);
+        Ok(())
+    }
+
+    fn execute_claim_liquidity_fees(
+        &mut self,
+        tx: &Transaction,
+        claimant_owner_id: [u8; 32],
+        op: &ClaimLiquidityFeesOp,
+        auth_inputs: &HashMap<TransactionOutpoint, UtxoEntry>,
+        journal: &mut JournalBuilder,
+    ) -> Result<(), NoopReason> {
+        let mut asset = self.assets.get(&op.asset_id).cloned().ok_or(NoopReason::AssetNotFound)?;
+        if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+            return Err(NoopReason::LegacyOpForLiquidityAsset);
+        }
+        let mut pool = asset.liquidity.clone().ok_or(NoopReason::AssetNotFound)?;
+        if pool.pool_nonce != op.expected_pool_nonce {
+            return Err(NoopReason::NonceStale);
+        }
+        if op.claim_amount_sompi < LIQUIDITY_MIN_PAYOUT_SOMPI {
+            return Err(NoopReason::InvalidAmount);
+        }
+        let recipient_index = usize::from(op.recipient_index);
+        if recipient_index >= pool.fee_recipients.len() {
+            return Err(NoopReason::BadLength);
+        }
+        let recipient_owner_id = pool.fee_recipients[recipient_index].owner_id;
+        let recipient_unclaimed = pool.fee_recipients[recipient_index].unclaimed_sompi;
+        if recipient_unclaimed < op.claim_amount_sompi {
+            return Err(NoopReason::InsufficientBalance);
+        }
+        validate_liquidity_claim_authorization(claimant_owner_id, recipient_owner_id)?;
+
+        self.validate_payout_output(tx, op.claim_receive_output_index, op.claim_amount_sompi, Some(recipient_owner_id))?;
+        let vault_transition = self.resolve_liquidity_vault_transition(tx, auth_inputs, pool.vault_outpoint)?;
+        let vault_delta =
+            vault_transition.input_value.checked_sub(vault_transition.output_value).ok_or(NoopReason::SupplyUnderflow)?;
+        if vault_delta != op.claim_amount_sompi {
+            return Err(NoopReason::VaultOutpointMismatch);
+        }
+
+        self.record_asset_before(op.asset_id, journal);
+
+        pool.fee_recipients[recipient_index].unclaimed_sompi = recipient_unclaimed - op.claim_amount_sompi;
+        pool.unclaimed_fee_total_sompi =
+            pool.unclaimed_fee_total_sompi.checked_sub(op.claim_amount_sompi).ok_or(NoopReason::SupplyUnderflow)?;
+        pool.vault_outpoint = TransactionOutpoint::new(tx.id(), vault_transition.output_index);
+        pool.vault_value_sompi = vault_transition.output_value;
+        pool.pool_nonce = pool.pool_nonce.checked_add(1).ok_or(NoopReason::SupplyOverflow)?;
+
+        asset.liquidity = Some(pool);
+        self.validate_liquidity_invariants(&asset)?;
+        self.set_asset_state(op.asset_id, asset);
+        Ok(())
+    }
+
+    fn collect_spent_liquidity_vault_inputs(
+        &self,
+        tx: &Transaction,
+        auth_inputs: &HashMap<TransactionOutpoint, UtxoEntry>,
+    ) -> Result<Vec<([u8; 32], TransactionOutpoint)>, NoopReason> {
+        let mut spent = Vec::new();
+        for input in tx.inputs.iter() {
+            let entry = auth_inputs.get(&input.previous_outpoint).ok_or(NoopReason::BadAuthInput)?;
+            if !matches!(ScriptClass::from_script(&entry.script_public_key), ScriptClass::LiquidityVault) {
+                continue;
+            }
+            let Some(asset_id) = self.find_liquidity_asset_by_vault_outpoint(input.previous_outpoint)? else {
+                return Err(NoopReason::VaultOutpointMismatch);
+            };
+            spent.push((asset_id, input.previous_outpoint));
+        }
+        Ok(spent)
+    }
+
+    fn find_liquidity_asset_by_vault_outpoint(&self, outpoint: TransactionOutpoint) -> Result<Option<[u8; 32]>, NoopReason> {
+        if let Some(asset_id) = self.liquidity_vault_outpoints.get(&outpoint).copied() {
+            let asset = self.assets.get(&asset_id).ok_or(NoopReason::InternalMalformedAcceptance)?;
+            let pool = asset.liquidity.as_ref().ok_or(NoopReason::InternalMalformedAcceptance)?;
+            if !matches!(asset.asset_class, TokenAssetClass::Liquidity) || pool.vault_outpoint != outpoint {
+                return Err(NoopReason::InternalMalformedAcceptance);
+            }
+            return Ok(Some(asset_id));
+        }
+
+        let mut matched = None;
+        for (asset_id, asset) in self.assets.iter() {
+            let Some(pool) = asset.liquidity.as_ref() else {
+                continue;
+            };
+            if !matches!(asset.asset_class, TokenAssetClass::Liquidity) || pool.vault_outpoint != outpoint {
+                continue;
+            }
+            if matched.replace(*asset_id).is_some() {
+                return Err(NoopReason::InternalMalformedAcceptance);
+            }
+        }
+        Ok(matched)
+    }
+
+    fn resolve_create_liquidity_vault_output(&self, tx: &Transaction) -> Result<(u32, u64), NoopReason> {
+        let mut found: Option<(u32, u64)> = None;
+        for (index, output) in tx.outputs.iter().enumerate() {
+            if !matches!(ScriptClass::from_script(&output.script_public_key), ScriptClass::LiquidityVault) {
+                continue;
+            }
+            let out_index = u32::try_from(index).map_err(|_| NoopReason::BadLength)?;
+            if found.is_some() {
+                return Err(NoopReason::VaultOutputCount);
+            }
+            found = Some((out_index, output.value));
+        }
+        found.ok_or(NoopReason::VaultOutputCount)
+    }
+
+    fn resolve_liquidity_vault_transition(
+        &self,
+        tx: &Transaction,
+        auth_inputs: &HashMap<TransactionOutpoint, UtxoEntry>,
+        expected_vault_outpoint: TransactionOutpoint,
+    ) -> Result<VaultTransition, NoopReason> {
+        let mut input_value = None;
+        for input in tx.inputs.iter() {
+            let Some(entry) = auth_inputs.get(&input.previous_outpoint) else {
+                continue;
+            };
+            if !matches!(ScriptClass::from_script(&entry.script_public_key), ScriptClass::LiquidityVault) {
+                continue;
+            }
+            if input_value.is_some() {
+                return Err(NoopReason::VaultInputCount);
+            }
+            if input.previous_outpoint != expected_vault_outpoint {
+                return Err(NoopReason::VaultOutpointMismatch);
+            }
+            input_value = Some(entry.amount);
+        }
+        let input_value = input_value.ok_or(NoopReason::VaultInputCount)?;
+
+        let mut output = None;
+        for (index, tx_output) in tx.outputs.iter().enumerate() {
+            if !matches!(ScriptClass::from_script(&tx_output.script_public_key), ScriptClass::LiquidityVault) {
+                continue;
+            }
+            if output.is_some() {
+                return Err(NoopReason::VaultOutputCount);
+            }
+            let out_index = u32::try_from(index).map_err(|_| NoopReason::BadLength)?;
+            output = Some((out_index, tx_output.value));
+        }
+        let (output_index, output_value) = output.ok_or(NoopReason::VaultOutputCount)?;
+        Ok(VaultTransition { input_value, output_index, output_value })
+    }
+
+    fn build_fee_recipient_state(
+        &self,
+        recipients: &[LiquidityRecipientAddress],
+    ) -> Result<Vec<LiquidityFeeRecipientState>, NoopReason> {
+        let mut out = Vec::with_capacity(recipients.len());
+        for recipient in recipients {
+            let owner_id = self
+                .owner_id_from_address_components(recipient.address_version, recipient.address_payload.as_slice())
+                .ok_or(NoopReason::RecipientEncodingInvalid)?;
+            out.push(LiquidityFeeRecipientState {
+                owner_id,
+                address_version: recipient.address_version,
+                address_payload: recipient.address_payload.clone(),
+                unclaimed_sompi: 0,
+            });
+        }
+        Ok(out)
+    }
+
+    fn owner_id_from_address_components(&self, address_version: u8, address_payload: &[u8]) -> Option<[u8; 32]> {
+        let auth_scheme = match address_version {
+            0 if address_payload.len() == 32 => OWNER_AUTH_SCHEME_PUBKEY,
+            1 if address_payload.len() == 33 => OWNER_AUTH_SCHEME_PUBKEY_ECDSA,
+            8 if address_payload.len() == 32 => OWNER_AUTH_SCHEME_SCRIPT_HASH,
+            _ => return None,
+        };
+        let pubkey_len = u16::try_from(address_payload.len()).ok()?;
+        let mut hasher = Blake2bParams::new().hash_length(32).to_state();
+        hasher.update(CAT_OWNER_DOMAIN);
+        hasher.update(&[auth_scheme]);
+        hasher.update(&pubkey_len.to_le_bytes());
+        hasher.update(address_payload);
+        let hash = hasher.finalize();
+        let mut owner_id = [0u8; 32];
+        owner_id.copy_from_slice(hash.as_bytes());
+        Some(owner_id)
+    }
+
+    fn apply_fee_to_pool(
+        &self,
+        recipients: &mut [LiquidityFeeRecipientState],
+        unclaimed_fee_total_sompi: &mut u64,
+        fee_trade: u64,
+    ) -> Result<(), NoopReason> {
+        if fee_trade == 0 {
+            return Ok(());
+        }
+        *unclaimed_fee_total_sompi = unclaimed_fee_total_sompi.checked_add(fee_trade).ok_or(NoopReason::SupplyOverflow)?;
+        match recipients.len() {
+            0 => Err(NoopReason::BadLiquidityRecipientCount),
+            1 => {
+                recipients[0].unclaimed_sompi =
+                    recipients[0].unclaimed_sompi.checked_add(fee_trade).ok_or(NoopReason::SupplyOverflow)?;
+                Ok(())
+            }
+            2 => {
+                let fee0 = fee_trade / 2;
+                let fee1 = fee_trade - fee0;
+                recipients[0].unclaimed_sompi = recipients[0].unclaimed_sompi.checked_add(fee0).ok_or(NoopReason::SupplyOverflow)?;
+                recipients[1].unclaimed_sompi = recipients[1].unclaimed_sompi.checked_add(fee1).ok_or(NoopReason::SupplyOverflow)?;
+                Ok(())
+            }
+            _ => Err(NoopReason::BadLiquidityRecipientCount),
+        }
+    }
+
+    fn validate_liquidity_invariants(&self, asset: &TokenAsset) -> Result<(), NoopReason> {
+        if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+            return Ok(());
+        }
+        let pool = asset.liquidity.as_ref().ok_or(NoopReason::AssetNotFound)?;
+        validate_curve_reserve_against_outstanding_supply(asset.total_supply, pool.curve_reserve_sompi)?;
+        let expected_vault = pool.curve_reserve_sompi.checked_add(pool.unclaimed_fee_total_sompi).ok_or(NoopReason::SupplyOverflow)?;
+        if pool.vault_value_sompi != expected_vault {
+            return Err(NoopReason::InternalMalformedAcceptance);
+        }
+        let expected_total = asset.total_supply.checked_add(pool.remaining_pool_supply).ok_or(NoopReason::SupplyOverflow)?;
+        if expected_total != asset.max_supply {
+            return Err(NoopReason::InternalMalformedAcceptance);
+        }
+        for (holder_owner_id, holder_address) in pool.holder_addresses.iter() {
+            let derived_owner_id = self
+                .owner_id_from_address_components(holder_address.address_version, holder_address.address_payload.as_slice())
+                .ok_or(NoopReason::InternalMalformedAcceptance)?;
+            if &derived_owner_id != holder_owner_id {
+                return Err(NoopReason::InternalMalformedAcceptance);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_payout_output(
+        &self,
+        tx: &Transaction,
+        output_index: u16,
+        expected_value: u64,
+        expected_owner_id: Option<[u8; 32]>,
+    ) -> Result<(), NoopReason> {
+        let output = tx.outputs.get(output_index as usize).ok_or(NoopReason::BadLength)?;
+        if output.value != expected_value {
+            return Err(NoopReason::InvalidAmount);
+        }
+        let class = ScriptClass::from_script(&output.script_public_key);
+        if !matches!(class, ScriptClass::PubKey | ScriptClass::PubKeyECDSA | ScriptClass::ScriptHash) {
+            return Err(NoopReason::PayoutScriptClassInvalid);
+        }
+        if let Some(owner_id) = expected_owner_id {
+            let payout_owner_id =
+                self.owner_id_from_script_if_whitelisted(&output.script_public_key).ok_or(NoopReason::BadAuthInput)?;
+            if payout_owner_id != owner_id {
+                return Err(NoopReason::BadAuthInput);
+            }
         }
         Ok(())
     }
@@ -990,6 +1756,41 @@ impl AtomicTokenState {
                 to_owner_id: None,
                 amount: Some(op.amount),
             },
+            TokenOp::CreateAssetWithMint(op) => TokenEventDetails {
+                op_type: Some(TokenOpCode::CreateAssetWithMint),
+                asset_id: Some(tx.id().as_bytes()),
+                from_owner_id,
+                to_owner_id: if op.initial_mint_amount > 0 { Some(op.initial_mint_to_owner_id) } else { None },
+                amount: if op.initial_mint_amount > 0 { Some(op.initial_mint_amount) } else { None },
+            },
+            TokenOp::CreateLiquidityAsset(op) => TokenEventDetails {
+                op_type: Some(TokenOpCode::CreateLiquidityAsset),
+                asset_id: Some(tx.id().as_bytes()),
+                from_owner_id,
+                to_owner_id: None,
+                amount: Some(op.launch_buy_min_token_out),
+            },
+            TokenOp::BuyLiquidityExactIn(op) => TokenEventDetails {
+                op_type: Some(TokenOpCode::BuyLiquidityExactIn),
+                asset_id: Some(op.asset_id),
+                from_owner_id,
+                to_owner_id: from_owner_id,
+                amount: Some(op.min_token_out),
+            },
+            TokenOp::SellLiquidityExactIn(op) => TokenEventDetails {
+                op_type: Some(TokenOpCode::SellLiquidityExactIn),
+                asset_id: Some(op.asset_id),
+                from_owner_id,
+                to_owner_id: None,
+                amount: Some(op.token_in),
+            },
+            TokenOp::ClaimLiquidityFees(op) => TokenEventDetails {
+                op_type: Some(TokenOpCode::ClaimLiquidityFees),
+                asset_id: Some(op.asset_id),
+                from_owner_id,
+                to_owner_id: None,
+                amount: Some(u128::from(op.claim_amount_sompi)),
+            },
         }
     }
 
@@ -1021,7 +1822,11 @@ impl AtomicTokenState {
 
         let outpoint = tx.inputs[auth_idx].previous_outpoint;
         let entry = auth_inputs.get(&outpoint).ok_or(NoopReason::BadAuthInput)?;
-        Ok(AuthContext { owner_id: self.owner_id_from_script(&entry.script_public_key)? })
+        let owner_id = self.owner_id_from_script(&entry.script_public_key)?;
+        let (auth_scheme, canonical_pubkey_bytes) =
+            self.canonical_owner_identity(&entry.script_public_key).ok_or(NoopReason::BadAuthInput)?;
+        let address_version = self.address_version_from_auth_scheme(auth_scheme).ok_or(NoopReason::BadAuthInput)?;
+        Ok(AuthContext { owner_id, address_version, address_payload: canonical_pubkey_bytes.to_vec() })
     }
 
     fn owner_id_from_script(&self, script_public_key: &ScriptPublicKey) -> Result<[u8; 32], NoopReason> {
@@ -1047,7 +1852,16 @@ impl AtomicTokenState {
         match ScriptClass::from_script(script_public_key) {
             ScriptClass::PubKey if script_bytes.len() == 34 => Some((OWNER_AUTH_SCHEME_PUBKEY, &script_bytes[1..33])),
             ScriptClass::PubKeyECDSA if script_bytes.len() == 35 => Some((OWNER_AUTH_SCHEME_PUBKEY_ECDSA, &script_bytes[1..34])),
-            ScriptClass::ScriptHash if script_bytes.len() == 34 => Some((OWNER_AUTH_SCHEME_SCRIPT_HASH, &script_bytes[2..34])),
+            ScriptClass::ScriptHash if script_bytes.len() == 35 => Some((OWNER_AUTH_SCHEME_SCRIPT_HASH, &script_bytes[2..34])),
+            _ => None,
+        }
+    }
+
+    fn address_version_from_auth_scheme(&self, auth_scheme: u8) -> Option<u8> {
+        match auth_scheme {
+            OWNER_AUTH_SCHEME_PUBKEY => Some(0),
+            OWNER_AUTH_SCHEME_PUBKEY_ECDSA => Some(1),
+            OWNER_AUTH_SCHEME_SCRIPT_HASH => Some(8),
             _ => None,
         }
     }
@@ -1087,11 +1901,15 @@ impl AtomicTokenState {
     fn insert_internal_malformed_noop(
         &mut self,
         accepting_block_hash: BlockHash,
+        accepting_block_daa_score: u64,
         tx_ref: &CanonicalTxRef,
         ordinal: u32,
         journal: &mut JournalBuilder,
     ) {
         let tx = &tx_ref.tx;
+        if accepting_block_daa_score < self.payload_hf_activation_daa_score {
+            return;
+        }
         if self.processed_ops.contains_key(&tx.id()) {
             return;
         }
@@ -1247,6 +2065,7 @@ impl AtomicTokenState {
                 nonces: self.nonces.clone(),
                 anchor_counts: self.anchor_counts.clone(),
                 processed_ops: self.processed_ops.clone(),
+                known_owner_addresses: self.known_owner_addresses.clone(),
             };
         }
         AtomicTokenReadView {
@@ -1260,6 +2079,7 @@ impl AtomicTokenState {
             nonces: self.nonces.clone(),
             anchor_counts: self.anchor_counts.clone(),
             processed_ops: self.processed_ops.clone(),
+            known_owner_addresses: self.known_owner_addresses.clone(),
         }
     }
 
@@ -1336,6 +2156,7 @@ impl AtomicTokenState {
             nonces,
             anchor_counts,
             processed_ops,
+            known_owner_addresses: self.known_owner_addresses.clone(),
         })
     }
 
@@ -1563,6 +2384,8 @@ impl AtomicTokenState {
         self.events = Vec::new();
         self.event_ids.clear();
         self.block_journals = journals_in_window.into_iter().collect();
+        self.rebuild_liquidity_vault_outpoint_index();
+        self.rebuild_known_owner_address_cache();
         if self.compute_state_hash() != expected_state_hash_at_fp {
             return Err(AtomicTokenError::Processing(
                 "snapshot import failed: state hash mismatch at snapshot at_block_hash".to_string(),
@@ -1691,6 +2514,7 @@ impl AtomicTokenState {
             if let Some(asset) = self.assets.get(&asset_id) {
                 hasher.update(&asset.asset_id);
                 hasher.update(&asset.creator_owner_id);
+                hasher.update(&[asset.asset_class as u8]);
                 hasher.update(&asset.mint_authority_owner_id);
                 hasher.update(&[asset.decimals]);
                 hasher.update(&[asset.supply_mode as u8]);
@@ -1702,6 +2526,38 @@ impl AtomicTokenState {
                 hasher.update(&asset.symbol);
                 hasher.update(&(asset.metadata.len() as u16).to_le_bytes());
                 hasher.update(&asset.metadata);
+                if let Some(pool) = asset.liquidity.as_ref() {
+                    hasher.update(&[1u8]);
+                    hasher.update(&pool.pool_nonce.to_le_bytes());
+                    hasher.update(&pool.remaining_pool_supply.to_le_bytes());
+                    hasher.update(&pool.curve_reserve_sompi.to_le_bytes());
+                    hasher.update(&pool.unclaimed_fee_total_sompi.to_le_bytes());
+                    hasher.update(&pool.fee_bps.to_le_bytes());
+                    hasher.update(&(pool.fee_recipients.len() as u8).to_le_bytes());
+                    for recipient in pool.fee_recipients.iter() {
+                        hasher.update(&recipient.owner_id);
+                        hasher.update(&[recipient.address_version]);
+                        hasher.update(&[recipient.address_payload.len() as u8]);
+                        hasher.update(&recipient.address_payload);
+                        hasher.update(&recipient.unclaimed_sompi.to_le_bytes());
+                    }
+                    let mut holder_ids: Vec<[u8; 32]> = pool.holder_addresses.keys().copied().collect();
+                    holder_ids.sort_unstable();
+                    hasher.update(&(holder_ids.len() as u32).to_le_bytes());
+                    for holder_id in holder_ids {
+                        if let Some(holder_address) = pool.holder_addresses.get(&holder_id) {
+                            hasher.update(&holder_id);
+                            hasher.update(&[holder_address.address_version]);
+                            hasher.update(&[holder_address.address_payload.len() as u8]);
+                            hasher.update(&holder_address.address_payload);
+                        }
+                    }
+                    hasher.update(&pool.vault_outpoint.transaction_id.as_bytes());
+                    hasher.update(&pool.vault_outpoint.index.to_le_bytes());
+                    hasher.update(&pool.vault_value_sompi.to_le_bytes());
+                } else {
+                    hasher.update(&[0u8]);
+                }
             }
         }
     }
@@ -1747,6 +2603,15 @@ impl AtomicTokenState {
                 hasher.update(&anchor_count.to_le_bytes());
             }
         }
+    }
+}
+
+fn map_liquidity_math_error(err: LiquidityMathError) -> NoopReason {
+    match err {
+        LiquidityMathError::Overflow => NoopReason::SupplyOverflow,
+        LiquidityMathError::InvalidInput => NoopReason::InvalidAmount,
+        LiquidityMathError::InvalidState => NoopReason::InternalMalformedAcceptance,
+        LiquidityMathError::ZeroOutput => NoopReason::ZeroOutput,
     }
 }
 
@@ -1836,10 +2701,68 @@ mod tests {
         payload
     }
 
+    fn payload_create_liquidity(
+        auth_input_index: u16,
+        nonce: u64,
+        max_supply: u128,
+        seed_reserve_sompi: u64,
+        launch_buy_sompi: u64,
+        launch_buy_min_token_out: u128,
+    ) -> Vec<u8> {
+        let mut payload = base_header(TokenOpCode::CreateLiquidityAsset, auth_input_index, nonce);
+        payload.push(8);
+        payload.extend_from_slice(&max_supply.to_le_bytes());
+        payload.push(4);
+        payload.push(3);
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(b"Pool");
+        payload.extend_from_slice(b"POL");
+        payload.extend_from_slice(&seed_reserve_sompi.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&launch_buy_sompi.to_le_bytes());
+        payload.extend_from_slice(&launch_buy_min_token_out.to_le_bytes());
+        payload
+    }
+
+    fn payload_buy_liquidity(
+        auth_input_index: u16,
+        nonce: u64,
+        asset_id: [u8; 32],
+        expected_pool_nonce: u64,
+        cpay_in_sompi: u64,
+        min_token_out: u128,
+    ) -> Vec<u8> {
+        let mut payload = base_header(TokenOpCode::BuyLiquidityExactIn, auth_input_index, nonce);
+        payload.extend_from_slice(&asset_id);
+        payload.extend_from_slice(&expected_pool_nonce.to_le_bytes());
+        payload.extend_from_slice(&cpay_in_sompi.to_le_bytes());
+        payload.extend_from_slice(&min_token_out.to_le_bytes());
+        payload
+    }
+
+    fn liquidity_vault_script() -> ScriptPublicKey {
+        ScriptPublicKey::new(0, ScriptVec::from_slice(&[0x04, b'C', b'L', b'V', b'1', 0x75, 0x51]))
+    }
+
     fn token_tx(previous_outpoint: TransactionOutpoint, output_script: ScriptPublicKey, payload: Vec<u8>) -> Transaction {
         let input = TransactionInput::new(previous_outpoint, vec![], 0, 1);
         let output = TransactionOutput::new(1, output_script);
         let mut tx = Transaction::new(TX_VERSION, vec![input], vec![output], 0, SUBNETWORK_ID_PAYLOAD, 0, payload);
+        tx.finalize();
+        tx
+    }
+
+    fn tx_with_inputs_outputs(
+        inputs: Vec<(TransactionOutpoint, u8)>,
+        outputs: Vec<TransactionOutput>,
+        payload: Vec<u8>,
+    ) -> Transaction {
+        let inputs = inputs
+            .into_iter()
+            .map(|(previous_outpoint, sig_op_count)| TransactionInput::new(previous_outpoint, vec![], 0, sig_op_count))
+            .collect();
+        let mut tx = Transaction::new(TX_VERSION, inputs, outputs, 0, SUBNETWORK_ID_PAYLOAD, 0, payload);
         tx.finalize();
         tx
     }
@@ -1867,6 +2790,28 @@ mod tests {
     }
 
     #[test]
+    fn pre_hf_cat_payloads_are_ignored() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        state.set_payload_hf_activation_daa_score(10);
+
+        let owner_script = test_script(7);
+        let owner_id = owner_id(&state, &owner_script);
+        let outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(1234), 0);
+        let payload = payload_create_asset(0, 1, 8, owner_id, b"PreHF", b"PHF", b"");
+        let tx = token_tx(outpoint, owner_script.clone(), payload);
+        let txid = tx.id();
+
+        let mut auth_inputs = HashMap::new();
+        auth_inputs.insert(outpoint, UtxoEntry::new(1000, owner_script, 0, false));
+
+        apply_block(&mut state, BlockHash::from_u64_word(4321), vec![tx_ref(tx, BlockHash::from_u64_word(4000), 0, 0)], &auth_inputs);
+
+        assert!(!state.processed_ops.contains_key(&txid));
+        assert!(!state.assets.contains_key(&hash_bytes(txid)));
+        assert_eq!(state.next_event_sequence, 0);
+    }
+
+    #[test]
     fn conformance_state_hash_golden_vector() {
         let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
         let asset_id = [0x11; 32];
@@ -1878,6 +2823,7 @@ mod tests {
             TokenAsset {
                 asset_id,
                 creator_owner_id: creator,
+                asset_class: TokenAssetClass::Standard,
                 mint_authority_owner_id: authority,
                 decimals: 8,
                 supply_mode: SupplyMode::Uncapped,
@@ -1889,6 +2835,7 @@ mod tests {
                 created_block_hash: None,
                 created_daa_score: None,
                 created_at: None,
+                liquidity: None,
             },
         );
         state.balances.insert(BalanceKey { asset_id, owner_id: owner }, 900);
@@ -1896,7 +2843,7 @@ mod tests {
 
         let hash = state.compute_state_hash();
         let hash_hex = to_hex(&hash);
-        assert_eq!(hash_hex, "dd6828acea650a8bbb967ae9648517c7ef71b93b0752697a4330abb1214fa359");
+        assert_eq!(hash_hex, "3f815fcb6d5526385d145f3a0beece30c0db2b834bc545da407b3eec9d3f5aab");
     }
 
     #[test]
@@ -1907,6 +2854,268 @@ mod tests {
         state.anchor_counts.insert(owner, 2);
         let after = state.compute_state_hash();
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn state_hash_commits_liquidity_holder_addresses() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let asset_id = [0x10; 32];
+        let creator_owner = [0x20; 32];
+        let holder_owner = [0x30; 32];
+        let mut holder_addresses = HashMap::new();
+        holder_addresses.insert(holder_owner, LiquidityHolderAddressState { address_version: 0, address_payload: vec![0x44; 32] });
+
+        state.assets.insert(
+            asset_id,
+            TokenAsset {
+                asset_id,
+                creator_owner_id: creator_owner,
+                asset_class: TokenAssetClass::Liquidity,
+                mint_authority_owner_id: [0u8; 32],
+                decimals: 8,
+                supply_mode: SupplyMode::Capped,
+                max_supply: 1_000,
+                total_supply: 100,
+                name: b"Liquidity".to_vec(),
+                symbol: b"LIQ".to_vec(),
+                metadata: vec![],
+                created_block_hash: None,
+                created_daa_score: None,
+                created_at: None,
+                liquidity: Some(LiquidityPoolState {
+                    pool_nonce: 1,
+                    remaining_pool_supply: 900,
+                    curve_reserve_sompi: 1_000_000,
+                    unclaimed_fee_total_sompi: 0,
+                    fee_bps: 0,
+                    fee_recipients: vec![],
+                    vault_outpoint: TransactionOutpoint::new(BlockHash::from_u64_word(7), 0),
+                    vault_value_sompi: 1_000_000,
+                    holder_addresses,
+                }),
+            },
+        );
+        let before = state.compute_state_hash();
+
+        let asset = state.assets.get_mut(&asset_id).expect("asset should exist");
+        let pool = asset.liquidity.as_mut().expect("liquidity should exist");
+        pool.holder_addresses
+            .insert(holder_owner, LiquidityHolderAddressState { address_version: 0, address_payload: vec![0x55; 32] });
+
+        let after = state.compute_state_hash();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn owner_id_accepts_standard_p2sh_script() {
+        let state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let script = cryptix_txscript::pay_to_script_hash_script(&[0x51]);
+
+        assert_eq!(script.script().len(), 35);
+        assert!(state.owner_id_from_script(&script).is_ok());
+    }
+
+    #[test]
+    fn liquidity_create_and_buy_events_record_actual_outputs() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let owner_script = test_script(7);
+        let owner = owner_id(&state, &owner_script);
+        let max_supply = 1_000u128;
+        let seed_reserve_sompi = 1_000u64;
+        let launch_buy_sompi = 100u64;
+        let launch_min = 1u128;
+        let launch_token_out = cpmm_buy(max_supply, seed_reserve_sompi, launch_buy_sompi).expect("launch quote should work").0;
+
+        let create_auth_outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(1), 0);
+        let create_payload = payload_create_liquidity(0, 1, max_supply, seed_reserve_sompi, launch_buy_sompi, launch_min);
+        let create_tx = tx_with_inputs_outputs(
+            vec![(create_auth_outpoint, 1)],
+            vec![
+                TransactionOutput::new(seed_reserve_sompi + launch_buy_sompi, liquidity_vault_script()),
+                TransactionOutput::new(1, owner_script.clone()),
+            ],
+            create_payload,
+        );
+        let asset_id = hash_bytes(create_tx.id());
+
+        let mut create_auth_inputs = HashMap::new();
+        create_auth_inputs.insert(create_auth_outpoint, UtxoEntry::new(10_000, owner_script.clone(), 0, false));
+        apply_block(
+            &mut state,
+            BlockHash::from_u64_word(10),
+            vec![tx_ref(create_tx.clone(), BlockHash::from_u64_word(9), 0, 0)],
+            &create_auth_inputs,
+        );
+
+        let create_event = state.events.last().expect("create event should be recorded");
+        assert_eq!(create_event.details.op_type, Some(TokenOpCode::CreateLiquidityAsset));
+        assert_eq!(create_event.details.to_owner_id, Some(owner));
+        assert_eq!(create_event.details.amount, Some(launch_token_out));
+        assert_ne!(create_event.details.amount, Some(launch_min));
+
+        let pool = state.assets.get(&asset_id).and_then(|asset| asset.liquidity.clone()).expect("pool should exist");
+        let buy_in_sompi = 100u64;
+        let buy_token_out =
+            cpmm_buy(pool.remaining_pool_supply, pool.curve_reserve_sompi, buy_in_sompi).expect("buy quote should work").0;
+        let buy_auth_outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(2), 0);
+        let buy_payload = payload_buy_liquidity(1, 2, asset_id, pool.pool_nonce, buy_in_sompi, 1);
+        let buy_tx = tx_with_inputs_outputs(
+            vec![(pool.vault_outpoint, 0), (buy_auth_outpoint, 1)],
+            vec![
+                TransactionOutput::new(pool.vault_value_sompi + buy_in_sompi, liquidity_vault_script()),
+                TransactionOutput::new(1, owner_script.clone()),
+            ],
+            buy_payload,
+        );
+
+        let mut buy_auth_inputs = HashMap::new();
+        buy_auth_inputs.insert(pool.vault_outpoint, UtxoEntry::new(pool.vault_value_sompi, liquidity_vault_script(), 0, false));
+        buy_auth_inputs.insert(buy_auth_outpoint, UtxoEntry::new(10_000, owner_script, 0, false));
+        apply_block(
+            &mut state,
+            BlockHash::from_u64_word(11),
+            vec![tx_ref(buy_tx, BlockHash::from_u64_word(10), 0, 0)],
+            &buy_auth_inputs,
+        );
+
+        let buy_event = state.events.last().expect("buy event should be recorded");
+        assert_eq!(buy_event.details.op_type, Some(TokenOpCode::BuyLiquidityExactIn));
+        assert_eq!(buy_event.details.amount, Some(buy_token_out));
+        assert_ne!(buy_event.details.amount, Some(1));
+    }
+
+    #[test]
+    fn liquidity_invariants_reject_mismatched_holder_owner_id() {
+        let state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let asset_id = [0xAA; 32];
+        let creator_owner = [0xBB; 32];
+        let wrong_owner = [0xCC; 32];
+
+        let mut holder_addresses = HashMap::new();
+        holder_addresses.insert(wrong_owner, LiquidityHolderAddressState { address_version: 0, address_payload: vec![0x99; 32] });
+
+        let asset = TokenAsset {
+            asset_id,
+            creator_owner_id: creator_owner,
+            asset_class: TokenAssetClass::Liquidity,
+            mint_authority_owner_id: [0u8; 32],
+            decimals: 8,
+            supply_mode: SupplyMode::Capped,
+            max_supply: 500,
+            total_supply: 100,
+            name: b"LiqX".to_vec(),
+            symbol: b"LX".to_vec(),
+            metadata: vec![],
+            created_block_hash: None,
+            created_daa_score: None,
+            created_at: None,
+            liquidity: Some(LiquidityPoolState {
+                pool_nonce: 1,
+                remaining_pool_supply: 400,
+                curve_reserve_sompi: 50_000,
+                unclaimed_fee_total_sompi: 0,
+                fee_bps: 0,
+                fee_recipients: vec![],
+                vault_outpoint: TransactionOutpoint::new(BlockHash::from_u64_word(8), 0),
+                vault_value_sompi: 50_000,
+                holder_addresses,
+            }),
+        };
+
+        let err = state.validate_liquidity_invariants(&asset).expect_err("invariants should fail");
+        assert_eq!(err, NoopReason::InternalMalformedAcceptance);
+    }
+
+    #[test]
+    fn liquidity_invariants_reject_zero_curve_reserve_with_outstanding_supply() {
+        let state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let asset = TokenAsset {
+            asset_id: [0xAB; 32],
+            creator_owner_id: [0xBC; 32],
+            asset_class: TokenAssetClass::Liquidity,
+            mint_authority_owner_id: [0u8; 32],
+            decimals: 8,
+            supply_mode: SupplyMode::Capped,
+            max_supply: 500,
+            total_supply: 1,
+            name: b"LiqY".to_vec(),
+            symbol: b"LY".to_vec(),
+            metadata: vec![],
+            created_block_hash: None,
+            created_daa_score: None,
+            created_at: None,
+            liquidity: Some(LiquidityPoolState {
+                pool_nonce: 1,
+                remaining_pool_supply: 499,
+                curve_reserve_sompi: 0,
+                unclaimed_fee_total_sompi: 0,
+                fee_bps: 0,
+                fee_recipients: vec![],
+                vault_outpoint: TransactionOutpoint::new(BlockHash::from_u64_word(9), 0),
+                vault_value_sompi: 0,
+                holder_addresses: HashMap::new(),
+            }),
+        };
+
+        let err = state.validate_liquidity_invariants(&asset).expect_err("invariants should fail");
+        assert_eq!(err, NoopReason::InternalMalformedAcceptance);
+    }
+
+    #[test]
+    fn liquidity_claim_authorization_requires_matching_owner() {
+        assert!(validate_liquidity_claim_authorization([0x10; 32], [0x10; 32]).is_ok());
+        assert_eq!(validate_liquidity_claim_authorization([0x10; 32], [0x20; 32]), Err(NoopReason::BadAuthInput));
+    }
+
+    #[test]
+    fn liquidity_transfer_is_allowed_for_liquidity_assets() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let asset_id = [0xD1; 32];
+        let sender_address_payload = vec![0x77; 32];
+        let sender_owner =
+            state.owner_id_from_address_components(0, sender_address_payload.as_slice()).expect("sender owner id should derive");
+        let recipient_owner = [0xD3; 32];
+        let mut holder_addresses = HashMap::new();
+        holder_addresses
+            .insert(sender_owner, LiquidityHolderAddressState { address_version: 0, address_payload: sender_address_payload });
+
+        state.assets.insert(
+            asset_id,
+            TokenAsset {
+                asset_id,
+                creator_owner_id: sender_owner,
+                asset_class: TokenAssetClass::Liquidity,
+                mint_authority_owner_id: [0u8; 32],
+                decimals: 8,
+                supply_mode: SupplyMode::Capped,
+                max_supply: 1_000,
+                total_supply: 100,
+                name: b"Liquidity".to_vec(),
+                symbol: b"LIQ".to_vec(),
+                metadata: vec![],
+                created_block_hash: None,
+                created_daa_score: None,
+                created_at: None,
+                liquidity: Some(LiquidityPoolState {
+                    pool_nonce: 1,
+                    remaining_pool_supply: 900,
+                    curve_reserve_sompi: 50_000,
+                    unclaimed_fee_total_sompi: 0,
+                    fee_bps: 0,
+                    fee_recipients: vec![],
+                    vault_outpoint: TransactionOutpoint::new(BlockHash::from_u64_word(10), 0),
+                    vault_value_sompi: 50_000,
+                    holder_addresses,
+                }),
+            },
+        );
+        state.balances.insert(BalanceKey { asset_id, owner_id: sender_owner }, 100);
+
+        let mut journal = JournalBuilder::default();
+        state.execute_transfer(sender_owner, asset_id, recipient_owner, 25, &mut journal).expect("liquidity transfer should succeed");
+
+        assert_eq!(state.balances.get(&BalanceKey { asset_id, owner_id: sender_owner }), Some(&75));
+        assert_eq!(state.balances.get(&BalanceKey { asset_id, owner_id: recipient_owner }), Some(&25));
     }
 
     #[test]

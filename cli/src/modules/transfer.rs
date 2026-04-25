@@ -42,7 +42,7 @@ impl Transfer {
         let notifier: GenerationNotifier = Arc::new(move |_ptx| {
             // tprintln!(ctx_, "Sending transaction: {}", ptx.id());
         });
-        let (summary, _ids, _fast_summary) = account
+        let (summary, ids, _fast_summary) = account
             .send(
                 outputs.into(),
                 priority_fee_sompi.into(),
@@ -57,6 +57,20 @@ impl Transfer {
             .await?;
 
         tprintln!(ctx, "Transfer - {summary}");
+        tprintln!(
+            ctx,
+            "Transferring {} CPAY to account `{}`, tx ids:",
+            sompi_to_cryptix_string(amount_sompi),
+            target_account.name_with_id()
+        );
+        if ids.is_empty() {
+            tprintln!(ctx, "  (none)");
+        } else {
+            for id in ids {
+                tprintln!(ctx, "  {id}");
+            }
+        }
+        tprintln!(ctx);
 
         Ok(())
     }

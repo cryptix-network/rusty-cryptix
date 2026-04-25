@@ -1,5 +1,7 @@
 use crate::imports::*;
 
+const DEFAULT_PUBLIC_BORSH_ENDPOINT: &str = "45.145.225.141:19301";
+
 #[derive(Default, Handler)]
 #[help("Connect to a Cryptix network")]
 pub struct Connect;
@@ -11,21 +13,27 @@ impl Connect {
             let network_id = ctx.wallet().network_id()?;
 
             let arg_or_server_address = argv.first().cloned().or_else(|| ctx.wallet().settings().get(WalletSettings::Server));
-            let (is_public, url) = match arg_or_server_address.as_deref() {
+            let (is_default_seed, url) = match arg_or_server_address.as_deref() {
                 Some("public") => {
-                    tprintln!(ctx, "Connecting to a public node");
-                    (true, Resolver::default().fetch(WrpcEncoding::Borsh, network_id).await.map_err(|e| e.to_string())?.url)
+                    let url = wrpc_client
+                        .parse_url_with_network_type(DEFAULT_PUBLIC_BORSH_ENDPOINT.to_string(), network_id.into())
+                        .map_err(|e| e.to_string())?;
+                    tprintln!(ctx, "Connecting to default public seed: {url}");
+                    (true, url)
                 }
                 None => {
-                    tprintln!(ctx, "No server set, connecting to a public node");
-                    (true, Resolver::default().fetch(WrpcEncoding::Borsh, network_id).await.map_err(|e| e.to_string())?.url)
+                    let url = wrpc_client
+                        .parse_url_with_network_type(DEFAULT_PUBLIC_BORSH_ENDPOINT.to_string(), network_id.into())
+                        .map_err(|e| e.to_string())?;
+                    tprintln!(ctx, "No server set, connecting to default public seed: {url}");
+                    (true, url)
                 }
                 Some(url) => {
                     (false, wrpc_client.parse_url_with_network_type(url.to_string(), network_id.into()).map_err(|e| e.to_string())?)
                 }
             };
 
-            if is_public {
+            if is_default_seed {
                 static WARNING: AtomicBool = AtomicBool::new(false);
                 if !WARNING.load(Ordering::Relaxed) {
                     WARNING.store(true, Ordering::Relaxed);
@@ -48,10 +56,10 @@ impl Connect {
             let options = ConnectOptions {
                 block_async_connect: true,
                 strategy: ConnectStrategy::Fallback,
-                url: Some(url),
+                url: Some(url.clone()),
                 ..Default::default()
             };
-            wrpc_client.connect(Some(options)).await.map_err(|e| e.to_string())?;
+            wrpc_client.connect(Some(options)).await.map_err(|e| format!("Unable to connect to {url}: {e}"))?;
         } else {
             terrorln!(ctx, "Unable to connect with non-wRPC client");
         }

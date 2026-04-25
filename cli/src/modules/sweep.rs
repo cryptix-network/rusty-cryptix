@@ -12,7 +12,7 @@ impl Sweep {
         let (wallet_secret, payment_secret) = ctx.ask_wallet_secret(Some(&account)).await?;
         let abortable = Abortable::default();
         // let ctx_ = ctx.clone();
-        let (summary, _ids) = account
+        let (summary, ids) = account
             .sweep(
                 wallet_secret,
                 payment_secret,
@@ -24,6 +24,15 @@ impl Sweep {
             .await?;
 
         tprintln!(ctx, "Sweep: {summary}");
+        tprintln!(ctx, "tx ids:");
+        if ids.is_empty() {
+            tprintln!(ctx, "  (none)");
+        } else {
+            for id in ids {
+                tprintln!(ctx, "  {id}");
+            }
+        }
+        tprintln!(ctx);
 
         Ok(())
     }

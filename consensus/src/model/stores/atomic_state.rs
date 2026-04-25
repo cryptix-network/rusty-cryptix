@@ -1,3 +1,4 @@
+use cryptix_consensus_core::tx::TransactionOutpoint;
 use cryptix_consensus_core::BlockHasher;
 use cryptix_database::prelude::CachePolicy;
 use cryptix_database::prelude::StoreError;
@@ -24,12 +25,43 @@ pub enum AtomicSupplyMode {
     Capped,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AtomicAssetClass {
+    #[default]
+    Standard,
+    Liquidity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AtomicLiquidityFeeRecipientState {
+    pub owner_id: [u8; 32],
+    pub address_version: u8,
+    pub address_payload: Vec<u8>,
+    pub unclaimed_sompi: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AtomicLiquidityPoolState {
+    pub pool_nonce: u64,
+    pub remaining_pool_supply: u128,
+    pub curve_reserve_sompi: u64,
+    pub unclaimed_fee_total_sompi: u64,
+    pub fee_bps: u16,
+    pub fee_recipients: Vec<AtomicLiquidityFeeRecipientState>,
+    pub vault_outpoint: TransactionOutpoint,
+    pub vault_value_sompi: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AtomicAssetState {
+    #[serde(default)]
+    pub asset_class: AtomicAssetClass,
     pub mint_authority_owner_id: [u8; 32],
     pub supply_mode: AtomicSupplyMode,
     pub max_supply: u128,
     pub total_supply: u128,
+    #[serde(default)]
+    pub liquidity: Option<AtomicLiquidityPoolState>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -42,6 +74,23 @@ pub struct AtomicConsensusState {
     pub balances: HashMap<AtomicBalanceKey, u128>,
     #[serde(default)]
     pub anchor_counts: HashMap<[u8; 32], u64>,
+    #[serde(default)]
+    pub liquidity_vault_outpoints: HashMap<TransactionOutpoint, [u8; 32]>,
+}
+
+impl AtomicConsensusState {
+    pub fn rebuild_liquidity_vault_outpoint_index(&mut self) {
+        self.liquidity_vault_outpoints.clear();
+        for (asset_id, asset) in self.assets.iter() {
+            let Some(pool) = asset.liquidity.as_ref() else {
+                continue;
+            };
+            if !matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
+                continue;
+            }
+            self.liquidity_vault_outpoints.insert(pool.vault_outpoint, *asset_id);
+        }
+    }
 }
 
 pub trait AtomicStateStoreReader {
@@ -60,11 +109,29 @@ struct AtomicConsensusStateEntry(Arc<AtomicConsensusState>);
 impl MemSizeEstimator for AtomicConsensusStateEntry {
     fn estimate_mem_bytes(&self) -> usize {
         let state = self.0.as_ref();
+        let liquidity_heap: usize = state
+            .assets
+            .values()
+            .map(|asset| {
+                asset
+                    .liquidity
+                    .as_ref()
+                    .map(|pool| {
+                        pool.fee_recipients
+                            .iter()
+                            .map(|recipient| size_of::<AtomicLiquidityFeeRecipientState>() + recipient.address_payload.len())
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0)
+            })
+            .sum();
         size_of::<Self>()
             + state.next_nonces.len() * (size_of::<[u8; 32]>() + size_of::<u64>())
             + state.assets.len() * (size_of::<[u8; 32]>() + size_of::<AtomicAssetState>())
             + state.balances.len() * (size_of::<AtomicBalanceKey>() + size_of::<u128>())
             + state.anchor_counts.len() * (size_of::<[u8; 32]>() + size_of::<u64>())
+            + state.liquidity_vault_outpoints.len() * (size_of::<TransactionOutpoint>() + size_of::<[u8; 32]>())
+            + liquidity_heap
     }
 }
 

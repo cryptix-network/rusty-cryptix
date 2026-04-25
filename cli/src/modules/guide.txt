@@ -2,9 +2,10 @@ Before you start, you must configure the default network setting.  There are cur
 3 networks available.  `mainnet`, `testnet` and `devnet`.  If you wish to experiment,
 you should select `testnet` by entering `network testnet`
 
-The `server` command configures the target server.  You can connect to any Rusty Cryptix
-node that has wRPC enabled with `--rpclisten-borsh=0.0.0.0`. If the server setting 
-is set to 'public' the node will connect to the public node infrastructure.
+The `server` command configures the target server. You can connect to any Rusty Cryptix
+node that has wRPC enabled with `--rpclisten-borsh=0.0.0.0`.
+If the server setting is set to `public` (or unset), `connect` uses the default public seed
+`45.145.225.141:19301` (wRPC Borsh).
 
 Both network and server values are stored in the application settings and are 
 used when running a local node or connecting to a remote node.
@@ -40,6 +41,15 @@ command to enable specific event notification.
 the selected account to an account named 'pete' (starts with a 'p' letter)
 
 `send <address> <amount>` - Send funds to a destination address .
+
+`token send <assetId> <toAddress> <amountRaw> [senderAddress]` - Send CAT tokens without manually building payload hex.
+`token mint <assetId> <toAddress> <amountRaw> [senderAddress]` - Mint CAT tokens (sender must have mint authority).
+`token burn <assetId> <amountRaw> [senderAddress]` - Burn CAT tokens.
+`token create <name> <symbol> <decimals> <uncapped|capped> <maxSupplyRaw> [--sender=<address>] [--mint-authority=<address>] [--metadata-hex=<hex>]` - Create CAT token.
+`token create-mint <name> <symbol> <decimals> <uncapped|capped> <maxSupplyRaw> <initialMintAmountRaw> <initialMintToAddress> [--sender=<address>] [--mint-authority=<address>] [--metadata-hex=<hex>]` - Create and mint CAT token in one tx.
+`token create-liquidity <name> <symbol> <decimals> <maxSupplyRaw> <seedReserveSompi> <feeBps> [recipientAddress[,recipientAddress2]] [--launch-buy-sompi=<sompi>] [--launch-buy-min-token-out=<amountRaw>] [--sender=<address>] [--metadata-hex=<hex>]` - Create CAT liquidity asset.
+`token balances <address> [address2 ...] [--assets=<assetId,assetId2>]` - Query token balances across multiple addresses.
+`token monitor <address> [address2 ...] [--assets=<assetId,assetId2>] [--interval=<seconds>] [--watch]` - Poll token balances and detect incoming deltas (interactive by default; use `--watch` for continuous mode; wallet daemon startup is `--start-daemon`).
 
 `estimate <amount>` - Provides a fee and UTXO consumption estimate for a transaction of a given amount.
 

@@ -12,5 +12,5 @@ pub mod result;
 pub mod utils;
 mod wizards;
 
-pub use cli::{cryptix_cli, CryptixCli, Options, TerminalOptions, TerminalTarget};
+pub use cli::{cryptix_cli, cryptix_cli_command, CryptixCli, Options, TerminalOptions, TerminalTarget};
 pub use workflow_terminal::Terminal;

@@ -39,6 +39,7 @@ pub mod stop;
 pub mod sweep;
 // pub mod test;
 pub mod theme;
+pub mod token;
 pub mod track;
 pub mod transfer;
 pub mod wallet;
@@ -85,6 +86,7 @@ pub fn register_handlers(cli: &Arc<CryptixCli>) -> Result<()> {
             server,
             settings,
             sweep,
+            token,
             track,
             transfer,
             wallet,

@@ -141,6 +141,70 @@ try_from! ( args: RpcTokenHolder, IRpcTokenHolder, {
 });
 
 declare! {
+    IRpcLiquidityFeeRecipient,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IRpcLiquidityFeeRecipient {
+        ownerId : string;
+        address : string;
+        unclaimedSompi : string;
+    }
+    "#,
+}
+
+try_from! ( args: RpcLiquidityFeeRecipient, IRpcLiquidityFeeRecipient, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IRpcLiquidityPoolState,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IRpcLiquidityPoolState {
+        assetId : string;
+        poolNonce : bigint;
+        feeBps : number;
+        maxSupply : string;
+        totalSupply : string;
+        circulatingSupply : string;
+        remainingPoolSupply : string;
+        curveReserveSompi : string;
+        unclaimedFeeTotalSompi : string;
+        vaultValueSompi : string;
+        vaultTxid : HexString;
+        vaultOutputIndex : number;
+        feeRecipients : IRpcLiquidityFeeRecipient[];
+    }
+    "#,
+}
+
+try_from! ( args: RpcLiquidityPoolState, IRpcLiquidityPoolState, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IRpcLiquidityHolder,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IRpcLiquidityHolder {
+        address? : string;
+        ownerId : string;
+        balance : string;
+    }
+    "#,
+}
+
+try_from! ( args: RpcLiquidityHolder, IRpcLiquidityHolder, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
     IRpcScBootstrapSource,
     r#"
     /**
@@ -608,6 +672,194 @@ declare! {
 }
 
 try_from! ( args: GetTokenOwnerIdByAddressResponse, IGetTokenOwnerIdByAddressResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetLiquidityPoolStateRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityPoolStateRequest {
+        assetId : string;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetLiquidityPoolStateRequest, GetLiquidityPoolStateRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetLiquidityPoolStateResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityPoolStateResponse {
+        pool? : IRpcLiquidityPoolState;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetLiquidityPoolStateResponse, IGetLiquidityPoolStateResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetLiquidityQuoteRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityQuoteRequest {
+        assetId : string;
+        side : number;
+        exactInAmount : string;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetLiquidityQuoteRequest, GetLiquidityQuoteRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetLiquidityQuoteResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityQuoteResponse {
+        side : number;
+        exactInAmount : string;
+        feeAmountSompi : string;
+        netInAmount : string;
+        amountOut : string;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetLiquidityQuoteResponse, IGetLiquidityQuoteResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetLiquidityFeeStateRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityFeeStateRequest {
+        assetId : string;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetLiquidityFeeStateRequest, GetLiquidityFeeStateRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetLiquidityFeeStateResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityFeeStateResponse {
+        assetId : string;
+        feeBps : number;
+        totalUnclaimedSompi : string;
+        recipients : IRpcLiquidityFeeRecipient[];
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetLiquidityFeeStateResponse, IGetLiquidityFeeStateResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetLiquidityClaimPreviewRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityClaimPreviewRequest {
+        assetId : string;
+        recipientAddress : string;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetLiquidityClaimPreviewRequest, GetLiquidityClaimPreviewRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetLiquidityClaimPreviewResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityClaimPreviewResponse {
+        recipientAddress : string;
+        ownerId? : string;
+        claimableAmountSompi : string;
+        minPayoutSompi : string;
+        claimableNow : boolean;
+        reason? : string;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetLiquidityClaimPreviewResponse, IGetLiquidityClaimPreviewResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetLiquidityHoldersRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityHoldersRequest {
+        assetId : string;
+        offset : number;
+        limit : number;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetLiquidityHoldersRequest, GetLiquidityHoldersRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetLiquidityHoldersResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityHoldersResponse {
+        holders : IRpcLiquidityHolder[];
+        total : bigint;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetLiquidityHoldersResponse, IGetLiquidityHoldersResponse, {
     Ok(to_value(&args)?.into())
 });
 

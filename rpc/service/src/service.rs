@@ -7,17 +7,24 @@ use crate::hfa::{FastIngressSource, HfaEngine, HfaRuntimeConfig};
 use crate::service::NetworkType::{Mainnet, Testnet};
 use async_trait::async_trait;
 use blake2b_simd::Params as Blake2bParams;
-use cryptix_addresses::Address;
+use cryptix_addresses::{Address, Version as AddressVersion};
 use cryptix_atomicindex::{
-    payload::{parse_atomic_token_payload, NoopReason, SupplyMode, TokenOp},
+    liquidity_math::{calculate_trade_fee, cpmm_buy, cpmm_sell, LiquidityMathError, LIQUIDITY_MIN_PAYOUT_SOMPI},
+    payload::{
+        parse_atomic_token_payload, BuyLiquidityExactInOp, CreateAssetWithMintOp, CreateLiquidityAssetOp, NoopReason,
+        SellLiquidityExactInOp, SupplyMode, TokenOp,
+    },
     service::{AtomicTokenService, ScBootstrapSource, ScSnapshotChunk, ScSnapshotManifestSignature},
-    state::{AtomicTokenHealth, AtomicTokenReadView, AtomicTokenRuntimeState, ProcessedOp, TokenAsset, TokenEvent},
+    state::{
+        AtomicTokenHealth, AtomicTokenReadView, AtomicTokenRuntimeState, LiquidityFeeRecipientState, LiquidityPoolState, ProcessedOp,
+        TokenAsset, TokenAssetClass, TokenEvent,
+    },
 };
 use cryptix_consensus_core::api::counters::ProcessingCounters;
 use cryptix_consensus_core::errors::block::RuleError;
 use cryptix_consensus_core::{
-    blockhash::BlockHashExtensions,
     block::Block,
+    blockhash::BlockHashExtensions,
     coinbase::MinerData,
     config::Config,
     constants::MAX_SOMPI,
@@ -144,10 +151,18 @@ const TOKEN_EVENTS_LIMIT_MAX: usize = 4096;
 const TOKEN_ASSETS_LIMIT_MAX: usize = 2048;
 const TOKEN_OWNER_BALANCES_LIMIT_MAX: usize = 4096;
 const TOKEN_HOLDERS_LIMIT_MAX: usize = 4096;
+const TOKEN_LIQUIDITY_HOLDERS_LIMIT_MAX: usize = 4096;
 const CAT_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
 const OWNER_AUTH_SCHEME_PUBKEY: u8 = 0;
 const OWNER_AUTH_SCHEME_PUBKEY_ECDSA: u8 = 1;
 const OWNER_AUTH_SCHEME_SCRIPT_HASH: u8 = 2;
+const LIQUIDITY_QUOTE_SIDE_BUY: u32 = 0;
+const LIQUIDITY_QUOTE_SIDE_SELL: u32 = 1;
+const CAT_ERR_HISTORICAL_STATE_UNAVAILABLE: &str = "CAT_ERR_HISTORICAL_STATE_UNAVAILABLE";
+const CAT_ERR_MIN_OUT_VIOLATION: &str = "CAT_ERR_MIN_OUT_VIOLATION";
+const CAT_ERR_ZERO_OUTPUT: &str = "CAT_ERR_ZERO_OUTPUT";
+const CAT_ERR_RECIPIENT_ENCODING_INVALID: &str = "CAT_ERR_RECIPIENT_ENCODING_INVALID";
+const CAT_ERR_PAYOUT_SCRIPT_CLASS_INVALID: &str = "CAT_ERR_PAYOUT_SCRIPT_CLASS_INVALID";
 
 impl RpcCoreService {
     pub const IDENT: &'static str = "rpc-core-service";
@@ -432,6 +447,18 @@ impl RpcCoreService {
         Self::ensure_token_read_ready(view)
     }
 
+    fn liquidity_read_view_unavailable_error(at_block_hash: Option<RpcHash>) -> RpcError {
+        if at_block_hash.is_some() {
+            RpcError::General(CAT_ERR_HISTORICAL_STATE_UNAVAILABLE.to_string())
+        } else {
+            RpcError::StaleContext
+        }
+    }
+
+    fn cat_error_with_detail(code: &str, detail: impl AsRef<str>) -> RpcError {
+        RpcError::General(format!("{code}: {}", detail.as_ref()))
+    }
+
     async fn atomic_context(&self, view: &AtomicTokenReadView) -> RpcResult<RpcTokenContext> {
         let consensus = self.consensus_manager.consensus();
         let session = consensus.session().await;
@@ -500,6 +527,197 @@ impl RpcCoreService {
         RpcTokenHolder { owner_id: entry.0.as_slice().to_hex(), balance: entry.1.to_string() }
     }
 
+    fn liquidity_address_string_from_components(
+        prefix: cryptix_addresses::Prefix,
+        address_version: u8,
+        address_payload: &[u8],
+    ) -> Option<String> {
+        let version = AddressVersion::try_from(address_version).ok()?;
+        if address_payload.len() != version.public_key_len() {
+            return None;
+        }
+        Some(Address::new(prefix, version, address_payload).to_string())
+    }
+
+    fn map_liquidity_fee_recipient(
+        recipient: &LiquidityFeeRecipientState,
+        prefix: cryptix_addresses::Prefix,
+    ) -> RpcLiquidityFeeRecipient {
+        let address =
+            Self::liquidity_address_string_from_components(prefix, recipient.address_version, recipient.address_payload.as_slice())
+                .unwrap_or_default();
+        RpcLiquidityFeeRecipient {
+            owner_id: recipient.owner_id.as_slice().to_hex(),
+            address,
+            unclaimed_sompi: recipient.unclaimed_sompi.to_string(),
+        }
+    }
+
+    fn map_liquidity_pool_state(
+        asset: &TokenAsset,
+        pool: &LiquidityPoolState,
+        prefix: cryptix_addresses::Prefix,
+    ) -> RpcLiquidityPoolState {
+        let circulating_supply = asset.max_supply.saturating_sub(pool.remaining_pool_supply);
+        RpcLiquidityPoolState {
+            asset_id: asset.asset_id.as_slice().to_hex(),
+            pool_nonce: pool.pool_nonce,
+            fee_bps: u32::from(pool.fee_bps),
+            max_supply: asset.max_supply.to_string(),
+            total_supply: asset.total_supply.to_string(),
+            circulating_supply: circulating_supply.to_string(),
+            remaining_pool_supply: pool.remaining_pool_supply.to_string(),
+            curve_reserve_sompi: pool.curve_reserve_sompi.to_string(),
+            unclaimed_fee_total_sompi: pool.unclaimed_fee_total_sompi.to_string(),
+            vault_value_sompi: pool.vault_value_sompi.to_string(),
+            vault_txid: pool.vault_outpoint.transaction_id,
+            vault_output_index: pool.vault_outpoint.index,
+            fee_recipients: pool.fee_recipients.iter().map(|recipient| Self::map_liquidity_fee_recipient(recipient, prefix)).collect(),
+        }
+    }
+
+    fn map_liquidity_holder(entry: ([u8; 32], u128), owner_to_address: &HashMap<[u8; 32], String>) -> RpcLiquidityHolder {
+        RpcLiquidityHolder {
+            address: owner_to_address.get(&entry.0).cloned(),
+            owner_id: entry.0.as_slice().to_hex(),
+            balance: entry.1.to_string(),
+        }
+    }
+
+    fn map_liquidity_math_error(err: LiquidityMathError) -> RpcError {
+        match err {
+            LiquidityMathError::Overflow => RpcError::General("liquidity math overflow".to_string()),
+            LiquidityMathError::InvalidInput => RpcError::General("liquidity math invalid input".to_string()),
+            LiquidityMathError::InvalidState => RpcError::General("liquidity math invalid curve state".to_string()),
+            LiquidityMathError::ZeroOutput => Self::cat_error_with_detail(CAT_ERR_ZERO_OUTPUT, "liquidity math produced zero output"),
+        }
+    }
+
+    fn map_liquidity_math_noop_reason(err: LiquidityMathError) -> NoopReason {
+        match err {
+            LiquidityMathError::Overflow => NoopReason::SupplyOverflow,
+            LiquidityMathError::InvalidInput => NoopReason::InvalidAmount,
+            LiquidityMathError::InvalidState => NoopReason::InternalMalformedAcceptance,
+            LiquidityMathError::ZeroOutput => NoopReason::ZeroOutput,
+        }
+    }
+
+    fn validate_curve_reserve_against_outstanding_supply(total_supply: u128, curve_reserve_sompi: u64) -> Option<NoopReason> {
+        if total_supply > 0 && curve_reserve_sompi == 0 {
+            Some(NoopReason::InternalMalformedAcceptance)
+        } else {
+            None
+        }
+    }
+
+    fn simulate_create_asset_with_mint_noop_reason(op: &CreateAssetWithMintOp) -> Option<NoopReason> {
+        if matches!(op.supply_mode, SupplyMode::Capped) && op.max_supply == 0 {
+            return Some(NoopReason::BadMaxSupply);
+        }
+        if matches!(op.supply_mode, SupplyMode::Uncapped) && op.max_supply != 0 {
+            return Some(NoopReason::BadMaxSupply);
+        }
+        if matches!(op.supply_mode, SupplyMode::Capped) && op.initial_mint_amount > op.max_supply {
+            return Some(NoopReason::SupplyCapExceeded);
+        }
+        None
+    }
+
+    fn simulate_create_liquidity_noop_reason(op: &CreateLiquidityAssetOp) -> Option<NoopReason> {
+        if op.max_supply == 0 {
+            return Some(NoopReason::BadMaxSupply);
+        }
+        if op.seed_reserve_sompi == 0 {
+            return Some(NoopReason::InvalidAmount);
+        }
+        if op.launch_buy_sompi == 0 {
+            return None;
+        }
+
+        let fee_trade = match calculate_trade_fee(op.launch_buy_sompi, op.fee_bps) {
+            Ok(value) => value,
+            Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+        };
+        let Some(launch_buy_net) = op.launch_buy_sompi.checked_sub(fee_trade) else {
+            return Some(NoopReason::SupplyUnderflow);
+        };
+        let (token_out, _, new_curve_reserve_sompi) = match cpmm_buy(op.max_supply, op.seed_reserve_sompi, launch_buy_net) {
+            Ok(state) => state,
+            Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+        };
+        if token_out < op.launch_buy_min_token_out {
+            return Some(NoopReason::MinOutViolation);
+        }
+        Self::validate_curve_reserve_against_outstanding_supply(token_out, new_curve_reserve_sompi)
+    }
+
+    fn simulate_buy_liquidity_noop_reason(
+        asset: &TokenAsset,
+        pool: &LiquidityPoolState,
+        op: &BuyLiquidityExactInOp,
+    ) -> Option<NoopReason> {
+        if pool.pool_nonce != op.expected_pool_nonce {
+            return Some(NoopReason::NonceStale);
+        }
+        let fee_trade = match calculate_trade_fee(op.cpay_in_sompi, pool.fee_bps) {
+            Ok(value) => value,
+            Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+        };
+        let Some(net_in) = op.cpay_in_sompi.checked_sub(fee_trade) else {
+            return Some(NoopReason::SupplyUnderflow);
+        };
+        let (token_out, _, new_curve_reserve_sompi) = match cpmm_buy(pool.remaining_pool_supply, pool.curve_reserve_sompi, net_in) {
+            Ok(state) => state,
+            Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+        };
+        if token_out < op.min_token_out {
+            return Some(NoopReason::MinOutViolation);
+        }
+        let Some(total_supply_after) = asset.total_supply.checked_add(token_out) else {
+            return Some(NoopReason::SupplyOverflow);
+        };
+        Self::validate_curve_reserve_against_outstanding_supply(total_supply_after, new_curve_reserve_sompi)
+    }
+
+    fn simulate_sell_liquidity_noop_reason(
+        asset: &TokenAsset,
+        pool: &LiquidityPoolState,
+        sender_balance: u128,
+        op: &SellLiquidityExactInOp,
+    ) -> Option<NoopReason> {
+        if pool.pool_nonce != op.expected_pool_nonce {
+            return Some(NoopReason::NonceStale);
+        }
+        if sender_balance < op.token_in {
+            return Some(NoopReason::InsufficientBalance);
+        }
+        let Some(supply_after) = asset.total_supply.checked_sub(op.token_in) else {
+            return Some(NoopReason::SupplyUnderflow);
+        };
+        let (gross_out, _, new_curve_reserve_sompi) =
+            match cpmm_sell(pool.remaining_pool_supply, pool.curve_reserve_sompi, op.token_in) {
+                Ok(state) => state,
+                Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+            };
+        let fee_trade = match calculate_trade_fee(gross_out, pool.fee_bps) {
+            Ok(value) => value,
+            Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+        };
+        let Some(cpay_out) = gross_out.checked_sub(fee_trade) else {
+            return Some(NoopReason::SupplyUnderflow);
+        };
+        if cpay_out == 0 {
+            return Some(NoopReason::ZeroOutput);
+        }
+        if cpay_out < op.min_cpay_out_sompi {
+            return Some(NoopReason::MinOutViolation);
+        }
+        if cpay_out < LIQUIDITY_MIN_PAYOUT_SOMPI {
+            return Some(NoopReason::InvalidAmount);
+        }
+        Self::validate_curve_reserve_against_outstanding_supply(supply_after, new_curve_reserve_sompi)
+    }
+
     fn token_asset_matches_query(asset: &TokenAsset, query: &str) -> bool {
         if query.is_empty() {
             return true;
@@ -539,7 +757,7 @@ impl RpcCoreService {
         let (auth_scheme, canonical_pubkey_bytes) = match ScriptClass::from_script(script_public_key) {
             ScriptClass::PubKey if script_bytes.len() == 34 => (OWNER_AUTH_SCHEME_PUBKEY, &script_bytes[1..33]),
             ScriptClass::PubKeyECDSA if script_bytes.len() == 35 => (OWNER_AUTH_SCHEME_PUBKEY_ECDSA, &script_bytes[1..34]),
-            ScriptClass::ScriptHash if script_bytes.len() == 34 => (OWNER_AUTH_SCHEME_SCRIPT_HASH, &script_bytes[2..34]),
+            ScriptClass::ScriptHash if script_bytes.len() == 35 => (OWNER_AUTH_SCHEME_SCRIPT_HASH, &script_bytes[2..34]),
             _ => return None,
         };
         let pubkey_len = u16::try_from(canonical_pubkey_bytes.len()).ok()?;
@@ -683,6 +901,62 @@ impl RpcCoreService {
                 }
                 if asset.total_supply < op.amount {
                     return Some(NoopReason::SupplyUnderflow);
+                }
+                None
+            }
+            TokenOp::CreateAssetWithMint(op) => Self::simulate_create_asset_with_mint_noop_reason(op),
+            TokenOp::CreateLiquidityAsset(op) => Self::simulate_create_liquidity_noop_reason(op),
+            TokenOp::BuyLiquidityExactIn(op) => {
+                let Some(asset) = view.assets.get(&op.asset_id) else {
+                    return Some(NoopReason::AssetNotFound);
+                };
+                if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+                    return Some(NoopReason::LegacyOpForLiquidityAsset);
+                }
+                let Some(pool) = asset.liquidity.as_ref() else {
+                    return Some(NoopReason::AssetNotFound);
+                };
+                Self::simulate_buy_liquidity_noop_reason(asset, pool, op)
+            }
+            TokenOp::SellLiquidityExactIn(op) => {
+                let Some(asset) = view.assets.get(&op.asset_id) else {
+                    return Some(NoopReason::AssetNotFound);
+                };
+                if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+                    return Some(NoopReason::LegacyOpForLiquidityAsset);
+                }
+                let Some(pool) = asset.liquidity.as_ref() else {
+                    return Some(NoopReason::AssetNotFound);
+                };
+                let sender_balance = view
+                    .balances
+                    .get(&cryptix_atomicindex::state::BalanceKey { asset_id: op.asset_id, owner_id })
+                    .copied()
+                    .unwrap_or(0);
+                Self::simulate_sell_liquidity_noop_reason(asset, pool, sender_balance, op)
+            }
+            TokenOp::ClaimLiquidityFees(op) => {
+                let Some(asset) = view.assets.get(&op.asset_id) else {
+                    return Some(NoopReason::AssetNotFound);
+                };
+                if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+                    return Some(NoopReason::LegacyOpForLiquidityAsset);
+                }
+                let Some(pool) = asset.liquidity.as_ref() else {
+                    return Some(NoopReason::AssetNotFound);
+                };
+                if pool.pool_nonce != op.expected_pool_nonce {
+                    return Some(NoopReason::NonceStale);
+                }
+                let recipient_index = usize::from(op.recipient_index);
+                if recipient_index >= pool.fee_recipients.len() {
+                    return Some(NoopReason::BadLength);
+                }
+                if pool.fee_recipients[recipient_index].owner_id != owner_id {
+                    return Some(NoopReason::BadAuthInput);
+                }
+                if pool.fee_recipients[recipient_index].unclaimed_sompi < op.claim_amount_sompi {
+                    return Some(NoopReason::InsufficientBalance);
                 }
                 None
             }
@@ -1392,8 +1666,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             header_hashes.push(request.start_hash);
 
             if limit > 1 {
-                let chain_path =
-                    session.async_get_virtual_chain_from_block(request.start_hash, Some(limit.saturating_sub(1))).await?;
+                let chain_path = session.async_get_virtual_chain_from_block(request.start_hash, Some(limit.saturating_sub(1))).await?;
                 header_hashes.extend(chain_path.added);
             }
         } else {
@@ -2116,6 +2389,229 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         Ok(GetTokenOwnerIdByAddressResponse { owner_id, reason, context })
     }
 
+    async fn get_liquidity_pool_state_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetLiquidityPoolStateRequest,
+    ) -> RpcResult<GetLiquidityPoolStateResponse> {
+        let GetLiquidityPoolStateRequest { asset_id, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
+        let view =
+            atomic.get_read_view(at_block_hash).await.ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
+        Self::ensure_token_read_ready(&view)?;
+
+        let prefix = self.config.prefix();
+        let pool = view.assets.get(&asset_id).and_then(|asset| {
+            if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+                return None;
+            }
+            asset.liquidity.as_ref().map(|liquidity| Self::map_liquidity_pool_state(asset, liquidity, prefix))
+        });
+
+        let context = self.atomic_context(&view).await?;
+        Ok(GetLiquidityPoolStateResponse { pool, context })
+    }
+
+    async fn get_liquidity_quote_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetLiquidityQuoteRequest,
+    ) -> RpcResult<GetLiquidityQuoteResponse> {
+        let GetLiquidityQuoteRequest { asset_id, side, exact_in_amount, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
+        let view =
+            atomic.get_read_view(at_block_hash).await.ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
+        Self::ensure_token_read_ready(&view)?;
+
+        let asset = view.assets.get(&asset_id).ok_or_else(|| RpcError::General("liquidity asset not found".to_string()))?;
+        if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+            return Err(RpcError::General("asset is not a liquidity asset".to_string()));
+        }
+        let pool = asset.liquidity.as_ref().ok_or_else(|| RpcError::General("liquidity state missing for asset".to_string()))?;
+
+        let (fee_amount_sompi, net_in_amount, amount_out) = match side {
+            LIQUIDITY_QUOTE_SIDE_BUY => {
+                let cpay_in = exact_in_amount
+                    .parse::<u64>()
+                    .map_err(|e| RpcError::General(format!("invalid `exactInAmount` for buy side: {e}")))?;
+                if cpay_in == 0 {
+                    return Err(Self::cat_error_with_detail(CAT_ERR_ZERO_OUTPUT, "buy exactInAmount must be > 0"));
+                }
+                let fee_trade = calculate_trade_fee(cpay_in, pool.fee_bps).map_err(Self::map_liquidity_math_error)?;
+                let cpay_net_in =
+                    cpay_in.checked_sub(fee_trade).ok_or_else(|| RpcError::General("liquidity quote underflow".to_string()))?;
+                let (token_out, _, _) = cpmm_buy(pool.remaining_pool_supply, pool.curve_reserve_sompi, cpay_net_in)
+                    .map_err(Self::map_liquidity_math_error)?;
+                (fee_trade.to_string(), cpay_net_in.to_string(), token_out.to_string())
+            }
+            LIQUIDITY_QUOTE_SIDE_SELL => {
+                let token_in = exact_in_amount
+                    .parse::<u128>()
+                    .map_err(|e| RpcError::General(format!("invalid `exactInAmount` for sell side: {e}")))?;
+                if token_in == 0 {
+                    return Err(Self::cat_error_with_detail(CAT_ERR_ZERO_OUTPUT, "sell exactInAmount must be > 0"));
+                }
+                let (gross_out, _, _) = cpmm_sell(pool.remaining_pool_supply, pool.curve_reserve_sompi, token_in)
+                    .map_err(Self::map_liquidity_math_error)?;
+                let fee_trade = calculate_trade_fee(gross_out, pool.fee_bps).map_err(Self::map_liquidity_math_error)?;
+                let cpay_out =
+                    gross_out.checked_sub(fee_trade).ok_or_else(|| RpcError::General("liquidity quote underflow".to_string()))?;
+                if cpay_out == 0 {
+                    return Err(Self::cat_error_with_detail(CAT_ERR_ZERO_OUTPUT, "liquidity quote zero output"));
+                }
+                if cpay_out < LIQUIDITY_MIN_PAYOUT_SOMPI {
+                    return Err(Self::cat_error_with_detail(
+                        CAT_ERR_MIN_OUT_VIOLATION,
+                        format!("liquidity quote output below minimum payout: {cpay_out} < {LIQUIDITY_MIN_PAYOUT_SOMPI}"),
+                    ));
+                }
+                (fee_trade.to_string(), token_in.to_string(), cpay_out.to_string())
+            }
+            _ => {
+                return Err(RpcError::General("invalid `side` (expected 0=buy or 1=sell)".to_string()));
+            }
+        };
+
+        let context = self.atomic_context(&view).await?;
+        Ok(GetLiquidityQuoteResponse { side, exact_in_amount, fee_amount_sompi, net_in_amount, amount_out, context })
+    }
+
+    async fn get_liquidity_fee_state_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetLiquidityFeeStateRequest,
+    ) -> RpcResult<GetLiquidityFeeStateResponse> {
+        let GetLiquidityFeeStateRequest { asset_id, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id_bytes = Self::parse_hex_32(&asset_id, "assetId")?;
+        let view =
+            atomic.get_read_view(at_block_hash).await.ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
+        Self::ensure_token_read_ready(&view)?;
+
+        let asset = view.assets.get(&asset_id_bytes).ok_or_else(|| RpcError::General("liquidity asset not found".to_string()))?;
+        if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+            return Err(RpcError::General("asset is not a liquidity asset".to_string()));
+        }
+        let pool = asset.liquidity.as_ref().ok_or_else(|| RpcError::General("liquidity state missing for asset".to_string()))?;
+
+        let prefix = self.config.prefix();
+        let recipients: Vec<RpcLiquidityFeeRecipient> =
+            pool.fee_recipients.iter().map(|recipient| Self::map_liquidity_fee_recipient(recipient, prefix)).collect();
+        let context = self.atomic_context(&view).await?;
+        Ok(GetLiquidityFeeStateResponse {
+            asset_id,
+            fee_bps: u32::from(pool.fee_bps),
+            total_unclaimed_sompi: pool.unclaimed_fee_total_sompi.to_string(),
+            recipients,
+            context,
+        })
+    }
+
+    async fn get_liquidity_claim_preview_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetLiquidityClaimPreviewRequest,
+    ) -> RpcResult<GetLiquidityClaimPreviewResponse> {
+        let GetLiquidityClaimPreviewRequest { asset_id, recipient_address, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id_bytes = Self::parse_hex_32(&asset_id, "assetId")?;
+        let view =
+            atomic.get_read_view(at_block_hash).await.ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
+        Self::ensure_token_read_ready(&view)?;
+
+        let asset = view.assets.get(&asset_id_bytes).ok_or_else(|| RpcError::General("liquidity asset not found".to_string()))?;
+        if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+            return Err(RpcError::General("asset is not a liquidity asset".to_string()));
+        }
+        let pool = asset.liquidity.as_ref().ok_or_else(|| RpcError::General("liquidity state missing for asset".to_string()))?;
+
+        let address = Address::try_from(recipient_address.as_str()).map_err(|e| {
+            Self::cat_error_with_detail(CAT_ERR_RECIPIENT_ENCODING_INVALID, format!("invalid `recipientAddress` string: {e}"))
+        })?;
+        let script_public_key = pay_to_address_script(&address);
+        let (owner_id, claimable_amount_sompi, claimable_now, reason) = match Self::owner_id_from_script(&script_public_key) {
+            Some(owner_id) => {
+                let maybe_recipient = pool.fee_recipients.iter().find(|recipient| recipient.owner_id == owner_id);
+                match maybe_recipient {
+                    Some(recipient) => {
+                        let claimable = recipient.unclaimed_sompi;
+                        let claimable_now = claimable >= LIQUIDITY_MIN_PAYOUT_SOMPI;
+                        let reason = if claimable_now { None } else { Some("below_min_payout".to_string()) };
+                        (Some(owner_id.as_slice().to_hex()), claimable, claimable_now, reason)
+                    }
+                    None => (Some(owner_id.as_slice().to_hex()), 0u64, false, Some("recipient_not_configured".to_string())),
+                }
+            }
+            None => (None, 0u64, false, Some(format!("{CAT_ERR_PAYOUT_SCRIPT_CLASS_INVALID}: unsupported_script_class"))),
+        };
+
+        let context = self.atomic_context(&view).await?;
+        Ok(GetLiquidityClaimPreviewResponse {
+            recipient_address,
+            owner_id,
+            claimable_amount_sompi: claimable_amount_sompi.to_string(),
+            min_payout_sompi: LIQUIDITY_MIN_PAYOUT_SOMPI.to_string(),
+            claimable_now,
+            reason,
+            context,
+        })
+    }
+
+    async fn get_liquidity_holders_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetLiquidityHoldersRequest,
+    ) -> RpcResult<GetLiquidityHoldersResponse> {
+        let GetLiquidityHoldersRequest { asset_id, offset, limit, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id_bytes = Self::parse_hex_32(&asset_id, "assetId")?;
+        let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_LIQUIDITY_HOLDERS_LIMIT_MAX);
+        let offset = usize::try_from(offset).map_err(|e| RpcError::General(e.to_string()))?;
+        let view =
+            atomic.get_read_view(at_block_hash).await.ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
+        Self::ensure_token_read_ready(&view)?;
+
+        let asset = view.assets.get(&asset_id_bytes).ok_or_else(|| RpcError::General("liquidity asset not found".to_string()))?;
+        if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+            return Err(RpcError::General("asset is not a liquidity asset".to_string()));
+        }
+        let pool = asset.liquidity.as_ref().ok_or_else(|| RpcError::General("liquidity state missing for asset".to_string()))?;
+
+        let mut holders: Vec<([u8; 32], u128)> = view
+            .balances
+            .iter()
+            .filter_map(
+                |(key, balance)| {
+                    if key.asset_id == asset_id_bytes && *balance > 0 {
+                        Some((key.owner_id, *balance))
+                    } else {
+                        None
+                    }
+                },
+            )
+            .collect();
+        holders.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let prefix = self.config.prefix();
+        let owner_to_address: HashMap<[u8; 32], String> = holders
+            .iter()
+            .filter_map(|(owner_id, _)| {
+                pool.holder_addresses.get(owner_id).or_else(|| view.known_owner_addresses.get(owner_id)).and_then(|holder| {
+                    Self::liquidity_address_string_from_components(prefix, holder.address_version, holder.address_payload.as_slice())
+                        .map(|address| (*owner_id, address))
+                })
+            })
+            .collect();
+
+        let total = holders.len() as u64;
+        let holders =
+            holders.into_iter().skip(offset).take(limit).map(|entry| Self::map_liquidity_holder(entry, &owner_to_address)).collect();
+        let context = self.atomic_context(&view).await?;
+        Ok(GetLiquidityHoldersResponse { holders, total, context })
+    }
+
     async fn export_token_snapshot_call(
         &self,
         _connection: Option<&DynRpcConnection>,
@@ -2320,5 +2816,120 @@ impl AsyncService for RpcCoreService {
             trace!("{} stopped", Self::IDENT);
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cryptix_consensus_core::{tx::TransactionOutpoint, Hash};
+
+    fn sample_liquidity_pool(remaining_pool_supply: u128, curve_reserve_sompi: u64, fee_bps: u16) -> LiquidityPoolState {
+        LiquidityPoolState {
+            pool_nonce: 7,
+            remaining_pool_supply,
+            curve_reserve_sompi,
+            unclaimed_fee_total_sompi: 0,
+            fee_bps,
+            fee_recipients: vec![],
+            vault_outpoint: TransactionOutpoint::new(Hash::from_u64_word(77), 0),
+            vault_value_sompi: curve_reserve_sompi,
+            holder_addresses: HashMap::new(),
+        }
+    }
+
+    fn sample_liquidity_asset(max_supply: u128, total_supply: u128, pool: LiquidityPoolState) -> TokenAsset {
+        TokenAsset {
+            asset_id: [0x11; 32],
+            creator_owner_id: [0x22; 32],
+            asset_class: TokenAssetClass::Liquidity,
+            mint_authority_owner_id: [0u8; 32],
+            decimals: 8,
+            supply_mode: SupplyMode::Capped,
+            max_supply,
+            total_supply,
+            name: b"Pool".to_vec(),
+            symbol: b"POOL".to_vec(),
+            metadata: vec![],
+            created_block_hash: None,
+            created_daa_score: None,
+            created_at: None,
+            liquidity: Some(pool),
+        }
+    }
+
+    #[test]
+    fn owner_id_accepts_standard_p2sh_script() {
+        let script_public_key = cryptix_txscript::pay_to_script_hash_script(&[0x51]);
+
+        assert_eq!(script_public_key.script().len(), 35);
+        assert!(RpcCoreService::owner_id_from_script(&script_public_key).is_some());
+    }
+
+    #[test]
+    fn simulate_create_asset_with_mint_rejects_initial_mint_above_cap() {
+        let op = CreateAssetWithMintOp {
+            decimals: 8,
+            supply_mode: SupplyMode::Capped,
+            max_supply: 100,
+            mint_authority_owner_id: [0x33; 32],
+            name: b"Token".to_vec(),
+            symbol: b"TKN".to_vec(),
+            metadata: vec![],
+            initial_mint_amount: 101,
+            initial_mint_to_owner_id: [0x44; 32],
+        };
+
+        assert_eq!(RpcCoreService::simulate_create_asset_with_mint_noop_reason(&op), Some(NoopReason::SupplyCapExceeded));
+    }
+
+    #[test]
+    fn simulate_create_liquidity_rejects_zero_seed_reserve() {
+        let op = CreateLiquidityAssetOp {
+            decimals: 8,
+            max_supply: 1_000,
+            name: b"Pool".to_vec(),
+            symbol: b"POOL".to_vec(),
+            metadata: vec![],
+            seed_reserve_sompi: 0,
+            fee_bps: 0,
+            recipients: vec![],
+            launch_buy_sompi: 0,
+            launch_buy_min_token_out: 0,
+        };
+
+        assert_eq!(RpcCoreService::simulate_create_liquidity_noop_reason(&op), Some(NoopReason::InvalidAmount));
+    }
+
+    #[test]
+    fn simulate_buy_liquidity_detects_min_out_violation() {
+        let pool = sample_liquidity_pool(900, 1_000, 0);
+        let asset = sample_liquidity_asset(1_000, 100, pool.clone());
+        let op = BuyLiquidityExactInOp {
+            asset_id: asset.asset_id,
+            expected_pool_nonce: pool.pool_nonce,
+            cpay_in_sompi: 25,
+            min_token_out: u128::MAX,
+        };
+
+        assert_eq!(RpcCoreService::simulate_buy_liquidity_noop_reason(&asset, &pool, &op), Some(NoopReason::MinOutViolation));
+    }
+
+    #[test]
+    fn simulate_sell_liquidity_rejects_reserve_exhaustion_with_outstanding_supply() {
+        let pool = sample_liquidity_pool(900, 1, 0);
+        let asset = sample_liquidity_asset(1_000, 100, pool.clone());
+        let op = SellLiquidityExactInOp {
+            asset_id: asset.asset_id,
+            expected_pool_nonce: pool.pool_nonce,
+            token_in: 1,
+            min_cpay_out_sompi: 1,
+            cpay_receive_output_index: 0,
+        };
+
+        assert_eq!(
+            RpcCoreService::simulate_sell_liquidity_noop_reason(&asset, &pool, 100, &op),
+            Some(NoopReason::InternalMalformedAcceptance)
+        );
     }
 }

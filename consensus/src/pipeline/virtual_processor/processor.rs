@@ -367,7 +367,11 @@ impl VirtualStateProcessor {
 
     fn load_block_atomic_state_or_default_before_hf(&self, block_hash: Hash) -> Option<AtomicConsensusState> {
         match self.atomic_state_store.get(block_hash) {
-            Ok(state) => Some(state.as_ref().clone()),
+            Ok(state) => {
+                let mut state = state.as_ref().clone();
+                state.rebuild_liquidity_vault_outpoint_index();
+                Some(state)
+            }
             Err(StoreError::KeyNotFound(_)) => {
                 let block_daa_score = self.headers_store.get_header(block_hash).unwrap().daa_score;
                 if self.transaction_validator.is_payload_hf_active(block_daa_score) {
@@ -949,8 +953,11 @@ impl VirtualStateProcessor {
         });
 
         // Enforce CAT nonce/state transitions deterministically so results do not
-        // depend on caller-provided slice order.
+        // depend on caller-provided slice order. Non-CAT transactions still pass
+        // through the atomic-state validator so reserved liquidity vault scripts
+        // are handled the same way as single validation and block templates.
         let mut ordered_atomic_indices = Vec::new();
+        let mut ordered_non_atomic_indices = Vec::new();
         for (idx, mtx) in mutable_txs.iter().enumerate() {
             if results[idx].is_err() {
                 continue;
@@ -959,14 +966,26 @@ impl VirtualStateProcessor {
                 Ok(Some((owner_id, nonce, txid_bytes))) => {
                     ordered_atomic_indices.push((owner_id, nonce, txid_bytes, idx));
                 }
-                Ok(None) => {}
+                Ok(None) => ordered_non_atomic_indices.push((mtx.id().as_bytes(), idx)),
                 Err(err) => results[idx] = Err(err),
             }
         }
         ordered_atomic_indices.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)).then(a.3.cmp(&b.3)));
+        ordered_non_atomic_indices.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
         let mut atomic_state = virtual_state.atomic_state.clone();
         for (_, _, _, idx) in ordered_atomic_indices.into_iter() {
+            if results[idx].is_err() {
+                continue;
+            }
+            let mtx = &mut mutable_txs[idx];
+            if let Err(err) =
+                self.validate_and_apply_atomic_state_transition(&mtx.as_verifiable(), virtual_daa_score, &mut atomic_state)
+            {
+                results[idx] = Err(err);
+            }
+        }
+        for (_, idx) in ordered_non_atomic_indices.into_iter() {
             if results[idx].is_err() {
                 continue;
             }

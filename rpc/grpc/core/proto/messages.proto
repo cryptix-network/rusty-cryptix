@@ -90,6 +90,11 @@ message CryptixdRequest {
     GetTokenHoldersRequestMessage getTokenHoldersRequest = 1156;
     GetTokenOwnerIdByAddressRequestMessage getTokenOwnerIdByAddressRequest = 1158;
     NotifyTokenEventsRequestMessage notifyTokenEventsRequest = 1160;
+    GetLiquidityPoolStateRequestMessage getLiquidityPoolStateRequest = 1164;
+    GetLiquidityQuoteRequestMessage getLiquidityQuoteRequest = 1166;
+    GetLiquidityFeeStateRequestMessage getLiquidityFeeStateRequest = 1168;
+    GetLiquidityClaimPreviewRequestMessage getLiquidityClaimPreviewRequest = 1170;
+    GetLiquidityHoldersRequestMessage getLiquidityHoldersRequest = 1172;
   }
 }
 
@@ -181,6 +186,11 @@ message CryptixdResponse {
     GetTokenOwnerIdByAddressResponseMessage getTokenOwnerIdByAddressResponse = 1159;
     NotifyTokenEventsResponseMessage notifyTokenEventsResponse = 1161;
     TokenEventsChangedNotificationMessage tokenEventsChangedNotification = 1162;
+    GetLiquidityPoolStateResponseMessage getLiquidityPoolStateResponse = 1165;
+    GetLiquidityQuoteResponseMessage getLiquidityQuoteResponse = 1167;
+    GetLiquidityFeeStateResponseMessage getLiquidityFeeStateResponse = 1169;
+    GetLiquidityClaimPreviewResponseMessage getLiquidityClaimPreviewResponse = 1171;
+    GetLiquidityHoldersResponseMessage getLiquidityHoldersResponse = 1173;
   }
 }
 

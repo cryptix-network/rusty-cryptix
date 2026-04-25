@@ -3231,6 +3231,438 @@ impl Deserializer for RpcTokenHolder {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcLiquidityFeeRecipient {
+    pub owner_id: String,
+    pub address: String,
+    pub unclaimed_sompi: String,
+}
+
+impl Serializer for RpcLiquidityFeeRecipient {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.owner_id, writer)?;
+        store!(String, &self.address, writer)?;
+        store!(String, &self.unclaimed_sompi, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcLiquidityFeeRecipient {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let owner_id = load!(String, reader)?;
+        let address = load!(String, reader)?;
+        let unclaimed_sompi = load!(String, reader)?;
+        Ok(Self { owner_id, address, unclaimed_sompi })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcLiquidityPoolState {
+    pub asset_id: String,
+    pub pool_nonce: u64,
+    pub fee_bps: u32,
+    pub max_supply: String,
+    pub total_supply: String,
+    pub circulating_supply: String,
+    pub remaining_pool_supply: String,
+    pub curve_reserve_sompi: String,
+    pub unclaimed_fee_total_sompi: String,
+    pub vault_value_sompi: String,
+    pub vault_txid: RpcHash,
+    pub vault_output_index: u32,
+    pub fee_recipients: Vec<RpcLiquidityFeeRecipient>,
+}
+
+impl Serializer for RpcLiquidityPoolState {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.asset_id, writer)?;
+        store!(u64, &self.pool_nonce, writer)?;
+        store!(u32, &self.fee_bps, writer)?;
+        store!(String, &self.max_supply, writer)?;
+        store!(String, &self.total_supply, writer)?;
+        store!(String, &self.circulating_supply, writer)?;
+        store!(String, &self.remaining_pool_supply, writer)?;
+        store!(String, &self.curve_reserve_sompi, writer)?;
+        store!(String, &self.unclaimed_fee_total_sompi, writer)?;
+        store!(String, &self.vault_value_sompi, writer)?;
+        store!(RpcHash, &self.vault_txid, writer)?;
+        store!(u32, &self.vault_output_index, writer)?;
+        store!(Vec<RpcLiquidityFeeRecipient>, &self.fee_recipients, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcLiquidityPoolState {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let asset_id = load!(String, reader)?;
+        let pool_nonce = load!(u64, reader)?;
+        let fee_bps = load!(u32, reader)?;
+        let max_supply = load!(String, reader)?;
+        let total_supply = load!(String, reader)?;
+        let circulating_supply = load!(String, reader)?;
+        let remaining_pool_supply = load!(String, reader)?;
+        let curve_reserve_sompi = load!(String, reader)?;
+        let unclaimed_fee_total_sompi = load!(String, reader)?;
+        let vault_value_sompi = load!(String, reader)?;
+        let vault_txid = load!(RpcHash, reader)?;
+        let vault_output_index = load!(u32, reader)?;
+        let fee_recipients = load!(Vec<RpcLiquidityFeeRecipient>, reader)?;
+        Ok(Self {
+            asset_id,
+            pool_nonce,
+            fee_bps,
+            max_supply,
+            total_supply,
+            circulating_supply,
+            remaining_pool_supply,
+            curve_reserve_sompi,
+            unclaimed_fee_total_sompi,
+            vault_value_sompi,
+            vault_txid,
+            vault_output_index,
+            fee_recipients,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcLiquidityHolder {
+    pub address: Option<String>,
+    pub owner_id: String,
+    pub balance: String,
+}
+
+impl Serializer for RpcLiquidityHolder {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Option<String>, &self.address, writer)?;
+        store!(String, &self.owner_id, writer)?;
+        store!(String, &self.balance, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcLiquidityHolder {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let address = load!(Option<String>, reader)?;
+        let owner_id = load!(String, reader)?;
+        let balance = load!(String, reader)?;
+        Ok(Self { address, owner_id, balance })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetLiquidityPoolStateRequest {
+    pub asset_id: String,
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetLiquidityPoolStateRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.asset_id, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetLiquidityPoolStateRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let asset_id = load!(String, reader)?;
+        let at_block_hash = load!(Option<RpcHash>, reader)?;
+        Ok(Self { asset_id, at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetLiquidityPoolStateResponse {
+    pub pool: Option<RpcLiquidityPoolState>,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetLiquidityPoolStateResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Option<RpcLiquidityPoolState>, &self.pool, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetLiquidityPoolStateResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let pool = load!(Option<RpcLiquidityPoolState>, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { pool, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetLiquidityQuoteRequest {
+    pub asset_id: String,
+    pub side: u32,
+    pub exact_in_amount: String,
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetLiquidityQuoteRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.asset_id, writer)?;
+        store!(u32, &self.side, writer)?;
+        store!(String, &self.exact_in_amount, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetLiquidityQuoteRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let asset_id = load!(String, reader)?;
+        let side = load!(u32, reader)?;
+        let exact_in_amount = load!(String, reader)?;
+        let at_block_hash = load!(Option<RpcHash>, reader)?;
+        Ok(Self { asset_id, side, exact_in_amount, at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetLiquidityQuoteResponse {
+    pub side: u32,
+    pub exact_in_amount: String,
+    pub fee_amount_sompi: String,
+    pub net_in_amount: String,
+    pub amount_out: String,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetLiquidityQuoteResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(u32, &self.side, writer)?;
+        store!(String, &self.exact_in_amount, writer)?;
+        store!(String, &self.fee_amount_sompi, writer)?;
+        store!(String, &self.net_in_amount, writer)?;
+        store!(String, &self.amount_out, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetLiquidityQuoteResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let side = load!(u32, reader)?;
+        let exact_in_amount = load!(String, reader)?;
+        let fee_amount_sompi = load!(String, reader)?;
+        let net_in_amount = load!(String, reader)?;
+        let amount_out = load!(String, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { side, exact_in_amount, fee_amount_sompi, net_in_amount, amount_out, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetLiquidityFeeStateRequest {
+    pub asset_id: String,
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetLiquidityFeeStateRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.asset_id, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetLiquidityFeeStateRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let asset_id = load!(String, reader)?;
+        let at_block_hash = load!(Option<RpcHash>, reader)?;
+        Ok(Self { asset_id, at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetLiquidityFeeStateResponse {
+    pub asset_id: String,
+    pub fee_bps: u32,
+    pub total_unclaimed_sompi: String,
+    pub recipients: Vec<RpcLiquidityFeeRecipient>,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetLiquidityFeeStateResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.asset_id, writer)?;
+        store!(u32, &self.fee_bps, writer)?;
+        store!(String, &self.total_unclaimed_sompi, writer)?;
+        store!(Vec<RpcLiquidityFeeRecipient>, &self.recipients, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetLiquidityFeeStateResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let asset_id = load!(String, reader)?;
+        let fee_bps = load!(u32, reader)?;
+        let total_unclaimed_sompi = load!(String, reader)?;
+        let recipients = load!(Vec<RpcLiquidityFeeRecipient>, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { asset_id, fee_bps, total_unclaimed_sompi, recipients, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetLiquidityClaimPreviewRequest {
+    pub asset_id: String,
+    pub recipient_address: String,
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetLiquidityClaimPreviewRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.asset_id, writer)?;
+        store!(String, &self.recipient_address, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetLiquidityClaimPreviewRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let asset_id = load!(String, reader)?;
+        let recipient_address = load!(String, reader)?;
+        let at_block_hash = load!(Option<RpcHash>, reader)?;
+        Ok(Self { asset_id, recipient_address, at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetLiquidityClaimPreviewResponse {
+    pub recipient_address: String,
+    pub owner_id: Option<String>,
+    pub claimable_amount_sompi: String,
+    pub min_payout_sompi: String,
+    pub claimable_now: bool,
+    pub reason: Option<String>,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetLiquidityClaimPreviewResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.recipient_address, writer)?;
+        store!(Option<String>, &self.owner_id, writer)?;
+        store!(String, &self.claimable_amount_sompi, writer)?;
+        store!(String, &self.min_payout_sompi, writer)?;
+        store!(bool, &self.claimable_now, writer)?;
+        store!(Option<String>, &self.reason, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetLiquidityClaimPreviewResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let recipient_address = load!(String, reader)?;
+        let owner_id = load!(Option<String>, reader)?;
+        let claimable_amount_sompi = load!(String, reader)?;
+        let min_payout_sompi = load!(String, reader)?;
+        let claimable_now = load!(bool, reader)?;
+        let reason = load!(Option<String>, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { recipient_address, owner_id, claimable_amount_sompi, min_payout_sompi, claimable_now, reason, context })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetLiquidityHoldersRequest {
+    pub asset_id: String,
+    pub offset: u32,
+    pub limit: u32,
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetLiquidityHoldersRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.asset_id, writer)?;
+        store!(u32, &self.offset, writer)?;
+        store!(u32, &self.limit, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetLiquidityHoldersRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let asset_id = load!(String, reader)?;
+        let offset = load!(u32, reader)?;
+        let limit = load!(u32, reader)?;
+        let at_block_hash = load!(Option<RpcHash>, reader)?;
+        Ok(Self { asset_id, offset, limit, at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetLiquidityHoldersResponse {
+    pub holders: Vec<RpcLiquidityHolder>,
+    pub total: u64,
+    pub context: RpcTokenContext,
+}
+
+impl Serializer for GetLiquidityHoldersResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Vec<RpcLiquidityHolder>, &self.holders, writer)?;
+        store!(u64, &self.total, writer)?;
+        store!(RpcTokenContext, &self.context, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetLiquidityHoldersResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let holders = load!(Vec<RpcLiquidityHolder>, reader)?;
+        let total = load!(u64, reader)?;
+        let context = load!(RpcTokenContext, reader)?;
+        Ok(Self { holders, total, context })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetTokenEventsRequest {

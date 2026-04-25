@@ -11,8 +11,7 @@ use cryptix_notify::{
     connection::{ChannelConnection, ChannelType},
     scope::{
         BlockAddedScope, FinalityConflictScope, NewBlockTemplateScope, PruningPointUtxoSetOverrideScope, Scope,
-        SinkBlueScoreChangedScope, TokenEventsChangedScope, UtxosChangedScope, VirtualChainChangedScope,
-        VirtualDaaScoreChangedScope,
+        SinkBlueScoreChangedScope, TokenEventsChangedScope, UtxosChangedScope, VirtualChainChangedScope, VirtualDaaScoreChangedScope,
     },
 };
 use cryptix_rpc_core::{api::rpc::RpcApi, model::*, Notification};
@@ -886,6 +885,80 @@ async fn sanity_test() {
                         .get_token_owner_id_by_address_call(
                             None,
                             GetTokenOwnerIdByAddressRequest { address: String::new(), at_block_hash: None },
+                        )
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetLiquidityPoolState => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_liquidity_pool_state_call(
+                            None,
+                            GetLiquidityPoolStateRequest { asset_id: "00".repeat(32), at_block_hash: None },
+                        )
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetLiquidityQuote => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_liquidity_quote_call(
+                            None,
+                            GetLiquidityQuoteRequest {
+                                asset_id: "00".repeat(32),
+                                side: 0,
+                                exact_in_amount: "1".to_string(),
+                                at_block_hash: None,
+                            },
+                        )
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetLiquidityFeeState => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_liquidity_fee_state_call(
+                            None,
+                            GetLiquidityFeeStateRequest { asset_id: "00".repeat(32), at_block_hash: None },
+                        )
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetLiquidityClaimPreview => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_liquidity_claim_preview_call(
+                            None,
+                            GetLiquidityClaimPreviewRequest {
+                                asset_id: "00".repeat(32),
+                                recipient_address: Address::new(Prefix::Simnet, Version::PubKey, &[0u8; 32]).to_string(),
+                                at_block_hash: None,
+                            },
+                        )
+                        .await;
+                    assert!(result.is_err());
+                })
+            }
+
+            CryptixdPayloadOps::GetLiquidityHolders => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let result = rpc_client
+                        .get_liquidity_holders_call(
+                            None,
+                            GetLiquidityHoldersRequest { asset_id: "00".repeat(32), offset: 0, limit: 10, at_block_hash: None },
                         )
                         .await;
                     assert!(result.is_err());

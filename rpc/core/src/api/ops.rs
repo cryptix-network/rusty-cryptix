@@ -182,6 +182,16 @@ pub enum RpcApiOps {
     GetTokenHolders = 172,
     /// Derive Cryptix Atomic owner id from an address, if script class is supported.
     GetTokenOwnerIdByAddress = 173,
+    /// Get Cryptix Atomic liquidity pool state for a liquidity asset.
+    GetLiquidityPoolState = 174,
+    /// Get Cryptix Atomic liquidity quote for exact-in buy/sell.
+    GetLiquidityQuote = 175,
+    /// Get Cryptix Atomic liquidity fee accrual state for a liquidity asset.
+    GetLiquidityFeeState = 176,
+    /// Get Cryptix Atomic liquidity fee-claim preview for a specific recipient address.
+    GetLiquidityClaimPreview = 177,
+    /// List Cryptix Atomic liquidity holders for a liquidity asset.
+    GetLiquidityHolders = 178,
 }
 
 impl RpcApiOps {

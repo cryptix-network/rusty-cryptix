@@ -7,6 +7,9 @@ pub const MAX_NAME_LEN: usize = 32;
 pub const MAX_SYMBOL_LEN: usize = 10;
 pub const MAX_METADATA_LEN: usize = 256;
 pub const MAX_DECIMALS: u8 = 18;
+pub const MAX_LIQUIDITY_RECIPIENTS: usize = 2;
+pub const MIN_LIQUIDITY_FEE_BPS: u16 = 10;
+pub const MAX_LIQUIDITY_FEE_BPS: u16 = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -15,6 +18,11 @@ pub enum TokenOpCode {
     Transfer = 1,
     Mint = 2,
     Burn = 3,
+    CreateAssetWithMint = 4,
+    CreateLiquidityAsset = 5,
+    BuyLiquidityExactIn = 6,
+    SellLiquidityExactIn = 7,
+    ClaimLiquidityFees = 8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +73,21 @@ pub enum NoopReason {
     BadMaxSupply = 20,
     AlreadyProcessed = 21,
     InternalMalformedAcceptance = 22,
+    BadLiquidityFeeBps = 23,
+    BadLiquidityRecipientCount = 24,
+    RecipientEncodingInvalid = 25,
+    RecipientDuplicate = 26,
+    RecipientNotCanonical = 27,
+    BadLaunchBuyFields = 28,
+    MinOutViolation = 29,
+    ZeroOutput = 30,
+    LegacyOpForLiquidityAsset = 31,
+    NonceStale = 32,
+    VaultInputCount = 33,
+    VaultOutputCount = 34,
+    VaultOutpointMismatch = 35,
+    PayoutScriptClassInvalid = 36,
+    HistoricalStateUnavailable = 37,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +106,19 @@ pub struct CreateAssetOp {
     pub name: Vec<u8>,
     pub symbol: Vec<u8>,
     pub metadata: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateAssetWithMintOp {
+    pub decimals: u8,
+    pub supply_mode: SupplyMode,
+    pub max_supply: u128,
+    pub mint_authority_owner_id: [u8; 32],
+    pub name: Vec<u8>,
+    pub symbol: Vec<u8>,
+    pub metadata: Vec<u8>,
+    pub initial_mint_amount: u128,
+    pub initial_mint_to_owner_id: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,11 +142,62 @@ pub struct BurnOp {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiquidityRecipientAddress {
+    pub address_version: u8,
+    pub address_payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateLiquidityAssetOp {
+    pub decimals: u8,
+    pub max_supply: u128,
+    pub name: Vec<u8>,
+    pub symbol: Vec<u8>,
+    pub metadata: Vec<u8>,
+    pub seed_reserve_sompi: u64,
+    pub fee_bps: u16,
+    pub recipients: Vec<LiquidityRecipientAddress>,
+    pub launch_buy_sompi: u64,
+    pub launch_buy_min_token_out: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuyLiquidityExactInOp {
+    pub asset_id: [u8; 32],
+    pub expected_pool_nonce: u64,
+    pub cpay_in_sompi: u64,
+    pub min_token_out: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SellLiquidityExactInOp {
+    pub asset_id: [u8; 32],
+    pub expected_pool_nonce: u64,
+    pub token_in: u128,
+    pub min_cpay_out_sompi: u64,
+    pub cpay_receive_output_index: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimLiquidityFeesOp {
+    pub asset_id: [u8; 32],
+    pub expected_pool_nonce: u64,
+    pub recipient_index: u8,
+    pub claim_amount_sompi: u64,
+    pub claim_receive_output_index: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TokenOp {
     CreateAsset(CreateAssetOp),
     Transfer(TransferOp),
     Mint(MintOp),
     Burn(BurnOp),
+    CreateAssetWithMint(CreateAssetWithMintOp),
+    CreateLiquidityAsset(CreateLiquidityAssetOp),
+    BuyLiquidityExactIn(BuyLiquidityExactInOp),
+    SellLiquidityExactIn(SellLiquidityExactInOp),
+    ClaimLiquidityFees(ClaimLiquidityFeesOp),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +241,11 @@ fn parse_atomic_token_payload_strict(payload: &[u8]) -> Result<ParsedTokenPayloa
         1 => TokenOpCode::Transfer,
         2 => TokenOpCode::Mint,
         3 => TokenOpCode::Burn,
+        4 => TokenOpCode::CreateAssetWithMint,
+        5 => TokenOpCode::CreateLiquidityAsset,
+        6 => TokenOpCode::BuyLiquidityExactIn,
+        7 => TokenOpCode::SellLiquidityExactIn,
+        8 => TokenOpCode::ClaimLiquidityFees,
         _ => return Err(NoopReason::BadOp),
     };
 
@@ -164,6 +256,9 @@ fn parse_atomic_token_payload_strict(payload: &[u8]) -> Result<ParsedTokenPayloa
 
     let auth_input_index = take_u16_le(payload, &mut cursor).ok_or(NoopReason::BadLength)?;
     let nonce = take_u64_le(payload, &mut cursor).ok_or(NoopReason::BadLength)?;
+    if nonce == 0 {
+        return Err(NoopReason::BadNonce);
+    }
 
     let header = TokenOpHeader { op, auth_input_index, nonce };
     let op = match op {
@@ -171,6 +266,11 @@ fn parse_atomic_token_payload_strict(payload: &[u8]) -> Result<ParsedTokenPayloa
         TokenOpCode::Transfer => TokenOp::Transfer(parse_transfer_op(payload, &mut cursor)?),
         TokenOpCode::Mint => TokenOp::Mint(parse_mint_op(payload, &mut cursor)?),
         TokenOpCode::Burn => TokenOp::Burn(parse_burn_op(payload, &mut cursor)?),
+        TokenOpCode::CreateAssetWithMint => TokenOp::CreateAssetWithMint(parse_create_asset_with_mint_op(payload, &mut cursor)?),
+        TokenOpCode::CreateLiquidityAsset => TokenOp::CreateLiquidityAsset(parse_create_liquidity_asset_op(payload, &mut cursor)?),
+        TokenOpCode::BuyLiquidityExactIn => TokenOp::BuyLiquidityExactIn(parse_buy_liquidity_exact_in_op(payload, &mut cursor)?),
+        TokenOpCode::SellLiquidityExactIn => TokenOp::SellLiquidityExactIn(parse_sell_liquidity_exact_in_op(payload, &mut cursor)?),
+        TokenOpCode::ClaimLiquidityFees => TokenOp::ClaimLiquidityFees(parse_claim_liquidity_fees_op(payload, &mut cursor)?),
     };
 
     if cursor != payload.len() {
@@ -181,37 +281,8 @@ fn parse_atomic_token_payload_strict(payload: &[u8]) -> Result<ParsedTokenPayloa
 }
 
 fn parse_create_asset_op(payload: &[u8], cursor: &mut usize) -> Result<CreateAssetOp, NoopReason> {
-    let decimals = take_u8(payload, cursor).ok_or(NoopReason::BadLength)?;
-    if decimals > MAX_DECIMALS {
-        return Err(NoopReason::BadDecimals);
-    }
-
-    let supply_mode_raw = take_u8(payload, cursor).ok_or(NoopReason::BadLength)?;
-    let supply_mode = match supply_mode_raw {
-        0 => SupplyMode::Uncapped,
-        1 => SupplyMode::Capped,
-        _ => return Err(NoopReason::BadSupplyMode),
-    };
-
-    let max_supply = take_u128_le(payload, cursor).ok_or(NoopReason::BadLength)?;
-    let mint_authority_owner_id = take_32(payload, cursor).ok_or(NoopReason::BadLength)?;
-
-    let name_len = take_u8(payload, cursor).ok_or(NoopReason::BadLength)? as usize;
-    let symbol_len = take_u8(payload, cursor).ok_or(NoopReason::BadLength)? as usize;
-    let metadata_len = take_u16_le(payload, cursor).ok_or(NoopReason::BadLength)? as usize;
-
-    if name_len > MAX_NAME_LEN || symbol_len > MAX_SYMBOL_LEN || metadata_len > MAX_METADATA_LEN {
-        return Err(NoopReason::BadLength);
-    }
-
-    let name = take_vec(payload, cursor, name_len).ok_or(NoopReason::BadLength)?;
-    let symbol = take_vec(payload, cursor, symbol_len).ok_or(NoopReason::BadLength)?;
-    let metadata = take_vec(payload, cursor, metadata_len).ok_or(NoopReason::BadLength)?;
-
-    if std::str::from_utf8(&name).is_err() || std::str::from_utf8(&symbol).is_err() {
-        return Err(NoopReason::BadUtf8);
-    }
-
+    let (decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata) =
+        parse_create_asset_common(payload, cursor)?;
     Ok(CreateAssetOp { decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata })
 }
 
@@ -248,6 +319,223 @@ fn parse_burn_op(payload: &[u8], cursor: &mut usize) -> Result<BurnOp, NoopReaso
     }
 
     Ok(BurnOp { asset_id, amount })
+}
+
+fn parse_create_asset_with_mint_op(payload: &[u8], cursor: &mut usize) -> Result<CreateAssetWithMintOp, NoopReason> {
+    let (decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata) =
+        parse_create_asset_common(payload, cursor)?;
+    let initial_mint_amount = take_u128_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+    let initial_mint_to_owner_id = take_32(payload, cursor).ok_or(NoopReason::BadLength)?;
+
+    if initial_mint_amount == 0 && initial_mint_to_owner_id != [0u8; 32] {
+        return Err(NoopReason::InvalidAmount);
+    }
+    if initial_mint_amount > 0 && initial_mint_to_owner_id == [0u8; 32] {
+        return Err(NoopReason::InvalidAmount);
+    }
+
+    Ok(CreateAssetWithMintOp {
+        decimals,
+        supply_mode,
+        max_supply,
+        mint_authority_owner_id,
+        name,
+        symbol,
+        metadata,
+        initial_mint_amount,
+        initial_mint_to_owner_id,
+    })
+}
+
+fn parse_create_liquidity_asset_op(payload: &[u8], cursor: &mut usize) -> Result<CreateLiquidityAssetOp, NoopReason> {
+    let decimals = take_u8(payload, cursor).ok_or(NoopReason::BadLength)?;
+    if decimals > MAX_DECIMALS {
+        return Err(NoopReason::BadDecimals);
+    }
+
+    let max_supply = take_u128_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+    if max_supply == 0 {
+        return Err(NoopReason::BadMaxSupply);
+    }
+
+    let name_len = take_u8(payload, cursor).ok_or(NoopReason::BadLength)? as usize;
+    let symbol_len = take_u8(payload, cursor).ok_or(NoopReason::BadLength)? as usize;
+    let metadata_len = take_u16_le(payload, cursor).ok_or(NoopReason::BadLength)? as usize;
+    if name_len > MAX_NAME_LEN || symbol_len > MAX_SYMBOL_LEN || metadata_len > MAX_METADATA_LEN {
+        return Err(NoopReason::BadLength);
+    }
+
+    let name = take_vec(payload, cursor, name_len).ok_or(NoopReason::BadLength)?;
+    let symbol = take_vec(payload, cursor, symbol_len).ok_or(NoopReason::BadLength)?;
+    let metadata = take_vec(payload, cursor, metadata_len).ok_or(NoopReason::BadLength)?;
+    if std::str::from_utf8(&name).is_err() || std::str::from_utf8(&symbol).is_err() {
+        return Err(NoopReason::BadUtf8);
+    }
+
+    let seed_reserve_sompi = take_u64_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+    let fee_bps = take_u16_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+    if !(fee_bps == 0 || (MIN_LIQUIDITY_FEE_BPS..=MAX_LIQUIDITY_FEE_BPS).contains(&fee_bps)) {
+        return Err(NoopReason::BadLiquidityFeeBps);
+    }
+
+    let recipient_count = take_u8(payload, cursor).ok_or(NoopReason::BadLength)? as usize;
+    if recipient_count > MAX_LIQUIDITY_RECIPIENTS {
+        return Err(NoopReason::BadLiquidityRecipientCount);
+    }
+    if fee_bps == 0 && recipient_count != 0 {
+        return Err(NoopReason::BadLiquidityRecipientCount);
+    }
+    if fee_bps > 0 && !(1..=MAX_LIQUIDITY_RECIPIENTS).contains(&recipient_count) {
+        return Err(NoopReason::BadLiquidityRecipientCount);
+    }
+
+    let mut recipients = Vec::with_capacity(recipient_count);
+    for _ in 0..recipient_count {
+        recipients.push(parse_recipient_address(payload, cursor)?);
+    }
+    if recipients.len() == 2 {
+        if recipients[0] == recipients[1] {
+            return Err(NoopReason::RecipientDuplicate);
+        }
+        if recipient_order_key(&recipients[0]) > recipient_order_key(&recipients[1]) {
+            return Err(NoopReason::RecipientNotCanonical);
+        }
+    }
+
+    let launch_buy_sompi = take_u64_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+    let launch_buy_min_token_out = take_u128_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+    if launch_buy_sompi == 0 && launch_buy_min_token_out != 0 {
+        return Err(NoopReason::BadLaunchBuyFields);
+    }
+    if launch_buy_sompi > 0 && launch_buy_min_token_out == 0 {
+        return Err(NoopReason::BadLaunchBuyFields);
+    }
+
+    Ok(CreateLiquidityAssetOp {
+        decimals,
+        max_supply,
+        name,
+        symbol,
+        metadata,
+        seed_reserve_sompi,
+        fee_bps,
+        recipients,
+        launch_buy_sompi,
+        launch_buy_min_token_out,
+    })
+}
+
+fn parse_buy_liquidity_exact_in_op(payload: &[u8], cursor: &mut usize) -> Result<BuyLiquidityExactInOp, NoopReason> {
+    let asset_id = take_32(payload, cursor).ok_or(NoopReason::BadLength)?;
+    let expected_pool_nonce = take_u64_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+    let cpay_in_sompi = take_u64_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+    let min_token_out = take_u128_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+
+    if expected_pool_nonce == 0 {
+        return Err(NoopReason::BadNonce);
+    }
+    if cpay_in_sompi == 0 {
+        return Err(NoopReason::InvalidAmount);
+    }
+    if min_token_out == 0 {
+        return Err(NoopReason::MinOutViolation);
+    }
+
+    Ok(BuyLiquidityExactInOp { asset_id, expected_pool_nonce, cpay_in_sompi, min_token_out })
+}
+
+fn parse_sell_liquidity_exact_in_op(payload: &[u8], cursor: &mut usize) -> Result<SellLiquidityExactInOp, NoopReason> {
+    let asset_id = take_32(payload, cursor).ok_or(NoopReason::BadLength)?;
+    let expected_pool_nonce = take_u64_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+    let token_in = take_u128_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+    let min_cpay_out_sompi = take_u64_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+    let cpay_receive_output_index = take_u16_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+
+    if expected_pool_nonce == 0 {
+        return Err(NoopReason::BadNonce);
+    }
+    if token_in == 0 {
+        return Err(NoopReason::InvalidAmount);
+    }
+    if min_cpay_out_sompi == 0 {
+        return Err(NoopReason::MinOutViolation);
+    }
+
+    Ok(SellLiquidityExactInOp { asset_id, expected_pool_nonce, token_in, min_cpay_out_sompi, cpay_receive_output_index })
+}
+
+fn parse_claim_liquidity_fees_op(payload: &[u8], cursor: &mut usize) -> Result<ClaimLiquidityFeesOp, NoopReason> {
+    let asset_id = take_32(payload, cursor).ok_or(NoopReason::BadLength)?;
+    let expected_pool_nonce = take_u64_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+    let recipient_index = take_u8(payload, cursor).ok_or(NoopReason::BadLength)?;
+    let claim_amount_sompi = take_u64_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+    let claim_receive_output_index = take_u16_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+
+    if expected_pool_nonce == 0 {
+        return Err(NoopReason::BadNonce);
+    }
+    if claim_amount_sompi == 0 {
+        return Err(NoopReason::InvalidAmount);
+    }
+
+    Ok(ClaimLiquidityFeesOp { asset_id, expected_pool_nonce, recipient_index, claim_amount_sompi, claim_receive_output_index })
+}
+
+fn parse_create_asset_common(
+    payload: &[u8],
+    cursor: &mut usize,
+) -> Result<(u8, SupplyMode, u128, [u8; 32], Vec<u8>, Vec<u8>, Vec<u8>), NoopReason> {
+    let decimals = take_u8(payload, cursor).ok_or(NoopReason::BadLength)?;
+    if decimals > MAX_DECIMALS {
+        return Err(NoopReason::BadDecimals);
+    }
+
+    let supply_mode_raw = take_u8(payload, cursor).ok_or(NoopReason::BadLength)?;
+    let supply_mode = match supply_mode_raw {
+        0 => SupplyMode::Uncapped,
+        1 => SupplyMode::Capped,
+        _ => return Err(NoopReason::BadSupplyMode),
+    };
+    let max_supply = take_u128_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+    let mint_authority_owner_id = take_32(payload, cursor).ok_or(NoopReason::BadLength)?;
+
+    let name_len = take_u8(payload, cursor).ok_or(NoopReason::BadLength)? as usize;
+    let symbol_len = take_u8(payload, cursor).ok_or(NoopReason::BadLength)? as usize;
+    let metadata_len = take_u16_le(payload, cursor).ok_or(NoopReason::BadLength)? as usize;
+    if name_len > MAX_NAME_LEN || symbol_len > MAX_SYMBOL_LEN || metadata_len > MAX_METADATA_LEN {
+        return Err(NoopReason::BadLength);
+    }
+
+    let name = take_vec(payload, cursor, name_len).ok_or(NoopReason::BadLength)?;
+    let symbol = take_vec(payload, cursor, symbol_len).ok_or(NoopReason::BadLength)?;
+    let metadata = take_vec(payload, cursor, metadata_len).ok_or(NoopReason::BadLength)?;
+    if std::str::from_utf8(&name).is_err() || std::str::from_utf8(&symbol).is_err() {
+        return Err(NoopReason::BadUtf8);
+    }
+
+    match supply_mode {
+        SupplyMode::Capped if max_supply == 0 => return Err(NoopReason::BadMaxSupply),
+        SupplyMode::Uncapped if max_supply != 0 => return Err(NoopReason::BadMaxSupply),
+        _ => {}
+    }
+
+    Ok((decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata))
+}
+
+fn parse_recipient_address(payload: &[u8], cursor: &mut usize) -> Result<LiquidityRecipientAddress, NoopReason> {
+    let address_version = take_u8(payload, cursor).ok_or(NoopReason::BadLength)?;
+    let expected_len = match address_version {
+        0 => 32usize,
+        1 => 33usize,
+        8 => 32usize,
+        _ => return Err(NoopReason::RecipientEncodingInvalid),
+    };
+    let address_payload = take_vec(payload, cursor, expected_len).ok_or(NoopReason::BadLength)?;
+    Ok(LiquidityRecipientAddress { address_version, address_payload })
+}
+
+fn recipient_order_key(recipient: &LiquidityRecipientAddress) -> (u8, &[u8]) {
+    (recipient.address_version, recipient.address_payload.as_slice())
 }
 
 fn take_bytes(payload: &[u8], cursor: &mut usize, len: usize) -> Option<Vec<u8>> {
@@ -366,5 +654,40 @@ mod tests {
         payload.extend_from_slice(&1u128.to_le_bytes());
         let result = parse_atomic_token_payload(&payload).unwrap();
         assert_eq!(result.unwrap_err(), NoopReason::BadFlags);
+    }
+
+    #[test]
+    fn parse_buy_liquidity_rejects_zero_expected_pool_nonce() {
+        let mut payload = build_header(6, 0, 1);
+        payload.extend_from_slice(&[1u8; 32]); // asset_id
+        payload.extend_from_slice(&0u64.to_le_bytes()); // expected_pool_nonce
+        payload.extend_from_slice(&1u64.to_le_bytes()); // cpay_in_sompi
+        payload.extend_from_slice(&1u128.to_le_bytes()); // min_token_out
+        let result = parse_atomic_token_payload(&payload).unwrap();
+        assert_eq!(result.unwrap_err(), NoopReason::BadNonce);
+    }
+
+    #[test]
+    fn parse_sell_liquidity_rejects_zero_expected_pool_nonce() {
+        let mut payload = build_header(7, 0, 1);
+        payload.extend_from_slice(&[2u8; 32]); // asset_id
+        payload.extend_from_slice(&0u64.to_le_bytes()); // expected_pool_nonce
+        payload.extend_from_slice(&1u128.to_le_bytes()); // token_in
+        payload.extend_from_slice(&1u64.to_le_bytes()); // min_cpay_out_sompi
+        payload.extend_from_slice(&0u16.to_le_bytes()); // cpay_receive_output_index
+        let result = parse_atomic_token_payload(&payload).unwrap();
+        assert_eq!(result.unwrap_err(), NoopReason::BadNonce);
+    }
+
+    #[test]
+    fn parse_claim_liquidity_rejects_zero_expected_pool_nonce() {
+        let mut payload = build_header(8, 0, 1);
+        payload.extend_from_slice(&[3u8; 32]); // asset_id
+        payload.extend_from_slice(&0u64.to_le_bytes()); // expected_pool_nonce
+        payload.push(0); // recipient_index
+        payload.extend_from_slice(&1u64.to_le_bytes()); // claim_amount_sompi
+        payload.extend_from_slice(&0u16.to_le_bytes()); // claim_receive_output_index
+        let result = parse_atomic_token_payload(&payload).unwrap();
+        assert_eq!(result.unwrap_err(), NoopReason::BadNonce);
     }
 }

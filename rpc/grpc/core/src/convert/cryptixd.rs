@@ -79,6 +79,11 @@ pub mod cryptixd_request_convert {
     impl_into_cryptixd_request!(GetTokenBalancesByOwner);
     impl_into_cryptixd_request!(GetTokenHolders);
     impl_into_cryptixd_request!(GetTokenOwnerIdByAddress);
+    impl_into_cryptixd_request!(GetLiquidityPoolState);
+    impl_into_cryptixd_request!(GetLiquidityQuote);
+    impl_into_cryptixd_request!(GetLiquidityFeeState);
+    impl_into_cryptixd_request!(GetLiquidityClaimPreview);
+    impl_into_cryptixd_request!(GetLiquidityHolders);
     impl_into_cryptixd_request!(ExportTokenSnapshot);
     impl_into_cryptixd_request!(ImportTokenSnapshot);
     impl_into_cryptixd_request!(GetTokenHealth);
@@ -241,6 +246,11 @@ pub mod cryptixd_response_convert {
     impl_into_cryptixd_response!(GetTokenBalancesByOwner);
     impl_into_cryptixd_response!(GetTokenHolders);
     impl_into_cryptixd_response!(GetTokenOwnerIdByAddress);
+    impl_into_cryptixd_response!(GetLiquidityPoolState);
+    impl_into_cryptixd_response!(GetLiquidityQuote);
+    impl_into_cryptixd_response!(GetLiquidityFeeState);
+    impl_into_cryptixd_response!(GetLiquidityClaimPreview);
+    impl_into_cryptixd_response!(GetLiquidityHolders);
     impl_into_cryptixd_response!(ExportTokenSnapshot);
     impl_into_cryptixd_response!(ImportTokenSnapshot);
     impl_into_cryptixd_response!(GetTokenHealth);

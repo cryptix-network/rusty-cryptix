@@ -393,6 +393,22 @@ impl Generator {
                     Some(outputs.iter().map(|output| output.amount).sum()),
                 )
             }
+            PaymentDestination::ScriptOutputs(outputs) => {
+                if final_transaction_priority_fee.is_none() {
+                    return Err(Error::GeneratorNoFeesForFinalTransaction);
+                }
+
+                for output in outputs.iter() {
+                    if output.amount == 0 {
+                        return Err(Error::GeneratorPaymentOutputZeroAmount);
+                    }
+                }
+
+                (
+                    outputs.iter().map(|output| TransactionOutput::new(output.amount, output.script_public_key.clone())).collect(),
+                    Some(outputs.iter().map(|output| output.amount).sum()),
+                )
+            }
         };
 
         if final_transaction_outputs.is_empty() && matches!(final_transaction_priority_fee, Fees::ReceiverPays(_)) {

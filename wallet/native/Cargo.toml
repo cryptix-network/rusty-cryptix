@@ -15,7 +15,21 @@ default = []
 [dependencies]
 async-std.workspace = true
 async-trait.workspace = true
+cryptix-addresses.workspace = true
 cryptix-cli.workspace = true
+cryptix-consensus-client.workspace = true
+cryptix-consensus-core.workspace = true
+cryptix-rpc-core.workspace = true
+cryptix-txscript.workspace = true
+cryptix-wallet-core.workspace = true
+cryptix-wrpc-client.workspace = true
+futures.workspace = true
+hex.workspace = true
+prost.workspace = true
+tonic.workspace = true
 tokio.workspace = true
 workflow-log.workspace = true
 workflow-terminal.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true

@@ -28,12 +28,15 @@ pub enum ScriptClass {
     PubKeyECDSA,
     /// Pay to script hash
     ScriptHash,
+    /// Reserved CAT liquidity vault script template.
+    LiquidityVault,
 }
 
 const NON_STANDARD: &str = "nonstandard";
 const PUB_KEY: &str = "pubkey";
 const PUB_KEY_ECDSA: &str = "pubkeyecdsa";
 const SCRIPT_HASH: &str = "scripthash";
+const LIQUIDITY_VAULT: &str = "liquidityvault";
 
 impl ScriptClass {
     pub fn from_script(script_public_key: &ScriptPublicKey) -> Self {
@@ -45,6 +48,8 @@ impl ScriptClass {
                 Self::PubKeyECDSA
             } else if Self::is_pay_to_script_hash(script_public_key_) {
                 Self::ScriptHash
+            } else if Self::is_liquidity_vault(script_public_key_) {
+                Self::LiquidityVault
             } else {
                 ScriptClass::NonStandard
             }
@@ -81,12 +86,27 @@ impl ScriptClass {
         (script_public_key[34] == opcodes::codes::OpEqual)
     }
 
+    /// Returns true if the script matches the reserved CAT liquidity vault template:
+    /// `OP_DATA_4 'C' 'L' 'V' '1' OP_DROP OP_TRUE`.
+    #[inline(always)]
+    pub fn is_liquidity_vault(script_public_key: &[u8]) -> bool {
+        script_public_key.len() == 7
+            && script_public_key[0] == opcodes::codes::OpData4
+            && script_public_key[1] == b'C'
+            && script_public_key[2] == b'L'
+            && script_public_key[3] == b'V'
+            && script_public_key[4] == b'1'
+            && script_public_key[5] == opcodes::codes::OpDrop
+            && script_public_key[6] == opcodes::codes::OpTrue
+    }
+
     fn as_str(&self) -> &'static str {
         match self {
             ScriptClass::NonStandard => NON_STANDARD,
             ScriptClass::PubKey => PUB_KEY,
             ScriptClass::PubKeyECDSA => PUB_KEY_ECDSA,
             ScriptClass::ScriptHash => SCRIPT_HASH,
+            ScriptClass::LiquidityVault => LIQUIDITY_VAULT,
         }
     }
 
@@ -96,6 +116,7 @@ impl ScriptClass {
             ScriptClass::PubKey => MAX_SCRIPT_PUBLIC_KEY_VERSION,
             ScriptClass::PubKeyECDSA => MAX_SCRIPT_PUBLIC_KEY_VERSION,
             ScriptClass::ScriptHash => MAX_SCRIPT_PUBLIC_KEY_VERSION,
+            ScriptClass::LiquidityVault => MAX_SCRIPT_PUBLIC_KEY_VERSION,
         }
     }
 }
@@ -115,6 +136,7 @@ impl FromStr for ScriptClass {
             PUB_KEY => Ok(ScriptClass::PubKey),
             PUB_KEY_ECDSA => Ok(ScriptClass::PubKeyECDSA),
             SCRIPT_HASH => Ok(ScriptClass::ScriptHash),
+            LIQUIDITY_VAULT => Ok(ScriptClass::LiquidityVault),
             _ => Err(Error::InvalidScriptClass(script_class.to_string())),
         }
     }
@@ -172,6 +194,12 @@ mod tests {
                 script: hex::decode("aa204a23f5eef4b2dead811c7efb4f1afbd8df845e804b6c36a4001fc096e13f815187").unwrap(),
                 version: 0,
                 class: ScriptClass::ScriptHash,
+            },
+            Test {
+                name: "valid liquidity vault script",
+                script: vec![opcodes::codes::OpData4, b'C', b'L', b'V', b'1', opcodes::codes::OpDrop, opcodes::codes::OpTrue],
+                version: 0,
+                class: ScriptClass::LiquidityVault,
             },
             Test {
                 name: "non standard script (unexpected version)",

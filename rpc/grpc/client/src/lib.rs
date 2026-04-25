@@ -293,6 +293,11 @@ impl RpcApi for GrpcClient {
     route!(get_token_balances_by_owner_call, GetTokenBalancesByOwner);
     route!(get_token_holders_call, GetTokenHolders);
     route!(get_token_owner_id_by_address_call, GetTokenOwnerIdByAddress);
+    route!(get_liquidity_pool_state_call, GetLiquidityPoolState);
+    route!(get_liquidity_quote_call, GetLiquidityQuote);
+    route!(get_liquidity_fee_state_call, GetLiquidityFeeState);
+    route!(get_liquidity_claim_preview_call, GetLiquidityClaimPreview);
+    route!(get_liquidity_holders_call, GetLiquidityHolders);
     route!(export_token_snapshot_call, ExportTokenSnapshot);
     route!(import_token_snapshot_call, ImportTokenSnapshot);
     route!(get_token_health_call, GetTokenHealth);

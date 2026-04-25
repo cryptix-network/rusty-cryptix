@@ -1,6 +1,6 @@
 use crate::protowire::{
-    cryptixd_response::Payload, BlockAddedNotificationMessage, CryptixdResponse, NewBlockTemplateNotificationMessage, RpcNotifyCommand,
-    TokenEventsChangedNotificationMessage,
+    cryptixd_response::Payload, BlockAddedNotificationMessage, CryptixdResponse, NewBlockTemplateNotificationMessage,
+    RpcNotifyCommand, TokenEventsChangedNotificationMessage,
 };
 use crate::protowire::{
     FinalityConflictNotificationMessage, FinalityConflictResolvedNotificationMessage, NotifyPruningPointUtxoSetOverrideRequestMessage,

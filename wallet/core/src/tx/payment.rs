@@ -40,6 +40,7 @@ extern "C" {
 pub enum PaymentDestination {
     Change,
     PaymentOutputs(PaymentOutputs),
+    ScriptOutputs(ScriptPaymentOutputs),
 }
 
 impl PaymentDestination {
@@ -47,6 +48,7 @@ impl PaymentDestination {
         match self {
             Self::Change => None,
             Self::PaymentOutputs(payment_outputs) => Some(payment_outputs.amount()),
+            Self::ScriptOutputs(outputs) => Some(outputs.amount()),
         }
     }
 }
@@ -104,6 +106,51 @@ impl From<PaymentOutput> for TransactionOutput {
 impl From<PaymentOutput> for PaymentDestination {
     fn from(output: PaymentOutput) -> Self {
         Self::PaymentOutputs(PaymentOutputs { outputs: vec![output] })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct ScriptPaymentOutput {
+    pub amount: u64,
+    pub script_public_key: ScriptPublicKey,
+}
+
+impl ScriptPaymentOutput {
+    pub fn new(amount: u64, script_public_key: ScriptPublicKey) -> Self {
+        Self { amount, script_public_key }
+    }
+}
+
+impl From<ScriptPaymentOutput> for TransactionOutput {
+    fn from(value: ScriptPaymentOutput) -> Self {
+        Self::new_with_inner(TransactionOutputInner { script_public_key: value.script_public_key, value: value.amount })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct ScriptPaymentOutputs {
+    pub outputs: Vec<ScriptPaymentOutput>,
+}
+
+impl ScriptPaymentOutputs {
+    pub fn amount(&self) -> u64 {
+        self.outputs.iter().map(|output| output.amount).sum()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ScriptPaymentOutput> {
+        self.outputs.iter()
+    }
+}
+
+impl From<ScriptPaymentOutputs> for PaymentDestination {
+    fn from(outputs: ScriptPaymentOutputs) -> Self {
+        Self::ScriptOutputs(outputs)
+    }
+}
+
+impl From<ScriptPaymentOutput> for PaymentDestination {
+    fn from(output: ScriptPaymentOutput) -> Self {
+        Self::ScriptOutputs(ScriptPaymentOutputs { outputs: vec![output] })
     }
 }
 

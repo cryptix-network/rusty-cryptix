@@ -367,6 +367,14 @@ impl PendingTransaction {
         Ok(())
     }
 
+    pub fn set_input_sig_op_count(&self, input_index: usize, sig_op_count: u8) -> Result<()> {
+        let mut mutable_tx = self.inner.signable_tx.lock()?.clone();
+        mutable_tx.tx.inputs[input_index].sig_op_count = sig_op_count;
+        *self.inner.signable_tx.lock().unwrap() = mutable_tx;
+
+        Ok(())
+    }
+
     pub fn sign_input(&self, input_index: usize, private_key: &[u8; 32], hash_type: SigHashType) -> Result<()> {
         let mut mutable_tx = self.inner.signable_tx.lock()?.clone();
 

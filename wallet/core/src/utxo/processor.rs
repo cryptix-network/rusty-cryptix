@@ -706,7 +706,7 @@ impl UtxoProcessor {
                 // @ZeroBytes
                 // Keep the heavy payload-enrichment path outside notification_guard.write()
                 // so send/submit paths waiting on notification_lock() are not blocked by
-                // expensive get_block() mergeset traversal. There was a Bug before. 
+                // expensive get_block() mergeset traversal. There was a Bug before.
                 self.handle_virtual_chain_changed(virtual_chain_changed_notification).await?;
             }
 

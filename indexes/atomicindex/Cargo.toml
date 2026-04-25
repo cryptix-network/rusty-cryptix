@@ -18,6 +18,7 @@ cryptix-consensus-core.workspace = true
 cryptix-consensus-notify.workspace = true
 cryptix-consensusmanager.workspace = true
 cryptix-core.workspace = true
+cryptix-math.workspace = true
 cryptix-notify.workspace = true
 cryptix-txscript.workspace = true
 cryptix-utils.workspace = true

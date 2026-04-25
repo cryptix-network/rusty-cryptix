@@ -341,8 +341,10 @@ impl AtomicTokenService {
         std::fs::create_dir_all(&snapshot_store_dir)
             .map_err(|e| AtomicTokenError::Processing(format!("failed to create Atomic bootstrap directory: {e}")))?;
         let state_path = atomic_data_dir.join("state.bin");
-        let state = load_state_from_path(&state_path, TOKEN_PROTOCOL_VERSION, &network_id)?
+        let mut state = load_state_from_path(&state_path, TOKEN_PROTOCOL_VERSION, &network_id)?
             .unwrap_or_else(|| AtomicTokenState::new(TOKEN_PROTOCOL_VERSION, network_id.clone()));
+        state.set_payload_hf_activation_daa_score(config.params.payload_hf_activation_daa_score);
+        state.rebuild_runtime_caches();
 
         let consensus_notify_channel = Channel::<ConsensusNotification>::default();
         let listener_id = consensus_notifier.register_new_listener(

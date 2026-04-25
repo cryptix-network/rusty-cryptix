@@ -1,0 +1,378 @@
+syntax = "proto3";
+
+package cryptixwalletd;
+
+service cryptixwalletd {
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse) {}
+  rpc GetExternalSpendableUTXOs(GetExternalSpendableUTXOsRequest)
+      returns (GetExternalSpendableUTXOsResponse) {}
+  rpc CreateUnsignedTransactions(CreateUnsignedTransactionsRequest)
+      returns (CreateUnsignedTransactionsResponse) {}
+  rpc ShowAddresses(ShowAddressesRequest) returns (ShowAddressesResponse) {}
+  rpc NewAddress(NewAddressRequest) returns (NewAddressResponse) {}
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse) {}
+  rpc Broadcast(BroadcastRequest) returns (BroadcastResponse) {}
+  rpc BroadcastReplacement(BroadcastRequest) returns (BroadcastResponse) {}
+  rpc Send(SendRequest) returns (SendResponse) {}
+  rpc Sign(SignRequest) returns (SignResponse) {}
+  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse) {}
+  rpc BumpFee(BumpFeeRequest) returns (BumpFeeResponse) {}
+  rpc SendPayload(SendPayloadRequest) returns (SendPayloadResponse) {}
+  rpc TokenSend(TokenSendRequest) returns (TokenSendResponse) {}
+  rpc TokenMint(TokenMintRequest) returns (TokenMintResponse) {}
+  rpc TokenBurn(TokenBurnRequest) returns (TokenBurnResponse) {}
+  rpc TokenCreate(TokenCreateRequest) returns (TokenCreateResponse) {}
+  rpc TokenCreateMint(TokenCreateMintRequest) returns (TokenCreateMintResponse) {}
+  rpc TokenCreateLiquidity(TokenCreateLiquidityRequest) returns (TokenCreateLiquidityResponse) {}
+  rpc TokenBuyLiquidity(TokenBuyLiquidityRequest) returns (TokenBuyLiquidityResponse) {}
+  rpc TokenSellLiquidity(TokenSellLiquidityRequest) returns (TokenSellLiquidityResponse) {}
+  rpc TokenClaimLiquidity(TokenClaimLiquidityRequest) returns (TokenClaimLiquidityResponse) {}
+  rpc TokenBalances(TokenBalancesRequest) returns (TokenBalancesResponse) {}
+  rpc ScanAddresses(ScanAddressesRequest) returns (ScanAddressesResponse) {}
+}
+
+message GetBalanceRequest {}
+
+message GetBalanceResponse {
+  uint64 available = 1;
+  uint64 pending = 2;
+  repeated AddressBalances addressBalances = 3;
+}
+
+message AddressBalances {
+  string address = 1;
+  uint64 available = 2;
+  uint64 pending = 3;
+}
+
+message FeePolicy {
+  oneof feePolicy {
+    double maxFeeRate = 6;
+    double exactFeeRate = 7;
+    uint64 maxFee = 8;
+  }
+}
+
+message CreateUnsignedTransactionsRequest {
+  string address = 1;
+  uint64 amount = 2;
+  repeated string from = 3;
+  bool useExistingChangeAddress = 4;
+  bool isSendAll = 5;
+  FeePolicy feePolicy = 6;
+}
+
+message CreateUnsignedTransactionsResponse {
+  repeated bytes unsignedTransactions = 1;
+}
+
+message ShowAddressesRequest {}
+
+message ShowAddressesResponse {
+  repeated string address = 1;
+}
+
+message NewAddressRequest {}
+
+message NewAddressResponse {
+  string address = 1;
+}
+
+message BroadcastRequest {
+  bool isDomain = 1;
+  repeated bytes transactions = 2;
+}
+
+message BroadcastResponse {
+  repeated string txIDs = 1;
+}
+
+message ShutdownRequest {}
+
+message ShutdownResponse {}
+
+message Outpoint {
+  string transactionId = 1;
+  uint32 index = 2;
+}
+
+message UtxosByAddressesEntry {
+  string address = 1;
+  Outpoint outpoint = 2;
+  UtxoEntry utxoEntry = 3;
+}
+
+message ScriptPublicKey {
+  uint32 version = 1;
+  string scriptPublicKey = 2;
+}
+
+message UtxoEntry {
+  uint64 amount = 1;
+  ScriptPublicKey scriptPublicKey = 2;
+  uint64 blockDaaScore = 3;
+  bool isCoinbase = 4;
+}
+
+message GetExternalSpendableUTXOsRequest {
+  string address = 1;
+}
+
+message GetExternalSpendableUTXOsResponse {
+  repeated UtxosByAddressesEntry Entries = 1;
+}
+
+message SendRequest {
+  string toAddress = 1;
+  uint64 amount = 2;
+  string password = 3;
+  repeated string from = 4;
+  bool useExistingChangeAddress = 5;
+  bool isSendAll = 6;
+  FeePolicy feePolicy = 7;
+}
+
+message SendResponse {
+  repeated string txIDs = 1;
+  repeated bytes signedTransactions = 2;
+}
+
+message SignRequest {
+  repeated bytes unsignedTransactions = 1;
+  string password = 2;
+}
+
+message SignResponse {
+  repeated bytes signedTransactions = 1;
+}
+
+message GetVersionRequest {}
+
+message GetVersionResponse {
+  string version = 1;
+}
+
+message BumpFeeRequest {
+  string password = 1;
+  repeated string from = 2;
+  bool useExistingChangeAddress = 3;
+  FeePolicy feePolicy = 4;
+  string txID = 5;
+}
+
+message BumpFeeResponse {
+  repeated bytes transactions = 1;
+  repeated string txIDs = 2;
+}
+
+message SendPayloadRequest {
+  string password = 1;
+  string sender_address = 2;
+  uint64 carrier_sompi = 3;
+  string payload_hex = 4;
+}
+
+message SendPayloadResponse {
+  repeated string tx_ids = 1;
+}
+
+message TokenSendRequest {
+  string asset_id = 1;
+  string to_address = 2;
+  string amount_raw = 3;
+  string password = 4;
+  string sender_address = 5;
+  uint32 auth_input_index = 6;
+}
+
+message TokenSendResponse {
+  repeated string tx_ids = 1;
+  uint64 nonce = 2;
+  string sender_owner_id = 3;
+  string recipient_owner_id = 4;
+}
+
+message TokenMintRequest {
+  string asset_id = 1;
+  string to_address = 2;
+  string amount_raw = 3;
+  string password = 4;
+  string sender_address = 5;
+  uint32 auth_input_index = 6;
+}
+
+message TokenMintResponse {
+  repeated string tx_ids = 1;
+  uint64 nonce = 2;
+  string sender_owner_id = 3;
+  string recipient_owner_id = 4;
+}
+
+message TokenBurnRequest {
+  string asset_id = 1;
+  string amount_raw = 2;
+  string password = 3;
+  string sender_address = 4;
+  uint32 auth_input_index = 5;
+}
+
+message TokenBurnResponse {
+  repeated string tx_ids = 1;
+  uint64 nonce = 2;
+  string sender_owner_id = 3;
+}
+
+message TokenCreateRequest {
+  string name = 1;
+  string symbol = 2;
+  uint32 decimals = 3;
+  bool capped = 4;
+  string max_supply_raw = 5;
+  string password = 6;
+  string sender_address = 7;
+  string mint_authority_address = 8;
+  string metadata_hex = 9;
+  uint32 auth_input_index = 10;
+}
+
+message TokenCreateResponse {
+  repeated string tx_ids = 1;
+  uint64 nonce = 2;
+  string sender_owner_id = 3;
+  string mint_authority_owner_id = 4;
+  string asset_id = 5;
+}
+
+message TokenCreateMintRequest {
+  string name = 1;
+  string symbol = 2;
+  uint32 decimals = 3;
+  bool capped = 4;
+  string max_supply_raw = 5;
+  string initial_mint_amount_raw = 6;
+  string initial_mint_to_address = 7;
+  string password = 8;
+  string sender_address = 9;
+  string mint_authority_address = 10;
+  string metadata_hex = 11;
+  uint32 auth_input_index = 12;
+}
+
+message TokenCreateMintResponse {
+  repeated string tx_ids = 1;
+  uint64 nonce = 2;
+  string sender_owner_id = 3;
+  string mint_authority_owner_id = 4;
+  string initial_mint_to_owner_id = 5;
+  string asset_id = 6;
+}
+
+message TokenCreateLiquidityRequest {
+  string name = 1;
+  string symbol = 2;
+  uint32 decimals = 3;
+  string max_supply_raw = 4;
+  uint64 seed_reserve_sompi = 5;
+  uint32 fee_bps = 6;
+  repeated string recipient_addresses = 7;
+  uint64 launch_buy_sompi = 8;
+  string launch_buy_min_token_out_raw = 9;
+  string password = 10;
+  string sender_address = 11;
+  string metadata_hex = 12;
+  uint32 auth_input_index = 13;
+}
+
+message TokenCreateLiquidityResponse {
+  repeated string tx_ids = 1;
+  uint64 nonce = 2;
+  string sender_owner_id = 3;
+  string asset_id = 4;
+}
+
+message TokenBuyLiquidityRequest {
+  string asset_id = 1;
+  uint64 cpay_in_sompi = 2;
+  string min_token_out_raw = 3;
+  string password = 4;
+  string sender_address = 5;
+  uint32 auth_input_index = 6;
+}
+
+message TokenBuyLiquidityResponse {
+  repeated string tx_ids = 1;
+  uint64 nonce = 2;
+  string sender_owner_id = 3;
+  uint64 pool_nonce = 4;
+  string token_out_raw = 5;
+}
+
+message TokenSellLiquidityRequest {
+  string asset_id = 1;
+  string token_in_raw = 2;
+  uint64 min_cpay_out_sompi = 3;
+  string password = 4;
+  string sender_address = 5;
+  uint32 auth_input_index = 6;
+}
+
+message TokenSellLiquidityResponse {
+  repeated string tx_ids = 1;
+  uint64 nonce = 2;
+  string sender_owner_id = 3;
+  uint64 pool_nonce = 4;
+  uint64 cpay_out_sompi = 5;
+}
+
+message TokenClaimLiquidityRequest {
+  string asset_id = 1;
+  uint32 recipient_index = 2;
+  uint64 claim_amount_sompi = 3;
+  string password = 4;
+  string sender_address = 5;
+  uint32 auth_input_index = 6;
+}
+
+message TokenClaimLiquidityResponse {
+  repeated string tx_ids = 1;
+  uint64 nonce = 2;
+  string sender_owner_id = 3;
+  uint64 pool_nonce = 4;
+}
+
+message TokenBalancesRequest {
+  repeated string addresses = 1;
+  repeated string asset_ids = 2;
+}
+
+message TokenBalance {
+  string asset_id = 1;
+  string amount_raw = 2;
+  string symbol = 3;
+  string name = 4;
+}
+
+message TokenAddressBalance {
+  string address = 1;
+  string owner_id = 2;
+  repeated TokenBalance balances = 3;
+  string skip_reason = 4;
+}
+
+message TokenBalancesResponse {
+  repeated TokenAddressBalance address_balances = 1;
+  repeated TokenBalance totals = 2;
+}
+
+message ScanAddressesRequest {
+  repeated string addresses = 1;
+  repeated string asset_ids = 2;
+}
+
+message ScanAddressesResponse {
+  repeated AddressBalances coin_balances = 1;
+  uint64 coin_available_total = 2;
+  uint64 coin_pending_total = 3;
+  repeated TokenAddressBalance token_address_balances = 4;
+  repeated TokenBalance token_totals = 5;
+}
