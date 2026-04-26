@@ -356,4 +356,5 @@ message BlockProducerClaimV1Message {
   bytes blockHash = 3;
   bytes nodePubkeyXonly = 4;
   bytes signature = 5;
+  optional uint64 nodePowNonce = 6;
 }

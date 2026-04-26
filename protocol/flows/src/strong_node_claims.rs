@@ -1,4 +1,4 @@
-use crate::node_identity::{network_code_from_name, UnifiedNodeIdentity};
+use crate::node_identity::{is_valid_pow_nonce, network_code_from_name, UnifiedNodeIdentity};
 use cryptix_consensus_core::ChainPath;
 use cryptix_core::{time::unix_now, warn};
 use cryptix_hashes::Hash;
@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 pub const STRONG_NODE_CLAIMS_P2P_SERVICE_BIT: u64 = P2P_SERVICE_BIT_STRONG_NODE_CLAIMS;
 pub const CLAIM_WINDOW_SIZE_BLOCKS: usize = 1000;
 pub const CLAIM_REORG_MARGIN_BLOCKS: usize = 256;
+pub const KNOWN_CLAIMS_PER_BLOCK_CAP: usize = 64;
 pub const PENDING_UNKNOWN_CLAIMS_CAP: usize = 4096;
 pub const PENDING_UNKNOWN_CLAIMS_TTL_SECONDS: u64 = 180;
 
@@ -58,6 +59,7 @@ struct ClaimRecord {
     block_hash: Hash,
     node_id: [u8; 32],
     pubkey_xonly: [u8; 32],
+    pow_nonce: u64,
     signature: [u8; 64],
     claim_id: [u8; 32],
     received_at_ms: u64,
@@ -100,6 +102,8 @@ struct ClaimDiskRecord {
     block_hash: String,
     node_id: String,
     pubkey_xonly: String,
+    #[serde(default)]
+    pow_nonce: u64,
     signature: String,
     claim_id: String,
     received_at_ms: u64,
@@ -122,7 +126,7 @@ impl StrongNodeClaimsEngine {
 
         let mut state = EngineState::default();
         if enabled {
-            if let Err(err) = load_state(&claims_dir, &mut state) {
+            if let Err(err) = load_state(&claims_dir, &mut state, network_code) {
                 warn!("strong-node-claims: failed loading persisted state: {err}");
             }
             recompute_scores(&mut state);
@@ -150,11 +154,17 @@ impl StrongNodeClaimsEngine {
             network: self.network_code as u32,
             block_hash: block_hash.as_bytes().to_vec(),
             node_pubkey_xonly: identity.pubkey_xonly.to_vec(),
+            node_pow_nonce: Some(identity.pow_nonce),
             signature: signature.to_vec(),
         })
     }
 
-    pub fn ingest_claim(&self, message: &BlockProducerClaimV1Message, hardfork_active: bool) -> ClaimIngestOutcome {
+    pub fn ingest_claim(
+        &self,
+        message: &BlockProducerClaimV1Message,
+        hardfork_active: bool,
+        expected_node_id: Option<[u8; 32]>,
+    ) -> ClaimIngestOutcome {
         if !self.enabled || !hardfork_active {
             return ClaimIngestOutcome::Ignored;
         }
@@ -165,12 +175,20 @@ impl StrongNodeClaimsEngine {
                 return ClaimIngestOutcome::Strike { reason, node_id: None };
             }
         };
+        if expected_node_id.is_some_and(|expected| expected != record.node_id) {
+            return ClaimIngestOutcome::Strike {
+                reason: "claim node ID does not match peer handshake identity".to_string(),
+                node_id: Some(record.node_id),
+            };
+        }
 
         let mut state = self.state.lock();
         cleanup_pending_unknown_claims(&mut state, now_ms);
         let known_block = state.retention_set.contains(&record.block_hash) || state.window_set.contains(&record.block_hash);
         if !known_block {
-            enqueue_pending_unknown_claim(&mut state, record, now_ms);
+            if !enqueue_pending_unknown_claim(&mut state, record, now_ms) {
+                return ClaimIngestOutcome::Dropped;
+            }
             state.dirty = true;
             return ClaimIngestOutcome::Accepted { pending: true };
         }
@@ -300,6 +318,7 @@ impl StrongNodeClaimsEngine {
                 network: self.network_code as u32,
                 block_hash: record.block_hash.as_bytes().to_vec(),
                 node_pubkey_xonly: record.pubkey_xonly.to_vec(),
+                node_pow_nonce: Some(record.pow_nonce),
                 signature: record.signature.to_vec(),
             })
             .collect()
@@ -331,9 +350,13 @@ fn validate_claim_message(
         message.block_hash.as_slice().try_into().map_err(|_| "block_hash must be exactly 32 bytes".to_string())?;
     let pubkey_xonly: [u8; 32] =
         message.node_pubkey_xonly.as_slice().try_into().map_err(|_| "node_pubkey_xonly must be exactly 32 bytes".to_string())?;
+    let pow_nonce = message.node_pow_nonce.ok_or_else(|| "node_powNonce is required".to_string())?;
     let signature: [u8; 64] = message.signature.as_slice().try_into().map_err(|_| "signature must be exactly 64 bytes".to_string())?;
 
     let node_id = *blake3::hash(&pubkey_xonly).as_bytes();
+    if !is_valid_pow_nonce(expected_network_code, &pubkey_xonly, pow_nonce) {
+        return Err("claim node identity proof-of-work is invalid".to_string());
+    }
     let block_hash = Hash::from_bytes(block_hash_raw);
     let claim_id = compute_claim_id(expected_network_code, &block_hash, &node_id);
     let secp_message = SecpMessage::from_digest_slice(&claim_id).map_err(|err| format!("invalid claim digest: {err}"))?;
@@ -341,11 +364,14 @@ fn validate_claim_message(
     let signature = SchnorrSignature::from_slice(&signature).map_err(|_| "invalid schnorr signature bytes".to_string())?;
     signature.verify(&secp_message, &pubkey).map_err(|_| "claim signature verification failed".to_string())?;
 
-    Ok(ClaimRecord { block_hash, node_id, pubkey_xonly, signature: *signature.as_ref(), claim_id, received_at_ms: now_ms })
+    Ok(ClaimRecord { block_hash, node_id, pubkey_xonly, pow_nonce, signature: *signature.as_ref(), claim_id, received_at_ms: now_ms })
 }
 
 fn claim_record_is_valid(record: &ClaimRecord, expected_network_code: u8) -> bool {
     if *blake3::hash(&record.pubkey_xonly).as_bytes() != record.node_id {
+        return false;
+    }
+    if !is_valid_pow_nonce(expected_network_code, &record.pubkey_xonly, record.pow_nonce) {
         return false;
     }
     let expected_claim_id = compute_claim_id(expected_network_code, &record.block_hash, &record.node_id);
@@ -398,6 +424,13 @@ fn insert_known_claim_locked(state: &mut EngineState, record: ClaimRecord) -> bo
     if entry.contains_key(&record.node_id) {
         return false;
     }
+    if entry.len() >= KNOWN_CLAIMS_PER_BLOCK_CAP {
+        let evicted_node_id = *entry.keys().next_back().expect("entry is non-empty when cap is reached");
+        if record.node_id >= evicted_node_id {
+            return false;
+        }
+        entry.remove(&evicted_node_id);
+    }
     entry.insert(record.node_id, record.clone());
     if entry.len() > 1 {
         state.conflict_total = state.conflict_total.saturating_add(1);
@@ -418,13 +451,25 @@ fn insert_known_claim_locked(state: &mut EngineState, record: ClaimRecord) -> bo
     true
 }
 
-fn enqueue_pending_unknown_claim(state: &mut EngineState, record: ClaimRecord, now_ms: u64) {
+fn enqueue_pending_unknown_claim(state: &mut EngineState, record: ClaimRecord, now_ms: u64) -> bool {
     let list = state.pending_unknown_claims.entry(record.block_hash).or_default();
     if list.iter().any(|existing| existing.node_id == record.node_id) {
-        return;
+        return false;
+    }
+    if list.len() >= KNOWN_CLAIMS_PER_BLOCK_CAP {
+        let Some(evicted_index) =
+            list.iter().enumerate().max_by(|(_, left), (_, right)| left.node_id.cmp(&right.node_id)).map(|(index, _)| index)
+        else {
+            return false;
+        };
+        if record.node_id >= list[evicted_index].node_id {
+            return false;
+        }
+        list.remove(evicted_index);
     }
     list.push(record);
     cleanup_pending_unknown_claims(state, now_ms);
+    true
 }
 
 fn promote_pending_unknown_claims_for_block_locked(state: &mut EngineState, block_hash: Hash) {
@@ -511,7 +556,7 @@ fn recompute_scores(state: &mut EngineState) {
     }
 }
 
-fn load_state(claims_dir: &Path, state: &mut EngineState) -> Result<(), String> {
+fn load_state(claims_dir: &Path, state: &mut EngineState, network_code: u8) -> Result<(), String> {
     let current_path = claims_dir.join(CLAIMS_STATE_CURRENT_FILE);
     let previous_path = claims_dir.join(CLAIMS_STATE_PREVIOUS_FILE);
     let disk = match read_and_decode_state_file(&current_path) {
@@ -568,7 +613,18 @@ fn load_state(claims_dir: &Path, state: &mut EngineState) -> Result<(), String> 
         let pubkey_xonly = decode_hex_32(&winner.pubkey_xonly)?;
         let signature = decode_hex_64(&winner.signature)?;
         let claim_id = decode_hex_32(&winner.claim_id)?;
-        let record = ClaimRecord { block_hash, node_id, pubkey_xonly, signature, claim_id, received_at_ms: winner.received_at_ms };
+        let record = ClaimRecord {
+            block_hash,
+            node_id,
+            pubkey_xonly,
+            pow_nonce: winner.pow_nonce,
+            signature,
+            claim_id,
+            received_at_ms: winner.received_at_ms,
+        };
+        if !claim_record_is_valid(&record, network_code) {
+            continue;
+        }
         state.winning_claim_by_block.insert(block_hash, record.clone());
         state.recent_claims_by_block.entry(block_hash).or_default().insert(node_id, record);
     }
@@ -613,6 +669,7 @@ fn persist_state_if_dirty(claims_dir: &Path, state: &mut EngineState) -> Result<
                 block_hash: winner.block_hash.to_string(),
                 node_id: hex_encode(winner.node_id),
                 pubkey_xonly: hex_encode(winner.pubkey_xonly),
+                pow_nonce: winner.pow_nonce,
                 signature: hex_encode(winner.signature),
                 claim_id: hex_encode(winner.claim_id),
                 received_at_ms: winner.received_at_ms,
@@ -682,6 +739,7 @@ mod tests {
     fn locked_constants_match_rev3() {
         assert_eq!(CLAIM_WINDOW_SIZE_BLOCKS, 1000);
         assert_eq!(CLAIM_REORG_MARGIN_BLOCKS, 256);
+        assert_eq!(KNOWN_CLAIMS_PER_BLOCK_CAP, 64);
         assert_eq!(PENDING_UNKNOWN_CLAIMS_CAP, 4096);
         assert_eq!(PENDING_UNKNOWN_CLAIMS_TTL_SECONDS, 180);
     }
@@ -721,14 +779,15 @@ mod tests {
     fn pending_claim_promotion_and_restart_rebuild() {
         let temp_dir = std::env::temp_dir().join(format!("strong-node-claims-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).expect("failed creating temp dir");
-        let engine = StrongNodeClaimsEngine::new(true, "mainnet", &temp_dir);
+        let engine = StrongNodeClaimsEngine::new(true, "devnet", &temp_dir);
 
         let claim = build_signed_claim_message(
-            0,
+            2,
             "9e335f14f1a549c374a273b014e4e6658c666b9be6bb7478085510abcba7fae2",
             "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            1_588_910,
         );
-        let outcome = engine.ingest_claim(&claim, true);
+        let outcome = engine.ingest_claim(&claim, true, None);
         match outcome {
             ClaimIngestOutcome::Accepted { pending } => assert!(pending, "claim should be pending before block is known"),
             other => panic!("unexpected ingest outcome: {other:?}"),
@@ -751,7 +810,7 @@ mod tests {
         assert_eq!(snapshot.entries[0].claimed_blocks, 1, "expected one claimed block after promotion");
         assert_eq!(engine.claim_node_ids_for_block(block_hash).len(), 1, "promoted claim should remain discoverable");
 
-        let reloaded = StrongNodeClaimsEngine::new(true, "mainnet", &temp_dir);
+        let reloaded = StrongNodeClaimsEngine::new(true, "devnet", &temp_dir);
         let reloaded_snapshot = reloaded.snapshot(true);
         assert_eq!(reloaded_snapshot.entries.len(), 1, "expected one scored entry after reload");
         assert_eq!(reloaded_snapshot.entries[0].claimed_blocks, 1, "expected one claimed block after reload");
@@ -764,16 +823,17 @@ mod tests {
     fn hardfork_gating_ignores_claims_and_chain_updates_pre_hf() {
         let temp_dir = std::env::temp_dir().join(format!("strong-node-claims-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).expect("failed creating temp dir");
-        let engine = StrongNodeClaimsEngine::new(true, "mainnet", &temp_dir);
+        let engine = StrongNodeClaimsEngine::new(true, "devnet", &temp_dir);
 
         assert!(!engine.should_advertise_service_bit(false), "service bit must remain disabled pre-HF");
 
         let claim = build_signed_claim_message(
-            0,
+            2,
             "9e335f14f1a549c374a273b014e4e6658c666b9be6bb7478085510abcba7fae2",
             "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            1_588_910,
         );
-        assert!(matches!(engine.ingest_claim(&claim, false), ClaimIngestOutcome::Ignored));
+        assert!(matches!(engine.ingest_claim(&claim, false, None), ClaimIngestOutcome::Ignored));
 
         let block_hash = Hash::from_bytes(decode_hex_32("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").unwrap());
         let mut path = ChainPath::default();
@@ -792,14 +852,15 @@ mod tests {
     fn removed_blocks_purge_claim_state() {
         let temp_dir = std::env::temp_dir().join(format!("strong-node-claims-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).expect("failed creating temp dir");
-        let engine = StrongNodeClaimsEngine::new(true, "mainnet", &temp_dir);
+        let engine = StrongNodeClaimsEngine::new(true, "devnet", &temp_dir);
 
         let claim = build_signed_claim_message(
-            0,
+            2,
             "9e335f14f1a549c374a273b014e4e6658c666b9be6bb7478085510abcba7fae2",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            1_588_910,
         );
-        let outcome = engine.ingest_claim(&claim, true);
+        let outcome = engine.ingest_claim(&claim, true, None);
         match outcome {
             ClaimIngestOutcome::Accepted { pending } => assert!(pending, "claim should be pending before block is known"),
             other => panic!("unexpected ingest outcome: {other:?}"),
@@ -825,12 +886,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
-    fn build_signed_claim_message(network_u8: u8, private_key_hex: &str, block_hash_hex: &str) -> BlockProducerClaimV1Message {
+    #[test]
+    fn claim_requires_valid_node_pow_nonce() {
+        let temp_dir = std::env::temp_dir().join(format!("strong-node-claims-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("failed creating temp dir");
+        let engine = StrongNodeClaimsEngine::new(true, "devnet", &temp_dir);
+        let mut claim = build_signed_claim_message(
+            2,
+            "9e335f14f1a549c374a273b014e4e6658c666b9be6bb7478085510abcba7fae2",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            1_588_910,
+        );
+        claim.node_pow_nonce = Some(0);
+        assert!(matches!(engine.ingest_claim(&claim, true, None), ClaimIngestOutcome::Strike { .. }));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn claim_must_match_expected_peer_node_id() {
+        let temp_dir = std::env::temp_dir().join(format!("strong-node-claims-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("failed creating temp dir");
+        let engine = StrongNodeClaimsEngine::new(true, "devnet", &temp_dir);
+        let claim = build_signed_claim_message(
+            2,
+            "9e335f14f1a549c374a273b014e4e6658c666b9be6bb7478085510abcba7fae2",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            1_588_910,
+        );
+        assert!(matches!(engine.ingest_claim(&claim, true, Some([0xff; 32])), ClaimIngestOutcome::Strike { .. }));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn known_and_pending_claims_are_capped_per_block() {
+        let block_hash = Hash::from_bytes([0; 32]);
+        let mut state = EngineState::default();
+        for i in 0..(KNOWN_CLAIMS_PER_BLOCK_CAP + 16) {
+            let mut node_id = [0u8; 32];
+            node_id[0] = 255u8.saturating_sub(i as u8);
+            let record = ClaimRecord {
+                block_hash,
+                node_id,
+                pubkey_xonly: [0; 32],
+                pow_nonce: 0,
+                signature: [0; 64],
+                claim_id: [0; 32],
+                received_at_ms: i as u64,
+            };
+            let _ = insert_known_claim_locked(&mut state, record.clone());
+            let _ = enqueue_pending_unknown_claim(&mut state, record, i as u64);
+        }
+        assert_eq!(state.recent_claims_by_block.get(&block_hash).map(BTreeMap::len), Some(KNOWN_CLAIMS_PER_BLOCK_CAP));
+        assert_eq!(state.pending_unknown_claims.get(&block_hash).map(Vec::len), Some(KNOWN_CLAIMS_PER_BLOCK_CAP));
+        let mut largest_node_id = [0u8; 32];
+        largest_node_id[0] = 255;
+        assert!(!state.recent_claims_by_block[&block_hash].contains_key(&largest_node_id));
+    }
+
+    fn build_signed_claim_message(
+        network_u8: u8,
+        private_key_hex: &str,
+        block_hash_hex: &str,
+        pow_nonce: u64,
+    ) -> BlockProducerClaimV1Message {
         let private_key = secp256k1::SecretKey::from_slice(&decode_hex_32(private_key_hex).unwrap()).unwrap();
         let keypair = Keypair::from_secret_key(secp256k1::SECP256K1, &private_key);
         let (pubkey_xonly, _) = XOnlyPublicKey::from_keypair(&keypair);
         let pubkey_xonly = pubkey_xonly.serialize();
 
+        assert!(is_valid_pow_nonce(network_u8, &pubkey_xonly, pow_nonce));
         let node_id = *blake3::hash(&pubkey_xonly).as_bytes();
         let block_hash = Hash::from_bytes(decode_hex_32(block_hash_hex).unwrap());
         let claim_id = compute_claim_id(network_u8, &block_hash, &node_id);
@@ -842,6 +966,7 @@ mod tests {
             network: network_u8 as u32,
             block_hash: block_hash.as_bytes().to_vec(),
             node_pubkey_xonly: pubkey_xonly.to_vec(),
+            node_pow_nonce: Some(pow_nonce),
             signature: signature.as_ref().to_vec(),
         }
     }

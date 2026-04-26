@@ -799,7 +799,9 @@ impl FlowContext {
             .claim_messages_for_block(block_hash)
             .into_iter()
             .filter(|message| {
-                Self::claim_message_node_id(message).map(|node_id| !self.is_claim_node_id_banned(&node_id)).unwrap_or(false)
+                Self::claim_message_node_id(message)
+                    .map(|node_id| node_id == self.unified_node_identity.node_id && !self.is_claim_node_id_banned(&node_id))
+                    .unwrap_or(false)
             })
             .collect()
     }
@@ -1233,10 +1235,15 @@ impl FlowContext {
     }
 
     pub async fn handle_block_producer_claim(&self, router: &Arc<Router>, message: BlockProducerClaimV1Message) {
-        let outcome = self.strong_node_claims_engine.ingest_claim(&message, self.is_payload_hf_active());
+        let peer_unified_node_id = router.properties().unified_node_id;
+        if self.is_payload_hf_active() && peer_unified_node_id.is_none() {
+            self.report_misbehaving_peer(router, "block producer claim peer has no verified unified node ID").await;
+            return;
+        }
+        let outcome = self.strong_node_claims_engine.ingest_claim(&message, self.is_payload_hf_active(), peer_unified_node_id);
         match outcome {
             ClaimIngestOutcome::Accepted { pending: _ } => {
-                self.broadcast_block_producer_claim(message, Some(router.key())).await;
+                self.strong_node_claims_engine.maybe_flush();
             }
             ClaimIngestOutcome::Strike { reason, node_id } => {
                 if let Some(node_id) = node_id {
@@ -1295,7 +1302,7 @@ impl FlowContext {
         }
         match self.strong_node_claims_engine.build_local_claim(block_hash, self.unified_node_identity.as_ref()) {
             Ok(message) => {
-                let _ = self.strong_node_claims_engine.ingest_claim(&message, self.is_payload_hf_active());
+                let _ = self.strong_node_claims_engine.ingest_claim(&message, self.is_payload_hf_active(), None);
                 self.broadcast_block_producer_claim(message, None).await;
             }
             Err(err) => warn!("failed building local block producer claim for {}: {}", block_hash, err),
