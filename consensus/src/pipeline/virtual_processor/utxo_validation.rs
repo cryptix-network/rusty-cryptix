@@ -1,5 +1,6 @@
 use super::VirtualStateProcessor;
 use crate::{
+    constants::{MAX_SOMPI, SOMPI_PER_CRYPTIX},
     errors::{
         BlockProcessResult,
         RuleError::{BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadUTXOCommitment, InvalidTransactionsInUtxoContext},
@@ -56,6 +57,10 @@ use std::{
 // Allow dust-sized redemptions so the final outstanding liquidity tokens can always exit.
 const LIQUIDITY_MIN_PAYOUT_SOMPI: u64 = 1;
 const CURVE_FLOOR_TOKEN: u128 = 1;
+const LIQUIDITY_TOKEN_DECIMALS: u8 = 0;
+const MIN_LIQUIDITY_SUPPLY_RAW: u128 = 1_000;
+const MAX_LIQUIDITY_SUPPLY_RAW: u128 = 1_000_000;
+const MIN_LIQUIDITY_SEED_RESERVE_SOMPI: u64 = SOMPI_PER_CRYPTIX;
 
 #[derive(Clone, Copy, Debug)]
 struct VaultTransition {
@@ -68,7 +73,8 @@ struct VaultTransition {
 mod tests {
     use super::{
         atomic_op_allows_liquidity_vault_output, validate_curve_reserve_against_outstanding_supply,
-        validate_liquidity_claim_authorization, AtomicPayloadOp,
+        validate_liquidity_claim_authorization, validate_liquidity_creation_parameters, AtomicPayloadOp, MAX_LIQUIDITY_SUPPLY_RAW,
+        MIN_LIQUIDITY_SEED_RESERVE_SOMPI, MIN_LIQUIDITY_SUPPLY_RAW,
     };
 
     #[test]
@@ -82,6 +88,15 @@ mod tests {
     fn liquidity_claims_require_matching_recipient_owner() {
         assert!(validate_liquidity_claim_authorization([0x22; 32], [0x22; 32]).is_ok());
         assert!(validate_liquidity_claim_authorization([0x22; 32], [0x33; 32]).is_err());
+    }
+
+    #[test]
+    fn liquidity_creation_parameters_enforce_mainnet_limits() {
+        assert!(validate_liquidity_creation_parameters(0, MIN_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SEED_RESERVE_SOMPI).is_ok());
+        assert!(validate_liquidity_creation_parameters(1, MIN_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SEED_RESERVE_SOMPI).is_err());
+        assert!(validate_liquidity_creation_parameters(0, MIN_LIQUIDITY_SUPPLY_RAW - 1, MIN_LIQUIDITY_SEED_RESERVE_SOMPI).is_err());
+        assert!(validate_liquidity_creation_parameters(0, MAX_LIQUIDITY_SUPPLY_RAW + 1, MIN_LIQUIDITY_SEED_RESERVE_SOMPI).is_err());
+        assert!(validate_liquidity_creation_parameters(0, MIN_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SEED_RESERVE_SOMPI - 1).is_err());
     }
 
     #[test]
@@ -216,6 +231,41 @@ fn validate_curve_reserve_against_outstanding_supply(
     } else {
         Ok(())
     }
+}
+
+fn validate_liquidity_creation_parameters(decimals: u8, max_supply: u128, seed_reserve_sompi: u64) -> TxResult<()> {
+    if decimals != LIQUIDITY_TOKEN_DECIMALS {
+        return Err(TxRuleError::InvalidAtomicPayload(format!("liquidity asset decimals must be `{}`", LIQUIDITY_TOKEN_DECIMALS)));
+    }
+    if !(MIN_LIQUIDITY_SUPPLY_RAW..=MAX_LIQUIDITY_SUPPLY_RAW).contains(&max_supply) {
+        return Err(TxRuleError::InvalidAtomicPayload(format!(
+            "liquidity asset max_supply must be in `{MIN_LIQUIDITY_SUPPLY_RAW}..={MAX_LIQUIDITY_SUPPLY_RAW}`"
+        )));
+    }
+    if seed_reserve_sompi < MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
+        return Err(TxRuleError::InvalidAtomicPayload(format!(
+            "liquidity asset seed_reserve_sompi must be at least `{MIN_LIQUIDITY_SEED_RESERVE_SOMPI}`"
+        )));
+    }
+    validate_liquidity_curve_reachability(max_supply, seed_reserve_sompi)
+}
+
+fn validate_liquidity_curve_reachability(remaining_pool_supply: u128, curve_reserve_sompi: u64) -> TxResult<()> {
+    if remaining_pool_supply == 0 {
+        return Ok(());
+    }
+    let y = remaining_pool_supply
+        .checked_add(CURVE_FLOOR_TOKEN)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("liquidity curve reachability y overflow".to_string()))?;
+    let required_final_reserve = u128::from(curve_reserve_sompi)
+        .checked_mul(y)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("liquidity curve reachability reserve overflow".to_string()))?;
+    if required_final_reserve > u128::from(MAX_SOMPI) {
+        return Err(TxRuleError::InvalidAtomicPayload(format!(
+            "liquidity curve final reserve `{required_final_reserve}` exceeds MAX_SOMPI `{MAX_SOMPI}`"
+        )));
+    }
+    Ok(())
 }
 
 /// A context for processing the UTXO state of a block with respect to its selected parent.
@@ -706,7 +756,7 @@ impl VirtualStateProcessor {
                 )?;
             }
             AtomicPayloadOp::CreateLiquidityAsset {
-                decimals: _,
+                decimals,
                 max_supply,
                 name: _,
                 symbol: _,
@@ -724,9 +774,7 @@ impl VirtualStateProcessor {
                         faster_hex::hex_string(&asset_id)
                     )));
                 }
-                if seed_reserve_sompi == 0 {
-                    return Err(TxRuleError::InvalidAtomicPayload("liquidity asset seed_reserve_sompi must be > 0".to_string()));
-                }
+                validate_liquidity_creation_parameters(decimals, max_supply, seed_reserve_sompi)?;
                 let (vault_output_index, vault_output_value) = self.resolve_create_liquidity_vault_output(tx)?;
                 let expected_vault_value = seed_reserve_sompi
                     .checked_add(launch_buy_sompi)
@@ -1425,6 +1473,7 @@ impl VirtualStateProcessor {
             return Err(TxRuleError::InvalidAtomicPayload("liquidity assets must always use capped supply mode".to_string()));
         }
         validate_curve_reserve_against_outstanding_supply(asset_id, asset.total_supply, pool.curve_reserve_sompi)?;
+        validate_liquidity_curve_reachability(pool.remaining_pool_supply, pool.curve_reserve_sompi)?;
         let expected_vault = pool
             .curve_reserve_sompi
             .checked_add(pool.unclaimed_fee_total_sompi)

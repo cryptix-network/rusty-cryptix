@@ -16,7 +16,7 @@ use cryptix_consensus_core::{
     blockstatus::BlockStatus,
     coinbase::MinerData,
     config::{params::MAINNET_PARAMS, ConfigBuilder},
-    constants::TX_VERSION,
+    constants::{SOMPI_PER_CRYPTIX, TX_VERSION},
     subnets::{SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PAYLOAD},
     tx::{MutableTransaction, ScriptPublicKey, ScriptVec, Transaction, TransactionInput, TransactionOutpoint, TransactionOutput},
     BlockHashSet,
@@ -372,7 +372,7 @@ fn payload_create_liquidity(
     launch_buy_min_token_out: u128,
 ) -> Vec<u8> {
     let mut payload = cat_header(5, auth_input_index, nonce);
-    payload.push(8);
+    payload.push(0);
     payload.extend_from_slice(&max_supply.to_le_bytes());
     payload.push(4);
     payload.push(3);
@@ -550,12 +550,12 @@ async fn setup_dual_owner_liquidity_pool() -> (TestContext, DualOwnerLiquidityFi
     let (funding_outpoint, funding_entry) = find_virtual_utxo_by_script(&ctx, &owner_script);
 
     let max_supply = 1_000u128;
-    let seed_reserve = 1_000u64;
+    let seed_reserve = SOMPI_PER_CRYPTIX;
     let fee_bps = 100u16;
-    let launch_buy = 100u64;
+    let launch_buy = SOMPI_PER_CRYPTIX;
     let tx_fee = 10_000u64;
-    let owner_anchor_value = 100_000u64;
-    let second_owner_anchor_value = 100_000u64;
+    let owner_anchor_value = 3 * SOMPI_PER_CRYPTIX;
+    let second_owner_anchor_value = 3 * SOMPI_PER_CRYPTIX;
     let (_, launch_token_out) = quote_buy(max_supply, seed_reserve, launch_buy, fee_bps);
     let create_vault_value = seed_reserve + launch_buy;
     let create_change_value = funding_entry
@@ -692,9 +692,9 @@ async fn liquidity_consensus_e2e_create_buy_sell_claim_updates_vault_state() {
     let (funding_outpoint, funding_entry) = find_virtual_utxo_by_script(&ctx, &owner_script);
 
     let max_supply = 1_000u128;
-    let seed_reserve = 1_000u64;
+    let seed_reserve = SOMPI_PER_CRYPTIX;
     let fee_bps = 100u16;
-    let launch_buy = 100u64;
+    let launch_buy = SOMPI_PER_CRYPTIX;
     let tx_fee = 10_000u64;
     let (_, launch_token_out) = quote_buy(max_supply, seed_reserve, launch_buy, fee_bps);
     let create_vault_value = seed_reserve + launch_buy;
@@ -727,7 +727,7 @@ async fn liquidity_consensus_e2e_create_buy_sell_claim_updates_vault_state() {
     assert_eq!(pool.pool_nonce, 1);
     assert_eq!(pool.vault_value_sompi, create_vault_value);
 
-    let buy_in = 100u64;
+    let buy_in = SOMPI_PER_CRYPTIX;
     let (_, buy_token_out) = quote_buy(pool.remaining_pool_supply, pool.curve_reserve_sompi, buy_in, fee_bps);
     let buy_vault_value = pool.vault_value_sompi + buy_in;
     owner_anchor_value -= buy_in + tx_fee;
@@ -826,7 +826,7 @@ async fn liquidity_parallel_vault_conflict_applies_only_one_branch() {
         &fixture.owner_script,
         p2sh_signature_script(),
         2,
-        100,
+        SOMPI_PER_CRYPTIX,
         fixture.tx_fee,
     );
     let (second_buy_tx, second_token_out, second_vault_value) = build_liquidity_buy_tx(
@@ -837,7 +837,7 @@ async fn liquidity_parallel_vault_conflict_applies_only_one_branch() {
         &fixture.second_owner_script,
         p2sh_signature_script_for(&second_p2sh_redeem_script()),
         1,
-        200,
+        2 * SOMPI_PER_CRYPTIX,
         fixture.tx_fee,
     );
 
@@ -888,7 +888,7 @@ async fn liquidity_reorg_switches_to_winning_conflicting_vault_branch() {
         &fixture.owner_script,
         p2sh_signature_script(),
         2,
-        100,
+        SOMPI_PER_CRYPTIX,
         fixture.tx_fee,
     );
     let (second_buy_tx, second_token_out, second_vault_value) = build_liquidity_buy_tx(
@@ -899,7 +899,7 @@ async fn liquidity_reorg_switches_to_winning_conflicting_vault_branch() {
         &fixture.second_owner_script,
         p2sh_signature_script_for(&second_p2sh_redeem_script()),
         1,
-        200,
+        2 * SOMPI_PER_CRYPTIX,
         fixture.tx_fee,
     );
 

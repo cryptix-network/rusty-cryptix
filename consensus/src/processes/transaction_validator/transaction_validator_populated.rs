@@ -1,4 +1,4 @@
-use crate::constants::{MAX_SOMPI, SEQUENCE_LOCK_TIME_DISABLED, SEQUENCE_LOCK_TIME_MASK};
+use crate::constants::{MAX_SOMPI, SEQUENCE_LOCK_TIME_DISABLED, SEQUENCE_LOCK_TIME_MASK, SOMPI_PER_CRYPTIX};
 use blake2b_simd::Params as Blake2bParams;
 use cryptix_consensus_core::{
     hashing::sighash::SigHashReusedValues,
@@ -238,6 +238,10 @@ const CAT_MAX_DECIMALS: u8 = 18;
 const CAT_MAX_LIQUIDITY_RECIPIENTS: usize = 2;
 const CAT_MIN_LIQUIDITY_FEE_BPS: u16 = 10;
 const CAT_MAX_LIQUIDITY_FEE_BPS: u16 = 1000;
+const CAT_LIQUIDITY_TOKEN_DECIMALS: u8 = 0;
+const CAT_MIN_LIQUIDITY_SUPPLY_RAW: u128 = 1_000;
+const CAT_MAX_LIQUIDITY_SUPPLY_RAW: u128 = 1_000_000;
+const CAT_MIN_LIQUIDITY_SEED_RESERVE_SOMPI: u64 = SOMPI_PER_CRYPTIX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AtomicPayloadSupplyMode {
@@ -457,12 +461,14 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
         }
         5 => {
             let decimals = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT decimals".to_string())?;
-            if decimals > CAT_MAX_DECIMALS {
-                return Err(format!("decimals `{decimals}` above max `{CAT_MAX_DECIMALS}`"));
+            if decimals != CAT_LIQUIDITY_TOKEN_DECIMALS {
+                return Err(format!("liquidity asset decimals must be `{CAT_LIQUIDITY_TOKEN_DECIMALS}`"));
             }
             let max_supply = take_u128_le(payload, &mut cursor).ok_or_else(|| "truncated CAT max_supply".to_string())?;
-            if max_supply == 0 {
-                return Err("liquidity asset max_supply must be non-zero".to_string());
+            if !(CAT_MIN_LIQUIDITY_SUPPLY_RAW..=CAT_MAX_LIQUIDITY_SUPPLY_RAW).contains(&max_supply) {
+                return Err(format!(
+                    "liquidity asset max_supply must be in `{CAT_MIN_LIQUIDITY_SUPPLY_RAW}..={CAT_MAX_LIQUIDITY_SUPPLY_RAW}`"
+                ));
             }
             let name_len = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT name length".to_string())? as usize;
             let symbol_len = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT symbol length".to_string())? as usize;
@@ -478,6 +484,15 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
             }
 
             let seed_reserve_sompi = take_u64_le(payload, &mut cursor).ok_or_else(|| "truncated CAT seed reserve".to_string())?;
+            if seed_reserve_sompi < CAT_MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
+                return Err(format!("liquidity asset seed_reserve_sompi must be at least `{CAT_MIN_LIQUIDITY_SEED_RESERVE_SOMPI}`"));
+            }
+            let required_final_reserve = u128::from(seed_reserve_sompi)
+                .checked_mul(max_supply.checked_add(1).ok_or_else(|| "liquidity asset max_supply + 1 overflow".to_string())?)
+                .ok_or_else(|| "liquidity asset final reserve overflow".to_string())?;
+            if required_final_reserve > u128::from(MAX_SOMPI) {
+                return Err(format!("liquidity curve final reserve `{required_final_reserve}` exceeds MAX_SOMPI `{MAX_SOMPI}`"));
+            }
             let fee_bps = take_u16_le(payload, &mut cursor).ok_or_else(|| "truncated CAT fee bps".to_string())?;
             if !(fee_bps == 0 || (CAT_MIN_LIQUIDITY_FEE_BPS..=CAT_MAX_LIQUIDITY_FEE_BPS).contains(&fee_bps)) {
                 return Err(format!(

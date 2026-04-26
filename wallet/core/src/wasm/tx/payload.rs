@@ -5,6 +5,7 @@ use crate::tx::{
     MESSENGER_ENVELOPE_V1_HEADER_LEN, MESSENGER_NONCE_LEN, MESSENGER_RECIPIENT_TAG_LEN, MESSENGER_SENDER_DATA_LEN,
     WALLET_PAYLOAD_HARD_LIMIT_BYTES,
 };
+use cryptix_consensus_core::constants::{MAX_SOMPI, SOMPI_PER_CRYPTIX};
 use cryptix_wasm_core::types::BinaryT;
 
 const CRYPTOBOX_NONCE_BYTES: usize = 24;
@@ -20,6 +21,10 @@ const CAT_MAX_DECIMALS: u8 = 18;
 const CAT_MAX_LIQUIDITY_RECIPIENTS: usize = 2;
 const CAT_MIN_LIQUIDITY_FEE_BPS: u16 = 10;
 const CAT_MAX_LIQUIDITY_FEE_BPS: u16 = 1000;
+const LIQUIDITY_TOKEN_DECIMALS: u8 = 0;
+const MIN_LIQUIDITY_SUPPLY_RAW: u128 = 1_000;
+const MAX_LIQUIDITY_SUPPLY_RAW: u128 = 1_000_000;
+const MIN_LIQUIDITY_SEED_RESERVE_SOMPI: u64 = SOMPI_PER_CRYPTIX;
 
 const CAT_OP_CREATE_ASSET: u8 = 0;
 const CAT_OP_TRANSFER: u8 = 1;
@@ -583,6 +588,7 @@ pub fn serialize_atomic_token_create_liquidity_asset_payload_js(
     if seed_reserve_sompi == 0 {
         return Err(Error::custom("seedReserveSompi must be greater than zero"));
     }
+    validate_liquidity_create_parameters(decimals, max_supply, seed_reserve_sompi)?;
 
     let fee_bps = parse_u16_from_u32("feeBps", fee_bps)?;
     if !(fee_bps == 0 || (CAT_MIN_LIQUIDITY_FEE_BPS..=CAT_MAX_LIQUIDITY_FEE_BPS).contains(&fee_bps)) {
@@ -625,6 +631,27 @@ pub fn serialize_atomic_token_create_liquidity_asset_payload_js(
     payload.extend_from_slice(&launch_buy_sompi.to_le_bytes());
     payload.extend_from_slice(&launch_buy_min_token_out.to_le_bytes());
     Ok(payload)
+}
+
+fn validate_liquidity_create_parameters(decimals: u8, max_supply: u128, seed_reserve_sompi: u64) -> Result<()> {
+    if decimals != LIQUIDITY_TOKEN_DECIMALS {
+        return Err(Error::custom(format!("liquidity token decimals must be {LIQUIDITY_TOKEN_DECIMALS}")));
+    }
+    if !(MIN_LIQUIDITY_SUPPLY_RAW..=MAX_LIQUIDITY_SUPPLY_RAW).contains(&max_supply) {
+        return Err(Error::custom(format!(
+            "maxSupply for liquidity tokens must be between {MIN_LIQUIDITY_SUPPLY_RAW} and {MAX_LIQUIDITY_SUPPLY_RAW}"
+        )));
+    }
+    if seed_reserve_sompi < MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
+        return Err(Error::custom(format!("seedReserveSompi must be at least {MIN_LIQUIDITY_SEED_RESERVE_SOMPI} (1 CPAY)")));
+    }
+    let required_final_reserve = u128::from(seed_reserve_sompi)
+        .checked_mul(max_supply.checked_add(1).ok_or_else(|| Error::custom("maxSupply + 1 overflows"))?)
+        .ok_or_else(|| Error::custom("liquidity final reserve check overflows"))?;
+    if required_final_reserve > u128::from(MAX_SOMPI) {
+        return Err(Error::custom("seedReserveSompi is too high for this maxSupply"));
+    }
+    Ok(())
 }
 
 /// Serialize CAT buy-liquidity-exact-in payload (op=6).

@@ -1,7 +1,7 @@
 use cryptix_addresses::Address;
 use cryptix_consensus_client::{TransactionOutpoint as ClientTransactionOutpoint, UtxoEntry, UtxoEntryReference};
 use cryptix_consensus_core::config::params::Params;
-use cryptix_consensus_core::constants::SOMPI_PER_CRYPTIX;
+use cryptix_consensus_core::constants::{MAX_SOMPI, SOMPI_PER_CRYPTIX};
 use cryptix_consensus_core::network::{NetworkId, NetworkType};
 use cryptix_consensus_core::tx::ScriptPublicKey;
 use cryptix_rpc_core::model::message::{
@@ -54,6 +54,10 @@ const CAT_MAX_DECIMALS: u8 = 18;
 const CAT_MAX_LIQUIDITY_RECIPIENTS: usize = 2;
 const CAT_MIN_LIQUIDITY_FEE_BPS: u16 = 10;
 const CAT_MAX_LIQUIDITY_FEE_BPS: u16 = 1000;
+const LIQUIDITY_TOKEN_DECIMALS: u8 = 0;
+const MIN_LIQUIDITY_SUPPLY_RAW: u128 = 1_000;
+const MAX_LIQUIDITY_SUPPLY_RAW: u128 = 1_000_000;
+const MIN_LIQUIDITY_SEED_RESERVE_SOMPI: u64 = SOMPI_PER_CRYPTIX;
 const DEFAULT_AUTH_INPUT_INDEX: u16 = 0;
 const LIQUIDITY_AUTH_INPUT_INDEX: u16 = 1;
 const LIQUIDITY_QUOTE_SIDE_BUY: u32 = 0;
@@ -923,6 +927,7 @@ impl WalletDaemonService {
         if seed_reserve_sompi == 0 {
             return Err(Status::invalid_argument("seed_reserve_sompi must be greater than zero"));
         }
+        Self::validate_liquidity_create_parameters(decimals, max_supply, seed_reserve_sompi)?;
         if recipients.len() > CAT_MAX_LIQUIDITY_RECIPIENTS {
             return Err(Status::invalid_argument(format!(
                 "recipient_addresses supports at most {CAT_MAX_LIQUIDITY_RECIPIENTS} entries"
@@ -948,6 +953,29 @@ impl WalletDaemonService {
         payload.extend_from_slice(&launch_buy_sompi.to_le_bytes());
         payload.extend_from_slice(&launch_buy_min_token_out.to_le_bytes());
         Ok(payload)
+    }
+
+    fn validate_liquidity_create_parameters(decimals: u8, max_supply: u128, seed_reserve_sompi: u64) -> Result<(), Status> {
+        if decimals != LIQUIDITY_TOKEN_DECIMALS {
+            return Err(Status::invalid_argument(format!("liquidity token decimals must be {LIQUIDITY_TOKEN_DECIMALS}")));
+        }
+        if !(MIN_LIQUIDITY_SUPPLY_RAW..=MAX_LIQUIDITY_SUPPLY_RAW).contains(&max_supply) {
+            return Err(Status::invalid_argument(format!(
+                "max_supply_raw for liquidity tokens must be between {MIN_LIQUIDITY_SUPPLY_RAW} and {MAX_LIQUIDITY_SUPPLY_RAW}"
+            )));
+        }
+        if seed_reserve_sompi < MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
+            return Err(Status::invalid_argument(format!(
+                "seed_reserve_sompi must be at least {MIN_LIQUIDITY_SEED_RESERVE_SOMPI} (1 CPAY)"
+            )));
+        }
+        let required_final_reserve = u128::from(seed_reserve_sompi)
+            .checked_mul(max_supply.checked_add(1).ok_or_else(|| Status::invalid_argument("max_supply_raw + 1 overflows"))?)
+            .ok_or_else(|| Status::invalid_argument("liquidity final reserve check overflows"))?;
+        if required_final_reserve > u128::from(MAX_SOMPI) {
+            return Err(Status::invalid_argument("seed_reserve_sompi is too high for this max_supply_raw"));
+        }
+        Ok(())
     }
 
     fn build_buy_liquidity_payload(

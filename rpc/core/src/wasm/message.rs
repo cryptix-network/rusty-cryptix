@@ -864,6 +864,38 @@ try_from! ( args: GetLiquidityHoldersResponse, IGetLiquidityHoldersResponse, {
 });
 
 declare! {
+    IGetConsensusAtomicStateHashRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetConsensusAtomicStateHashRequest {
+        blockHash : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetConsensusAtomicStateHashRequest, GetConsensusAtomicStateHashRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetConsensusAtomicStateHashResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetConsensusAtomicStateHashResponse {
+        stateHash? : string;
+    }
+    "#,
+}
+
+try_from! ( args: GetConsensusAtomicStateHashResponse, IGetConsensusAtomicStateHashResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
     IExportTokenSnapshotRequest,
     r#"
     /**

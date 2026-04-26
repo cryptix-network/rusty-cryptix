@@ -1,8 +1,13 @@
+use cryptix_consensus_core::constants::{MAX_SOMPI, SOMPI_PER_CRYPTIX};
 use cryptix_math::Uint256;
 
 // Allow dust-sized redemptions so the final outstanding liquidity tokens can always exit.
 pub const LIQUIDITY_MIN_PAYOUT_SOMPI: u64 = 1;
 pub const CURVE_FLOOR_TOKEN: u128 = 1;
+pub const LIQUIDITY_TOKEN_DECIMALS: u8 = 0;
+pub const MIN_LIQUIDITY_SUPPLY_RAW: u128 = 1_000;
+pub const MAX_LIQUIDITY_SUPPLY_RAW: u128 = 1_000_000;
+pub const MIN_LIQUIDITY_SEED_RESERVE_SOMPI: u64 = SOMPI_PER_CRYPTIX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LiquidityMathError {
@@ -15,6 +20,18 @@ pub enum LiquidityMathError {
 pub fn calculate_trade_fee(amount: u64, fee_bps: u16) -> Result<u64, LiquidityMathError> {
     let fee = (u128::from(amount)).checked_mul(u128::from(fee_bps)).ok_or(LiquidityMathError::Overflow)? / 10_000u128;
     u64::try_from(fee).map_err(|_| LiquidityMathError::Overflow)
+}
+
+pub fn validate_liquidity_curve_reachability(remaining_pool_supply: u128, curve_reserve_sompi: u64) -> Result<(), LiquidityMathError> {
+    if remaining_pool_supply == 0 {
+        return Ok(());
+    }
+    let y = remaining_pool_supply.checked_add(CURVE_FLOOR_TOKEN).ok_or(LiquidityMathError::Overflow)?;
+    let required_final_reserve = u128::from(curve_reserve_sompi).checked_mul(y).ok_or(LiquidityMathError::Overflow)?;
+    if required_final_reserve > u128::from(MAX_SOMPI) {
+        return Err(LiquidityMathError::InvalidInput);
+    }
+    Ok(())
 }
 
 pub fn cpmm_buy(

@@ -1,6 +1,10 @@
 use crate::{
     error::{AtomicTokenError, AtomicTokenResult},
-    liquidity_math::{calculate_trade_fee, cpmm_buy, cpmm_sell, LiquidityMathError, LIQUIDITY_MIN_PAYOUT_SOMPI},
+    liquidity_math::{
+        calculate_trade_fee, cpmm_buy, cpmm_sell, validate_liquidity_curve_reachability, LiquidityMathError,
+        LIQUIDITY_MIN_PAYOUT_SOMPI, LIQUIDITY_TOKEN_DECIMALS, MAX_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SEED_RESERVE_SOMPI,
+        MIN_LIQUIDITY_SUPPLY_RAW,
+    },
     payload::{
         parse_atomic_token_payload, ApplyStatus, BuyLiquidityExactInOp, ClaimLiquidityFeesOp, CreateAssetOp, CreateAssetWithMintOp,
         CreateLiquidityAssetOp, EventType, LiquidityRecipientAddress, MintOp, NoopReason, ParsedTokenPayload, SellLiquidityExactInOp,
@@ -1246,9 +1250,16 @@ impl AtomicTokenState {
         if self.assets.contains_key(&asset_id) {
             return Err(NoopReason::AssetAlreadyExists);
         }
-        if op.seed_reserve_sompi == 0 {
+        if op.decimals != LIQUIDITY_TOKEN_DECIMALS {
+            return Err(NoopReason::BadDecimals);
+        }
+        if !(MIN_LIQUIDITY_SUPPLY_RAW..=MAX_LIQUIDITY_SUPPLY_RAW).contains(&op.max_supply) {
+            return Err(NoopReason::BadMaxSupply);
+        }
+        if op.seed_reserve_sompi < MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
             return Err(NoopReason::InvalidAmount);
         }
+        validate_liquidity_curve_reachability(op.max_supply, op.seed_reserve_sompi).map_err(map_liquidity_math_error)?;
 
         let (vault_output_index, vault_output_value) = self.resolve_create_liquidity_vault_output(tx)?;
         let expected_vault_value = op.seed_reserve_sompi.checked_add(op.launch_buy_sompi).ok_or(NoopReason::SupplyOverflow)?;
@@ -1676,6 +1687,8 @@ impl AtomicTokenState {
         }
         let pool = asset.liquidity.as_ref().ok_or(NoopReason::AssetNotFound)?;
         validate_curve_reserve_against_outstanding_supply(asset.total_supply, pool.curve_reserve_sompi)?;
+        validate_liquidity_curve_reachability(pool.remaining_pool_supply, pool.curve_reserve_sompi)
+            .map_err(map_liquidity_math_error)?;
         let expected_vault = pool.curve_reserve_sompi.checked_add(pool.unclaimed_fee_total_sompi).ok_or(NoopReason::SupplyOverflow)?;
         if pool.vault_value_sompi != expected_vault {
             return Err(NoopReason::InternalMalformedAcceptance);
@@ -2710,7 +2723,7 @@ mod tests {
         launch_buy_min_token_out: u128,
     ) -> Vec<u8> {
         let mut payload = base_header(TokenOpCode::CreateLiquidityAsset, auth_input_index, nonce);
-        payload.push(8);
+        payload.push(0);
         payload.extend_from_slice(&max_supply.to_le_bytes());
         payload.push(4);
         payload.push(3);
@@ -2921,8 +2934,8 @@ mod tests {
         let owner_script = test_script(7);
         let owner = owner_id(&state, &owner_script);
         let max_supply = 1_000u128;
-        let seed_reserve_sompi = 1_000u64;
-        let launch_buy_sompi = 100u64;
+        let seed_reserve_sompi = MIN_LIQUIDITY_SEED_RESERVE_SOMPI;
+        let launch_buy_sompi = MIN_LIQUIDITY_SEED_RESERVE_SOMPI;
         let launch_min = 1u128;
         let launch_token_out = cpmm_buy(max_supply, seed_reserve_sompi, launch_buy_sompi).expect("launch quote should work").0;
 
@@ -2939,7 +2952,8 @@ mod tests {
         let asset_id = hash_bytes(create_tx.id());
 
         let mut create_auth_inputs = HashMap::new();
-        create_auth_inputs.insert(create_auth_outpoint, UtxoEntry::new(10_000, owner_script.clone(), 0, false));
+        create_auth_inputs
+            .insert(create_auth_outpoint, UtxoEntry::new(3 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI, owner_script.clone(), 0, false));
         apply_block(
             &mut state,
             BlockHash::from_u64_word(10),
@@ -2954,7 +2968,7 @@ mod tests {
         assert_ne!(create_event.details.amount, Some(launch_min));
 
         let pool = state.assets.get(&asset_id).and_then(|asset| asset.liquidity.clone()).expect("pool should exist");
-        let buy_in_sompi = 100u64;
+        let buy_in_sompi = MIN_LIQUIDITY_SEED_RESERVE_SOMPI;
         let buy_token_out =
             cpmm_buy(pool.remaining_pool_supply, pool.curve_reserve_sompi, buy_in_sompi).expect("buy quote should work").0;
         let buy_auth_outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(2), 0);
@@ -2970,7 +2984,7 @@ mod tests {
 
         let mut buy_auth_inputs = HashMap::new();
         buy_auth_inputs.insert(pool.vault_outpoint, UtxoEntry::new(pool.vault_value_sompi, liquidity_vault_script(), 0, false));
-        buy_auth_inputs.insert(buy_auth_outpoint, UtxoEntry::new(10_000, owner_script, 0, false));
+        buy_auth_inputs.insert(buy_auth_outpoint, UtxoEntry::new(2 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI, owner_script, 0, false));
         apply_block(
             &mut state,
             BlockHash::from_u64_word(11),

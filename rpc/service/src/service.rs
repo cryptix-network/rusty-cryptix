@@ -9,7 +9,11 @@ use async_trait::async_trait;
 use blake2b_simd::Params as Blake2bParams;
 use cryptix_addresses::{Address, Version as AddressVersion};
 use cryptix_atomicindex::{
-    liquidity_math::{calculate_trade_fee, cpmm_buy, cpmm_sell, LiquidityMathError, LIQUIDITY_MIN_PAYOUT_SOMPI},
+    liquidity_math::{
+        calculate_trade_fee, cpmm_buy, cpmm_sell, validate_liquidity_curve_reachability, LiquidityMathError,
+        LIQUIDITY_MIN_PAYOUT_SOMPI, LIQUIDITY_TOKEN_DECIMALS, MAX_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SEED_RESERVE_SOMPI,
+        MIN_LIQUIDITY_SUPPLY_RAW,
+    },
     payload::{
         parse_atomic_token_payload, BuyLiquidityExactInOp, CreateAssetWithMintOp, CreateLiquidityAssetOp, NoopReason,
         SellLiquidityExactInOp, SupplyMode, TokenOp,
@@ -624,10 +628,16 @@ impl RpcCoreService {
     }
 
     fn simulate_create_liquidity_noop_reason(op: &CreateLiquidityAssetOp) -> Option<NoopReason> {
-        if op.max_supply == 0 {
+        if op.decimals != LIQUIDITY_TOKEN_DECIMALS {
+            return Some(NoopReason::BadDecimals);
+        }
+        if !(MIN_LIQUIDITY_SUPPLY_RAW..=MAX_LIQUIDITY_SUPPLY_RAW).contains(&op.max_supply) {
             return Some(NoopReason::BadMaxSupply);
         }
-        if op.seed_reserve_sompi == 0 {
+        if op.seed_reserve_sompi < MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
+            return Some(NoopReason::InvalidAmount);
+        }
+        if validate_liquidity_curve_reachability(op.max_supply, op.seed_reserve_sompi).is_err() {
             return Some(NoopReason::InvalidAmount);
         }
         if op.launch_buy_sompi == 0 {
@@ -641,12 +651,16 @@ impl RpcCoreService {
         let Some(launch_buy_net) = op.launch_buy_sompi.checked_sub(fee_trade) else {
             return Some(NoopReason::SupplyUnderflow);
         };
-        let (token_out, _, new_curve_reserve_sompi) = match cpmm_buy(op.max_supply, op.seed_reserve_sompi, launch_buy_net) {
-            Ok(state) => state,
-            Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
-        };
+        let (token_out, new_remaining_pool_supply, new_curve_reserve_sompi) =
+            match cpmm_buy(op.max_supply, op.seed_reserve_sompi, launch_buy_net) {
+                Ok(state) => state,
+                Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+            };
         if token_out < op.launch_buy_min_token_out {
             return Some(NoopReason::MinOutViolation);
+        }
+        if validate_liquidity_curve_reachability(new_remaining_pool_supply, new_curve_reserve_sompi).is_err() {
+            return Some(NoopReason::InvalidAmount);
         }
         Self::validate_curve_reserve_against_outstanding_supply(token_out, new_curve_reserve_sompi)
     }
@@ -2858,7 +2872,7 @@ mod tests {
             creator_owner_id: [0x22; 32],
             asset_class: TokenAssetClass::Liquidity,
             mint_authority_owner_id: [0u8; 32],
-            decimals: 8,
+            decimals: 0,
             supply_mode: SupplyMode::Capped,
             max_supply,
             total_supply,
@@ -2883,7 +2897,7 @@ mod tests {
     #[test]
     fn simulate_create_asset_with_mint_rejects_initial_mint_above_cap() {
         let op = CreateAssetWithMintOp {
-            decimals: 8,
+            decimals: 0,
             supply_mode: SupplyMode::Capped,
             max_supply: 100,
             mint_authority_owner_id: [0x33; 32],
@@ -2900,7 +2914,7 @@ mod tests {
     #[test]
     fn simulate_create_liquidity_rejects_zero_seed_reserve() {
         let op = CreateLiquidityAssetOp {
-            decimals: 8,
+            decimals: 0,
             max_supply: 1_000,
             name: b"Pool".to_vec(),
             symbol: b"POOL".to_vec(),

@@ -365,7 +365,7 @@ pub const MAINNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     storage_mass_activation_daa_score: u64::MAX,
-    payload_hf_activation_daa_score: 999_999_999_991,
+    payload_hf_activation_daa_score: 2_000,
     payload_max_len_consensus: 8192,
     payload_max_len_standard: 2048,
     payload_weight_multiplier: 4,
@@ -430,7 +430,7 @@ pub const TESTNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     storage_mass_activation_daa_score: u64::MAX,
-    payload_hf_activation_daa_score: 999_999_999_991,
+    payload_hf_activation_daa_score: 2_000,
     payload_max_len_consensus: 8192,
     payload_max_len_standard: 2048,
     payload_weight_multiplier: 4,
@@ -494,7 +494,7 @@ pub const SIMNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     storage_mass_activation_daa_score: 0,
-    payload_hf_activation_daa_score: 999_999_999_991,
+    payload_hf_activation_daa_score: 2_000,
     payload_max_len_consensus: 8192,
     payload_max_len_standard: 2048,
     payload_weight_multiplier: 4,
@@ -544,7 +544,7 @@ pub const DEVNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     storage_mass_activation_daa_score: u64::MAX,
-    payload_hf_activation_daa_score: 999_999_999_991,
+    payload_hf_activation_daa_score: 2_000,
     payload_max_len_consensus: 8192,
     payload_max_len_standard: 2048,
     payload_weight_multiplier: 4,

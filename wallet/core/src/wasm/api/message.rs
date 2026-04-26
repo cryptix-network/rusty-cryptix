@@ -4,7 +4,7 @@ use super::extensions::*;
 use crate::account::descriptor::IAccountDescriptor;
 use crate::api::message::*;
 use crate::imports::*;
-use crate::tx::{Fees, PaymentDestination, PaymentOutputs};
+use crate::tx::{payment_destination_from_js_outputs, Fees};
 use crate::wasm::tx::fees::IFees;
 use crate::wasm::tx::GeneratorSummary;
 use js_sys::Array;
@@ -1417,9 +1417,7 @@ try_from! ( args: IAccountsSendRequest, AccountsSendRequest, {
     let priority_fee_sompi = args.get::<IFees>("priorityFeeSompi")?.try_into()?;
     let payload = args.try_get_value("payload")?.map(|v| v.try_as_vec_u8()).transpose()?;
 
-    let outputs = args.get_value("destination")?;
-    let destination: PaymentDestination =
-        if outputs.is_undefined() { PaymentDestination::Change } else { PaymentOutputs::try_owned_from(outputs)?.into() };
+    let destination = payment_destination_from_js_outputs(args.get_value("destination")?)?;
 
     let fast_path_enabled = args.try_get_bool("fastPath")?.unwrap_or(false);
     let fast_intent_nonce = args.try_get_value("fastIntentNonce")?.map(|v| v.try_as_u64()).transpose()?;
@@ -1580,9 +1578,7 @@ try_from! ( args: IAccountsEstimateRequest, AccountsEstimateRequest, {
     let priority_fee_sompi = args.get::<IFees>("priorityFeeSompi")?.try_into()?;
     let payload = args.try_get_value("payload")?.map(|v| v.try_as_vec_u8()).transpose()?;
 
-    let outputs = args.get_value("destination")?;
-    let destination: PaymentDestination =
-        if outputs.is_undefined() { PaymentDestination::Change } else { PaymentOutputs::try_owned_from(outputs)?.into() };
+    let destination = payment_destination_from_js_outputs(args.get_value("destination")?)?;
 
     Ok(AccountsEstimateRequest { account_id, sender_address, priority_fee_sompi, destination, payload })
 });
