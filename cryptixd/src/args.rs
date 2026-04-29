@@ -90,6 +90,7 @@ pub struct Args {
     pub hfa_microblock_interval_ms_normal: u64,
     pub autoban: bool,
     pub banserver: bool,
+    pub antifraud_guard: bool,
     pub antifraud_allow_peer_fallback: bool,
     // Deprecated and ignored: banserver endpoint is fixed in code.
     pub banserver_url: Option<String>,
@@ -158,6 +159,7 @@ impl Default for Args {
             hfa_microblock_interval_ms_normal: 50,
             autoban: false,
             banserver: true,
+            antifraud_guard: false,
             antifraud_allow_peer_fallback: false,
             banserver_url: None,
             coinbase_maturity_override: None,
@@ -508,10 +510,16 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
                 .help("Disable remote ban list synchronization from the antifraud banserver (overrides config)."),
         )
         .arg(
+            Arg::new("antifraud-guard")
+                .long("antifraud-guard")
+                .action(ArgAction::SetTrue)
+                .help("Also query the optional AntiFraud guard mirror as a secondary consistency endpoint."),
+        )
+        .arg(
             Arg::new("antifraud-allow-peer-fallback")
                 .long("antifraud-allow-peer-fallback")
                 .action(ArgAction::SetTrue)
-                .help("Allow peer snapshot fallback for AntiFraud when seed endpoints are unavailable; also implied by --nodnsseed."),
+                .help("Allow peer snapshot fallback for AntiFraud when seed endpoints are unavailable."),
         )
         .arg(arg!(--"disable-upnp" "Disable upnp"))
         .arg(arg!(--"nodnsseed" "Disable DNS seeding for peers"))
@@ -652,6 +660,7 @@ impl Args {
             ),
             autoban: autoban_enabled,
             banserver: banserver_enabled,
+            antifraud_guard: arg_match_unwrap_or::<bool>(&m, "antifraud-guard", defaults.antifraud_guard),
             antifraud_allow_peer_fallback: arg_match_unwrap_or::<bool>(
                 &m,
                 "antifraud-allow-peer-fallback",
@@ -697,5 +706,22 @@ fn arg_match_many_unwrap_or<T: Clone + Send + Sync + 'static>(m: &clap::ArgMatch
     match m.get_many::<T>(arg_id) {
         Some(val_ref) => val_ref.cloned().collect(),
         None => default,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+
+    #[test]
+    fn antifraud_guard_is_disabled_by_default() {
+        let args = Args::parse(["cryptixd"]).expect("default args should parse");
+        assert!(!args.antifraud_guard);
+    }
+
+    #[test]
+    fn antifraud_guard_flag_enables_secondary_endpoint() {
+        let args = Args::parse(["cryptixd", "--antifraud-guard"]).expect("flag args should parse");
+        assert!(args.antifraud_guard);
     }
 }

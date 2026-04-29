@@ -56,9 +56,10 @@ Feedback and contributions are always welcome.
 | `--no-autoban` | switch | `false` | Force-disable automatic banning of repeatedly misbehaving peers (overrides config). |
 | `--banserver` | switch | `true` | Enable remote ban list synchronization from the antifraud banserver. |
 | `--no-banserver` | switch | `false` | Disable remote ban list synchronization from the antifraud banserver (overrides config). |
-| `--antifraud-allow-peer-fallback` | switch | `false` | Allow peer snapshot fallback for AntiFraud when seed endpoints are unavailable. This is also implied by `--nodnsseed`. |
+| `--antifraud-guard` | switch | `false` | Also query the optional AntiFraud guard mirror as a secondary consistency endpoint. |
+| `--antifraud-allow-peer-fallback` | switch | `false` | Allow peer snapshot fallback for AntiFraud when seed endpoints are unavailable. |
 | `--disable-upnp` | switch | `false` | Disable UPnP. |
-| `--nodnsseed` | switch | `false` | Disable DNS peer seeding. This also disables Atomic bootstrap DNS seed sources and allows Atomic/AntiFraud peer-majority mode from manual/configured peers only. |
+| `--nodnsseed` | switch | `false` | Disable DNS peer seeding. This also disables Atomic bootstrap DNS seed sources and allows Atomic peer-majority mode from manual/configured peers only. |
 | `--nogrpc` | switch | `false` | Disable gRPC server. |
 | `--ram-scale=<FACTOR>` | float | `1.0` | Scale memory-bound internal limits. |
 | `--num-prealloc-utxos=<N>` | integer | none | Devnet preallocation count (`devnet-prealloc` feature only). |
@@ -338,8 +339,9 @@ cargo run --release --bin cryptixd -- --help
 
   Banserver sync defaults:
   - enabled by default (`banserver = true`)
+  - uses the primary AntiFraud endpoint only by default; `--antifraud-guard` enables the optional guard mirror consistency check
   - startup fetch + periodic refresh every 10 minutes
-  - `--no-banserver` disables endpoint fetches; peer snapshot fallback requires `--antifraud-allow-peer-fallback` or `--nodnsseed`
+  - `--no-banserver` disables endpoint fetches; peer snapshot fallback requires `--antifraud-allow-peer-fallback`
   - fail-open: server/network/payload errors keep the current AntiFraud state and do not crash node operation
 </details>
 

@@ -72,7 +72,7 @@ pub struct ConnectionManager {
     banserver_enabled: bool,
     anti_fraud_allow_peer_fallback: bool,
     banserver_primary_url: String,
-    banserver_secondary_url: String,
+    banserver_secondary_url: Option<String>,
     anti_fraud_network: AntiFraudNetwork,
     anti_fraud_persist_dir: Option<PathBuf>,
     anti_fraud_state: ParkingLotMutex<AntiFraudState>,
@@ -260,13 +260,14 @@ impl ConnectionManager {
         default_port: u16,
         address_manager: Arc<ParkingLotMutex<AddressManager>>,
         banserver_enabled: bool,
+        antifraud_guard_enabled: bool,
         anti_fraud_allow_peer_fallback: bool,
         network_name: String,
         anti_fraud_persist_base_dir: Option<PathBuf>,
     ) -> Arc<Self> {
         let (tx, rx) = unbounded_channel::<()>();
         let banserver_primary_url = DEFAULT_BANSERVER_URL.to_owned();
-        let banserver_secondary_url = DEFAULT_BANSERVER_SECONDARY_URL.to_owned();
+        let banserver_secondary_url = antifraud_guard_enabled.then(|| DEFAULT_BANSERVER_SECONDARY_URL.to_owned());
         let anti_fraud_network = AntiFraudNetwork::from_network_name(&network_name).unwrap_or(AntiFraudNetwork::Mainnet);
         let anti_fraud_persist_dir = anti_fraud_persist_base_dir.map(|path| path.join(ANTI_FRAUD_PERSIST_DIR));
         let manager = Arc::new(Self {
@@ -1044,7 +1045,10 @@ impl ConnectionManager {
 
     async fn fetch_banserver_payload(&self) -> BanserverFetchOutcome {
         let primary_result = self.fetch_banserver_payload_from_endpoint("primary", self.banserver_primary_url.trim()).await;
-        let secondary_result = self.fetch_banserver_payload_from_endpoint("secondary", self.banserver_secondary_url.trim()).await;
+        let secondary_result = self
+            .banserver_secondary_url
+            .as_deref()
+            .map(|secondary_url| self.fetch_banserver_payload_from_endpoint("secondary", secondary_url.trim()));
 
         let mut endpoint_payloads = Vec::<EndpointBanserverPayload>::with_capacity(2);
         let mut endpoint_errors = Vec::<String>::new();
@@ -1053,9 +1057,11 @@ impl ConnectionManager {
             Ok(payload) => endpoint_payloads.push(payload),
             Err(err) => endpoint_errors.push(format!("primary endpoint unavailable: {err}")),
         }
-        match secondary_result {
-            Ok(payload) => endpoint_payloads.push(payload),
-            Err(err) => endpoint_errors.push(format!("secondary endpoint unavailable: {err}")),
+        if let Some(result) = secondary_result {
+            match result.await {
+                Ok(payload) => endpoint_payloads.push(payload),
+                Err(err) => endpoint_errors.push(format!("secondary endpoint unavailable: {err}")),
+            }
         }
 
         if endpoint_payloads.iter().any(|entry| !entry.enabled) {
