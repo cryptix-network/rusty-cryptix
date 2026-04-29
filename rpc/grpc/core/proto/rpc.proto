@@ -1026,6 +1026,7 @@ message RpcTokenAssetMessage {
   optional string createdBlockHash = 11;
   optional uint64 createdDaaScore = 12;
   optional uint64 createdAt = 13;
+  string platformTag = 14;
 }
 
 message GetTokenAssetRequestMessage {
@@ -1193,6 +1194,10 @@ message RpcLiquidityPoolStateMessage {
   string vaultTxid = 11;
   uint32 vaultOutputIndex = 12;
   repeated RpcLiquidityFeeRecipientMessage feeRecipients = 13;
+  bool liquidityLockEnabled = 14;
+  string unlockTargetSompi = 15;
+  bool unlocked = 16;
+  bool sellLocked = 17;
 }
 
 message GetLiquidityPoolStateRequestMessage {

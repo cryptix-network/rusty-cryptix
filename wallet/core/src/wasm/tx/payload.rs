@@ -17,6 +17,7 @@ const CAT_FLAGS: u8 = 0;
 const CAT_MAX_NAME_LEN: usize = 32;
 const CAT_MAX_SYMBOL_LEN: usize = 10;
 const CAT_MAX_METADATA_LEN: usize = 256;
+const CAT_MAX_PLATFORM_TAG_LEN: usize = 50;
 const CAT_MAX_DECIMALS: u8 = 18;
 const CAT_MAX_LIQUIDITY_RECIPIENTS: usize = 2;
 const CAT_MIN_LIQUIDITY_FEE_BPS: u16 = 10;
@@ -208,6 +209,30 @@ fn validate_token_identity_fields(name: &str, symbol: &str, metadata: &[u8], dec
     Ok(())
 }
 
+fn validate_platform_tag(platform_tag: &str) -> Result<()> {
+    if platform_tag.len() > CAT_MAX_PLATFORM_TAG_LEN {
+        return Err(Error::custom(format!("platformTag must be <= {CAT_MAX_PLATFORM_TAG_LEN} UTF-8 bytes")));
+    }
+    Ok(())
+}
+
+fn append_platform_tag_tail(payload: &mut Vec<u8>, platform_tag: &str) -> Result<()> {
+    validate_platform_tag(platform_tag)?;
+    let tag_len =
+        u8::try_from(platform_tag.len()).map_err(|_| Error::custom("platformTag length does not fit into u8"))?;
+    payload.push(tag_len);
+    payload.extend_from_slice(platform_tag.as_bytes());
+    Ok(())
+}
+
+fn append_optional_platform_tag_tail(payload: &mut Vec<u8>, platform_tag: &str) -> Result<()> {
+    validate_platform_tag(platform_tag)?;
+    if !platform_tag.is_empty() {
+        append_platform_tag_tail(payload, platform_tag)?;
+    }
+    Ok(())
+}
+
 fn push_create_asset_common(
     payload: &mut Vec<u8>,
     decimals: u8,
@@ -385,10 +410,12 @@ export interface IAtomicTokenPayloadConstants {
     maxNameBytes: number;
     maxSymbolBytes: number;
     maxMetadataBytes: number;
+    maxPlatformTagBytes: number;
     maxDecimals: number;
     maxLiquidityRecipients: number;
     minLiquidityFeeBps: number;
     maxLiquidityFeeBps: number;
+    maxLiquidityUnlockTargetSompi: string;
 }
 "#;
 
@@ -400,10 +427,12 @@ pub fn atomic_token_payload_constants_js() -> Result<Object> {
     object.set("maxNameBytes", &JsValue::from_f64(CAT_MAX_NAME_LEN as f64))?;
     object.set("maxSymbolBytes", &JsValue::from_f64(CAT_MAX_SYMBOL_LEN as f64))?;
     object.set("maxMetadataBytes", &JsValue::from_f64(CAT_MAX_METADATA_LEN as f64))?;
+    object.set("maxPlatformTagBytes", &JsValue::from_f64(CAT_MAX_PLATFORM_TAG_LEN as f64))?;
     object.set("maxDecimals", &JsValue::from_f64(CAT_MAX_DECIMALS as f64))?;
     object.set("maxLiquidityRecipients", &JsValue::from_f64(CAT_MAX_LIQUIDITY_RECIPIENTS as f64))?;
     object.set("minLiquidityFeeBps", &JsValue::from_f64(CAT_MIN_LIQUIDITY_FEE_BPS as f64))?;
     object.set("maxLiquidityFeeBps", &JsValue::from_f64(CAT_MAX_LIQUIDITY_FEE_BPS as f64))?;
+    object.set("maxLiquidityUnlockTargetSompi", &MAX_SOMPI.to_string().into())?;
     Ok(object)
 }
 
@@ -420,10 +449,12 @@ pub fn serialize_atomic_token_create_asset_payload_js(
     name: String,
     symbol: String,
     metadata: BinaryT,
+    platform_tag: Option<String>,
 ) -> Result<Vec<u8>> {
     let nonce = parse_u64_bigint("nonce", nonce)?;
     let max_supply = parse_u128_decimal("maxSupply", max_supply.as_str())?;
     let metadata = metadata.try_as_vec_u8()?;
+    let platform_tag = platform_tag.unwrap_or_default();
 
     let mut payload = build_cat_header(CAT_OP_CREATE_ASSET, auth_input_index, nonce)?;
     push_create_asset_common(
@@ -436,6 +467,7 @@ pub fn serialize_atomic_token_create_asset_payload_js(
         symbol.as_str(),
         metadata.as_slice(),
     )?;
+    append_optional_platform_tag_tail(&mut payload, platform_tag.as_str())?;
     Ok(payload)
 }
 
@@ -528,12 +560,14 @@ pub fn serialize_atomic_token_create_asset_with_mint_payload_js(
     metadata: BinaryT,
     initial_mint_amount: String,
     initial_mint_to_owner_id: String,
+    platform_tag: Option<String>,
 ) -> Result<Vec<u8>> {
     let nonce = parse_u64_bigint("nonce", nonce)?;
     let max_supply = parse_u128_decimal("maxSupply", max_supply.as_str())?;
     let metadata = metadata.try_as_vec_u8()?;
     let initial_mint_amount = parse_u128_decimal("initialMintAmount", initial_mint_amount.as_str())?;
     let initial_mint_to_owner_id = parse_hex_32("initialMintToOwnerId", initial_mint_to_owner_id.as_str())?;
+    let platform_tag = platform_tag.unwrap_or_default();
 
     if initial_mint_amount == 0 && initial_mint_to_owner_id != [0u8; 32] {
         return Err(Error::custom("initialMintToOwnerId must be zeroed when initialMintAmount is 0"));
@@ -555,6 +589,7 @@ pub fn serialize_atomic_token_create_asset_with_mint_payload_js(
     )?;
     payload.extend_from_slice(&initial_mint_amount.to_le_bytes());
     payload.extend_from_slice(&initial_mint_to_owner_id);
+    append_optional_platform_tag_tail(&mut payload, platform_tag.as_str())?;
     Ok(payload)
 }
 
@@ -574,6 +609,8 @@ pub fn serialize_atomic_token_create_liquidity_asset_payload_js(
     recipient_addresses: Array,
     launch_buy_sompi: BigInt,
     launch_buy_min_token_out: String,
+    platform_tag: Option<String>,
+    liquidity_unlock_target_sompi: Option<BigInt>,
 ) -> Result<Vec<u8>> {
     let nonce = parse_u64_bigint("nonce", nonce)?;
     let max_supply = parse_u128_decimal("maxSupply", max_supply.as_str())?;
@@ -582,7 +619,9 @@ pub fn serialize_atomic_token_create_liquidity_asset_payload_js(
     }
 
     let metadata = metadata.try_as_vec_u8()?;
+    let platform_tag = platform_tag.unwrap_or_default();
     validate_token_identity_fields(name.as_str(), symbol.as_str(), metadata.as_slice(), decimals)?;
+    validate_platform_tag(platform_tag.as_str())?;
 
     let seed_reserve_sompi = parse_u64_bigint("seedReserveSompi", seed_reserve_sompi)?;
     if seed_reserve_sompi == 0 {
@@ -611,6 +650,13 @@ pub fn serialize_atomic_token_create_liquidity_asset_payload_js(
     if launch_buy_sompi > 0 && launch_buy_min_token_out == 0 {
         return Err(Error::custom("launchBuyMinTokenOut must be > 0 when launchBuySompi is > 0"));
     }
+    let liquidity_unlock_target_sompi = match liquidity_unlock_target_sompi {
+        Some(value) => parse_u64_bigint("liquidityUnlockTargetSompi", value)?,
+        None => 0,
+    };
+    if liquidity_unlock_target_sompi > MAX_SOMPI {
+        return Err(Error::custom(format!("liquidityUnlockTargetSompi must be 0 or <= MAX_SOMPI ({MAX_SOMPI})")));
+    }
 
     let mut payload = build_cat_header(CAT_OP_CREATE_LIQUIDITY_ASSET, auth_input_index, nonce)?;
     payload.push(decimals);
@@ -630,6 +676,10 @@ pub fn serialize_atomic_token_create_liquidity_asset_payload_js(
     }
     payload.extend_from_slice(&launch_buy_sompi.to_le_bytes());
     payload.extend_from_slice(&launch_buy_min_token_out.to_le_bytes());
+    if !platform_tag.is_empty() || liquidity_unlock_target_sompi > 0 {
+        append_platform_tag_tail(&mut payload, platform_tag.as_str())?;
+        payload.extend_from_slice(&liquidity_unlock_target_sompi.to_le_bytes());
+    }
     Ok(payload)
 }
 

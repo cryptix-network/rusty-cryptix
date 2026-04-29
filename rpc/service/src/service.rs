@@ -483,6 +483,7 @@ impl RpcCoreService {
     fn map_token_asset(asset: TokenAsset) -> RpcTokenAsset {
         let safe_name = Self::sanitize_token_display_text(&asset.name);
         let safe_symbol = Self::sanitize_token_display_text(&asset.symbol);
+        let safe_platform_tag = Self::sanitize_token_display_text(&asset.platform_tag);
         RpcTokenAsset {
             asset_id: asset.asset_id.as_slice().to_hex(),
             creator_owner_id: asset.creator_owner_id.as_slice().to_hex(),
@@ -497,6 +498,7 @@ impl RpcCoreService {
             created_block_hash: asset.created_block_hash,
             created_daa_score: asset.created_daa_score,
             created_at: asset.created_at,
+            platform_tag: safe_platform_tag,
         }
     }
 
@@ -563,6 +565,8 @@ impl RpcCoreService {
         prefix: cryptix_addresses::Prefix,
     ) -> RpcLiquidityPoolState {
         let circulating_supply = asset.max_supply.saturating_sub(pool.remaining_pool_supply);
+        let liquidity_lock_enabled = pool.unlock_target_sompi > 0;
+        let sell_locked = liquidity_lock_enabled && !pool.unlocked;
         RpcLiquidityPoolState {
             asset_id: asset.asset_id.as_slice().to_hex(),
             pool_nonce: pool.pool_nonce,
@@ -577,6 +581,10 @@ impl RpcCoreService {
             vault_txid: pool.vault_outpoint.transaction_id,
             vault_output_index: pool.vault_outpoint.index,
             fee_recipients: pool.fee_recipients.iter().map(|recipient| Self::map_liquidity_fee_recipient(recipient, prefix)).collect(),
+            liquidity_lock_enabled,
+            unlock_target_sompi: pool.unlock_target_sompi.to_string(),
+            unlocked: pool.unlocked,
+            sell_locked,
         }
     }
 
@@ -640,6 +648,9 @@ impl RpcCoreService {
         if validate_liquidity_curve_reachability(op.max_supply, op.seed_reserve_sompi).is_err() {
             return Some(NoopReason::InvalidAmount);
         }
+        if op.liquidity_unlock_target_sompi > MAX_SOMPI {
+            return Some(NoopReason::BadLiquidityUnlockTarget);
+        }
         if op.launch_buy_sompi == 0 {
             return None;
         }
@@ -701,6 +712,9 @@ impl RpcCoreService {
     ) -> Option<NoopReason> {
         if pool.pool_nonce != op.expected_pool_nonce {
             return Some(NoopReason::NonceStale);
+        }
+        if pool.unlock_target_sompi > 0 && !pool.unlocked {
+            return Some(NoopReason::LiquiditySellLocked);
         }
         if sender_balance < op.token_in {
             return Some(NoopReason::InsufficientBalance);
@@ -961,6 +975,9 @@ impl RpcCoreService {
                 };
                 if pool.pool_nonce != op.expected_pool_nonce {
                     return Some(NoopReason::NonceStale);
+                }
+                if pool.unlock_target_sompi > 0 && !pool.unlocked {
+                    return Some(NoopReason::LiquiditySellLocked);
                 }
                 let recipient_index = usize::from(op.recipient_index);
                 if recipient_index >= pool.fee_recipients.len() {
@@ -2862,6 +2879,8 @@ mod tests {
             fee_recipients: vec![],
             vault_outpoint: TransactionOutpoint::new(Hash::from_u64_word(77), 0),
             vault_value_sompi: curve_reserve_sompi,
+            unlock_target_sompi: 0,
+            unlocked: true,
             holder_addresses: HashMap::new(),
         }
     }
@@ -2879,6 +2898,7 @@ mod tests {
             name: b"Pool".to_vec(),
             symbol: b"POOL".to_vec(),
             metadata: vec![],
+            platform_tag: Vec::new(),
             created_block_hash: None,
             created_daa_score: None,
             created_at: None,
@@ -2906,6 +2926,7 @@ mod tests {
             metadata: vec![],
             initial_mint_amount: 101,
             initial_mint_to_owner_id: [0x44; 32],
+            platform_tag: Vec::new(),
         };
 
         assert_eq!(RpcCoreService::simulate_create_asset_with_mint_noop_reason(&op), Some(NoopReason::SupplyCapExceeded));
@@ -2924,6 +2945,8 @@ mod tests {
             recipients: vec![],
             launch_buy_sompi: 0,
             launch_buy_min_token_out: 0,
+            platform_tag: Vec::new(),
+            liquidity_unlock_target_sompi: 0,
         };
 
         assert_eq!(RpcCoreService::simulate_create_liquidity_noop_reason(&op), Some(NoopReason::InvalidAmount));
@@ -2958,6 +2981,26 @@ mod tests {
         assert_eq!(
             RpcCoreService::simulate_sell_liquidity_noop_reason(&asset, &pool, 100, &op),
             Some(NoopReason::InternalMalformedAcceptance)
+        );
+    }
+
+    #[test]
+    fn simulate_sell_liquidity_rejects_active_lock() {
+        let mut pool = sample_liquidity_pool(900, 1_000, 0);
+        pool.unlock_target_sompi = 2_000;
+        pool.unlocked = false;
+        let asset = sample_liquidity_asset(1_000, 100, pool.clone());
+        let op = SellLiquidityExactInOp {
+            asset_id: asset.asset_id,
+            expected_pool_nonce: pool.pool_nonce,
+            token_in: 1,
+            min_cpay_out_sompi: 1,
+            cpay_receive_output_index: 0,
+        };
+
+        assert_eq!(
+            RpcCoreService::simulate_sell_liquidity_noop_reason(&asset, &pool, 100, &op),
+            Some(NoopReason::LiquiditySellLocked)
         );
     }
 }

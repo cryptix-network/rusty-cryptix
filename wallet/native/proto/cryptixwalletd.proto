@@ -233,6 +233,7 @@ message TokenCreateRequest {
   string mint_authority_address = 8;
   string metadata_hex = 9;
   uint32 auth_input_index = 10;
+  string platform_tag = 11;
 }
 
 message TokenCreateResponse {
@@ -256,6 +257,7 @@ message TokenCreateMintRequest {
   string mint_authority_address = 10;
   string metadata_hex = 11;
   uint32 auth_input_index = 12;
+  string platform_tag = 13;
 }
 
 message TokenCreateMintResponse {
@@ -281,6 +283,8 @@ message TokenCreateLiquidityRequest {
   string sender_address = 11;
   string metadata_hex = 12;
   uint32 auth_input_index = 13;
+  string platform_tag = 14;
+  uint64 liquidity_unlock_target_sompi = 15;
 }
 
 message TokenCreateLiquidityResponse {

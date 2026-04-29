@@ -14,6 +14,7 @@ use crate::{
 use blake2b_simd::Params as Blake2bParams;
 use cryptix_consensus_core::{
     acceptance_data::AcceptanceData,
+    constants::MAX_SOMPI,
     tx::{ScriptPublicKey, Transaction, TransactionOutpoint, UtxoEntry},
     Hash as BlockHash,
 };
@@ -202,7 +203,15 @@ pub struct LiquidityPoolState {
     pub vault_outpoint: TransactionOutpoint,
     pub vault_value_sompi: u64,
     #[serde(default)]
+    pub unlock_target_sompi: u64,
+    #[serde(default = "default_liquidity_unlocked")]
+    pub unlocked: bool,
+    #[serde(default)]
     pub holder_addresses: HashMap<[u8; 32], LiquidityHolderAddressState>,
+}
+
+fn default_liquidity_unlocked() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +228,8 @@ pub struct TokenAsset {
     pub name: Vec<u8>,
     pub symbol: Vec<u8>,
     pub metadata: Vec<u8>,
+    #[serde(default)]
+    pub platform_tag: Vec<u8>,
     #[serde(default)]
     pub created_block_hash: Option<BlockHash>,
     #[serde(default)]
@@ -327,6 +338,18 @@ fn validate_curve_reserve_against_outstanding_supply(total_supply: u128, curve_r
         Err(NoopReason::InternalMalformedAcceptance)
     } else {
         Ok(())
+    }
+}
+
+fn liquidity_sell_locked(pool: &LiquidityPoolState) -> bool {
+    pool.unlock_target_sompi > 0 && !pool.unlocked
+}
+
+fn validate_liquidity_unlock_target(unlock_target_sompi: u64) -> Result<(), NoopReason> {
+    if unlock_target_sompi == 0 || unlock_target_sompi <= MAX_SOMPI {
+        Ok(())
+    } else {
+        Err(NoopReason::BadLiquidityUnlockTarget)
     }
 }
 
@@ -1066,6 +1089,7 @@ impl AtomicTokenState {
                 name: op.name.clone(),
                 symbol: op.symbol.clone(),
                 metadata: op.metadata.clone(),
+                platform_tag: op.platform_tag.clone(),
                 created_block_hash: Some(accepting_block_hash),
                 created_daa_score: Some(accepting_block_daa_score),
                 created_at: Some(accepting_block_time),
@@ -1093,6 +1117,7 @@ impl AtomicTokenState {
             name: op.name.clone(),
             symbol: op.symbol.clone(),
             metadata: op.metadata.clone(),
+            platform_tag: op.platform_tag.clone(),
         };
         self.execute_create_asset(
             txid_bytes,
@@ -1259,6 +1284,7 @@ impl AtomicTokenState {
         if op.seed_reserve_sompi < MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
             return Err(NoopReason::InvalidAmount);
         }
+        validate_liquidity_unlock_target(op.liquidity_unlock_target_sompi)?;
         validate_liquidity_curve_reachability(op.max_supply, op.seed_reserve_sompi).map_err(map_liquidity_math_error)?;
 
         let (vault_output_index, vault_output_value) = self.resolve_create_liquidity_vault_output(tx)?;
@@ -1302,6 +1328,7 @@ impl AtomicTokenState {
         }
 
         self.record_asset_before(asset_id, journal);
+        let unlocked = op.liquidity_unlock_target_sompi == 0 || curve_reserve_sompi >= op.liquidity_unlock_target_sompi;
         let asset = TokenAsset {
             asset_id,
             creator_owner_id,
@@ -1314,6 +1341,7 @@ impl AtomicTokenState {
             name: op.name.clone(),
             symbol: op.symbol.clone(),
             metadata: op.metadata.clone(),
+            platform_tag: op.platform_tag.clone(),
             created_block_hash: Some(accepting_block_hash),
             created_daa_score: Some(accepting_block_daa_score),
             created_at: Some(accepting_block_time),
@@ -1326,6 +1354,8 @@ impl AtomicTokenState {
                 fee_recipients,
                 vault_outpoint: TransactionOutpoint::new(tx.id(), vault_output_index),
                 vault_value_sompi: vault_output_value,
+                unlock_target_sompi: op.liquidity_unlock_target_sompi,
+                unlocked,
                 holder_addresses,
             }),
         };
@@ -1372,6 +1402,9 @@ impl AtomicTokenState {
 
         pool.remaining_pool_supply = new_remaining_pool_supply;
         pool.curve_reserve_sompi = new_curve_reserve_sompi;
+        if pool.unlock_target_sompi > 0 && new_curve_reserve_sompi >= pool.unlock_target_sompi {
+            pool.unlocked = true;
+        }
         self.apply_fee_to_pool(&mut pool.fee_recipients, &mut pool.unclaimed_fee_total_sompi, fee_trade)?;
         pool.vault_outpoint = TransactionOutpoint::new(tx.id(), vault_transition.output_index);
         pool.vault_value_sompi = vault_transition.output_value;
@@ -1410,6 +1443,9 @@ impl AtomicTokenState {
         let mut pool = asset.liquidity.clone().ok_or(NoopReason::AssetNotFound)?;
         if pool.pool_nonce != op.expected_pool_nonce {
             return Err(NoopReason::NonceStale);
+        }
+        if liquidity_sell_locked(&pool) {
+            return Err(NoopReason::LiquiditySellLocked);
         }
 
         let sender_key = BalanceKey { asset_id: op.asset_id, owner_id: seller_owner_id };
@@ -1479,6 +1515,9 @@ impl AtomicTokenState {
         let mut pool = asset.liquidity.clone().ok_or(NoopReason::AssetNotFound)?;
         if pool.pool_nonce != op.expected_pool_nonce {
             return Err(NoopReason::NonceStale);
+        }
+        if liquidity_sell_locked(&pool) {
+            return Err(NoopReason::LiquiditySellLocked);
         }
         if op.claim_amount_sompi < LIQUIDITY_MIN_PAYOUT_SOMPI {
             return Err(NoopReason::InvalidAmount);
@@ -1686,6 +1725,13 @@ impl AtomicTokenState {
             return Ok(());
         }
         let pool = asset.liquidity.as_ref().ok_or(NoopReason::AssetNotFound)?;
+        validate_liquidity_unlock_target(pool.unlock_target_sompi)?;
+        if pool.unlock_target_sompi == 0 && !pool.unlocked {
+            return Err(NoopReason::InternalMalformedAcceptance);
+        }
+        if pool.unlock_target_sompi > 0 && !pool.unlocked && pool.curve_reserve_sompi >= pool.unlock_target_sompi {
+            return Err(NoopReason::InternalMalformedAcceptance);
+        }
         validate_curve_reserve_against_outstanding_supply(asset.total_supply, pool.curve_reserve_sompi)?;
         validate_liquidity_curve_reachability(pool.remaining_pool_supply, pool.curve_reserve_sompi)
             .map_err(map_liquidity_math_error)?;
@@ -2539,6 +2585,8 @@ impl AtomicTokenState {
                 hasher.update(&asset.symbol);
                 hasher.update(&(asset.metadata.len() as u16).to_le_bytes());
                 hasher.update(&asset.metadata);
+                hasher.update(&[asset.platform_tag.len() as u8]);
+                hasher.update(&asset.platform_tag);
                 if let Some(pool) = asset.liquidity.as_ref() {
                     hasher.update(&[1u8]);
                     hasher.update(&pool.pool_nonce.to_le_bytes());
@@ -2568,6 +2616,8 @@ impl AtomicTokenState {
                     hasher.update(&pool.vault_outpoint.transaction_id.as_bytes());
                     hasher.update(&pool.vault_outpoint.index.to_le_bytes());
                     hasher.update(&pool.vault_value_sompi.to_le_bytes());
+                    hasher.update(&pool.unlock_target_sompi.to_le_bytes());
+                    hasher.update(&[u8::from(pool.unlocked)]);
                 } else {
                     hasher.update(&[0u8]);
                 }
@@ -2845,6 +2895,7 @@ mod tests {
                 name: b"Atomic".to_vec(),
                 symbol: b"ATM".to_vec(),
                 metadata: vec![0xA1, 0xB2],
+                platform_tag: Vec::new(),
                 created_block_hash: None,
                 created_daa_score: None,
                 created_at: None,
@@ -2856,7 +2907,7 @@ mod tests {
 
         let hash = state.compute_state_hash();
         let hash_hex = to_hex(&hash);
-        assert_eq!(hash_hex, "3f815fcb6d5526385d145f3a0beece30c0db2b834bc545da407b3eec9d3f5aab");
+        assert_eq!(hash_hex, "82adad80dcc568b7e71b2ca202bf43d0f7b199425a8a3ee8ab18b065ee5a4ed4");
     }
 
     #[test]
@@ -2892,6 +2943,7 @@ mod tests {
                 name: b"Liquidity".to_vec(),
                 symbol: b"LIQ".to_vec(),
                 metadata: vec![],
+                platform_tag: Vec::new(),
                 created_block_hash: None,
                 created_daa_score: None,
                 created_at: None,
@@ -2904,6 +2956,8 @@ mod tests {
                     fee_recipients: vec![],
                     vault_outpoint: TransactionOutpoint::new(BlockHash::from_u64_word(7), 0),
                     vault_value_sompi: 1_000_000,
+                    unlock_target_sompi: 0,
+                    unlocked: true,
                     holder_addresses,
                 }),
             },
@@ -2999,6 +3053,136 @@ mod tests {
     }
 
     #[test]
+    fn liquidity_lock_blocks_outflows_until_buy_reaches_target_then_stays_unlocked() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let owner_script = test_script(33);
+        let owner_payload = vec![0x33; 32];
+        let owner = state
+            .owner_id_from_address_components(0, owner_payload.as_slice())
+            .expect("owner id should derive");
+        let asset_id = [0x44; 32];
+        let vault_outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(44), 0);
+        let target = 2 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI;
+
+        state.assets.insert(
+            asset_id,
+            TokenAsset {
+                asset_id,
+                creator_owner_id: owner,
+                asset_class: TokenAssetClass::Liquidity,
+                mint_authority_owner_id: [0u8; 32],
+                decimals: 0,
+                supply_mode: SupplyMode::Capped,
+                max_supply: 1_000,
+                total_supply: 0,
+                name: b"Lock".to_vec(),
+                symbol: b"LCK".to_vec(),
+                metadata: vec![],
+                platform_tag: Vec::new(),
+                created_block_hash: None,
+                created_daa_score: None,
+                created_at: None,
+                liquidity: Some(LiquidityPoolState {
+                    pool_nonce: 1,
+                    remaining_pool_supply: 1_000,
+                    curve_reserve_sompi: MIN_LIQUIDITY_SEED_RESERVE_SOMPI,
+                    unclaimed_fee_total_sompi: 0,
+                    fee_bps: 0,
+                    fee_recipients: vec![],
+                    vault_outpoint,
+                    vault_value_sompi: MIN_LIQUIDITY_SEED_RESERVE_SOMPI,
+                    unlock_target_sompi: target,
+                    unlocked: false,
+                    holder_addresses: HashMap::new(),
+                }),
+            },
+        );
+
+        let dummy_tx = tx_with_inputs_outputs(vec![], vec![], vec![]);
+        let mut journal = JournalBuilder::default();
+        let locked_sell = SellLiquidityExactInOp {
+            asset_id,
+            expected_pool_nonce: 1,
+            token_in: 1,
+            min_cpay_out_sompi: 1,
+            cpay_receive_output_index: 1,
+        };
+        assert_eq!(
+            state.execute_sell_liquidity(&dummy_tx, owner, &locked_sell, &HashMap::new(), &mut journal),
+            Err(NoopReason::LiquiditySellLocked)
+        );
+        let locked_claim = ClaimLiquidityFeesOp {
+            asset_id,
+            expected_pool_nonce: 1,
+            recipient_index: 0,
+            claim_amount_sompi: 1,
+            claim_receive_output_index: 1,
+        };
+        assert_eq!(
+            state.execute_claim_liquidity_fees(&dummy_tx, owner, &locked_claim, &HashMap::new(), &mut journal),
+            Err(NoopReason::LiquiditySellLocked)
+        );
+
+        let buy_tx = tx_with_inputs_outputs(
+            vec![(vault_outpoint, 0)],
+            vec![TransactionOutput::new(target, liquidity_vault_script())],
+            vec![],
+        );
+        let mut buy_auth_inputs = HashMap::new();
+        buy_auth_inputs.insert(
+            vault_outpoint,
+            UtxoEntry::new(MIN_LIQUIDITY_SEED_RESERVE_SOMPI, liquidity_vault_script(), 0, false),
+        );
+        let buyer_auth = AuthContext { owner_id: owner, address_version: 0, address_payload: owner_payload };
+        let buy_op = BuyLiquidityExactInOp {
+            asset_id,
+            expected_pool_nonce: 1,
+            cpay_in_sompi: MIN_LIQUIDITY_SEED_RESERVE_SOMPI,
+            min_token_out: 1,
+        };
+        let token_out = state
+            .execute_buy_liquidity(&buy_tx, &buyer_auth, &buy_op, &buy_auth_inputs, &mut journal)
+            .expect("buy should unlock the pool");
+        assert!(token_out > 1);
+
+        let pool_after_buy = state.assets.get(&asset_id).and_then(|asset| asset.liquidity.as_ref()).expect("pool should exist");
+        assert!(pool_after_buy.unlocked);
+        assert_eq!(pool_after_buy.unlock_target_sompi, target);
+        assert_eq!(pool_after_buy.curve_reserve_sompi, target);
+
+        let (cpay_out, _, new_curve_reserve_sompi) =
+            cpmm_sell(pool_after_buy.remaining_pool_supply, pool_after_buy.curve_reserve_sompi, 1).expect("sell quote should work");
+        assert!(new_curve_reserve_sompi < target);
+        let sell_tx = tx_with_inputs_outputs(
+            vec![(pool_after_buy.vault_outpoint, 0)],
+            vec![
+                TransactionOutput::new(pool_after_buy.vault_value_sompi - cpay_out, liquidity_vault_script()),
+                TransactionOutput::new(cpay_out, owner_script),
+            ],
+            vec![],
+        );
+        let mut sell_auth_inputs = HashMap::new();
+        sell_auth_inputs.insert(
+            pool_after_buy.vault_outpoint,
+            UtxoEntry::new(pool_after_buy.vault_value_sompi, liquidity_vault_script(), 0, false),
+        );
+        let sell_op = SellLiquidityExactInOp {
+            asset_id,
+            expected_pool_nonce: pool_after_buy.pool_nonce,
+            token_in: 1,
+            min_cpay_out_sompi: 1,
+            cpay_receive_output_index: 1,
+        };
+        state
+            .execute_sell_liquidity(&sell_tx, owner, &sell_op, &sell_auth_inputs, &mut journal)
+            .expect("sell should be allowed after unlock");
+
+        let pool_after_sell = state.assets.get(&asset_id).and_then(|asset| asset.liquidity.as_ref()).expect("pool should exist");
+        assert!(pool_after_sell.unlocked);
+        assert!(pool_after_sell.curve_reserve_sompi < target);
+    }
+
+    #[test]
     fn liquidity_invariants_reject_mismatched_holder_owner_id() {
         let state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
         let asset_id = [0xAA; 32];
@@ -3020,6 +3204,7 @@ mod tests {
             name: b"LiqX".to_vec(),
             symbol: b"LX".to_vec(),
             metadata: vec![],
+            platform_tag: Vec::new(),
             created_block_hash: None,
             created_daa_score: None,
             created_at: None,
@@ -3032,6 +3217,8 @@ mod tests {
                 fee_recipients: vec![],
                 vault_outpoint: TransactionOutpoint::new(BlockHash::from_u64_word(8), 0),
                 vault_value_sompi: 50_000,
+                unlock_target_sompi: 0,
+                unlocked: true,
                 holder_addresses,
             }),
         };
@@ -3055,6 +3242,7 @@ mod tests {
             name: b"LiqY".to_vec(),
             symbol: b"LY".to_vec(),
             metadata: vec![],
+            platform_tag: Vec::new(),
             created_block_hash: None,
             created_daa_score: None,
             created_at: None,
@@ -3067,6 +3255,8 @@ mod tests {
                 fee_recipients: vec![],
                 vault_outpoint: TransactionOutpoint::new(BlockHash::from_u64_word(9), 0),
                 vault_value_sompi: 0,
+                unlock_target_sompi: 0,
+                unlocked: true,
                 holder_addresses: HashMap::new(),
             }),
         };
@@ -3107,6 +3297,7 @@ mod tests {
                 name: b"Liquidity".to_vec(),
                 symbol: b"LIQ".to_vec(),
                 metadata: vec![],
+                platform_tag: Vec::new(),
                 created_block_hash: None,
                 created_daa_score: None,
                 created_at: None,
@@ -3119,6 +3310,8 @@ mod tests {
                     fee_recipients: vec![],
                     vault_outpoint: TransactionOutpoint::new(BlockHash::from_u64_word(10), 0),
                     vault_value_sompi: 50_000,
+                    unlock_target_sompi: 0,
+                    unlocked: true,
                     holder_addresses,
                 }),
             },

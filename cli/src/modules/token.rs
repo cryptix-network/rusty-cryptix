@@ -27,6 +27,7 @@ const CAT_OP_CLAIM_LIQUIDITY_FEES: u8 = 8;
 const CAT_MAX_NAME_LEN: usize = 32;
 const CAT_MAX_SYMBOL_LEN: usize = 10;
 const CAT_MAX_METADATA_LEN: usize = 256;
+const CAT_MAX_PLATFORM_TAG_LEN: usize = 50;
 const CAT_MAX_DECIMALS: u8 = 18;
 const CAT_MAX_LIQUIDITY_RECIPIENTS: usize = 2;
 const CAT_MIN_LIQUIDITY_FEE_BPS: u16 = 10;
@@ -211,7 +212,7 @@ impl Token {
 
     async fn create(self: Arc<Self>, ctx: Arc<CryptixCli>, mut argv: Vec<String>) -> Result<()> {
         if argv.len() < 5 {
-            tprintln!(ctx, "usage: token create <name> <symbol> <decimals> <uncapped|capped> <maxSupplyRaw> [--sender=<address>] [--mint-authority=<address>] [--metadata-hex=<hex>]");
+            tprintln!(ctx, "usage: token create <name> <symbol> <decimals> <uncapped|capped> <maxSupplyRaw> [--sender=<address>] [--mint-authority=<address>] [--metadata-hex=<hex>] [--platform-tag=<tag>]");
             return Ok(());
         }
 
@@ -225,7 +226,7 @@ impl Token {
         let max_supply = Self::parse_u128(argv.remove(0).as_str(), "maxSupplyRaw")?;
         Self::validate_supply_mode(supply_mode, max_supply)?;
 
-        let (sender_opt, mint_authority_opt, metadata) = Self::parse_create_options(argv)?;
+        let (sender_opt, mint_authority_opt, metadata, platform_tag) = Self::parse_create_options(argv)?;
         Self::validate_asset_identity_fields(name.as_str(), symbol.as_str(), metadata.as_slice(), decimals)?;
 
         let sender_address = sender_opt.unwrap_or(account.receive_address()?);
@@ -243,6 +244,7 @@ impl Token {
             max_supply,
             mint_authority_owner_id.as_str(),
             metadata.as_slice(),
+            platform_tag.as_str(),
             nonce,
             DEFAULT_AUTH_INPUT_INDEX,
         )?;
@@ -272,7 +274,7 @@ impl Token {
 
     async fn create_with_mint(self: Arc<Self>, ctx: Arc<CryptixCli>, mut argv: Vec<String>) -> Result<()> {
         if argv.len() < 7 {
-            tprintln!(ctx, "usage: token create-mint <name> <symbol> <decimals> <uncapped|capped> <maxSupplyRaw> <initialMintAmountRaw> <initialMintToAddress> [--sender=<address>] [--mint-authority=<address>] [--metadata-hex=<hex>]");
+            tprintln!(ctx, "usage: token create-mint <name> <symbol> <decimals> <uncapped|capped> <maxSupplyRaw> <initialMintAmountRaw> <initialMintToAddress> [--sender=<address>] [--mint-authority=<address>] [--metadata-hex=<hex>] [--platform-tag=<tag>]");
             return Ok(());
         }
 
@@ -295,7 +297,7 @@ impl Token {
             return Err(Error::custom("initialMintAmountRaw exceeds maxSupplyRaw for capped token"));
         }
 
-        let (sender_opt, mint_authority_opt, metadata) = Self::parse_create_options(argv)?;
+        let (sender_opt, mint_authority_opt, metadata, platform_tag) = Self::parse_create_options(argv)?;
         Self::validate_asset_identity_fields(name.as_str(), symbol.as_str(), metadata.as_slice(), decimals)?;
 
         let sender_address = sender_opt.unwrap_or(account.receive_address()?);
@@ -316,6 +318,7 @@ impl Token {
             metadata.as_slice(),
             initial_mint_amount,
             initial_mint_to_owner_id.as_str(),
+            platform_tag.as_str(),
             nonce,
             DEFAULT_AUTH_INPUT_INDEX,
         )?;
@@ -349,7 +352,7 @@ impl Token {
         if argv.len() < 6 {
             tprintln!(
                 ctx,
-                "usage: token create-liquidity <name> <symbol> <decimals> <maxSupplyRaw> <seedReserveSompi> <feeBps> [recipientAddress[,recipientAddress2]] [--launch-buy-sompi=<sompi>] [--launch-buy-min-token-out=<amountRaw>] [--sender=<address>] [--metadata-hex=<hex>]"
+                "usage: token create-liquidity <name> <symbol> <decimals> <maxSupplyRaw> <seedReserveSompi> <feeBps> [recipientAddress[,recipientAddress2]] [--launch-buy-sompi=<sompi>] [--launch-buy-min-token-out=<amountRaw>] [--sender=<address>] [--metadata-hex=<hex>] [--platform-tag=<tag>] [--liquidity-unlock-target-sompi=<sompi>]"
             );
             return Ok(());
         }
@@ -390,7 +393,14 @@ impl Token {
             return Err(Error::custom("recipient addresses are required when feeBps is > 0"));
         }
 
-        let (sender_opt, metadata, launch_buy_sompi, launch_buy_min_token_out) = Self::parse_create_liquidity_options(argv)?;
+        let (
+            sender_opt,
+            metadata,
+            launch_buy_sompi,
+            launch_buy_min_token_out,
+            platform_tag,
+            liquidity_unlock_target_sompi,
+        ) = Self::parse_create_liquidity_options(argv)?;
         Self::validate_asset_identity_fields(name.as_str(), symbol.as_str(), metadata.as_slice(), decimals)?;
         if launch_buy_sompi == 0 && launch_buy_min_token_out != 0 {
             return Err(Error::custom("launchBuyMinTokenOut must be 0 when launchBuySompi is 0"));
@@ -413,6 +423,8 @@ impl Token {
             recipients.as_slice(),
             launch_buy_sompi,
             launch_buy_min_token_out,
+            platform_tag.as_str(),
+            liquidity_unlock_target_sompi,
             nonce,
             DEFAULT_AUTH_INPUT_INDEX,
         )?;
@@ -463,6 +475,7 @@ impl Token {
             if let Some(sender) = argv.first() { Address::try_from(sender.as_str())? } else { account.receive_address()? };
 
         let pool = Self::fetch_liquidity_pool(&rpc, asset_id.as_str()).await?;
+        Self::ensure_liquidity_outflow_unlocked(&pool, "liquidity sell")?;
         let quote = rpc
             .get_liquidity_quote_call(
                 None,
@@ -609,6 +622,7 @@ impl Token {
             if let Some(sender) = argv.first() { Address::try_from(sender.as_str())? } else { account.receive_address()? };
 
         let pool = Self::fetch_liquidity_pool(&rpc, asset_id.as_str()).await?;
+        Self::ensure_liquidity_outflow_unlocked(&pool, "liquidity fee claim")?;
         let sender_owner_id = Self::resolve_owner_id(&rpc, &sender_address, "senderAddress").await?;
         let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str()).await?;
         let payload = Self::build_claim_liquidity_payload(
@@ -1104,10 +1118,11 @@ impl Token {
         }
     }
 
-    fn parse_create_options(mut argv: Vec<String>) -> Result<(Option<Address>, Option<Address>, Vec<u8>)> {
+    fn parse_create_options(mut argv: Vec<String>) -> Result<(Option<Address>, Option<Address>, Vec<u8>, String)> {
         let mut sender = None;
         let mut mint_authority = None;
         let mut metadata = Vec::new();
+        let mut platform_tag = None;
 
         while !argv.is_empty() {
             let arg = argv.remove(0);
@@ -1128,23 +1143,32 @@ impl Token {
                 let normalized = raw.trim().strip_prefix("0x").unwrap_or(raw.trim());
                 metadata = Vec::<u8>::from_hex(normalized)
                     .map_err(|err| Error::custom(format!("--metadata-hex must be valid hex: {err}")))?;
+            } else if let Some(raw) = arg.strip_prefix("--platform-tag=") {
+                if platform_tag.is_some() {
+                    return Err(Error::custom("--platform-tag provided more than once"));
+                }
+                Self::validate_platform_tag(raw)?;
+                platform_tag = Some(raw.to_string());
             } else {
                 return Err(Error::custom(format!(
-                    "unknown option `{arg}`. supported: --sender=, --mint-authority=, --metadata-hex="
+                    "unknown option `{arg}`. supported: --sender=, --mint-authority=, --metadata-hex=, --platform-tag="
                 )));
             }
         }
 
-        Ok((sender, mint_authority, metadata))
+        Ok((sender, mint_authority, metadata, platform_tag.unwrap_or_default()))
     }
 
-    fn parse_create_liquidity_options(mut argv: Vec<String>) -> Result<(Option<Address>, Vec<u8>, u64, u128)> {
+    fn parse_create_liquidity_options(mut argv: Vec<String>) -> Result<(Option<Address>, Vec<u8>, u64, u128, String, u64)> {
         let mut sender = None;
         let mut metadata = Vec::new();
         let mut launch_buy_sompi = 0u64;
         let mut launch_buy_min_token_out = 0u128;
+        let mut platform_tag = None;
+        let mut liquidity_unlock_target_sompi = 0u64;
         let mut launch_buy_sompi_set = false;
         let mut launch_buy_min_set = false;
+        let mut unlock_target_set = false;
 
         while !argv.is_empty() {
             let arg = argv.remove(0);
@@ -1174,9 +1198,26 @@ impl Token {
                 }
                 launch_buy_min_set = true;
                 launch_buy_min_token_out = Self::parse_u128(raw, "--launch-buy-min-token-out")?;
+            } else if let Some(raw) = arg.strip_prefix("--platform-tag=") {
+                if platform_tag.is_some() {
+                    return Err(Error::custom("--platform-tag provided more than once"));
+                }
+                Self::validate_platform_tag(raw)?;
+                platform_tag = Some(raw.to_string());
+            } else if let Some(raw) = arg.strip_prefix("--liquidity-unlock-target-sompi=") {
+                if unlock_target_set {
+                    return Err(Error::custom("--liquidity-unlock-target-sompi provided more than once"));
+                }
+                unlock_target_set = true;
+                liquidity_unlock_target_sompi = Self::parse_u64(raw, "--liquidity-unlock-target-sompi")?;
+                if liquidity_unlock_target_sompi > MAX_SOMPI {
+                    return Err(Error::custom(format!(
+                        "--liquidity-unlock-target-sompi must be 0 or <= MAX_SOMPI ({MAX_SOMPI})"
+                    )));
+                }
             } else {
                 return Err(Error::custom(format!(
-                    "unknown option `{arg}`. supported: --sender=, --metadata-hex=, --launch-buy-sompi=, --launch-buy-min-token-out="
+                    "unknown option `{arg}`. supported: --sender=, --metadata-hex=, --launch-buy-sompi=, --launch-buy-min-token-out=, --platform-tag=, --liquidity-unlock-target-sompi="
                 )));
             }
         }
@@ -1185,7 +1226,7 @@ impl Token {
             return Err(Error::custom("--launch-buy-sompi and --launch-buy-min-token-out must be provided together"));
         }
 
-        Ok((sender, metadata, launch_buy_sompi, launch_buy_min_token_out))
+        Ok((sender, metadata, launch_buy_sompi, launch_buy_min_token_out, platform_tag.unwrap_or_default(), liquidity_unlock_target_sompi))
     }
 
     fn parse_liquidity_recipients_csv(csv: &str) -> Result<Vec<LiquidityRecipient>> {
@@ -1239,6 +1280,40 @@ impl Token {
         }
         if metadata.len() > CAT_MAX_METADATA_LEN {
             return Err(Error::custom(format!("metadata must be <= {} bytes", CAT_MAX_METADATA_LEN)));
+        }
+        Ok(())
+    }
+
+    fn validate_platform_tag(platform_tag: &str) -> Result<()> {
+        if platform_tag.len() > CAT_MAX_PLATFORM_TAG_LEN {
+            return Err(Error::custom(format!("platform tag must be <= {} UTF-8 bytes", CAT_MAX_PLATFORM_TAG_LEN)));
+        }
+        Ok(())
+    }
+
+    fn append_platform_tag_tail(payload: &mut Vec<u8>, platform_tag: &str) -> Result<()> {
+        Self::validate_platform_tag(platform_tag)?;
+        let tag_len =
+            u8::try_from(platform_tag.len()).map_err(|_| Error::custom("platform tag length does not fit into u8"))?;
+        payload.push(tag_len);
+        payload.extend_from_slice(platform_tag.as_bytes());
+        Ok(())
+    }
+
+    fn append_optional_platform_tag_tail(payload: &mut Vec<u8>, platform_tag: &str) -> Result<()> {
+        Self::validate_platform_tag(platform_tag)?;
+        if !platform_tag.is_empty() {
+            Self::append_platform_tag_tail(payload, platform_tag)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_liquidity_outflow_unlocked(pool: &RpcLiquidityPoolState, operation: &str) -> Result<()> {
+        if pool.sell_locked {
+            return Err(Error::custom(format!(
+                "{operation} is locked until curveReserveSompi reaches {}",
+                pool.unlock_target_sompi
+            )));
         }
         Ok(())
     }
@@ -1366,6 +1441,7 @@ impl Token {
         max_supply: u128,
         mint_authority_owner_id: &str,
         metadata: &[u8],
+        platform_tag: &str,
         nonce: u64,
         auth_input_index: u16,
     ) -> Result<Vec<u8>> {
@@ -1380,6 +1456,7 @@ impl Token {
             mint_authority_owner_id,
             metadata,
         )?;
+        Self::append_optional_platform_tag_tail(&mut payload, platform_tag)?;
         Ok(payload)
     }
 
@@ -1393,6 +1470,7 @@ impl Token {
         metadata: &[u8],
         initial_mint_amount: u128,
         initial_mint_to_owner_id: &str,
+        platform_tag: &str,
         nonce: u64,
         auth_input_index: u16,
     ) -> Result<Vec<u8>> {
@@ -1410,6 +1488,7 @@ impl Token {
         )?;
         payload.extend_from_slice(&initial_mint_amount.to_le_bytes());
         payload.extend_from_slice(&initial_mint_to_owner_id);
+        Self::append_optional_platform_tag_tail(&mut payload, platform_tag)?;
         Ok(payload)
     }
 
@@ -1424,6 +1503,8 @@ impl Token {
         recipients: &[LiquidityRecipient],
         launch_buy_sompi: u64,
         launch_buy_min_token_out: u128,
+        platform_tag: &str,
+        liquidity_unlock_target_sompi: u64,
         nonce: u64,
         auth_input_index: u16,
     ) -> Result<Vec<u8>> {
@@ -1432,6 +1513,12 @@ impl Token {
         }
         if seed_reserve_sompi == 0 {
             return Err(Error::custom("seedReserveSompi must be greater than zero"));
+        }
+        Self::validate_platform_tag(platform_tag)?;
+        if liquidity_unlock_target_sompi > MAX_SOMPI {
+            return Err(Error::custom(format!(
+                "liquidityUnlockTargetSompi must be 0 or <= MAX_SOMPI ({MAX_SOMPI})"
+            )));
         }
         Self::validate_liquidity_create_parameters(decimals, max_supply, seed_reserve_sompi)?;
         if recipients.len() > CAT_MAX_LIQUIDITY_RECIPIENTS {
@@ -1456,6 +1543,10 @@ impl Token {
         }
         payload.extend_from_slice(&launch_buy_sompi.to_le_bytes());
         payload.extend_from_slice(&launch_buy_min_token_out.to_le_bytes());
+        if !platform_tag.is_empty() || liquidity_unlock_target_sompi > 0 {
+            Self::append_platform_tag_tail(&mut payload, platform_tag)?;
+            payload.extend_from_slice(&liquidity_unlock_target_sompi.to_le_bytes());
+        }
         Ok(payload)
     }
 
@@ -1545,17 +1636,17 @@ impl Token {
         tprintln!(ctx, "    Burn CAT tokens from sender authority.");
         tprintln!(
             ctx,
-            "  create <name> <symbol> <decimals> <uncapped|capped> <maxSupplyRaw> [--sender=<address>] [--mint-authority=<address>] [--metadata-hex=<hex>]"
+            "  create <name> <symbol> <decimals> <uncapped|capped> <maxSupplyRaw> [--sender=<address>] [--mint-authority=<address>] [--metadata-hex=<hex>] [--platform-tag=<tag>]"
         );
         tprintln!(ctx, "    Create CAT token (no initial mint). Asset id equals create txid.");
         tprintln!(
             ctx,
-            "  create-mint <name> <symbol> <decimals> <uncapped|capped> <maxSupplyRaw> <initialMintAmountRaw> <initialMintToAddress> [--sender=<address>] [--mint-authority=<address>] [--metadata-hex=<hex>]"
+            "  create-mint <name> <symbol> <decimals> <uncapped|capped> <maxSupplyRaw> <initialMintAmountRaw> <initialMintToAddress> [--sender=<address>] [--mint-authority=<address>] [--metadata-hex=<hex>] [--platform-tag=<tag>]"
         );
         tprintln!(ctx, "    Create CAT token and mint in same operation. Asset id equals create txid.");
         tprintln!(
             ctx,
-            "  create-liquidity <name> <symbol> <decimals> <maxSupplyRaw> <seedReserveSompi> <feeBps> [recipientAddress[,recipientAddress2]] [--launch-buy-sompi=<sompi>] [--launch-buy-min-token-out=<amountRaw>] [--sender=<address>] [--metadata-hex=<hex>]"
+            "  create-liquidity <name> <symbol> <decimals> <maxSupplyRaw> <seedReserveSompi> <feeBps> [recipientAddress[,recipientAddress2]] [--launch-buy-sompi=<sompi>] [--launch-buy-min-token-out=<amountRaw>] [--sender=<address>] [--metadata-hex=<hex>] [--platform-tag=<tag>] [--liquidity-unlock-target-sompi=<sompi>]"
         );
         tprintln!(ctx, "    Create CAT liquidity asset (vault value = seedReserveSompi + launchBuySompi).");
         tprintln!(ctx, "  buy-liquidity <assetId> <cpayInSompi> <minTokenOutRaw> [senderAddress]");

@@ -2828,11 +2828,12 @@ pub struct RpcTokenAsset {
     pub created_block_hash: Option<RpcHash>,
     pub created_daa_score: Option<u64>,
     pub created_at: Option<u64>,
+    pub platform_tag: String,
 }
 
 impl Serializer for RpcTokenAsset {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &2, writer)?;
+        store!(u16, &3, writer)?;
         store!(String, &self.asset_id, writer)?;
         store!(String, &self.creator_owner_id, writer)?;
         store!(String, &self.mint_authority_owner_id, writer)?;
@@ -2846,6 +2847,7 @@ impl Serializer for RpcTokenAsset {
         store!(Option<RpcHash>, &self.created_block_hash, writer)?;
         store!(Option<u64>, &self.created_daa_score, writer)?;
         store!(Option<u64>, &self.created_at, writer)?;
+        store!(String, &self.platform_tag, writer)?;
         Ok(())
     }
 }
@@ -2866,6 +2868,7 @@ impl Deserializer for RpcTokenAsset {
         let created_block_hash = if version >= 2 { load!(Option<RpcHash>, reader)? } else { None };
         let created_daa_score = if version >= 2 { load!(Option<u64>, reader)? } else { None };
         let created_at = if version >= 2 { load!(Option<u64>, reader)? } else { None };
+        let platform_tag = if version >= 3 { load!(String, reader)? } else { String::new() };
         Ok(Self {
             asset_id,
             creator_owner_id,
@@ -2880,6 +2883,7 @@ impl Deserializer for RpcTokenAsset {
             created_block_hash,
             created_daa_score,
             created_at,
+            platform_tag,
         })
     }
 }
@@ -3275,11 +3279,15 @@ pub struct RpcLiquidityPoolState {
     pub vault_txid: RpcHash,
     pub vault_output_index: u32,
     pub fee_recipients: Vec<RpcLiquidityFeeRecipient>,
+    pub liquidity_lock_enabled: bool,
+    pub unlock_target_sompi: String,
+    pub unlocked: bool,
+    pub sell_locked: bool,
 }
 
 impl Serializer for RpcLiquidityPoolState {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
         store!(String, &self.asset_id, writer)?;
         store!(u64, &self.pool_nonce, writer)?;
         store!(u32, &self.fee_bps, writer)?;
@@ -3293,13 +3301,17 @@ impl Serializer for RpcLiquidityPoolState {
         store!(RpcHash, &self.vault_txid, writer)?;
         store!(u32, &self.vault_output_index, writer)?;
         store!(Vec<RpcLiquidityFeeRecipient>, &self.fee_recipients, writer)?;
+        store!(bool, &self.liquidity_lock_enabled, writer)?;
+        store!(String, &self.unlock_target_sompi, writer)?;
+        store!(bool, &self.unlocked, writer)?;
+        store!(bool, &self.sell_locked, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for RpcLiquidityPoolState {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let asset_id = load!(String, reader)?;
         let pool_nonce = load!(u64, reader)?;
         let fee_bps = load!(u32, reader)?;
@@ -3313,6 +3325,10 @@ impl Deserializer for RpcLiquidityPoolState {
         let vault_txid = load!(RpcHash, reader)?;
         let vault_output_index = load!(u32, reader)?;
         let fee_recipients = load!(Vec<RpcLiquidityFeeRecipient>, reader)?;
+        let liquidity_lock_enabled = if version >= 2 { load!(bool, reader)? } else { false };
+        let unlock_target_sompi = if version >= 2 { load!(String, reader)? } else { "0".to_string() };
+        let unlocked = if version >= 2 { load!(bool, reader)? } else { true };
+        let sell_locked = if version >= 2 { load!(bool, reader)? } else { false };
         Ok(Self {
             asset_id,
             pool_nonce,
@@ -3327,6 +3343,10 @@ impl Deserializer for RpcLiquidityPoolState {
             vault_txid,
             vault_output_index,
             fee_recipients,
+            liquidity_lock_enabled,
+            unlock_target_sompi,
+            unlocked,
+            sell_locked,
         })
     }
 }

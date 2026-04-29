@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use cryptix_consensus_core::constants::MAX_SOMPI;
+
 use crate::liquidity_math::{
     validate_liquidity_curve_reachability, LIQUIDITY_TOKEN_DECIMALS, MAX_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SEED_RESERVE_SOMPI,
     MIN_LIQUIDITY_SUPPLY_RAW,
@@ -11,6 +13,7 @@ pub const CRYPTIX_ATOMIC_TOKEN_VERSION: u8 = 1;
 pub const MAX_NAME_LEN: usize = 32;
 pub const MAX_SYMBOL_LEN: usize = 10;
 pub const MAX_METADATA_LEN: usize = 256;
+pub const MAX_PLATFORM_TAG_LEN: usize = 50;
 pub const MAX_DECIMALS: u8 = 18;
 pub const MAX_LIQUIDITY_RECIPIENTS: usize = 2;
 pub const MIN_LIQUIDITY_FEE_BPS: u16 = 10;
@@ -93,6 +96,9 @@ pub enum NoopReason {
     VaultOutpointMismatch = 35,
     PayoutScriptClassInvalid = 36,
     HistoricalStateUnavailable = 37,
+    BadPlatformTag = 38,
+    BadLiquidityUnlockTarget = 39,
+    LiquiditySellLocked = 40,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +117,8 @@ pub struct CreateAssetOp {
     pub name: Vec<u8>,
     pub symbol: Vec<u8>,
     pub metadata: Vec<u8>,
+    #[serde(default)]
+    pub platform_tag: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +132,8 @@ pub struct CreateAssetWithMintOp {
     pub metadata: Vec<u8>,
     pub initial_mint_amount: u128,
     pub initial_mint_to_owner_id: [u8; 32],
+    #[serde(default)]
+    pub platform_tag: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +174,10 @@ pub struct CreateLiquidityAssetOp {
     pub recipients: Vec<LiquidityRecipientAddress>,
     pub launch_buy_sompi: u64,
     pub launch_buy_min_token_out: u128,
+    #[serde(default)]
+    pub platform_tag: Vec<u8>,
+    #[serde(default)]
+    pub liquidity_unlock_target_sompi: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,7 +302,8 @@ fn parse_atomic_token_payload_strict(payload: &[u8]) -> Result<ParsedTokenPayloa
 fn parse_create_asset_op(payload: &[u8], cursor: &mut usize) -> Result<CreateAssetOp, NoopReason> {
     let (decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata) =
         parse_create_asset_common(payload, cursor)?;
-    Ok(CreateAssetOp { decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata })
+    let platform_tag = parse_optional_platform_tag_tail(payload, cursor)?;
+    Ok(CreateAssetOp { decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata, platform_tag })
 }
 
 fn parse_transfer_op(payload: &[u8], cursor: &mut usize) -> Result<TransferOp, NoopReason> {
@@ -338,6 +353,7 @@ fn parse_create_asset_with_mint_op(payload: &[u8], cursor: &mut usize) -> Result
     if initial_mint_amount > 0 && initial_mint_to_owner_id == [0u8; 32] {
         return Err(NoopReason::InvalidAmount);
     }
+    let platform_tag = parse_optional_platform_tag_tail(payload, cursor)?;
 
     Ok(CreateAssetWithMintOp {
         decimals,
@@ -349,6 +365,7 @@ fn parse_create_asset_with_mint_op(payload: &[u8], cursor: &mut usize) -> Result
         metadata,
         initial_mint_amount,
         initial_mint_to_owner_id,
+        platform_tag,
     })
 }
 
@@ -421,6 +438,8 @@ fn parse_create_liquidity_asset_op(payload: &[u8], cursor: &mut usize) -> Result
         return Err(NoopReason::BadLaunchBuyFields);
     }
 
+    let (platform_tag, liquidity_unlock_target_sompi) = parse_optional_liquidity_create_tail(payload, cursor)?;
+
     Ok(CreateLiquidityAssetOp {
         decimals,
         max_supply,
@@ -432,6 +451,8 @@ fn parse_create_liquidity_asset_op(payload: &[u8], cursor: &mut usize) -> Result
         recipients,
         launch_buy_sompi,
         launch_buy_min_token_out,
+        platform_tag,
+        liquidity_unlock_target_sompi,
     })
 }
 
@@ -532,6 +553,43 @@ fn parse_create_asset_common(
     Ok((decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata))
 }
 
+fn parse_optional_platform_tag_tail(payload: &[u8], cursor: &mut usize) -> Result<Vec<u8>, NoopReason> {
+    if *cursor == payload.len() {
+        return Ok(Vec::new());
+    }
+    parse_platform_tag(payload, cursor)
+}
+
+fn parse_optional_liquidity_create_tail(payload: &[u8], cursor: &mut usize) -> Result<(Vec<u8>, u64), NoopReason> {
+    if *cursor == payload.len() {
+        return Ok((Vec::new(), 0));
+    }
+    let platform_tag = parse_platform_tag(payload, cursor)?;
+    let liquidity_unlock_target_sompi = take_u64_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+    validate_liquidity_unlock_target(liquidity_unlock_target_sompi)?;
+    Ok((platform_tag, liquidity_unlock_target_sompi))
+}
+
+fn parse_platform_tag(payload: &[u8], cursor: &mut usize) -> Result<Vec<u8>, NoopReason> {
+    let platform_tag_len = take_u8(payload, cursor).ok_or(NoopReason::BadLength)? as usize;
+    if platform_tag_len > MAX_PLATFORM_TAG_LEN {
+        return Err(NoopReason::BadPlatformTag);
+    }
+    let platform_tag = take_vec(payload, cursor, platform_tag_len).ok_or(NoopReason::BadLength)?;
+    if std::str::from_utf8(&platform_tag).is_err() {
+        return Err(NoopReason::BadPlatformTag);
+    }
+    Ok(platform_tag)
+}
+
+fn validate_liquidity_unlock_target(value: u64) -> Result<(), NoopReason> {
+    if value == 0 || value <= MAX_SOMPI {
+        Ok(())
+    } else {
+        Err(NoopReason::BadLiquidityUnlockTarget)
+    }
+}
+
 fn parse_recipient_address(payload: &[u8], cursor: &mut usize) -> Result<LiquidityRecipientAddress, NoopReason> {
     let address_version = take_u8(payload, cursor).ok_or(NoopReason::BadLength)?;
     let expected_len = match address_version {
@@ -621,8 +679,7 @@ mod tests {
         bytes
     }
 
-    #[test]
-    fn parse_create_asset_ok() {
+    fn build_create_asset_payload() -> Vec<u8> {
         let mut payload = build_header(0, 3, 7);
         payload.push(8);
         payload.push(1);
@@ -634,6 +691,29 @@ mod tests {
         payload.extend_from_slice(b"Gold");
         payload.extend_from_slice(b"GLD");
         payload.extend_from_slice(b"hello");
+        payload
+    }
+
+    fn build_create_liquidity_payload() -> Vec<u8> {
+        let mut payload = build_header(5, 3, 7);
+        payload.push(LIQUIDITY_TOKEN_DECIMALS);
+        payload.extend_from_slice(&MIN_LIQUIDITY_SUPPLY_RAW.to_le_bytes());
+        payload.push(4);
+        payload.push(4);
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(b"Pool");
+        payload.extend_from_slice(b"POOL");
+        payload.extend_from_slice(&MIN_LIQUIDITY_SEED_RESERVE_SOMPI.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&0u128.to_le_bytes());
+        payload
+    }
+
+    #[test]
+    fn parse_create_asset_ok() {
+        let payload = build_create_asset_payload();
 
         let parsed = parse_atomic_token_payload(&payload).unwrap().unwrap();
         match parsed.op {
@@ -644,9 +724,71 @@ mod tests {
                 assert_eq!(op.name, b"Gold");
                 assert_eq!(op.symbol, b"GLD");
                 assert_eq!(op.metadata, b"hello");
+                assert!(op.platform_tag.is_empty());
             }
             _ => panic!("expected create asset"),
         }
+    }
+
+    #[test]
+    fn parse_create_asset_accepts_platform_tag_at_limit() {
+        let mut payload = build_create_asset_payload();
+        payload.push(MAX_PLATFORM_TAG_LEN as u8);
+        payload.extend(std::iter::repeat(b'x').take(MAX_PLATFORM_TAG_LEN));
+
+        let parsed = parse_atomic_token_payload(&payload).unwrap().unwrap();
+        match parsed.op {
+            TokenOp::CreateAsset(op) => assert_eq!(op.platform_tag, vec![b'x'; MAX_PLATFORM_TAG_LEN]),
+            _ => panic!("expected create asset"),
+        }
+    }
+
+    #[test]
+    fn parse_create_asset_rejects_bad_platform_tag() {
+        let mut too_long = build_create_asset_payload();
+        too_long.push((MAX_PLATFORM_TAG_LEN + 1) as u8);
+        too_long.extend(std::iter::repeat(b'x').take(MAX_PLATFORM_TAG_LEN + 1));
+        assert_eq!(parse_atomic_token_payload(&too_long).unwrap().unwrap_err(), NoopReason::BadPlatformTag);
+
+        let mut invalid_utf8 = build_create_asset_payload();
+        invalid_utf8.push(1);
+        invalid_utf8.push(0xff);
+        assert_eq!(parse_atomic_token_payload(&invalid_utf8).unwrap().unwrap_err(), NoopReason::BadPlatformTag);
+    }
+
+    #[test]
+    fn parse_liquidity_create_lock_tail_defaults_and_accepts_max() {
+        let payload = build_create_liquidity_payload();
+        let parsed = parse_atomic_token_payload(&payload).unwrap().unwrap();
+        match parsed.op {
+            TokenOp::CreateLiquidityAsset(op) => {
+                assert!(op.platform_tag.is_empty());
+                assert_eq!(op.liquidity_unlock_target_sompi, 0);
+            }
+            _ => panic!("expected liquidity create asset"),
+        }
+
+        let mut locked = build_create_liquidity_payload();
+        locked.push(6);
+        locked.extend_from_slice(b"Bridge");
+        locked.extend_from_slice(&MAX_SOMPI.to_le_bytes());
+        let parsed = parse_atomic_token_payload(&locked).unwrap().unwrap();
+        match parsed.op {
+            TokenOp::CreateLiquidityAsset(op) => {
+                assert_eq!(op.platform_tag, b"Bridge");
+                assert_eq!(op.liquidity_unlock_target_sompi, MAX_SOMPI);
+            }
+            _ => panic!("expected liquidity create asset"),
+        }
+    }
+
+    #[test]
+    fn parse_liquidity_create_rejects_unlock_target_above_max() {
+        let mut payload = build_create_liquidity_payload();
+        payload.push(0);
+        payload.extend_from_slice(&(MAX_SOMPI + 1).to_le_bytes());
+
+        assert_eq!(parse_atomic_token_payload(&payload).unwrap().unwrap_err(), NoopReason::BadLiquidityUnlockTarget);
     }
 
     #[test]

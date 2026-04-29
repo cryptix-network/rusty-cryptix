@@ -234,6 +234,7 @@ const OWNER_AUTH_SCHEME_SCRIPT_HASH: u8 = 2;
 const CAT_MAX_NAME_LEN: usize = 32;
 const CAT_MAX_SYMBOL_LEN: usize = 10;
 const CAT_MAX_METADATA_LEN: usize = 256;
+const CAT_MAX_PLATFORM_TAG_LEN: usize = 50;
 const CAT_MAX_DECIMALS: u8 = 18;
 const CAT_MAX_LIQUIDITY_RECIPIENTS: usize = 2;
 const CAT_MIN_LIQUIDITY_FEE_BPS: u16 = 10;
@@ -259,6 +260,7 @@ pub(crate) enum AtomicPayloadOp {
         name: Vec<u8>,
         symbol: Vec<u8>,
         metadata: Vec<u8>,
+        platform_tag: Vec<u8>,
     },
     Transfer {
         asset_id: [u8; 32],
@@ -284,6 +286,7 @@ pub(crate) enum AtomicPayloadOp {
         metadata: Vec<u8>,
         initial_mint_amount: u128,
         initial_mint_to_owner_id: [u8; 32],
+        platform_tag: Vec<u8>,
     },
     CreateLiquidityAsset {
         decimals: u8,
@@ -296,6 +299,8 @@ pub(crate) enum AtomicPayloadOp {
         recipients: Vec<AtomicPayloadRecipientAddress>,
         launch_buy_sompi: u64,
         launch_buy_min_token_out: u128,
+        platform_tag: Vec<u8>,
+        liquidity_unlock_target_sompi: u64,
     },
     BuyLiquidityExactIn {
         asset_id: [u8; 32],
@@ -406,7 +411,18 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
                 _ => {}
             }
 
-            AtomicPayloadOp::CreateAsset { decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata }
+            let platform_tag = parse_optional_platform_tag_tail(payload, &mut cursor)?;
+
+            AtomicPayloadOp::CreateAsset {
+                decimals,
+                supply_mode,
+                max_supply,
+                mint_authority_owner_id,
+                name,
+                symbol,
+                metadata,
+                platform_tag,
+            }
         }
         1 => {
             let asset_id = take_32(payload, &mut cursor).ok_or_else(|| "truncated CAT asset_id".to_string())?;
@@ -447,6 +463,7 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
             if initial_mint_amount > 0 && initial_mint_to_owner_id == [0u8; 32] {
                 return Err("initial_mint_to_owner_id must be non-zero when initial_mint_amount is non-zero".to_string());
             }
+            let platform_tag = parse_optional_platform_tag_tail(payload, &mut cursor)?;
             AtomicPayloadOp::CreateAssetWithMint {
                 decimals,
                 supply_mode,
@@ -457,6 +474,7 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
                 metadata,
                 initial_mint_amount,
                 initial_mint_to_owner_id,
+                platform_tag,
             }
         }
         5 => {
@@ -532,6 +550,7 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
             if launch_buy_sompi > 0 && launch_buy_min_token_out == 0 {
                 return Err("launch_buy_min_token_out must be >0 when launch_buy_sompi is >0".to_string());
             }
+            let (platform_tag, liquidity_unlock_target_sompi) = parse_optional_liquidity_create_tail(payload, &mut cursor)?;
 
             AtomicPayloadOp::CreateLiquidityAsset {
                 decimals,
@@ -544,6 +563,8 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
                 recipients,
                 launch_buy_sompi,
                 launch_buy_min_token_out,
+                platform_tag,
+                liquidity_unlock_target_sompi,
             }
         }
         6 => {
@@ -654,6 +675,38 @@ fn parse_create_asset_common(
         _ => {}
     }
     Ok((decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata))
+}
+
+fn parse_optional_platform_tag_tail(payload: &[u8], cursor: &mut usize) -> Result<Vec<u8>, String> {
+    if *cursor == payload.len() {
+        return Ok(Vec::new());
+    }
+    parse_platform_tag(payload, cursor)
+}
+
+fn parse_optional_liquidity_create_tail(payload: &[u8], cursor: &mut usize) -> Result<(Vec<u8>, u64), String> {
+    if *cursor == payload.len() {
+        return Ok((Vec::new(), 0));
+    }
+    let platform_tag = parse_platform_tag(payload, cursor)?;
+    let liquidity_unlock_target_sompi =
+        take_u64_le(payload, cursor).ok_or_else(|| "truncated CAT liquidity unlock target".to_string())?;
+    if liquidity_unlock_target_sompi > MAX_SOMPI {
+        return Err(format!("liquidity unlock target exceeds MAX_SOMPI `{MAX_SOMPI}`"));
+    }
+    Ok((platform_tag, liquidity_unlock_target_sompi))
+}
+
+fn parse_platform_tag(payload: &[u8], cursor: &mut usize) -> Result<Vec<u8>, String> {
+    let platform_tag_len = take_u8(payload, cursor).ok_or_else(|| "truncated CAT platform tag length".to_string())? as usize;
+    if platform_tag_len > CAT_MAX_PLATFORM_TAG_LEN {
+        return Err(format!("platform_tag exceeds max `{CAT_MAX_PLATFORM_TAG_LEN}` bytes"));
+    }
+    let platform_tag = take_vec(payload, cursor, platform_tag_len).ok_or_else(|| "truncated CAT platform tag".to_string())?;
+    if std::str::from_utf8(&platform_tag).is_err() {
+        return Err("platform_tag must be valid utf-8".to_string());
+    }
+    Ok(platform_tag)
 }
 
 fn parse_recipient_address(payload: &[u8], cursor: &mut usize) -> Result<AtomicPayloadRecipientAddress, String> {

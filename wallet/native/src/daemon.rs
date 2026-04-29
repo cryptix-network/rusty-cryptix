@@ -50,6 +50,7 @@ const CAT_OP_CLAIM_LIQUIDITY_FEES: u8 = 8;
 const CAT_MAX_NAME_LEN: usize = 32;
 const CAT_MAX_SYMBOL_LEN: usize = 10;
 const CAT_MAX_METADATA_LEN: usize = 256;
+const CAT_MAX_PLATFORM_TAG_LEN: usize = 50;
 const CAT_MAX_DECIMALS: u8 = 18;
 const CAT_MAX_LIQUIDITY_RECIPIENTS: usize = 2;
 const CAT_MIN_LIQUIDITY_FEE_BPS: u16 = 10;
@@ -431,6 +432,40 @@ impl WalletDaemonService {
         }
         if metadata.len() > CAT_MAX_METADATA_LEN {
             return Err(Status::invalid_argument(format!("metadata must be <= {CAT_MAX_METADATA_LEN} bytes")));
+        }
+        Ok(())
+    }
+
+    fn validate_platform_tag(platform_tag: &str) -> Result<(), Status> {
+        if platform_tag.len() > CAT_MAX_PLATFORM_TAG_LEN {
+            return Err(Status::invalid_argument(format!("platform_tag must be <= {CAT_MAX_PLATFORM_TAG_LEN} UTF-8 bytes")));
+        }
+        Ok(())
+    }
+
+    fn append_platform_tag_tail(payload: &mut Vec<u8>, platform_tag: &str) -> Result<(), Status> {
+        Self::validate_platform_tag(platform_tag)?;
+        let tag_len = u8::try_from(platform_tag.len())
+            .map_err(|_| Status::invalid_argument(format!("platform_tag must be <= {CAT_MAX_PLATFORM_TAG_LEN} UTF-8 bytes")))?;
+        payload.push(tag_len);
+        payload.extend_from_slice(platform_tag.as_bytes());
+        Ok(())
+    }
+
+    fn append_optional_platform_tag_tail(payload: &mut Vec<u8>, platform_tag: &str) -> Result<(), Status> {
+        Self::validate_platform_tag(platform_tag)?;
+        if !platform_tag.is_empty() {
+            Self::append_platform_tag_tail(payload, platform_tag)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_liquidity_outflow_unlocked(pool: &RpcLiquidityPoolState, operation: &str) -> Result<(), Status> {
+        if pool.sell_locked {
+            return Err(Status::failed_precondition(format!(
+                "{operation} is locked until curve_reserve_sompi reaches {}",
+                pool.unlock_target_sompi
+            )));
         }
         Ok(())
     }
@@ -860,6 +895,7 @@ impl WalletDaemonService {
         max_supply: u128,
         mint_authority_owner_id: &str,
         metadata: &[u8],
+        platform_tag: &str,
         nonce: u64,
         auth_input_index: u16,
     ) -> Result<Vec<u8>, Status> {
@@ -874,6 +910,7 @@ impl WalletDaemonService {
             mint_authority_owner_id,
             metadata,
         )?;
+        Self::append_optional_platform_tag_tail(&mut payload, platform_tag)?;
         Ok(payload)
     }
 
@@ -887,6 +924,7 @@ impl WalletDaemonService {
         metadata: &[u8],
         initial_mint_amount: u128,
         initial_mint_to_owner_id: &str,
+        platform_tag: &str,
         nonce: u64,
         auth_input_index: u16,
     ) -> Result<Vec<u8>, Status> {
@@ -904,6 +942,7 @@ impl WalletDaemonService {
         )?;
         payload.extend_from_slice(&initial_mint_amount.to_le_bytes());
         payload.extend_from_slice(&initial_mint_to_owner_id);
+        Self::append_optional_platform_tag_tail(&mut payload, platform_tag)?;
         Ok(payload)
     }
 
@@ -918,6 +957,8 @@ impl WalletDaemonService {
         recipients: &[LiquidityRecipient],
         launch_buy_sompi: u64,
         launch_buy_min_token_out: u128,
+        platform_tag: &str,
+        liquidity_unlock_target_sompi: u64,
         nonce: u64,
         auth_input_index: u16,
     ) -> Result<Vec<u8>, Status> {
@@ -926,6 +967,12 @@ impl WalletDaemonService {
         }
         if seed_reserve_sompi == 0 {
             return Err(Status::invalid_argument("seed_reserve_sompi must be greater than zero"));
+        }
+        Self::validate_platform_tag(platform_tag)?;
+        if liquidity_unlock_target_sompi > MAX_SOMPI {
+            return Err(Status::invalid_argument(format!(
+                "liquidity_unlock_target_sompi must be 0 or <= MAX_SOMPI ({MAX_SOMPI})"
+            )));
         }
         Self::validate_liquidity_create_parameters(decimals, max_supply, seed_reserve_sompi)?;
         if recipients.len() > CAT_MAX_LIQUIDITY_RECIPIENTS {
@@ -952,6 +999,10 @@ impl WalletDaemonService {
         }
         payload.extend_from_slice(&launch_buy_sompi.to_le_bytes());
         payload.extend_from_slice(&launch_buy_min_token_out.to_le_bytes());
+        if !platform_tag.is_empty() || liquidity_unlock_target_sompi > 0 {
+            Self::append_platform_tag_tail(&mut payload, platform_tag)?;
+            payload.extend_from_slice(&liquidity_unlock_target_sompi.to_le_bytes());
+        }
         Ok(payload)
     }
 
@@ -1366,6 +1417,7 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
         let max_supply = Self::parse_u128(request.max_supply_raw.as_str(), "max_supply_raw")?;
         let supply_mode = Self::validate_supply_mode(request.capped, max_supply)?;
         let metadata = Self::parse_metadata_hex(request.metadata_hex.as_str())?;
+        Self::validate_platform_tag(request.platform_tag.as_str())?;
         Self::validate_asset_identity_fields(request.name.as_str(), request.symbol.as_str(), metadata.as_slice(), decimals)?;
         let auth_input_index = if request.auth_input_index == 0 {
             DEFAULT_AUTH_INPUT_INDEX
@@ -1398,6 +1450,7 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
             max_supply,
             mint_authority_owner_id.as_str(),
             metadata.as_slice(),
+            request.platform_tag.as_str(),
             nonce,
             auth_input_index,
         )?;
@@ -1422,6 +1475,7 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
         }
 
         let metadata = Self::parse_metadata_hex(request.metadata_hex.as_str())?;
+        Self::validate_platform_tag(request.platform_tag.as_str())?;
         Self::validate_asset_identity_fields(request.name.as_str(), request.symbol.as_str(), metadata.as_slice(), decimals)?;
         let auth_input_index = if request.auth_input_index == 0 {
             DEFAULT_AUTH_INPUT_INDEX
@@ -1459,6 +1513,7 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
             metadata.as_slice(),
             initial_mint_amount,
             initial_mint_to_owner_id.as_str(),
+            request.platform_tag.as_str(),
             nonce,
             auth_input_index,
         )?;
@@ -1484,6 +1539,12 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
         let decimals = Self::parse_decimals(request.decimals)?;
         let max_supply = Self::parse_positive_u128(request.max_supply_raw.as_str(), "max_supply_raw")?;
         let metadata = Self::parse_metadata_hex(request.metadata_hex.as_str())?;
+        Self::validate_platform_tag(request.platform_tag.as_str())?;
+        if request.liquidity_unlock_target_sompi > MAX_SOMPI {
+            return Err(Status::invalid_argument(format!(
+                "liquidity_unlock_target_sompi must be 0 or <= MAX_SOMPI ({MAX_SOMPI})"
+            )));
+        }
         Self::validate_asset_identity_fields(request.name.as_str(), request.symbol.as_str(), metadata.as_slice(), decimals)?;
         if request.seed_reserve_sompi == 0 {
             return Err(Status::invalid_argument("seed_reserve_sompi must be greater than zero"));
@@ -1539,6 +1600,8 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
             recipients.as_slice(),
             request.launch_buy_sompi,
             launch_buy_min_token_out,
+            request.platform_tag.as_str(),
+            request.liquidity_unlock_target_sompi,
             nonce,
             auth_input_index,
         )?;
@@ -1582,6 +1645,7 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
         };
         let asset_id = Self::normalize_asset_id(request.asset_id.as_str());
         let pool = self.fetch_liquidity_pool(asset_id.as_str()).await?;
+        Self::ensure_liquidity_outflow_unlocked(&pool, "liquidity sell")?;
         let quote = self
             .rpc()
             .get_liquidity_quote_call(
@@ -1738,6 +1802,7 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
         };
         let asset_id = Self::normalize_asset_id(request.asset_id.as_str());
         let pool = self.fetch_liquidity_pool(asset_id.as_str()).await?;
+        Self::ensure_liquidity_outflow_unlocked(&pool, "liquidity fee claim")?;
         let sender_owner_id = self.resolve_owner_id(&sender_address, "sender_address").await?;
         let nonce = self.resolve_sender_nonce(sender_owner_id.as_str()).await?;
         let payload = Self::build_claim_liquidity_payload(

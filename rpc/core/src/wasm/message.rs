@@ -68,6 +68,7 @@ declare! {
         createdBlockHash? : HexString;
         createdDaaScore? : bigint;
         createdAt? : bigint;
+        platformTag : string;
     }
     "#,
 }
@@ -178,6 +179,10 @@ declare! {
         vaultTxid : HexString;
         vaultOutputIndex : number;
         feeRecipients : IRpcLiquidityFeeRecipient[];
+        liquidityLockEnabled : boolean;
+        unlockTargetSompi : string;
+        unlocked : boolean;
+        sellLocked : boolean;
     }
     "#,
 }

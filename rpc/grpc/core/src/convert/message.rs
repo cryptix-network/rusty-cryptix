@@ -654,6 +654,7 @@ from!(item: &cryptix_rpc_core::RpcTokenAsset, protowire::RpcTokenAssetMessage, {
         created_block_hash: item.created_block_hash.map(|hash| hash.to_string()),
         created_daa_score: item.created_daa_score,
         created_at: item.created_at,
+        platform_tag: item.platform_tag.clone(),
     }
 });
 from!(item: &cryptix_rpc_core::RpcTokenEvent, protowire::RpcTokenEventMessage, {
@@ -702,6 +703,10 @@ from!(item: &cryptix_rpc_core::RpcLiquidityPoolState, protowire::RpcLiquidityPoo
         vault_txid: item.vault_txid.to_string(),
         vault_output_index: item.vault_output_index,
         fee_recipients: item.fee_recipients.iter().map(Into::into).collect(),
+        liquidity_lock_enabled: item.liquidity_lock_enabled,
+        unlock_target_sompi: item.unlock_target_sompi.clone(),
+        unlocked: item.unlocked,
+        sell_locked: item.sell_locked,
     }
 });
 from!(item: &cryptix_rpc_core::RpcLiquidityHolder, protowire::RpcLiquidityHolderMessage, {
@@ -1641,6 +1646,7 @@ try_from!(item: &protowire::RpcTokenAssetMessage, cryptix_rpc_core::RpcTokenAsse
             .transpose()?,
         created_daa_score: item.created_daa_score,
         created_at: item.created_at,
+        platform_tag: item.platform_tag.clone(),
     }
 });
 try_from!(item: &protowire::RpcTokenEventMessage, cryptix_rpc_core::RpcTokenEvent, {
@@ -1689,6 +1695,10 @@ try_from!(item: &protowire::RpcLiquidityPoolStateMessage, cryptix_rpc_core::RpcL
             .iter()
             .map(|recipient| recipient.try_into())
             .collect::<RpcResult<Vec<_>>>()?,
+        liquidity_lock_enabled: item.liquidity_lock_enabled,
+        unlock_target_sompi: item.unlock_target_sompi.clone(),
+        unlocked: item.unlocked,
+        sell_locked: item.sell_locked,
     }
 });
 try_from!(item: &protowire::RpcLiquidityHolderMessage, cryptix_rpc_core::RpcLiquidityHolder, {

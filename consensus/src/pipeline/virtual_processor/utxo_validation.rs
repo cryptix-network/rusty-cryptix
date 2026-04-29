@@ -209,6 +209,20 @@ fn atomic_op_allows_liquidity_vault_output(op: &AtomicPayloadOp) -> bool {
     )
 }
 
+fn liquidity_sell_locked(pool: &AtomicLiquidityPoolState) -> bool {
+    pool.unlock_target_sompi > 0 && !pool.unlocked
+}
+
+fn validate_liquidity_unlock_target(unlock_target_sompi: u64) -> TxResult<()> {
+    if unlock_target_sompi > MAX_SOMPI {
+        Err(TxRuleError::InvalidAtomicPayload(format!(
+            "liquidity unlock target `{unlock_target_sompi}` exceeds MAX_SOMPI `{MAX_SOMPI}`"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_liquidity_claim_authorization(claimant_owner_id: [u8; 32], recipient_owner_id: [u8; 32]) -> TxResult<()> {
     if claimant_owner_id == recipient_owner_id {
         Ok(())
@@ -676,6 +690,7 @@ impl VirtualStateProcessor {
                 name: _,
                 symbol: _,
                 metadata: _,
+                platform_tag,
             } => {
                 let asset_id = tx_id_bytes;
                 if atomic_state.assets.contains_key(&asset_id) {
@@ -697,6 +712,7 @@ impl VirtualStateProcessor {
                         supply_mode,
                         max_supply,
                         total_supply: 0,
+                        platform_tag,
                         liquidity: None,
                     },
                 )?;
@@ -711,6 +727,7 @@ impl VirtualStateProcessor {
                 metadata: _,
                 initial_mint_amount,
                 initial_mint_to_owner_id,
+                platform_tag,
             } => {
                 let asset_id = tx_id_bytes;
                 if atomic_state.assets.contains_key(&asset_id) {
@@ -751,6 +768,7 @@ impl VirtualStateProcessor {
                         supply_mode,
                         max_supply,
                         total_supply,
+                        platform_tag,
                         liquidity: None,
                     },
                 )?;
@@ -766,6 +784,8 @@ impl VirtualStateProcessor {
                 recipients,
                 launch_buy_sompi,
                 launch_buy_min_token_out,
+                platform_tag,
+                liquidity_unlock_target_sompi,
             } => {
                 let asset_id = tx_id_bytes;
                 if atomic_state.assets.contains_key(&asset_id) {
@@ -775,6 +795,7 @@ impl VirtualStateProcessor {
                     )));
                 }
                 validate_liquidity_creation_parameters(decimals, max_supply, seed_reserve_sompi)?;
+                validate_liquidity_unlock_target(liquidity_unlock_target_sompi)?;
                 let (vault_output_index, vault_output_value) = self.resolve_create_liquidity_vault_output(tx)?;
                 let expected_vault_value = seed_reserve_sompi
                     .checked_add(launch_buy_sompi)
@@ -828,12 +849,15 @@ impl VirtualStateProcessor {
                 }
 
                 let vault_outpoint = TransactionOutpoint::new(tx.tx().id(), vault_output_index);
+                let unlocked =
+                    liquidity_unlock_target_sompi == 0 || curve_reserve_sompi >= liquidity_unlock_target_sompi;
                 let asset = AtomicAssetState {
                     asset_class: AtomicAssetClass::Liquidity,
                     mint_authority_owner_id: [0u8; 32],
                     supply_mode: AtomicSupplyMode::Capped,
                     max_supply,
                     total_supply,
+                    platform_tag,
                     liquidity: Some(AtomicLiquidityPoolState {
                         pool_nonce: 1,
                         remaining_pool_supply,
@@ -843,6 +867,8 @@ impl VirtualStateProcessor {
                         fee_recipients,
                         vault_outpoint,
                         vault_value_sompi: vault_output_value,
+                        unlock_target_sompi: liquidity_unlock_target_sompi,
+                        unlocked,
                     }),
                 };
                 self.validate_liquidity_invariants(asset_id, &asset)?;
@@ -1025,6 +1051,9 @@ impl VirtualStateProcessor {
 
                 pool.remaining_pool_supply = new_remaining_pool_supply;
                 pool.curve_reserve_sompi = new_curve_reserve_sompi;
+                if pool.unlock_target_sompi > 0 && pool.curve_reserve_sompi >= pool.unlock_target_sompi {
+                    pool.unlocked = true;
+                }
                 self.apply_fee_to_pool(&mut pool.fee_recipients, &mut pool.unclaimed_fee_total_sompi, fee_trade)?;
                 pool.vault_outpoint = TransactionOutpoint::new(tx.tx().id(), vault_transition.output_index);
                 pool.vault_value_sompi = vault_transition.output_value;
@@ -1080,6 +1109,13 @@ impl VirtualStateProcessor {
                         faster_hex::hex_string(&asset_id),
                         pool.pool_nonce,
                         expected_pool_nonce
+                    )));
+                }
+                if liquidity_sell_locked(&pool) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "liquidity sell locked for asset `{}` until curve reserve reaches `{}` sompi",
+                        faster_hex::hex_string(&asset_id),
+                        pool.unlock_target_sompi
                     )));
                 }
                 let sender_key = AtomicBalanceKey { asset_id, owner_id };
@@ -1185,6 +1221,13 @@ impl VirtualStateProcessor {
                         faster_hex::hex_string(&asset_id),
                         pool.pool_nonce,
                         expected_pool_nonce
+                    )));
+                }
+                if liquidity_sell_locked(&pool) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "liquidity fee claim locked for asset `{}` until curve reserve reaches `{}` sompi",
+                        faster_hex::hex_string(&asset_id),
+                        pool.unlock_target_sompi
                     )));
                 }
                 if claim_amount_sompi < LIQUIDITY_MIN_PAYOUT_SOMPI {
@@ -1471,6 +1514,18 @@ impl VirtualStateProcessor {
         })?;
         if !matches!(asset.supply_mode, AtomicSupplyMode::Capped) {
             return Err(TxRuleError::InvalidAtomicPayload("liquidity assets must always use capped supply mode".to_string()));
+        }
+        validate_liquidity_unlock_target(pool.unlock_target_sompi)?;
+        if pool.unlock_target_sompi == 0 && !pool.unlocked {
+            return Err(TxRuleError::InvalidAtomicPayload(
+                "liquidity lock disabled pools must be marked unlocked".to_string(),
+            ));
+        }
+        if pool.unlock_target_sompi > 0 && pool.curve_reserve_sompi >= pool.unlock_target_sompi && !pool.unlocked {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "liquidity lock target reached for asset `{}` but pool is still locked",
+                faster_hex::hex_string(&asset_id)
+            )));
         }
         validate_curve_reserve_against_outstanding_supply(asset_id, asset.total_supply, pool.curve_reserve_sompi)?;
         validate_liquidity_curve_reachability(pool.remaining_pool_supply, pool.curve_reserve_sompi)?;

@@ -1,5 +1,5 @@
 use blake2b_simd::Params as Blake2bParams;
-use cryptix_consensus_core::tx::TransactionOutpoint;
+use cryptix_consensus_core::{constants::MAX_SOMPI, tx::TransactionOutpoint};
 use cryptix_consensus_core::BlockHasher;
 use cryptix_database::prelude::CachePolicy;
 use cryptix_database::prelude::StoreError;
@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::Arc;
 
-const ATOMIC_CONSENSUS_STATE_MAGIC: &[u8; 8] = b"CATCS001";
-const ATOMIC_CONSENSUS_STATE_HASH_DOMAIN: &[u8] = b"cryptix-atomic-consensus-state-v1";
+const ATOMIC_CONSENSUS_STATE_MAGIC: &[u8; 8] = b"CATCS002";
+const ATOMIC_CONSENSUS_STATE_HASH_DOMAIN: &[u8] = b"cryptix-atomic-consensus-state-v2";
 const ATOMIC_STATE_COMMITMENT_DOMAIN: &[u8] = b"cryptix-utxo-atomic-state-commitment-v1";
 const ATOMIC_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
 const OWNER_AUTH_SCHEME_PUBKEY: u8 = 0;
@@ -24,6 +24,7 @@ const OWNER_AUTH_SCHEME_SCRIPT_HASH: u8 = 2;
 const MAX_ATOMIC_LIQUIDITY_FEE_RECIPIENTS: usize = 2;
 const MIN_ATOMIC_LIQUIDITY_FEE_BPS: u16 = 10;
 const MAX_ATOMIC_LIQUIDITY_FEE_BPS: u16 = 1000;
+const MAX_ATOMIC_PLATFORM_TAG_LEN: usize = 50;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AtomicBalanceKey {
@@ -62,6 +63,10 @@ pub struct AtomicLiquidityPoolState {
     pub fee_recipients: Vec<AtomicLiquidityFeeRecipientState>,
     pub vault_outpoint: TransactionOutpoint,
     pub vault_value_sompi: u64,
+    #[serde(default)]
+    pub unlock_target_sompi: u64,
+    #[serde(default = "default_atomic_liquidity_unlocked")]
+    pub unlocked: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +77,8 @@ pub struct AtomicAssetState {
     pub supply_mode: AtomicSupplyMode,
     pub max_supply: u128,
     pub total_supply: u128,
+    #[serde(default)]
+    pub platform_tag: Vec<u8>,
     #[serde(default)]
     pub liquidity: Option<AtomicLiquidityPoolState>,
 }
@@ -88,6 +95,10 @@ pub struct AtomicConsensusState {
     pub anchor_counts: HashMap<[u8; 32], u64>,
     #[serde(default)]
     pub liquidity_vault_outpoints: HashMap<TransactionOutpoint, [u8; 32]>,
+}
+
+fn default_atomic_liquidity_unlocked() -> bool {
+    true
 }
 
 impl AtomicConsensusState {
@@ -265,6 +276,12 @@ impl AtomicConsensusState {
 
         let mut expected_vault_index = HashMap::new();
         for (asset_id, asset) in self.assets.iter() {
+            if asset.platform_tag.len() > MAX_ATOMIC_PLATFORM_TAG_LEN {
+                return Err(format!("atomic asset `{}` platform tag exceeds max length", faster_hex::hex_string(asset_id)));
+            }
+            if std::str::from_utf8(&asset.platform_tag).is_err() {
+                return Err(format!("atomic asset `{}` platform tag is not valid utf-8", faster_hex::hex_string(asset_id)));
+            }
             match asset.supply_mode {
                 AtomicSupplyMode::Uncapped if asset.max_supply != 0 => {
                     return Err(format!("uncapped asset `{}` has non-zero max_supply", faster_hex::hex_string(asset_id)))
@@ -325,6 +342,18 @@ fn validate_liquidity_asset_normalized(
     }
     if pool.pool_nonce == 0 {
         return Err(format!("liquidity asset `{}` has zero pool nonce", faster_hex::hex_string(&asset_id)));
+    }
+    if pool.unlock_target_sompi == 0 && !pool.unlocked {
+        return Err(format!("liquidity asset `{}` has disabled lock but is not marked unlocked", faster_hex::hex_string(&asset_id)));
+    }
+    if pool.unlock_target_sompi > MAX_SOMPI {
+        return Err(format!("liquidity asset `{}` unlock target exceeds MAX_SOMPI", faster_hex::hex_string(&asset_id)));
+    }
+    if pool.unlock_target_sompi > 0 && !pool.unlocked && pool.curve_reserve_sompi >= pool.unlock_target_sompi {
+        return Err(format!(
+            "liquidity asset `{}` reached unlock target but is not marked unlocked",
+            faster_hex::hex_string(&asset_id)
+        ));
     }
     if asset.total_supply > 0 && pool.curve_reserve_sompi == 0 {
         return Err(format!("liquidity asset `{}` has outstanding supply without reserve", faster_hex::hex_string(&asset_id)));
@@ -449,6 +478,8 @@ fn write_asset(out: &mut Vec<u8>, asset: &AtomicAssetState) {
     write_u8(out, atomic_supply_mode_to_u8(asset.supply_mode));
     write_u128(out, asset.max_supply);
     write_u128(out, asset.total_supply);
+    write_len(out, asset.platform_tag.len());
+    out.extend_from_slice(&asset.platform_tag);
     match asset.liquidity.as_ref() {
         Some(pool) => {
             write_u8(out, 1);
@@ -474,6 +505,8 @@ fn write_liquidity_pool(out: &mut Vec<u8>, pool: &AtomicLiquidityPoolState) {
     }
     write_outpoint(out, pool.vault_outpoint);
     write_u64(out, pool.vault_value_sompi);
+    write_u64(out, pool.unlock_target_sompi);
+    write_u8(out, u8::from(pool.unlocked));
 }
 
 fn write_outpoint(out: &mut Vec<u8>, outpoint: TransactionOutpoint) {
@@ -564,12 +597,20 @@ impl<'a> AtomicStateReader<'a> {
         };
         let max_supply = self.read_u128()?;
         let total_supply = self.read_u128()?;
+        let platform_tag_len = self.read_len()?;
+        if platform_tag_len > MAX_ATOMIC_PLATFORM_TAG_LEN {
+            return Err(format!("atomic platform tag length `{platform_tag_len}` exceeds max"));
+        }
+        let platform_tag = self.read_bytes(platform_tag_len)?.to_vec();
+        if std::str::from_utf8(&platform_tag).is_err() {
+            return Err("atomic platform tag must be valid utf-8".to_string());
+        }
         let liquidity = match self.read_u8()? {
             0 => None,
             1 => Some(self.read_liquidity_pool()?),
             other => return Err(format!("invalid atomic liquidity presence flag `{other}`")),
         };
-        Ok(AtomicAssetState { asset_class, mint_authority_owner_id, supply_mode, max_supply, total_supply, liquidity })
+        Ok(AtomicAssetState { asset_class, mint_authority_owner_id, supply_mode, max_supply, total_supply, platform_tag, liquidity })
     }
 
     fn read_liquidity_pool(&mut self) -> Result<AtomicLiquidityPoolState, String> {
@@ -593,6 +634,12 @@ impl<'a> AtomicStateReader<'a> {
         }
         let vault_outpoint = self.read_outpoint()?;
         let vault_value_sompi = self.read_u64()?;
+        let unlock_target_sompi = self.read_u64()?;
+        let unlocked = match self.read_u8()? {
+            0 => false,
+            1 => true,
+            other => return Err(format!("invalid atomic liquidity unlocked flag `{other}`")),
+        };
         Ok(AtomicLiquidityPoolState {
             pool_nonce,
             remaining_pool_supply,
@@ -602,6 +649,8 @@ impl<'a> AtomicStateReader<'a> {
             fee_recipients,
             vault_outpoint,
             vault_value_sompi,
+            unlock_target_sompi,
+            unlocked,
         })
     }
 
@@ -749,6 +798,7 @@ mod tests {
             supply_mode: AtomicSupplyMode::Capped,
             max_supply: u128_from_words(0x0200, 9_999),
             total_supply: standard_total,
+            platform_tag: Vec::new(),
             liquidity: None,
         };
         let liquidity_asset = AtomicAssetState {
@@ -757,6 +807,7 @@ mod tests {
             supply_mode: AtomicSupplyMode::Capped,
             max_supply: liquidity_max_supply,
             total_supply: liquidity_total,
+            platform_tag: Vec::new(),
             liquidity: Some(AtomicLiquidityPoolState {
                 pool_nonce: 17,
                 remaining_pool_supply: liquidity_remaining,
@@ -779,6 +830,8 @@ mod tests {
                 ],
                 vault_outpoint: TransactionOutpoint::new(hash(0x77), 3),
                 vault_value_sompi: 123_456_819,
+                unlock_target_sompi: 0,
+                unlocked: true,
             }),
         };
 
@@ -846,6 +899,7 @@ mod tests {
             supply_mode: AtomicSupplyMode::Capped,
             max_supply: 1_000,
             total_supply: 11,
+            platform_tag: Vec::new(),
             liquidity: None,
         };
         let fee_recipient_payload = vec![4; 32];
@@ -857,6 +911,7 @@ mod tests {
             supply_mode: AtomicSupplyMode::Capped,
             max_supply: 10_000,
             total_supply: 500,
+            platform_tag: Vec::new(),
             liquidity: Some(AtomicLiquidityPoolState {
                 pool_nonce: 7,
                 remaining_pool_supply: 9_500,
@@ -871,6 +926,8 @@ mod tests {
                 }],
                 vault_outpoint: TransactionOutpoint::new(hash(9), 1),
                 vault_value_sompi: 253,
+                unlock_target_sompi: 0,
+                unlocked: true,
             }),
         };
 
