@@ -571,6 +571,16 @@ impl RpcCoreService {
         let max_buy_in =
             max_buy_in_sompi(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, pool.fee_bps)
                 .unwrap_or(0);
+        let current_spot_price_sompi = min_gross_input_for_token_out(
+            pool.real_token_reserves,
+            pool.virtual_cpay_reserves_sompi,
+            pool.virtual_token_reserves,
+            1,
+            pool.fee_bps,
+        )
+        .unwrap_or(0);
+        let circulating_mcap_cpay_sompi = circulating_token_supply.checked_mul(u128::from(current_spot_price_sompi)).unwrap_or(0);
+        let fdv_mcap_cpay_sompi = asset.max_supply.checked_mul(u128::from(current_spot_price_sompi)).unwrap_or(0);
         RpcLiquidityPoolState {
             asset_id: asset.asset_id.as_slice().to_hex(),
             pool_nonce: pool.pool_nonce,
@@ -593,6 +603,10 @@ impl RpcCoreService {
             unlock_target_sompi: pool.unlock_target_sompi.to_string(),
             unlocked: pool.unlocked,
             sell_locked,
+            liquidity_cpay_sompi: pool.real_cpay_reserves_sompi.to_string(),
+            current_spot_price_sompi: current_spot_price_sompi.to_string(),
+            circulating_mcap_cpay_sompi: circulating_mcap_cpay_sompi.to_string(),
+            fdv_mcap_cpay_sompi: fdv_mcap_cpay_sompi.to_string(),
         }
     }
 
@@ -3042,6 +3056,26 @@ mod tests {
         };
 
         assert_eq!(RpcCoreService::simulate_buy_liquidity_noop_reason(&asset, &pool, &op), Some(NoopReason::MinOutViolation));
+    }
+
+    #[test]
+    fn map_liquidity_pool_state_exposes_fdv_and_circulating_mcap_separately() {
+        let pool = sample_liquidity_pool(900, 1_000, 30);
+        let asset = sample_liquidity_asset(1_000, 100, pool.clone());
+        let rpc_pool = RpcCoreService::map_liquidity_pool_state(&asset, &pool, cryptix_addresses::Prefix::Testnet);
+        let spot_price = min_gross_input_for_token_out(
+            pool.real_token_reserves,
+            pool.virtual_cpay_reserves_sompi,
+            pool.virtual_token_reserves,
+            1,
+            pool.fee_bps,
+        )
+        .expect("spot price should quote one token");
+
+        assert_eq!(rpc_pool.liquidity_cpay_sompi, pool.real_cpay_reserves_sompi.to_string());
+        assert_eq!(rpc_pool.current_spot_price_sompi, spot_price.to_string());
+        assert_eq!(rpc_pool.circulating_mcap_cpay_sompi, (100u128 * u128::from(spot_price)).to_string());
+        assert_eq!(rpc_pool.fdv_mcap_cpay_sompi, (1_000u128 * u128::from(spot_price)).to_string());
     }
 
     #[test]

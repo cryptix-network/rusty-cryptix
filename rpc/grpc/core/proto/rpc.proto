@@ -1202,6 +1202,10 @@ message RpcLiquidityPoolStateMessage {
   string virtualTokenReserves = 19;
   string maxBuyInSompi = 20;
   string maxTokensOut = 21;
+  string liquidityCpaySompi = 22;
+  string currentSpotPriceSompi = 23;
+  string circulatingMcapCpaySompi = 24;
+  string fdvMcapCpaySompi = 25;
 }
 
 message GetLiquidityPoolStateRequestMessage {

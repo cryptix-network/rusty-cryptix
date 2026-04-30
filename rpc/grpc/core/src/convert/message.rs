@@ -711,6 +711,10 @@ from!(item: &cryptix_rpc_core::RpcLiquidityPoolState, protowire::RpcLiquidityPoo
         unlock_target_sompi: item.unlock_target_sompi.clone(),
         unlocked: item.unlocked,
         sell_locked: item.sell_locked,
+        liquidity_cpay_sompi: item.liquidity_cpay_sompi.clone(),
+        current_spot_price_sompi: item.current_spot_price_sompi.clone(),
+        circulating_mcap_cpay_sompi: item.circulating_mcap_cpay_sompi.clone(),
+        fdv_mcap_cpay_sompi: item.fdv_mcap_cpay_sompi.clone(),
     }
 });
 from!(item: &cryptix_rpc_core::RpcLiquidityHolder, protowire::RpcLiquidityHolderMessage, {
@@ -1707,6 +1711,10 @@ try_from!(item: &protowire::RpcLiquidityPoolStateMessage, cryptix_rpc_core::RpcL
         unlock_target_sompi: item.unlock_target_sompi.clone(),
         unlocked: item.unlocked,
         sell_locked: item.sell_locked,
+        liquidity_cpay_sompi: item.liquidity_cpay_sompi.clone(),
+        current_spot_price_sompi: item.current_spot_price_sompi.clone(),
+        circulating_mcap_cpay_sompi: item.circulating_mcap_cpay_sompi.clone(),
+        fdv_mcap_cpay_sompi: item.fdv_mcap_cpay_sompi.clone(),
     }
 });
 try_from!(item: &protowire::RpcLiquidityHolderMessage, cryptix_rpc_core::RpcLiquidityHolder, {

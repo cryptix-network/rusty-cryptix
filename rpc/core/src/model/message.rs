@@ -3287,11 +3287,15 @@ pub struct RpcLiquidityPoolState {
     pub unlock_target_sompi: String,
     pub unlocked: bool,
     pub sell_locked: bool,
+    pub liquidity_cpay_sompi: String,
+    pub current_spot_price_sompi: String,
+    pub circulating_mcap_cpay_sompi: String,
+    pub fdv_mcap_cpay_sompi: String,
 }
 
 impl Serializer for RpcLiquidityPoolState {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &2, writer)?;
+        store!(u16, &3, writer)?;
         store!(String, &self.asset_id, writer)?;
         store!(u64, &self.pool_nonce, writer)?;
         store!(u32, &self.fee_bps, writer)?;
@@ -3313,6 +3317,10 @@ impl Serializer for RpcLiquidityPoolState {
         store!(String, &self.unlock_target_sompi, writer)?;
         store!(bool, &self.unlocked, writer)?;
         store!(bool, &self.sell_locked, writer)?;
+        store!(String, &self.liquidity_cpay_sompi, writer)?;
+        store!(String, &self.current_spot_price_sompi, writer)?;
+        store!(String, &self.circulating_mcap_cpay_sompi, writer)?;
+        store!(String, &self.fdv_mcap_cpay_sompi, writer)?;
         Ok(())
     }
 }
@@ -3341,6 +3349,10 @@ impl Deserializer for RpcLiquidityPoolState {
         let unlock_target_sompi = if version >= 2 { load!(String, reader)? } else { "0".to_string() };
         let unlocked = if version >= 2 { load!(bool, reader)? } else { true };
         let sell_locked = if version >= 2 { load!(bool, reader)? } else { false };
+        let liquidity_cpay_sompi = if version >= 3 { load!(String, reader)? } else { real_cpay_reserves_sompi.clone() };
+        let current_spot_price_sompi = if version >= 3 { load!(String, reader)? } else { "0".to_string() };
+        let circulating_mcap_cpay_sompi = if version >= 3 { load!(String, reader)? } else { "0".to_string() };
+        let fdv_mcap_cpay_sompi = if version >= 3 { load!(String, reader)? } else { "0".to_string() };
         Ok(Self {
             asset_id,
             pool_nonce,
@@ -3363,6 +3375,10 @@ impl Deserializer for RpcLiquidityPoolState {
             unlock_target_sompi,
             unlocked,
             sell_locked,
+            liquidity_cpay_sompi,
+            current_spot_price_sompi,
+            circulating_mcap_cpay_sompi,
+            fdv_mcap_cpay_sompi,
         })
     }
 }

@@ -187,6 +187,10 @@ declare! {
         unlockTargetSompi : string;
         unlocked : boolean;
         sellLocked : boolean;
+        liquidityCpaySompi : string;
+        currentSpotPriceSompi : string;
+        circulatingMcapCpaySompi : string;
+        fdvMcapCpaySompi : string;
     }
     "#,
 }
