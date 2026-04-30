@@ -3271,9 +3271,13 @@ pub struct RpcLiquidityPoolState {
     pub fee_bps: u32,
     pub max_supply: String,
     pub total_supply: String,
-    pub circulating_supply: String,
-    pub remaining_pool_supply: String,
-    pub curve_reserve_sompi: String,
+    pub circulating_token_supply: String,
+    pub real_cpay_reserves_sompi: String,
+    pub real_token_reserves: String,
+    pub virtual_cpay_reserves_sompi: String,
+    pub virtual_token_reserves: String,
+    pub max_buy_in_sompi: String,
+    pub max_tokens_out: String,
     pub unclaimed_fee_total_sompi: String,
     pub vault_value_sompi: String,
     pub vault_txid: RpcHash,
@@ -3293,9 +3297,13 @@ impl Serializer for RpcLiquidityPoolState {
         store!(u32, &self.fee_bps, writer)?;
         store!(String, &self.max_supply, writer)?;
         store!(String, &self.total_supply, writer)?;
-        store!(String, &self.circulating_supply, writer)?;
-        store!(String, &self.remaining_pool_supply, writer)?;
-        store!(String, &self.curve_reserve_sompi, writer)?;
+        store!(String, &self.circulating_token_supply, writer)?;
+        store!(String, &self.real_cpay_reserves_sompi, writer)?;
+        store!(String, &self.real_token_reserves, writer)?;
+        store!(String, &self.virtual_cpay_reserves_sompi, writer)?;
+        store!(String, &self.virtual_token_reserves, writer)?;
+        store!(String, &self.max_buy_in_sompi, writer)?;
+        store!(String, &self.max_tokens_out, writer)?;
         store!(String, &self.unclaimed_fee_total_sompi, writer)?;
         store!(String, &self.vault_value_sompi, writer)?;
         store!(RpcHash, &self.vault_txid, writer)?;
@@ -3317,9 +3325,13 @@ impl Deserializer for RpcLiquidityPoolState {
         let fee_bps = load!(u32, reader)?;
         let max_supply = load!(String, reader)?;
         let total_supply = load!(String, reader)?;
-        let circulating_supply = load!(String, reader)?;
-        let remaining_pool_supply = load!(String, reader)?;
-        let curve_reserve_sompi = load!(String, reader)?;
+        let circulating_token_supply = load!(String, reader)?;
+        let real_cpay_reserves_sompi = load!(String, reader)?;
+        let real_token_reserves = load!(String, reader)?;
+        let virtual_cpay_reserves_sompi = load!(String, reader)?;
+        let virtual_token_reserves = load!(String, reader)?;
+        let max_buy_in_sompi = load!(String, reader)?;
+        let max_tokens_out = load!(String, reader)?;
         let unclaimed_fee_total_sompi = load!(String, reader)?;
         let vault_value_sompi = load!(String, reader)?;
         let vault_txid = load!(RpcHash, reader)?;
@@ -3335,9 +3347,13 @@ impl Deserializer for RpcLiquidityPoolState {
             fee_bps,
             max_supply,
             total_supply,
-            circulating_supply,
-            remaining_pool_supply,
-            curve_reserve_sompi,
+            circulating_token_supply,
+            real_cpay_reserves_sompi,
+            real_token_reserves,
+            virtual_cpay_reserves_sompi,
+            virtual_token_reserves,
+            max_buy_in_sompi,
+            max_tokens_out,
             unclaimed_fee_total_sompi,
             vault_value_sompi,
             vault_txid,

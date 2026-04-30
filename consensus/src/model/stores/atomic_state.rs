@@ -1,6 +1,6 @@
 use blake2b_simd::Params as Blake2bParams;
-use cryptix_consensus_core::{constants::MAX_SOMPI, tx::TransactionOutpoint};
 use cryptix_consensus_core::BlockHasher;
+use cryptix_consensus_core::{constants::MAX_SOMPI, tx::TransactionOutpoint};
 use cryptix_database::prelude::CachePolicy;
 use cryptix_database::prelude::StoreError;
 use cryptix_database::prelude::DB;
@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::Arc;
 
-const ATOMIC_CONSENSUS_STATE_MAGIC: &[u8; 8] = b"CATCS002";
-const ATOMIC_CONSENSUS_STATE_HASH_DOMAIN: &[u8] = b"cryptix-atomic-consensus-state-v2";
+const ATOMIC_CONSENSUS_STATE_MAGIC: &[u8; 8] = b"CATCS003";
+const ATOMIC_CONSENSUS_STATE_HASH_DOMAIN: &[u8] = b"cryptix-atomic-consensus-state-v3";
 const ATOMIC_STATE_COMMITMENT_DOMAIN: &[u8] = b"cryptix-utxo-atomic-state-commitment-v1";
 const ATOMIC_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
 const OWNER_AUTH_SCHEME_PUBKEY: u8 = 0;
@@ -56,8 +56,10 @@ pub struct AtomicLiquidityFeeRecipientState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AtomicLiquidityPoolState {
     pub pool_nonce: u64,
-    pub remaining_pool_supply: u128,
-    pub curve_reserve_sompi: u64,
+    pub real_cpay_reserves_sompi: u64,
+    pub real_token_reserves: u128,
+    pub virtual_cpay_reserves_sompi: u64,
+    pub virtual_token_reserves: u128,
     pub unclaimed_fee_total_sompi: u64,
     pub fee_bps: u16,
     pub fee_recipients: Vec<AtomicLiquidityFeeRecipientState>,
@@ -349,18 +351,24 @@ fn validate_liquidity_asset_normalized(
     if pool.unlock_target_sompi > MAX_SOMPI {
         return Err(format!("liquidity asset `{}` unlock target exceeds MAX_SOMPI", faster_hex::hex_string(&asset_id)));
     }
-    if pool.unlock_target_sompi > 0 && !pool.unlocked && pool.curve_reserve_sompi >= pool.unlock_target_sompi {
+    if pool.unlock_target_sompi > 0 && !pool.unlocked && pool.real_cpay_reserves_sompi >= pool.unlock_target_sompi {
         return Err(format!(
             "liquidity asset `{}` reached unlock target but is not marked unlocked",
             faster_hex::hex_string(&asset_id)
         ));
     }
-    if asset.total_supply > 0 && pool.curve_reserve_sompi == 0 {
-        return Err(format!("liquidity asset `{}` has outstanding supply without reserve", faster_hex::hex_string(&asset_id)));
+    if pool.real_cpay_reserves_sompi == 0 {
+        return Err(format!("liquidity asset `{}` has zero real CPAY reserve", faster_hex::hex_string(&asset_id)));
+    }
+    if pool.real_token_reserves == 0 {
+        return Err(format!("liquidity asset `{}` has zero real token reserve", faster_hex::hex_string(&asset_id)));
+    }
+    if pool.virtual_cpay_reserves_sompi == 0 || pool.virtual_token_reserves == 0 {
+        return Err(format!("liquidity asset `{}` has zero virtual reserve", faster_hex::hex_string(&asset_id)));
     }
 
     let expected_vault_value = pool
-        .curve_reserve_sompi
+        .real_cpay_reserves_sompi
         .checked_add(pool.unclaimed_fee_total_sompi)
         .ok_or_else(|| format!("liquidity asset `{}` vault value overflow", faster_hex::hex_string(&asset_id)))?;
     if pool.vault_value_sompi != expected_vault_value {
@@ -369,7 +377,7 @@ fn validate_liquidity_asset_normalized(
 
     let expected_supply = asset
         .total_supply
-        .checked_add(pool.remaining_pool_supply)
+        .checked_add(pool.real_token_reserves)
         .ok_or_else(|| format!("liquidity asset `{}` supply invariant overflow", faster_hex::hex_string(&asset_id)))?;
     if expected_supply != asset.max_supply {
         return Err(format!("liquidity asset `{}` supply invariant violation", faster_hex::hex_string(&asset_id)));
@@ -491,8 +499,10 @@ fn write_asset(out: &mut Vec<u8>, asset: &AtomicAssetState) {
 
 fn write_liquidity_pool(out: &mut Vec<u8>, pool: &AtomicLiquidityPoolState) {
     write_u64(out, pool.pool_nonce);
-    write_u128(out, pool.remaining_pool_supply);
-    write_u64(out, pool.curve_reserve_sompi);
+    write_u64(out, pool.real_cpay_reserves_sompi);
+    write_u128(out, pool.real_token_reserves);
+    write_u64(out, pool.virtual_cpay_reserves_sompi);
+    write_u128(out, pool.virtual_token_reserves);
     write_u64(out, pool.unclaimed_fee_total_sompi);
     write_u16(out, pool.fee_bps);
     write_len(out, pool.fee_recipients.len());
@@ -615,8 +625,10 @@ impl<'a> AtomicStateReader<'a> {
 
     fn read_liquidity_pool(&mut self) -> Result<AtomicLiquidityPoolState, String> {
         let pool_nonce = self.read_u64()?;
-        let remaining_pool_supply = self.read_u128()?;
-        let curve_reserve_sompi = self.read_u64()?;
+        let real_cpay_reserves_sompi = self.read_u64()?;
+        let real_token_reserves = self.read_u128()?;
+        let virtual_cpay_reserves_sompi = self.read_u64()?;
+        let virtual_token_reserves = self.read_u128()?;
         let unclaimed_fee_total_sompi = self.read_u64()?;
         let fee_bps = self.read_u16()?;
         let recipient_len = self.read_len()?;
@@ -642,8 +654,10 @@ impl<'a> AtomicStateReader<'a> {
         };
         Ok(AtomicLiquidityPoolState {
             pool_nonce,
-            remaining_pool_supply,
-            curve_reserve_sompi,
+            real_cpay_reserves_sompi,
+            real_token_reserves,
+            virtual_cpay_reserves_sompi,
+            virtual_token_reserves,
             unclaimed_fee_total_sompi,
             fee_bps,
             fee_recipients,
@@ -810,8 +824,10 @@ mod tests {
             platform_tag: Vec::new(),
             liquidity: Some(AtomicLiquidityPoolState {
                 pool_nonce: 17,
-                remaining_pool_supply: liquidity_remaining,
-                curve_reserve_sompi: 123_456_789,
+                real_cpay_reserves_sompi: 123_456_789,
+                real_token_reserves: liquidity_remaining,
+                virtual_cpay_reserves_sompi: 1_000_000_000_000,
+                virtual_token_reserves: 1_300_000,
                 unclaimed_fee_total_sompi: 30,
                 fee_bps: 250,
                 fee_recipients: vec![
@@ -914,8 +930,10 @@ mod tests {
             platform_tag: Vec::new(),
             liquidity: Some(AtomicLiquidityPoolState {
                 pool_nonce: 7,
-                remaining_pool_supply: 9_500,
-                curve_reserve_sompi: 250,
+                real_cpay_reserves_sompi: 250,
+                real_token_reserves: 9_500,
+                virtual_cpay_reserves_sompi: 1_000_000_000_000,
+                virtual_token_reserves: 1_300_000,
                 unclaimed_fee_total_sompi: 3,
                 fee_bps: 100,
                 fee_recipients: vec![AtomicLiquidityFeeRecipientState {

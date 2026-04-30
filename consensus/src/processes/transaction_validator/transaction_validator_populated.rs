@@ -240,8 +240,8 @@ const CAT_MAX_LIQUIDITY_RECIPIENTS: usize = 2;
 const CAT_MIN_LIQUIDITY_FEE_BPS: u16 = 10;
 const CAT_MAX_LIQUIDITY_FEE_BPS: u16 = 1000;
 const CAT_LIQUIDITY_TOKEN_DECIMALS: u8 = 0;
-const CAT_MIN_LIQUIDITY_SUPPLY_RAW: u128 = 1_000;
-const CAT_MAX_LIQUIDITY_SUPPLY_RAW: u128 = 1_000_000;
+const CAT_MIN_LIQUIDITY_SUPPLY_RAW: u128 = 100_000;
+const CAT_MAX_LIQUIDITY_SUPPLY_RAW: u128 = 10_000_000;
 const CAT_MIN_LIQUIDITY_SEED_RESERVE_SOMPI: u64 = SOMPI_PER_CRYPTIX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -502,14 +502,8 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
             }
 
             let seed_reserve_sompi = take_u64_le(payload, &mut cursor).ok_or_else(|| "truncated CAT seed reserve".to_string())?;
-            if seed_reserve_sompi < CAT_MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
-                return Err(format!("liquidity asset seed_reserve_sompi must be at least `{CAT_MIN_LIQUIDITY_SEED_RESERVE_SOMPI}`"));
-            }
-            let required_final_reserve = u128::from(seed_reserve_sompi)
-                .checked_mul(max_supply.checked_add(1).ok_or_else(|| "liquidity asset max_supply + 1 overflow".to_string())?)
-                .ok_or_else(|| "liquidity asset final reserve overflow".to_string())?;
-            if required_final_reserve > u128::from(MAX_SOMPI) {
-                return Err(format!("liquidity curve final reserve `{required_final_reserve}` exceeds MAX_SOMPI `{MAX_SOMPI}`"));
+            if seed_reserve_sompi != CAT_MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
+                return Err(format!("liquidity asset seed_reserve_sompi must be exactly `{CAT_MIN_LIQUIDITY_SEED_RESERVE_SOMPI}`"));
             }
             let fee_bps = take_u16_le(payload, &mut cursor).ok_or_else(|| "truncated CAT fee bps".to_string())?;
             if !(fee_bps == 0 || (CAT_MIN_LIQUIDITY_FEE_BPS..=CAT_MAX_LIQUIDITY_FEE_BPS).contains(&fee_bps)) {

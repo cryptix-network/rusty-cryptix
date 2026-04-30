@@ -486,21 +486,33 @@ fn ceil_div(n: u128, d: u128) -> u128 {
     (n + d - 1) / d
 }
 
-fn quote_buy(remaining_pool_supply: u128, curve_reserve_sompi: u64, cpay_in_sompi: u64, fee_bps: u16) -> (u64, u128) {
+fn quote_buy(
+    real_token_reserves: u128,
+    virtual_cpay_reserves_sompi: u64,
+    virtual_token_reserves: u128,
+    cpay_in_sompi: u64,
+    fee_bps: u16,
+) -> (u64, u128) {
     let trade_fee = fee(cpay_in_sompi, fee_bps);
     let net = cpay_in_sompi - trade_fee;
-    let y_before = remaining_pool_supply + 1;
-    let x_before = u128::from(curve_reserve_sompi);
+    let x_before = u128::from(virtual_cpay_reserves_sompi);
     let x_after = x_before + u128::from(net);
-    let y_after = ceil_div(x_before * y_before, x_after);
-    (trade_fee, y_before - y_after)
+    let y_after = ceil_div(x_before * virtual_token_reserves, x_after);
+    let token_out = virtual_token_reserves - y_after;
+    assert!(token_out < real_token_reserves);
+    (trade_fee, token_out)
 }
 
-fn quote_sell(remaining_pool_supply: u128, curve_reserve_sompi: u64, token_in: u128, fee_bps: u16) -> (u64, u64) {
-    let y_before = remaining_pool_supply + 1;
-    let y_after = y_before + token_in;
-    let x_before = u128::from(curve_reserve_sompi);
-    let x_after = (x_before * y_before) / y_after;
+const INITIAL_LIQUIDITY_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 250_000_000_000_000;
+
+fn initial_liquidity_virtual_token_reserves(max_supply: u128) -> u128 {
+    max_supply * 6 / 5
+}
+
+fn quote_sell(virtual_cpay_reserves_sompi: u64, virtual_token_reserves: u128, token_in: u128, fee_bps: u16) -> (u64, u64) {
+    let y_after = virtual_token_reserves + token_in;
+    let x_before = u128::from(virtual_cpay_reserves_sompi);
+    let x_after = (x_before * virtual_token_reserves) / y_after;
     let gross = u64::try_from(x_before - x_after).unwrap();
     let trade_fee = fee(gross, fee_bps);
     (trade_fee, gross - trade_fee)
@@ -549,14 +561,20 @@ async fn setup_dual_owner_liquidity_pool() -> (TestContext, DualOwnerLiquidityFi
     }
     let (funding_outpoint, funding_entry) = find_virtual_utxo_by_script(&ctx, &owner_script);
 
-    let max_supply = 1_000u128;
+    let max_supply = 1_000_000u128;
     let seed_reserve = SOMPI_PER_CRYPTIX;
     let fee_bps = 100u16;
-    let launch_buy = SOMPI_PER_CRYPTIX;
+    let launch_buy = 10 * SOMPI_PER_CRYPTIX;
     let tx_fee = 10_000u64;
-    let owner_anchor_value = 3 * SOMPI_PER_CRYPTIX;
-    let second_owner_anchor_value = 3 * SOMPI_PER_CRYPTIX;
-    let (_, launch_token_out) = quote_buy(max_supply, seed_reserve, launch_buy, fee_bps);
+    let owner_anchor_value = 50 * SOMPI_PER_CRYPTIX;
+    let second_owner_anchor_value = 50 * SOMPI_PER_CRYPTIX;
+    let (_, launch_token_out) = quote_buy(
+        max_supply,
+        INITIAL_LIQUIDITY_VIRTUAL_CPAY_RESERVES_SOMPI,
+        initial_liquidity_virtual_token_reserves(max_supply),
+        launch_buy,
+        fee_bps,
+    );
     let create_vault_value = seed_reserve + launch_buy;
     let create_change_value = funding_entry
         .amount
@@ -616,7 +634,8 @@ fn build_liquidity_buy_tx(
     buy_in: u64,
     tx_fee: u64,
 ) -> (Transaction, u128, u64) {
-    let (_, token_out) = quote_buy(pool.remaining_pool_supply, pool.curve_reserve_sompi, buy_in, pool.fee_bps);
+    let (_, token_out) =
+        quote_buy(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, buy_in, pool.fee_bps);
     let vault_value = pool.vault_value_sompi + buy_in;
     let change_value = auth_anchor_value - buy_in - tx_fee;
     let tx = payload_tx(
@@ -691,12 +710,18 @@ async fn liquidity_consensus_e2e_create_buy_sell_claim_updates_vault_state() {
     }
     let (funding_outpoint, funding_entry) = find_virtual_utxo_by_script(&ctx, &owner_script);
 
-    let max_supply = 1_000u128;
+    let max_supply = 1_000_000u128;
     let seed_reserve = SOMPI_PER_CRYPTIX;
     let fee_bps = 100u16;
-    let launch_buy = SOMPI_PER_CRYPTIX;
+    let launch_buy = 10 * SOMPI_PER_CRYPTIX;
     let tx_fee = 10_000u64;
-    let (_, launch_token_out) = quote_buy(max_supply, seed_reserve, launch_buy, fee_bps);
+    let (_, launch_token_out) = quote_buy(
+        max_supply,
+        INITIAL_LIQUIDITY_VIRTUAL_CPAY_RESERVES_SOMPI,
+        initial_liquidity_virtual_token_reserves(max_supply),
+        launch_buy,
+        fee_bps,
+    );
     let create_vault_value = seed_reserve + launch_buy;
     let create_change_value = funding_entry.amount - create_vault_value - tx_fee;
     let create_payload = payload_create_liquidity(0, 1, max_supply, seed_reserve, fee_bps, &recipient_payload, launch_buy, 1);
@@ -726,9 +751,11 @@ async fn liquidity_consensus_e2e_create_buy_sell_claim_updates_vault_state() {
     let pool = asset.liquidity.as_ref().expect("pool should exist");
     assert_eq!(pool.pool_nonce, 1);
     assert_eq!(pool.vault_value_sompi, create_vault_value);
+    assert_eq!(pool.vault_value_sompi, pool.real_cpay_reserves_sompi + pool.unclaimed_fee_total_sompi);
 
-    let buy_in = SOMPI_PER_CRYPTIX;
-    let (_, buy_token_out) = quote_buy(pool.remaining_pool_supply, pool.curve_reserve_sompi, buy_in, fee_bps);
+    let buy_in = 10 * SOMPI_PER_CRYPTIX;
+    let (_, buy_token_out) =
+        quote_buy(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, buy_in, fee_bps);
     let buy_vault_value = pool.vault_value_sompi + buy_in;
     owner_anchor_value -= buy_in + tx_fee;
     let buy_payload = payload_buy_liquidity(1, 2, asset_id, pool.pool_nonce, buy_in, 1);
@@ -753,10 +780,11 @@ async fn liquidity_consensus_e2e_create_buy_sell_claim_updates_vault_state() {
     let pool = asset.liquidity.as_ref().expect("pool should exist");
     assert_eq!(pool.pool_nonce, 2);
     assert_eq!(pool.vault_value_sompi, buy_vault_value);
+    assert_eq!(pool.vault_value_sompi, pool.real_cpay_reserves_sompi + pool.unclaimed_fee_total_sompi);
     assert_eq!(atomic.balances.get(&AtomicBalanceKey { asset_id, owner_id }), Some(&(launch_token_out + buy_token_out)));
 
-    let token_in = 20u128;
-    let (_, cpay_out) = quote_sell(pool.remaining_pool_supply, pool.curve_reserve_sompi, token_in, fee_bps);
+    let token_in = 2u128;
+    let (_, cpay_out) = quote_sell(pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, token_in, fee_bps);
     assert!(cpay_out > 0);
     let sell_vault_value = pool.vault_value_sompi - cpay_out;
     owner_anchor_value -= tx_fee;
@@ -783,6 +811,7 @@ async fn liquidity_consensus_e2e_create_buy_sell_claim_updates_vault_state() {
     let pool = asset.liquidity.as_ref().expect("pool should exist");
     assert_eq!(pool.pool_nonce, 3);
     assert_eq!(pool.vault_value_sompi, sell_vault_value);
+    assert_eq!(pool.vault_value_sompi, pool.real_cpay_reserves_sompi + pool.unclaimed_fee_total_sompi);
     assert_eq!(atomic.balances.get(&AtomicBalanceKey { asset_id, owner_id }), Some(&(launch_token_out + buy_token_out - token_in)));
     assert!(pool.unclaimed_fee_total_sompi >= 1);
 
@@ -826,7 +855,7 @@ async fn liquidity_parallel_vault_conflict_applies_only_one_branch() {
         &fixture.owner_script,
         p2sh_signature_script(),
         2,
-        SOMPI_PER_CRYPTIX,
+        10 * SOMPI_PER_CRYPTIX,
         fixture.tx_fee,
     );
     let (second_buy_tx, second_token_out, second_vault_value) = build_liquidity_buy_tx(
@@ -837,7 +866,7 @@ async fn liquidity_parallel_vault_conflict_applies_only_one_branch() {
         &fixture.second_owner_script,
         p2sh_signature_script_for(&second_p2sh_redeem_script()),
         1,
-        2 * SOMPI_PER_CRYPTIX,
+        20 * SOMPI_PER_CRYPTIX,
         fixture.tx_fee,
     );
 
@@ -888,7 +917,7 @@ async fn liquidity_reorg_switches_to_winning_conflicting_vault_branch() {
         &fixture.owner_script,
         p2sh_signature_script(),
         2,
-        SOMPI_PER_CRYPTIX,
+        10 * SOMPI_PER_CRYPTIX,
         fixture.tx_fee,
     );
     let (second_buy_tx, second_token_out, second_vault_value) = build_liquidity_buy_tx(
@@ -899,7 +928,7 @@ async fn liquidity_reorg_switches_to_winning_conflicting_vault_branch() {
         &fixture.second_owner_script,
         p2sh_signature_script_for(&second_p2sh_redeem_script()),
         1,
-        2 * SOMPI_PER_CRYPTIX,
+        20 * SOMPI_PER_CRYPTIX,
         fixture.tx_fee,
     );
 

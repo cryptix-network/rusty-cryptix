@@ -171,9 +171,13 @@ declare! {
         feeBps : number;
         maxSupply : string;
         totalSupply : string;
-        circulatingSupply : string;
-        remainingPoolSupply : string;
-        curveReserveSompi : string;
+        circulatingTokenSupply : string;
+        realCpayReservesSompi : string;
+        realTokenReserves : string;
+        virtualCpayReservesSompi : string;
+        virtualTokenReserves : string;
+        maxBuyInSompi : string;
+        maxTokensOut : string;
         unclaimedFeeTotalSompi : string;
         vaultValueSompi : string;
         vaultTxid : HexString;

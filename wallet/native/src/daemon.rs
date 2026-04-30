@@ -56,8 +56,7 @@ const CAT_MAX_LIQUIDITY_RECIPIENTS: usize = 2;
 const CAT_MIN_LIQUIDITY_FEE_BPS: u16 = 10;
 const CAT_MAX_LIQUIDITY_FEE_BPS: u16 = 1000;
 const LIQUIDITY_TOKEN_DECIMALS: u8 = 0;
-const MIN_LIQUIDITY_SUPPLY_RAW: u128 = 1_000;
-const MAX_LIQUIDITY_SUPPLY_RAW: u128 = 1_000_000;
+const LIQUIDITY_TOKEN_SUPPLY_RAW: u128 = 1_000_000;
 const MIN_LIQUIDITY_SEED_RESERVE_SOMPI: u64 = SOMPI_PER_CRYPTIX;
 const DEFAULT_AUTH_INPUT_INDEX: u16 = 0;
 const LIQUIDITY_AUTH_INPUT_INDEX: u16 = 1;
@@ -463,7 +462,7 @@ impl WalletDaemonService {
     fn ensure_liquidity_outflow_unlocked(pool: &RpcLiquidityPoolState, operation: &str) -> Result<(), Status> {
         if pool.sell_locked {
             return Err(Status::failed_precondition(format!(
-                "{operation} is locked until curve_reserve_sompi reaches {}",
+                "{operation} is locked until real_cpay_reserves_sompi reaches {}",
                 pool.unlock_target_sompi
             )));
         }
@@ -970,9 +969,7 @@ impl WalletDaemonService {
         }
         Self::validate_platform_tag(platform_tag)?;
         if liquidity_unlock_target_sompi > MAX_SOMPI {
-            return Err(Status::invalid_argument(format!(
-                "liquidity_unlock_target_sompi must be 0 or <= MAX_SOMPI ({MAX_SOMPI})"
-            )));
+            return Err(Status::invalid_argument(format!("liquidity_unlock_target_sompi must be 0 or <= MAX_SOMPI ({MAX_SOMPI})")));
         }
         Self::validate_liquidity_create_parameters(decimals, max_supply, seed_reserve_sompi)?;
         if recipients.len() > CAT_MAX_LIQUIDITY_RECIPIENTS {
@@ -1010,21 +1007,15 @@ impl WalletDaemonService {
         if decimals != LIQUIDITY_TOKEN_DECIMALS {
             return Err(Status::invalid_argument(format!("liquidity token decimals must be {LIQUIDITY_TOKEN_DECIMALS}")));
         }
-        if !(MIN_LIQUIDITY_SUPPLY_RAW..=MAX_LIQUIDITY_SUPPLY_RAW).contains(&max_supply) {
+        if max_supply != LIQUIDITY_TOKEN_SUPPLY_RAW {
             return Err(Status::invalid_argument(format!(
-                "max_supply_raw for liquidity tokens must be between {MIN_LIQUIDITY_SUPPLY_RAW} and {MAX_LIQUIDITY_SUPPLY_RAW}"
+                "max_supply_raw for liquidity tokens must be exactly {LIQUIDITY_TOKEN_SUPPLY_RAW}"
             )));
         }
-        if seed_reserve_sompi < MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
+        if seed_reserve_sompi != MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
             return Err(Status::invalid_argument(format!(
-                "seed_reserve_sompi must be at least {MIN_LIQUIDITY_SEED_RESERVE_SOMPI} (1 CPAY)"
+                "seed_reserve_sompi must be exactly {MIN_LIQUIDITY_SEED_RESERVE_SOMPI} (1 CPAY)"
             )));
-        }
-        let required_final_reserve = u128::from(seed_reserve_sompi)
-            .checked_mul(max_supply.checked_add(1).ok_or_else(|| Status::invalid_argument("max_supply_raw + 1 overflows"))?)
-            .ok_or_else(|| Status::invalid_argument("liquidity final reserve check overflows"))?;
-        if required_final_reserve > u128::from(MAX_SOMPI) {
-            return Err(Status::invalid_argument("seed_reserve_sompi is too high for this max_supply_raw"));
         }
         Ok(())
     }
@@ -1541,9 +1532,7 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
         let metadata = Self::parse_metadata_hex(request.metadata_hex.as_str())?;
         Self::validate_platform_tag(request.platform_tag.as_str())?;
         if request.liquidity_unlock_target_sompi > MAX_SOMPI {
-            return Err(Status::invalid_argument(format!(
-                "liquidity_unlock_target_sompi must be 0 or <= MAX_SOMPI ({MAX_SOMPI})"
-            )));
+            return Err(Status::invalid_argument(format!("liquidity_unlock_target_sompi must be 0 or <= MAX_SOMPI ({MAX_SOMPI})")));
         }
         Self::validate_asset_identity_fields(request.name.as_str(), request.symbol.as_str(), metadata.as_slice(), decimals)?;
         if request.seed_reserve_sompi == 0 {

@@ -33,8 +33,10 @@ const CAT_MAX_LIQUIDITY_RECIPIENTS: usize = 2;
 const CAT_MIN_LIQUIDITY_FEE_BPS: u16 = 10;
 const CAT_MAX_LIQUIDITY_FEE_BPS: u16 = 1000;
 const LIQUIDITY_TOKEN_DECIMALS: u8 = 0;
-const MIN_LIQUIDITY_SUPPLY_RAW: u128 = 1_000;
-const MAX_LIQUIDITY_SUPPLY_RAW: u128 = 1_000_000;
+const MIN_LIQUIDITY_TOKEN_SUPPLY_RAW: u128 = 100_000;
+const LIQUIDITY_TOKEN_SUPPLY_RAW: u128 = 1_000_000;
+const DEFAULT_LIQUIDITY_TOKEN_SUPPLY_RAW: u128 = LIQUIDITY_TOKEN_SUPPLY_RAW;
+const MAX_LIQUIDITY_TOKEN_SUPPLY_RAW: u128 = 10_000_000;
 const MIN_LIQUIDITY_SEED_RESERVE_SOMPI: u64 = SOMPI_PER_CRYPTIX;
 
 const DEFAULT_AUTH_INPUT_INDEX: u16 = 0;
@@ -352,8 +354,9 @@ impl Token {
         if argv.len() < 6 {
             tprintln!(
                 ctx,
-                "usage: token create-liquidity <name> <symbol> <decimals> <maxSupplyRaw> <seedReserveSompi> <feeBps> [recipientAddress[,recipientAddress2]] [--launch-buy-sompi=<sompi>] [--launch-buy-min-token-out=<amountRaw>] [--sender=<address>] [--metadata-hex=<hex>] [--platform-tag=<tag>] [--liquidity-unlock-target-sompi=<sompi>]"
+                "usage: token create-liquidity <name> <symbol> <decimals=0> <maxSupplyRaw:{MIN_LIQUIDITY_TOKEN_SUPPLY_RAW}..={MAX_LIQUIDITY_TOKEN_SUPPLY_RAW}> <seedReserveSompi={MIN_LIQUIDITY_SEED_RESERVE_SOMPI}> <feeBps> [recipientAddress[,recipientAddress2]] [--launch-buy-sompi=<sompi>] [--launch-buy-min-token-out=<amountRaw>] [--sender=<address>] [--metadata-hex=<hex>] [--platform-tag=<tag>] [--liquidity-unlock-target-sompi=<sompi>]"
             );
+            tprintln!(ctx, "defaults: maxSupplyRaw={DEFAULT_LIQUIDITY_TOKEN_SUPPLY_RAW}, decimals=0, seedReserveSompi=1 CPAY");
             return Ok(());
         }
 
@@ -393,14 +396,8 @@ impl Token {
             return Err(Error::custom("recipient addresses are required when feeBps is > 0"));
         }
 
-        let (
-            sender_opt,
-            metadata,
-            launch_buy_sompi,
-            launch_buy_min_token_out,
-            platform_tag,
-            liquidity_unlock_target_sompi,
-        ) = Self::parse_create_liquidity_options(argv)?;
+        let (sender_opt, metadata, launch_buy_sompi, launch_buy_min_token_out, platform_tag, liquidity_unlock_target_sompi) =
+            Self::parse_create_liquidity_options(argv)?;
         Self::validate_asset_identity_fields(name.as_str(), symbol.as_str(), metadata.as_slice(), decimals)?;
         if launch_buy_sompi == 0 && launch_buy_min_token_out != 0 {
             return Err(Error::custom("launchBuyMinTokenOut must be 0 when launchBuySompi is 0"));
@@ -1211,9 +1208,7 @@ impl Token {
                 unlock_target_set = true;
                 liquidity_unlock_target_sompi = Self::parse_u64(raw, "--liquidity-unlock-target-sompi")?;
                 if liquidity_unlock_target_sompi > MAX_SOMPI {
-                    return Err(Error::custom(format!(
-                        "--liquidity-unlock-target-sompi must be 0 or <= MAX_SOMPI ({MAX_SOMPI})"
-                    )));
+                    return Err(Error::custom(format!("--liquidity-unlock-target-sompi must be 0 or <= MAX_SOMPI ({MAX_SOMPI})")));
                 }
             } else {
                 return Err(Error::custom(format!(
@@ -1226,7 +1221,14 @@ impl Token {
             return Err(Error::custom("--launch-buy-sompi and --launch-buy-min-token-out must be provided together"));
         }
 
-        Ok((sender, metadata, launch_buy_sompi, launch_buy_min_token_out, platform_tag.unwrap_or_default(), liquidity_unlock_target_sompi))
+        Ok((
+            sender,
+            metadata,
+            launch_buy_sompi,
+            launch_buy_min_token_out,
+            platform_tag.unwrap_or_default(),
+            liquidity_unlock_target_sompi,
+        ))
     }
 
     fn parse_liquidity_recipients_csv(csv: &str) -> Result<Vec<LiquidityRecipient>> {
@@ -1293,8 +1295,7 @@ impl Token {
 
     fn append_platform_tag_tail(payload: &mut Vec<u8>, platform_tag: &str) -> Result<()> {
         Self::validate_platform_tag(platform_tag)?;
-        let tag_len =
-            u8::try_from(platform_tag.len()).map_err(|_| Error::custom("platform tag length does not fit into u8"))?;
+        let tag_len = u8::try_from(platform_tag.len()).map_err(|_| Error::custom("platform tag length does not fit into u8"))?;
         payload.push(tag_len);
         payload.extend_from_slice(platform_tag.as_bytes());
         Ok(())
@@ -1311,7 +1312,7 @@ impl Token {
     fn ensure_liquidity_outflow_unlocked(pool: &RpcLiquidityPoolState, operation: &str) -> Result<()> {
         if pool.sell_locked {
             return Err(Error::custom(format!(
-                "{operation} is locked until curveReserveSompi reaches {}",
+                "{operation} is locked until realCpayReservesSompi reaches {}",
                 pool.unlock_target_sompi
             )));
         }
@@ -1516,9 +1517,7 @@ impl Token {
         }
         Self::validate_platform_tag(platform_tag)?;
         if liquidity_unlock_target_sompi > MAX_SOMPI {
-            return Err(Error::custom(format!(
-                "liquidityUnlockTargetSompi must be 0 or <= MAX_SOMPI ({MAX_SOMPI})"
-            )));
+            return Err(Error::custom(format!("liquidityUnlockTargetSompi must be 0 or <= MAX_SOMPI ({MAX_SOMPI})")));
         }
         Self::validate_liquidity_create_parameters(decimals, max_supply, seed_reserve_sompi)?;
         if recipients.len() > CAT_MAX_LIQUIDITY_RECIPIENTS {
@@ -1554,19 +1553,13 @@ impl Token {
         if decimals != LIQUIDITY_TOKEN_DECIMALS {
             return Err(Error::custom(format!("liquidity token decimals must be {LIQUIDITY_TOKEN_DECIMALS}")));
         }
-        if !(MIN_LIQUIDITY_SUPPLY_RAW..=MAX_LIQUIDITY_SUPPLY_RAW).contains(&max_supply) {
+        if !(MIN_LIQUIDITY_TOKEN_SUPPLY_RAW..=MAX_LIQUIDITY_TOKEN_SUPPLY_RAW).contains(&max_supply) {
             return Err(Error::custom(format!(
-                "maxSupplyRaw for liquidity tokens must be between {MIN_LIQUIDITY_SUPPLY_RAW} and {MAX_LIQUIDITY_SUPPLY_RAW}"
+                "maxSupplyRaw for liquidity tokens must be between {MIN_LIQUIDITY_TOKEN_SUPPLY_RAW} and {MAX_LIQUIDITY_TOKEN_SUPPLY_RAW}"
             )));
         }
-        if seed_reserve_sompi < MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
-            return Err(Error::custom(format!("seedReserveSompi must be at least {MIN_LIQUIDITY_SEED_RESERVE_SOMPI} (1 CPAY)")));
-        }
-        let required_final_reserve = u128::from(seed_reserve_sompi)
-            .checked_mul(max_supply.checked_add(1).ok_or_else(|| Error::custom("maxSupplyRaw + 1 overflows"))?)
-            .ok_or_else(|| Error::custom("liquidity final reserve check overflows"))?;
-        if required_final_reserve > u128::from(MAX_SOMPI) {
-            return Err(Error::custom("seedReserveSompi is too high for this maxSupplyRaw"));
+        if seed_reserve_sompi != MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
+            return Err(Error::custom(format!("seedReserveSompi must be exactly {MIN_LIQUIDITY_SEED_RESERVE_SOMPI} (1 CPAY)")));
         }
         Ok(())
     }

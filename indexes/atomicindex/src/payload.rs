@@ -3,8 +3,7 @@ use serde::{Deserialize, Serialize};
 use cryptix_consensus_core::constants::MAX_SOMPI;
 
 use crate::liquidity_math::{
-    validate_liquidity_curve_reachability, LIQUIDITY_TOKEN_DECIMALS, MAX_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SEED_RESERVE_SOMPI,
-    MIN_LIQUIDITY_SUPPLY_RAW,
+    LIQUIDITY_TOKEN_DECIMALS, MAX_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SEED_RESERVE_SOMPI, MIN_LIQUIDITY_SUPPLY_RAW,
 };
 
 pub const CRYPTIX_ATOMIC_TOKEN_MAGIC: [u8; 3] = *b"CAT";
@@ -395,10 +394,9 @@ fn parse_create_liquidity_asset_op(payload: &[u8], cursor: &mut usize) -> Result
     }
 
     let seed_reserve_sompi = take_u64_le(payload, cursor).ok_or(NoopReason::BadLength)?;
-    if seed_reserve_sompi < MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
+    if seed_reserve_sompi != MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
         return Err(NoopReason::InvalidAmount);
     }
-    validate_liquidity_curve_reachability(max_supply, seed_reserve_sompi).map_err(|_| NoopReason::InvalidAmount)?;
 
     let fee_bps = take_u16_le(payload, cursor).ok_or(NoopReason::BadLength)?;
     if !(fee_bps == 0 || (MIN_LIQUIDITY_FEE_BPS..=MAX_LIQUIDITY_FEE_BPS).contains(&fee_bps)) {
@@ -697,7 +695,7 @@ mod tests {
     fn build_create_liquidity_payload() -> Vec<u8> {
         let mut payload = build_header(5, 3, 7);
         payload.push(LIQUIDITY_TOKEN_DECIMALS);
-        payload.extend_from_slice(&MIN_LIQUIDITY_SUPPLY_RAW.to_le_bytes());
+        payload.extend_from_slice(&crate::liquidity_math::DEFAULT_LIQUIDITY_SUPPLY_RAW.to_le_bytes());
         payload.push(4);
         payload.push(4);
         payload.extend_from_slice(&0u16.to_le_bytes());

@@ -1186,9 +1186,9 @@ message RpcLiquidityPoolStateMessage {
   uint32 feeBps = 3;
   string maxSupply = 4;
   string totalSupply = 5;
-  string circulatingSupply = 6;
-  string remainingPoolSupply = 7;
-  string curveReserveSompi = 8;
+  string circulatingTokenSupply = 6;
+  string realCpayReservesSompi = 7;
+  string realTokenReserves = 8;
   string unclaimedFeeTotalSompi = 9;
   string vaultValueSompi = 10;
   string vaultTxid = 11;
@@ -1198,6 +1198,10 @@ message RpcLiquidityPoolStateMessage {
   string unlockTargetSompi = 15;
   bool unlocked = 16;
   bool sellLocked = 17;
+  string virtualCpayReservesSompi = 18;
+  string virtualTokenReserves = 19;
+  string maxBuyInSompi = 20;
+  string maxTokensOut = 21;
 }
 
 message GetLiquidityPoolStateRequestMessage {

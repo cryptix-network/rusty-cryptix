@@ -56,11 +56,15 @@ use std::{
 
 // Allow dust-sized redemptions so the final outstanding liquidity tokens can always exit.
 const LIQUIDITY_MIN_PAYOUT_SOMPI: u64 = 1;
-const CURVE_FLOOR_TOKEN: u128 = 1;
 const LIQUIDITY_TOKEN_DECIMALS: u8 = 0;
-const MIN_LIQUIDITY_SUPPLY_RAW: u128 = 1_000;
-const MAX_LIQUIDITY_SUPPLY_RAW: u128 = 1_000_000;
-const MIN_LIQUIDITY_SEED_RESERVE_SOMPI: u64 = SOMPI_PER_CRYPTIX;
+const MIN_LIQUIDITY_SUPPLY_RAW: u128 = 100_000;
+const LIQUIDITY_TOKEN_SUPPLY_RAW: u128 = 1_000_000;
+const MAX_LIQUIDITY_SUPPLY_RAW: u128 = 10_000_000;
+const INITIAL_REAL_CPAY_RESERVES_SOMPI: u64 = SOMPI_PER_CRYPTIX;
+const MIN_CPAY_RESERVE_SOMPI: u64 = 1;
+const MIN_REAL_TOKEN_RESERVE: u128 = 1;
+const INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 250_000_000_000_000;
+const INITIAL_VIRTUAL_TOKEN_RESERVES: u128 = LIQUIDITY_TOKEN_SUPPLY_RAW * 6 / 5;
 
 #[derive(Clone, Copy, Debug)]
 struct VaultTransition {
@@ -72,17 +76,10 @@ struct VaultTransition {
 #[cfg(test)]
 mod tests {
     use super::{
-        atomic_op_allows_liquidity_vault_output, validate_curve_reserve_against_outstanding_supply,
-        validate_liquidity_claim_authorization, validate_liquidity_creation_parameters, AtomicPayloadOp, MAX_LIQUIDITY_SUPPLY_RAW,
-        MIN_LIQUIDITY_SEED_RESERVE_SOMPI, MIN_LIQUIDITY_SUPPLY_RAW,
+        atomic_op_allows_liquidity_vault_output, validate_liquidity_claim_authorization, validate_liquidity_creation_parameters,
+        AtomicPayloadOp, INITIAL_REAL_CPAY_RESERVES_SOMPI, LIQUIDITY_TOKEN_SUPPLY_RAW, MAX_LIQUIDITY_SUPPLY_RAW,
+        MIN_LIQUIDITY_SUPPLY_RAW,
     };
-
-    #[test]
-    fn liquidity_reserve_must_exist_while_tokens_remain_outstanding() {
-        assert!(validate_curve_reserve_against_outstanding_supply([0x11; 32], 1, 0).is_err());
-        assert!(validate_curve_reserve_against_outstanding_supply([0x11; 32], 0, 0).is_ok());
-        assert!(validate_curve_reserve_against_outstanding_supply([0x11; 32], 5, 1).is_ok());
-    }
 
     #[test]
     fn liquidity_claims_require_matching_recipient_owner() {
@@ -92,11 +89,13 @@ mod tests {
 
     #[test]
     fn liquidity_creation_parameters_enforce_mainnet_limits() {
-        assert!(validate_liquidity_creation_parameters(0, MIN_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SEED_RESERVE_SOMPI).is_ok());
-        assert!(validate_liquidity_creation_parameters(1, MIN_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SEED_RESERVE_SOMPI).is_err());
-        assert!(validate_liquidity_creation_parameters(0, MIN_LIQUIDITY_SUPPLY_RAW - 1, MIN_LIQUIDITY_SEED_RESERVE_SOMPI).is_err());
-        assert!(validate_liquidity_creation_parameters(0, MAX_LIQUIDITY_SUPPLY_RAW + 1, MIN_LIQUIDITY_SEED_RESERVE_SOMPI).is_err());
-        assert!(validate_liquidity_creation_parameters(0, MIN_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SEED_RESERVE_SOMPI - 1).is_err());
+        assert!(validate_liquidity_creation_parameters(0, LIQUIDITY_TOKEN_SUPPLY_RAW, INITIAL_REAL_CPAY_RESERVES_SOMPI).is_ok());
+        assert!(validate_liquidity_creation_parameters(0, MIN_LIQUIDITY_SUPPLY_RAW, INITIAL_REAL_CPAY_RESERVES_SOMPI).is_ok());
+        assert!(validate_liquidity_creation_parameters(0, MAX_LIQUIDITY_SUPPLY_RAW, INITIAL_REAL_CPAY_RESERVES_SOMPI).is_ok());
+        assert!(validate_liquidity_creation_parameters(1, LIQUIDITY_TOKEN_SUPPLY_RAW, INITIAL_REAL_CPAY_RESERVES_SOMPI).is_err());
+        assert!(validate_liquidity_creation_parameters(0, MIN_LIQUIDITY_SUPPLY_RAW - 1, INITIAL_REAL_CPAY_RESERVES_SOMPI).is_err());
+        assert!(validate_liquidity_creation_parameters(0, MAX_LIQUIDITY_SUPPLY_RAW + 1, INITIAL_REAL_CPAY_RESERVES_SOMPI).is_err());
+        assert!(validate_liquidity_creation_parameters(0, LIQUIDITY_TOKEN_SUPPLY_RAW, INITIAL_REAL_CPAY_RESERVES_SOMPI - 1).is_err());
     }
 
     #[test]
@@ -123,52 +122,64 @@ fn calculate_trade_fee(amount: u64, fee_bps: u16) -> TxResult<u64> {
     u64::try_from(fee).map_err(|_| TxRuleError::InvalidAtomicPayload("fee does not fit into u64".to_string()))
 }
 
-fn cpmm_buy(remaining_pool_supply: u128, curve_reserve_sompi: u64, cpay_net_in: u64) -> TxResult<(u128, u128, u64)> {
-    let y_before = remaining_pool_supply
-        .checked_add(CURVE_FLOOR_TOKEN)
-        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM y_before overflow".to_string()))?;
-    let x_before = curve_reserve_sompi;
-    let x_after =
-        x_before.checked_add(cpay_net_in).ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM x_after overflow".to_string()))?;
-    if x_after == 0 {
+fn cpmm_buy(
+    real_token_reserves: u128,
+    virtual_cpay_reserves_sompi: u64,
+    virtual_token_reserves: u128,
+    cpay_net_in: u64,
+) -> TxResult<(u128, u128, u64, u128)> {
+    if real_token_reserves <= MIN_REAL_TOKEN_RESERVE {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM buy real token reserve floor reached".to_string()));
+    }
+    let x_after = virtual_cpay_reserves_sompi
+        .checked_add(cpay_net_in)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM x_after overflow".to_string()))?;
+    if x_after == 0 || virtual_token_reserves == 0 {
         return Err(TxRuleError::InvalidAtomicPayload("CPMM buy x_after cannot be zero".to_string()));
     }
 
-    let k = Uint256::from_u64(x_before) * Uint256::from_u128(y_before);
+    let k = Uint256::from_u64(virtual_cpay_reserves_sompi) * Uint256::from_u128(virtual_token_reserves);
     let y_after_u256 = ceil_div_u256(k, Uint256::from_u64(x_after));
     let y_after = u128::try_from(y_after_u256)
         .map_err(|_| TxRuleError::InvalidAtomicPayload("CPMM buy y_after conversion overflow".to_string()))?;
     if y_after == 0 {
         return Err(TxRuleError::InvalidAtomicPayload("CPMM buy y_after cannot be zero".to_string()));
     }
-    if y_after > y_before {
+    if y_after > virtual_token_reserves {
         return Err(TxRuleError::InvalidAtomicPayload("CPMM buy would increase y_after".to_string()));
     }
 
-    let token_out =
-        y_before.checked_sub(y_after).ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM buy token_out underflow".to_string()))?;
+    let token_out = virtual_token_reserves
+        .checked_sub(y_after)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM buy token_out underflow".to_string()))?;
     if token_out == 0 {
         return Err(TxRuleError::InvalidAtomicPayload("CPMM buy produced zero token_out".to_string()));
     }
-    let new_remaining_pool_supply = y_after
-        .checked_sub(CURVE_FLOOR_TOKEN)
-        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM buy remaining supply underflow".to_string()))?;
+    let new_real_token_reserves = real_token_reserves
+        .checked_sub(token_out)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM buy real token reserve underflow".to_string()))?;
+    if new_real_token_reserves < MIN_REAL_TOKEN_RESERVE {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM buy would drain final real token".to_string()));
+    }
 
-    Ok((token_out, new_remaining_pool_supply, x_after))
+    Ok((token_out, new_real_token_reserves, x_after, y_after))
 }
 
-fn cpmm_sell(remaining_pool_supply: u128, curve_reserve_sompi: u64, token_in: u128) -> TxResult<(u64, u128, u64)> {
-    let y_before = remaining_pool_supply
-        .checked_add(CURVE_FLOOR_TOKEN)
-        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM y_before overflow".to_string()))?;
-    let y_after =
-        y_before.checked_add(token_in).ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM y_after overflow".to_string()))?;
+fn cpmm_sell(
+    real_cpay_reserves_sompi: u64,
+    virtual_cpay_reserves_sompi: u64,
+    virtual_token_reserves: u128,
+    token_in: u128,
+) -> TxResult<(u64, u64, u64, u128)> {
+    let y_after = virtual_token_reserves
+        .checked_add(token_in)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM y_after overflow".to_string()))?;
     if y_after == 0 {
         return Err(TxRuleError::InvalidAtomicPayload("CPMM sell y_after cannot be zero".to_string()));
     }
 
-    let x_before = curve_reserve_sompi;
-    let k = Uint256::from_u64(x_before) * Uint256::from_u128(y_before);
+    let x_before = virtual_cpay_reserves_sompi;
+    let k = Uint256::from_u64(x_before) * Uint256::from_u128(virtual_token_reserves);
     let x_after_u256 = k / Uint256::from_u128(y_after);
     let x_after_u128 = u128::try_from(x_after_u256)
         .map_err(|_| TxRuleError::InvalidAtomicPayload("CPMM sell x_after conversion overflow".to_string()))?;
@@ -183,10 +194,13 @@ fn cpmm_sell(remaining_pool_supply: u128, curve_reserve_sompi: u64, token_in: u1
     if gross_out == 0 {
         return Err(TxRuleError::InvalidAtomicPayload("CPMM sell produced zero gross_out".to_string()));
     }
-    let new_remaining_pool_supply = remaining_pool_supply
-        .checked_add(token_in)
-        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM sell remaining supply overflow".to_string()))?;
-    Ok((gross_out, new_remaining_pool_supply, x_after))
+    let new_real_cpay_reserves_sompi = real_cpay_reserves_sompi
+        .checked_sub(gross_out)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM sell real CPAY reserve underflow".to_string()))?;
+    if new_real_cpay_reserves_sompi < MIN_CPAY_RESERVE_SOMPI {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM sell would drain final real sompi".to_string()));
+    }
+    Ok((gross_out, new_real_cpay_reserves_sompi, x_after, y_after))
 }
 
 fn ceil_div_u256(numerator: Uint256, denominator: Uint256) -> Uint256 {
@@ -197,6 +211,18 @@ fn ceil_div_u256(numerator: Uint256, denominator: Uint256) -> Uint256 {
     } else {
         quotient + Uint256::from_u64(1)
     }
+}
+
+fn initial_virtual_token_reserves(max_supply: u128) -> TxResult<u128> {
+    if !(MIN_LIQUIDITY_SUPPLY_RAW..=MAX_LIQUIDITY_SUPPLY_RAW).contains(&max_supply) {
+        return Err(TxRuleError::InvalidAtomicPayload(format!(
+            "liquidity asset max_supply must be in `{MIN_LIQUIDITY_SUPPLY_RAW}..={MAX_LIQUIDITY_SUPPLY_RAW}`"
+        )));
+    }
+    max_supply
+        .checked_mul(6)
+        .and_then(|value| value.checked_div(5))
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("liquidity virtual token reserve overflow".to_string()))
 }
 
 fn atomic_op_allows_liquidity_vault_output(op: &AtomicPayloadOp) -> bool {
@@ -231,22 +257,6 @@ fn validate_liquidity_claim_authorization(claimant_owner_id: [u8; 32], recipient
     }
 }
 
-fn validate_curve_reserve_against_outstanding_supply(
-    asset_id: [u8; 32],
-    total_supply: u128,
-    curve_reserve_sompi: u64,
-) -> TxResult<()> {
-    if total_supply > 0 && curve_reserve_sompi == 0 {
-        Err(TxRuleError::InvalidAtomicPayload(format!(
-            "curve reserve exhausted for liquidity asset `{}` while `{}` tokens remain outstanding",
-            faster_hex::hex_string(&asset_id),
-            total_supply
-        )))
-    } else {
-        Ok(())
-    }
-}
-
 fn validate_liquidity_creation_parameters(decimals: u8, max_supply: u128, seed_reserve_sompi: u64) -> TxResult<()> {
     if decimals != LIQUIDITY_TOKEN_DECIMALS {
         return Err(TxRuleError::InvalidAtomicPayload(format!("liquidity asset decimals must be `{}`", LIQUIDITY_TOKEN_DECIMALS)));
@@ -256,27 +266,9 @@ fn validate_liquidity_creation_parameters(decimals: u8, max_supply: u128, seed_r
             "liquidity asset max_supply must be in `{MIN_LIQUIDITY_SUPPLY_RAW}..={MAX_LIQUIDITY_SUPPLY_RAW}`"
         )));
     }
-    if seed_reserve_sompi < MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
+    if seed_reserve_sompi != INITIAL_REAL_CPAY_RESERVES_SOMPI {
         return Err(TxRuleError::InvalidAtomicPayload(format!(
-            "liquidity asset seed_reserve_sompi must be at least `{MIN_LIQUIDITY_SEED_RESERVE_SOMPI}`"
-        )));
-    }
-    validate_liquidity_curve_reachability(max_supply, seed_reserve_sompi)
-}
-
-fn validate_liquidity_curve_reachability(remaining_pool_supply: u128, curve_reserve_sompi: u64) -> TxResult<()> {
-    if remaining_pool_supply == 0 {
-        return Ok(());
-    }
-    let y = remaining_pool_supply
-        .checked_add(CURVE_FLOOR_TOKEN)
-        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("liquidity curve reachability y overflow".to_string()))?;
-    let required_final_reserve = u128::from(curve_reserve_sompi)
-        .checked_mul(y)
-        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("liquidity curve reachability reserve overflow".to_string()))?;
-    if required_final_reserve > u128::from(MAX_SOMPI) {
-        return Err(TxRuleError::InvalidAtomicPayload(format!(
-            "liquidity curve final reserve `{required_final_reserve}` exceeds MAX_SOMPI `{MAX_SOMPI}`"
+            "liquidity asset seed_reserve_sompi must be `{INITIAL_REAL_CPAY_RESERVES_SOMPI}`"
         )));
     }
     Ok(())
@@ -811,8 +803,10 @@ impl VirtualStateProcessor {
                     return Err(TxRuleError::InvalidAtomicPayload("fee_bps > 0 requires at least one recipient".to_string()));
                 }
 
-                let mut remaining_pool_supply = max_supply;
-                let mut curve_reserve_sompi = seed_reserve_sompi;
+                let mut real_cpay_reserves_sompi = INITIAL_REAL_CPAY_RESERVES_SOMPI;
+                let mut real_token_reserves = max_supply;
+                let mut virtual_cpay_reserves_sompi = INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI;
+                let mut virtual_token_reserves = initial_virtual_token_reserves(max_supply)?;
                 let mut unclaimed_fee_total_sompi = 0u64;
                 let mut total_supply = 0u128;
 
@@ -821,8 +815,8 @@ impl VirtualStateProcessor {
                     let launch_buy_net = launch_buy_sompi
                         .checked_sub(fee_trade)
                         .ok_or_else(|| TxRuleError::InvalidAtomicPayload("launch buy fee underflow".to_string()))?;
-                    let (token_out, new_remaining_pool_supply, new_curve_reserve_sompi) =
-                        cpmm_buy(remaining_pool_supply, curve_reserve_sompi, launch_buy_net)?;
+                    let (token_out, new_real_token_reserves, new_virtual_cpay_reserves_sompi, new_virtual_token_reserves) =
+                        cpmm_buy(real_token_reserves, virtual_cpay_reserves_sompi, virtual_token_reserves, launch_buy_net)?;
                     if token_out < launch_buy_min_token_out {
                         return Err(TxRuleError::InvalidAtomicPayload(format!(
                             "launch buy min_token_out violated: expected at least `{}`, got `{}`",
@@ -832,8 +826,12 @@ impl VirtualStateProcessor {
                     if token_out == 0 {
                         return Err(TxRuleError::InvalidAtomicPayload("launch buy produced zero token_out".to_string()));
                     }
-                    remaining_pool_supply = new_remaining_pool_supply;
-                    curve_reserve_sompi = new_curve_reserve_sompi;
+                    real_cpay_reserves_sompi = real_cpay_reserves_sompi
+                        .checked_add(launch_buy_net)
+                        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("launch buy real CPAY reserve overflow".to_string()))?;
+                    real_token_reserves = new_real_token_reserves;
+                    virtual_cpay_reserves_sompi = new_virtual_cpay_reserves_sompi;
+                    virtual_token_reserves = new_virtual_token_reserves;
                     self.apply_fee_to_pool(&mut fee_recipients, &mut unclaimed_fee_total_sompi, fee_trade)?;
                     total_supply = token_out;
 
@@ -849,8 +847,7 @@ impl VirtualStateProcessor {
                 }
 
                 let vault_outpoint = TransactionOutpoint::new(tx.tx().id(), vault_output_index);
-                let unlocked =
-                    liquidity_unlock_target_sompi == 0 || curve_reserve_sompi >= liquidity_unlock_target_sompi;
+                let unlocked = liquidity_unlock_target_sompi == 0 || real_cpay_reserves_sompi >= liquidity_unlock_target_sompi;
                 let asset = AtomicAssetState {
                     asset_class: AtomicAssetClass::Liquidity,
                     mint_authority_owner_id: [0u8; 32],
@@ -860,8 +857,10 @@ impl VirtualStateProcessor {
                     platform_tag,
                     liquidity: Some(AtomicLiquidityPoolState {
                         pool_nonce: 1,
-                        remaining_pool_supply,
-                        curve_reserve_sompi,
+                        real_cpay_reserves_sompi,
+                        real_token_reserves,
+                        virtual_cpay_reserves_sompi,
+                        virtual_token_reserves,
                         unclaimed_fee_total_sompi,
                         fee_bps,
                         fee_recipients,
@@ -1037,8 +1036,8 @@ impl VirtualStateProcessor {
                 let net_in = cpay_in_sompi
                     .checked_sub(fee_trade)
                     .ok_or_else(|| TxRuleError::InvalidAtomicPayload("buy fee underflow".to_string()))?;
-                let (token_out, new_remaining_pool_supply, new_curve_reserve_sompi) =
-                    cpmm_buy(pool.remaining_pool_supply, pool.curve_reserve_sompi, net_in)?;
+                let (token_out, new_real_token_reserves, new_virtual_cpay_reserves_sompi, new_virtual_token_reserves) =
+                    cpmm_buy(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, net_in)?;
                 if token_out < min_token_out {
                     return Err(TxRuleError::InvalidAtomicPayload(format!(
                         "buy min_token_out violated: expected at least `{}`, got `{}`",
@@ -1049,9 +1048,14 @@ impl VirtualStateProcessor {
                     return Err(TxRuleError::InvalidAtomicPayload("buy produced zero token_out".to_string()));
                 }
 
-                pool.remaining_pool_supply = new_remaining_pool_supply;
-                pool.curve_reserve_sompi = new_curve_reserve_sompi;
-                if pool.unlock_target_sompi > 0 && pool.curve_reserve_sompi >= pool.unlock_target_sompi {
+                pool.real_cpay_reserves_sompi = pool
+                    .real_cpay_reserves_sompi
+                    .checked_add(net_in)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("buy real CPAY reserve overflow".to_string()))?;
+                pool.real_token_reserves = new_real_token_reserves;
+                pool.virtual_cpay_reserves_sompi = new_virtual_cpay_reserves_sompi;
+                pool.virtual_token_reserves = new_virtual_token_reserves;
+                if pool.unlock_target_sompi > 0 && pool.real_cpay_reserves_sompi >= pool.unlock_target_sompi {
                     pool.unlocked = true;
                 }
                 self.apply_fee_to_pool(&mut pool.fee_recipients, &mut pool.unclaimed_fee_total_sompi, fee_trade)?;
@@ -1113,7 +1117,7 @@ impl VirtualStateProcessor {
                 }
                 if liquidity_sell_locked(&pool) {
                     return Err(TxRuleError::InvalidAtomicPayload(format!(
-                        "liquidity sell locked for asset `{}` until curve reserve reaches `{}` sompi",
+                        "liquidity sell locked for asset `{}` until real CPAY reserve reaches `{}` sompi",
                         faster_hex::hex_string(&asset_id),
                         pool.unlock_target_sompi
                     )));
@@ -1133,8 +1137,8 @@ impl VirtualStateProcessor {
                     ))
                 })?;
 
-                let (gross_out, new_remaining_pool_supply, new_curve_reserve_sompi) =
-                    cpmm_sell(pool.remaining_pool_supply, pool.curve_reserve_sompi, token_in)?;
+                let (gross_out, new_real_cpay_reserves_sompi, new_virtual_cpay_reserves_sompi, new_virtual_token_reserves) =
+                    cpmm_sell(pool.real_cpay_reserves_sompi, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, token_in)?;
                 let fee_trade = calculate_trade_fee(gross_out, pool.fee_bps)?;
                 let cpay_out = gross_out
                     .checked_sub(fee_trade)
@@ -1154,8 +1158,6 @@ impl VirtualStateProcessor {
                         cpay_out, LIQUIDITY_MIN_PAYOUT_SOMPI
                     )));
                 }
-                validate_curve_reserve_against_outstanding_supply(asset_id, supply_after, new_curve_reserve_sompi)?;
-
                 self.validate_payout_output(tx, cpay_receive_output_index, cpay_out, None)?;
                 let vault_transition = self.resolve_liquidity_vault_transition(tx, pool.vault_outpoint)?;
                 let vault_delta = vault_transition
@@ -1169,8 +1171,13 @@ impl VirtualStateProcessor {
                     )));
                 }
 
-                pool.remaining_pool_supply = new_remaining_pool_supply;
-                pool.curve_reserve_sompi = new_curve_reserve_sompi;
+                pool.real_cpay_reserves_sompi = new_real_cpay_reserves_sompi;
+                pool.real_token_reserves = pool
+                    .real_token_reserves
+                    .checked_add(token_in)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("sell real token reserve overflow".to_string()))?;
+                pool.virtual_cpay_reserves_sompi = new_virtual_cpay_reserves_sompi;
+                pool.virtual_token_reserves = new_virtual_token_reserves;
                 self.apply_fee_to_pool(&mut pool.fee_recipients, &mut pool.unclaimed_fee_total_sompi, fee_trade)?;
                 pool.vault_outpoint = TransactionOutpoint::new(tx.tx().id(), vault_transition.output_index);
                 pool.vault_value_sompi = vault_transition.output_value;
@@ -1517,41 +1524,55 @@ impl VirtualStateProcessor {
         }
         validate_liquidity_unlock_target(pool.unlock_target_sompi)?;
         if pool.unlock_target_sompi == 0 && !pool.unlocked {
-            return Err(TxRuleError::InvalidAtomicPayload(
-                "liquidity lock disabled pools must be marked unlocked".to_string(),
-            ));
+            return Err(TxRuleError::InvalidAtomicPayload("liquidity lock disabled pools must be marked unlocked".to_string()));
         }
-        if pool.unlock_target_sompi > 0 && pool.curve_reserve_sompi >= pool.unlock_target_sompi && !pool.unlocked {
+        if pool.unlock_target_sompi > 0 && pool.real_cpay_reserves_sompi >= pool.unlock_target_sompi && !pool.unlocked {
             return Err(TxRuleError::InvalidAtomicPayload(format!(
                 "liquidity lock target reached for asset `{}` but pool is still locked",
                 faster_hex::hex_string(&asset_id)
             )));
         }
-        validate_curve_reserve_against_outstanding_supply(asset_id, asset.total_supply, pool.curve_reserve_sompi)?;
-        validate_liquidity_curve_reachability(pool.remaining_pool_supply, pool.curve_reserve_sompi)?;
+        if pool.real_cpay_reserves_sompi < MIN_CPAY_RESERVE_SOMPI {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "real CPAY reserve floor violation for asset `{}`",
+                faster_hex::hex_string(&asset_id)
+            )));
+        }
+        if pool.real_token_reserves < MIN_REAL_TOKEN_RESERVE {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "real token reserve floor violation for asset `{}`",
+                faster_hex::hex_string(&asset_id)
+            )));
+        }
+        if pool.virtual_cpay_reserves_sompi == 0 || pool.virtual_token_reserves == 0 {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "virtual reserve invariant violation for asset `{}`",
+                faster_hex::hex_string(&asset_id)
+            )));
+        }
         let expected_vault = pool
-            .curve_reserve_sompi
+            .real_cpay_reserves_sompi
             .checked_add(pool.unclaimed_fee_total_sompi)
             .ok_or_else(|| TxRuleError::InvalidAtomicPayload("vault invariant overflow".to_string()))?;
         if pool.vault_value_sompi != expected_vault {
             return Err(TxRuleError::InvalidAtomicPayload(format!(
-                "vault invariant violation for asset `{}`: vault_value `{}` != reserve `{}` + fees `{}`",
+                "vault invariant violation for asset `{}`: vault_value `{}` != real reserve `{}` + fees `{}`",
                 faster_hex::hex_string(&asset_id),
                 pool.vault_value_sompi,
-                pool.curve_reserve_sompi,
+                pool.real_cpay_reserves_sompi,
                 pool.unclaimed_fee_total_sompi
             )));
         }
         let expected_total = asset
             .total_supply
-            .checked_add(pool.remaining_pool_supply)
+            .checked_add(pool.real_token_reserves)
             .ok_or_else(|| TxRuleError::InvalidAtomicPayload("supply invariant overflow".to_string()))?;
         if expected_total != asset.max_supply {
             return Err(TxRuleError::InvalidAtomicPayload(format!(
-                "supply invariant violation for asset `{}`: total `{}` + remaining `{}` != max `{}`",
+                "supply invariant violation for asset `{}`: circulating `{}` + real token reserves `{}` != max `{}`",
                 faster_hex::hex_string(&asset_id),
                 asset.total_supply,
-                pool.remaining_pool_supply,
+                pool.real_token_reserves,
                 asset.max_supply
             )));
         }
