@@ -122,6 +122,102 @@ fn calculate_trade_fee(amount: u64, fee_bps: u16) -> TxResult<u64> {
     u64::try_from(fee).map_err(|_| TxRuleError::InvalidAtomicPayload("fee does not fit into u64".to_string()))
 }
 
+fn min_gross_input_for_net_input(net_in: u64, fee_bps: u16) -> TxResult<u64> {
+    if net_in == 0 || fee_bps >= 10_000 {
+        return Err(TxRuleError::InvalidAtomicPayload("canonical buy net input or fee_bps is invalid".to_string()));
+    }
+    if fee_bps == 0 {
+        return Ok(net_in);
+    }
+
+    let fee_denominator = 10_000u128
+        .checked_sub(u128::from(fee_bps))
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy fee denominator underflow".to_string()))?;
+    let mut gross = (u128::from(net_in)
+        .checked_sub(1)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy net underflow".to_string()))?)
+    .checked_mul(10_000u128)
+    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy gross multiplication overflow".to_string()))?
+    .checked_div(fee_denominator)
+    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy fee denominator is zero".to_string()))?
+    .checked_add(1)
+    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy gross addition overflow".to_string()))?;
+    let mut gross_u64 = u64::try_from(gross)
+        .map_err(|_| TxRuleError::InvalidAtomicPayload("canonical buy gross input does not fit u64".to_string()))?;
+
+    while gross_u64 > 1 {
+        let previous = gross_u64
+            .checked_sub(1)
+            .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy gross decrement underflow".to_string()))?;
+        let previous_fee = calculate_trade_fee(previous, fee_bps)?;
+        if previous
+            .checked_sub(previous_fee)
+            .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy previous fee underflow".to_string()))?
+            < net_in
+        {
+            break;
+        }
+        gross_u64 = previous;
+    }
+    while {
+        let fee = calculate_trade_fee(gross_u64, fee_bps)?;
+        gross_u64.checked_sub(fee).ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy fee underflow".to_string()))?
+            < net_in
+    } {
+        gross = u128::from(gross_u64)
+            .checked_add(1)
+            .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy gross increment overflow".to_string()))?;
+        gross_u64 = u64::try_from(gross)
+            .map_err(|_| TxRuleError::InvalidAtomicPayload("canonical buy gross input does not fit u64".to_string()))?;
+    }
+    Ok(gross_u64)
+}
+
+fn min_gross_input_for_token_out(
+    real_token_reserves: u128,
+    virtual_cpay_reserves_sompi: u64,
+    virtual_token_reserves: u128,
+    token_out: u128,
+    fee_bps: u16,
+) -> TxResult<u64> {
+    if token_out == 0 || virtual_cpay_reserves_sompi == 0 || virtual_token_reserves == 0 {
+        return Err(TxRuleError::InvalidAtomicPayload("canonical buy target token_out is invalid".to_string()));
+    }
+    let spendable_tokens = real_token_reserves
+        .checked_sub(MIN_REAL_TOKEN_RESERVE)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy real token reserve floor reached".to_string()))?;
+    if token_out > spendable_tokens {
+        return Err(TxRuleError::InvalidAtomicPayload("canonical buy token_out drains final token".to_string()));
+    }
+    let y_after = virtual_token_reserves
+        .checked_sub(token_out)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy y_after underflow".to_string()))?;
+    if y_after == 0 {
+        return Err(TxRuleError::InvalidAtomicPayload("canonical buy y_after cannot be zero".to_string()));
+    }
+
+    let x_before = Uint256::from_u64(virtual_cpay_reserves_sompi);
+    let k = x_before * Uint256::from_u128(virtual_token_reserves);
+    let x_after = ceil_div_u256(k, Uint256::from_u128(y_after));
+    if x_after <= x_before {
+        return Err(TxRuleError::InvalidAtomicPayload("canonical buy produced zero net input".to_string()));
+    }
+    let net_in_u256 = x_after - x_before;
+    let net_in_u128 = u128::try_from(net_in_u256)
+        .map_err(|_| TxRuleError::InvalidAtomicPayload("canonical buy net input does not fit u128".to_string()))?;
+    let net_in = u64::try_from(net_in_u128)
+        .map_err(|_| TxRuleError::InvalidAtomicPayload("canonical buy net input does not fit u64".to_string()))?;
+    let gross_in = min_gross_input_for_net_input(net_in, fee_bps)?;
+
+    let fee = calculate_trade_fee(gross_in, fee_bps)?;
+    let net = gross_in.checked_sub(fee).ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy fee underflow".to_string()))?;
+    let (actual_token_out, _, _, _) = cpmm_buy(real_token_reserves, virtual_cpay_reserves_sompi, virtual_token_reserves, net)?;
+    if actual_token_out < token_out {
+        return Err(TxRuleError::InvalidAtomicPayload("canonical buy verification failed".to_string()));
+    }
+    Ok(gross_in)
+}
+
 fn cpmm_buy(
     real_token_reserves: u128,
     virtual_cpay_reserves_sompi: u64,
@@ -823,6 +919,19 @@ impl VirtualStateProcessor {
                             launch_buy_min_token_out, token_out
                         )));
                     }
+                    let canonical_launch_buy = min_gross_input_for_token_out(
+                        real_token_reserves,
+                        virtual_cpay_reserves_sompi,
+                        virtual_token_reserves,
+                        token_out,
+                        fee_bps,
+                    )?;
+                    if launch_buy_sompi != canonical_launch_buy {
+                        return Err(TxRuleError::InvalidAtomicPayload(format!(
+                            "launch buy CPAY input is not canonical: expected `{}`, got `{}`",
+                            canonical_launch_buy, launch_buy_sompi
+                        )));
+                    }
                     if token_out == 0 {
                         return Err(TxRuleError::InvalidAtomicPayload("launch buy produced zero token_out".to_string()));
                     }
@@ -1042,6 +1151,19 @@ impl VirtualStateProcessor {
                     return Err(TxRuleError::InvalidAtomicPayload(format!(
                         "buy min_token_out violated: expected at least `{}`, got `{}`",
                         min_token_out, token_out
+                    )));
+                }
+                let canonical_cpay_in = min_gross_input_for_token_out(
+                    pool.real_token_reserves,
+                    pool.virtual_cpay_reserves_sompi,
+                    pool.virtual_token_reserves,
+                    token_out,
+                    pool.fee_bps,
+                )?;
+                if cpay_in_sompi != canonical_cpay_in {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "buy CPAY input is not canonical: expected `{}`, got `{}`",
+                        canonical_cpay_in, cpay_in_sompi
                     )));
                 }
                 if token_out == 0 {

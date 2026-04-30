@@ -1,4 +1,4 @@
-use cryptix_consensus_core::constants::{MAX_SOMPI, SOMPI_PER_CRYPTIX};
+use cryptix_consensus_core::constants::SOMPI_PER_CRYPTIX;
 use cryptix_math::Uint256;
 
 // Allow dust-sized redemptions so the final outstanding liquidity tokens can always exit.
@@ -33,6 +33,81 @@ pub fn initial_virtual_token_reserves(max_supply: u128) -> Result<u128, Liquidit
 pub fn calculate_trade_fee(amount: u64, fee_bps: u16) -> Result<u64, LiquidityMathError> {
     let fee = (u128::from(amount)).checked_mul(u128::from(fee_bps)).ok_or(LiquidityMathError::Overflow)? / 10_000u128;
     u64::try_from(fee).map_err(|_| LiquidityMathError::Overflow)
+}
+
+pub fn min_gross_input_for_net_input(net_in: u64, fee_bps: u16) -> Result<u64, LiquidityMathError> {
+    if net_in == 0 || fee_bps >= 10_000 {
+        return Err(LiquidityMathError::InvalidInput);
+    }
+    if fee_bps == 0 {
+        return Ok(net_in);
+    }
+
+    let fee_denominator = 10_000u128.checked_sub(u128::from(fee_bps)).ok_or(LiquidityMathError::InvalidInput)?;
+    let mut gross = (u128::from(net_in).checked_sub(1).ok_or(LiquidityMathError::InvalidInput)?)
+        .checked_mul(10_000u128)
+        .ok_or(LiquidityMathError::Overflow)?
+        .checked_div(fee_denominator)
+        .ok_or(LiquidityMathError::InvalidInput)?
+        .checked_add(1)
+        .ok_or(LiquidityMathError::Overflow)?;
+    let mut gross_u64 = u64::try_from(gross).map_err(|_| LiquidityMathError::Overflow)?;
+
+    while gross_u64 > 1 {
+        let previous = gross_u64.checked_sub(1).ok_or(LiquidityMathError::Overflow)?;
+        let previous_fee = calculate_trade_fee(previous, fee_bps)?;
+        if previous.checked_sub(previous_fee).ok_or(LiquidityMathError::Overflow)? < net_in {
+            break;
+        }
+        gross_u64 = previous;
+    }
+    while {
+        let fee = calculate_trade_fee(gross_u64, fee_bps)?;
+        gross_u64.checked_sub(fee).ok_or(LiquidityMathError::Overflow)? < net_in
+    } {
+        gross = u128::from(gross_u64).checked_add(1).ok_or(LiquidityMathError::Overflow)?;
+        gross_u64 = u64::try_from(gross).map_err(|_| LiquidityMathError::Overflow)?;
+    }
+    Ok(gross_u64)
+}
+
+pub fn min_gross_input_for_token_out(
+    real_token_reserves: u128,
+    virtual_cpay_reserves_sompi: u64,
+    virtual_token_reserves: u128,
+    token_out: u128,
+    fee_bps: u16,
+) -> Result<u64, LiquidityMathError> {
+    if token_out == 0 || virtual_cpay_reserves_sompi == 0 || virtual_token_reserves == 0 {
+        return Err(LiquidityMathError::InvalidInput);
+    }
+    let spendable_tokens = real_token_reserves.checked_sub(MIN_REAL_TOKEN_RESERVE).ok_or(LiquidityMathError::InvalidInput)?;
+    if token_out > spendable_tokens {
+        return Err(LiquidityMathError::InvalidInput);
+    }
+    let y_after = virtual_token_reserves.checked_sub(token_out).ok_or(LiquidityMathError::InvalidInput)?;
+    if y_after == 0 {
+        return Err(LiquidityMathError::InvalidInput);
+    }
+
+    let x_before = Uint256::from_u64(virtual_cpay_reserves_sompi);
+    let k = x_before * Uint256::from_u128(virtual_token_reserves);
+    let x_after = ceil_div_u256(k, Uint256::from_u128(y_after));
+    if x_after <= x_before {
+        return Err(LiquidityMathError::ZeroOutput);
+    }
+    let net_in_u256 = x_after - x_before;
+    let net_in_u128 = u128::try_from(net_in_u256).map_err(|_| LiquidityMathError::Overflow)?;
+    let net_in = u64::try_from(net_in_u128).map_err(|_| LiquidityMathError::Overflow)?;
+    let gross_in = min_gross_input_for_net_input(net_in, fee_bps)?;
+
+    let fee = calculate_trade_fee(gross_in, fee_bps)?;
+    let net = gross_in.checked_sub(fee).ok_or(LiquidityMathError::Overflow)?;
+    let (actual_token_out, _, _, _) = cpmm_buy(real_token_reserves, virtual_cpay_reserves_sompi, virtual_token_reserves, net)?;
+    if actual_token_out < token_out {
+        return Err(LiquidityMathError::InvalidState);
+    }
+    Ok(gross_in)
 }
 
 pub fn cpmm_buy(
@@ -111,25 +186,11 @@ pub fn max_buy_in_sompi(
     virtual_token_reserves: u128,
     fee_bps: u16,
 ) -> Result<u64, LiquidityMathError> {
-    if real_token_reserves <= MIN_REAL_TOKEN_RESERVE {
+    let token_out = max_tokens_out(real_token_reserves);
+    if token_out == 0 {
         return Ok(0);
     }
-    let mut low = 0u64;
-    let mut high = MAX_SOMPI;
-    while low < high {
-        let mid = low + (high - low + 1) / 2;
-        let fee = calculate_trade_fee(mid, fee_bps)?;
-        let Some(net) = mid.checked_sub(fee) else {
-            return Err(LiquidityMathError::Overflow);
-        };
-        let accepted = cpmm_buy(real_token_reserves, virtual_cpay_reserves_sompi, virtual_token_reserves, net).is_ok();
-        if accepted {
-            low = mid;
-        } else {
-            high = mid - 1;
-        }
-    }
-    Ok(low)
+    min_gross_input_for_token_out(real_token_reserves, virtual_cpay_reserves_sompi, virtual_token_reserves, token_out, fee_bps)
 }
 
 pub fn max_tokens_out(real_token_reserves: u128) -> u128 {
@@ -248,6 +309,73 @@ mod tests {
         }
         assert_eq!(initial_virtual_token_reserves(MIN_LIQUIDITY_SUPPLY_RAW - 1), Err(LiquidityMathError::InvalidInput));
         assert_eq!(initial_virtual_token_reserves(MAX_LIQUIDITY_SUPPLY_RAW + 1), Err(LiquidityMathError::InvalidInput));
+    }
+
+    #[test]
+    fn min_gross_input_for_token_out_removes_integer_overpay() {
+        let budget = 10 * SOMPI_PER_CRYPTIX;
+        let (budget_token_out, _, _, _) =
+            cpmm_buy(LIQUIDITY_TOKEN_SUPPLY_RAW, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_TOKEN_RESERVES, budget)
+                .expect("budget buy should quote");
+        assert_eq!(budget_token_out, 4);
+
+        let canonical = min_gross_input_for_token_out(
+            LIQUIDITY_TOKEN_SUPPLY_RAW,
+            INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+            INITIAL_VIRTUAL_TOKEN_RESERVES,
+            budget_token_out,
+            0,
+        )
+        .expect("canonical input should calculate");
+        assert_eq!(canonical, 833_336_112);
+        assert!(canonical < budget);
+
+        let (previous_token_out, _, _, _) =
+            cpmm_buy(LIQUIDITY_TOKEN_SUPPLY_RAW, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_TOKEN_RESERVES, canonical - 1)
+                .expect("previous input should still buy a smaller whole-token amount");
+        assert_eq!(previous_token_out, 3);
+    }
+
+    #[test]
+    fn min_gross_input_for_token_out_accounts_for_trade_fee_flooring() {
+        let budget = 1_000 * SOMPI_PER_CRYPTIX;
+        let fee_bps = 100;
+        let fee = calculate_trade_fee(budget, fee_bps).expect("fee should calculate");
+        let net = budget - fee;
+        let (budget_token_out, _, _, _) =
+            cpmm_buy(LIQUIDITY_TOKEN_SUPPLY_RAW, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_TOKEN_RESERVES, net)
+                .expect("budget buy should quote");
+        let canonical = min_gross_input_for_token_out(
+            LIQUIDITY_TOKEN_SUPPLY_RAW,
+            INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+            INITIAL_VIRTUAL_TOKEN_RESERVES,
+            budget_token_out,
+            fee_bps,
+        )
+        .expect("canonical input should calculate");
+        assert!(canonical < budget);
+
+        let canonical_fee = calculate_trade_fee(canonical, fee_bps).expect("fee should calculate");
+        let (canonical_token_out, _, _, _) = cpmm_buy(
+            LIQUIDITY_TOKEN_SUPPLY_RAW,
+            INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+            INITIAL_VIRTUAL_TOKEN_RESERVES,
+            canonical - canonical_fee,
+        )
+        .expect("canonical buy should quote");
+        assert_eq!(canonical_token_out, budget_token_out);
+
+        let previous = canonical - 1;
+        let previous_fee = calculate_trade_fee(previous, fee_bps).expect("fee should calculate");
+        let previous_token_out = cpmm_buy(
+            LIQUIDITY_TOKEN_SUPPLY_RAW,
+            INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+            INITIAL_VIRTUAL_TOKEN_RESERVES,
+            previous - previous_fee,
+        )
+        .map(|(token_out, _, _, _)| token_out)
+        .unwrap_or(0);
+        assert!(previous_token_out < budget_token_out);
     }
 
     #[test]
@@ -447,16 +575,16 @@ mod tests {
                 INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
                 INITIAL_VIRTUAL_TOKEN_RESERVES,
                 0,
-                1_249_999_999_999_999,
+                1_249_992_500_037_500,
             ),
             (
                 LIQUIDITY_TOKEN_SUPPLY_RAW,
                 INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
                 INITIAL_VIRTUAL_TOKEN_RESERVES,
                 100,
-                1_262_626_262_626_261,
+                1_262_618_686_906_565,
             ),
-            (500_000, 1_234_567_890_123, 987_654, 250, 1_298_280_622_171),
+            (500_000, 1_234_567_890_123, 987_654, 250, 1_298_275_363_323),
         ];
 
         for (real_tokens, virtual_cpay, virtual_tokens, fee_bps, expected_max) in cases {
@@ -467,17 +595,20 @@ mod tests {
             let net = max - fee;
             let (token_out, new_real_tokens, _, _) =
                 cpmm_buy(real_tokens, virtual_cpay, virtual_tokens, net).expect("max gross buy must be accepted");
-            assert!(token_out > 0);
-            assert!(new_real_tokens >= MIN_REAL_TOKEN_RESERVE);
+            assert_eq!(token_out, max_tokens_out(real_tokens));
+            assert_eq!(new_real_tokens, MIN_REAL_TOKEN_RESERVE);
 
             let over = max + 1;
             let over_fee = calculate_trade_fee(over, fee_bps).expect("over fee should calculate");
             let over_net = over - over_fee;
-            assert_eq!(
-                cpmm_buy(real_tokens, virtual_cpay, virtual_tokens, over_net),
-                Err(LiquidityMathError::InvalidInput),
-                "max+1 gross input must be rejected"
-            );
+            if let Ok((over_token_out, _, _, _)) = cpmm_buy(real_tokens, virtual_cpay, virtual_tokens, over_net) {
+                assert_eq!(over_token_out, token_out);
+                assert_ne!(
+                    over,
+                    min_gross_input_for_token_out(real_tokens, virtual_cpay, virtual_tokens, over_token_out, fee_bps)
+                        .expect("canonical over input should calculate")
+                );
+            }
         }
     }
 

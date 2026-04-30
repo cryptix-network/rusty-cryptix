@@ -1,7 +1,7 @@
 use crate::{
     error::{AtomicTokenError, AtomicTokenResult},
     liquidity_math::{
-        calculate_trade_fee, cpmm_buy, cpmm_sell, initial_virtual_token_reserves, LiquidityMathError,
+        calculate_trade_fee, cpmm_buy, cpmm_sell, initial_virtual_token_reserves, min_gross_input_for_token_out, LiquidityMathError,
         INITIAL_REAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI, LIQUIDITY_MIN_PAYOUT_SOMPI, LIQUIDITY_TOKEN_DECIMALS,
         MAX_LIQUIDITY_SUPPLY_RAW, MIN_CPAY_RESERVE_SOMPI, MIN_LIQUIDITY_SEED_RESERVE_SOMPI, MIN_LIQUIDITY_SUPPLY_RAW,
         MIN_REAL_TOKEN_RESERVE,
@@ -1313,6 +1313,17 @@ impl AtomicTokenState {
             if token_out < op.launch_buy_min_token_out {
                 return Err(NoopReason::MinOutViolation);
             }
+            let canonical_launch_buy = min_gross_input_for_token_out(
+                real_token_reserves,
+                virtual_cpay_reserves_sompi,
+                virtual_token_reserves,
+                token_out,
+                op.fee_bps,
+            )
+            .map_err(map_liquidity_math_error)?;
+            if op.launch_buy_sompi != canonical_launch_buy {
+                return Err(NoopReason::InvalidAmount);
+            }
             real_cpay_reserves_sompi = real_cpay_reserves_sompi.checked_add(launch_buy_net).ok_or(NoopReason::SupplyOverflow)?;
             real_token_reserves = new_real_token_reserves;
             virtual_cpay_reserves_sompi = new_virtual_cpay_reserves_sompi;
@@ -1404,6 +1415,17 @@ impl AtomicTokenState {
                 .map_err(map_liquidity_math_error)?;
         if token_out < op.min_token_out {
             return Err(NoopReason::MinOutViolation);
+        }
+        let canonical_cpay_in = min_gross_input_for_token_out(
+            pool.real_token_reserves,
+            pool.virtual_cpay_reserves_sompi,
+            pool.virtual_token_reserves,
+            token_out,
+            pool.fee_bps,
+        )
+        .map_err(map_liquidity_math_error)?;
+        if op.cpay_in_sompi != canonical_cpay_in {
+            return Err(NoopReason::InvalidAmount);
         }
 
         self.record_asset_before(op.asset_id, journal);
@@ -3012,16 +3034,24 @@ mod tests {
         let owner = owner_id(&state, &owner_script);
         let max_supply = crate::liquidity_math::LIQUIDITY_TOKEN_SUPPLY_RAW;
         let seed_reserve_sompi = MIN_LIQUIDITY_SEED_RESERVE_SOMPI;
-        let launch_buy_sompi = 10 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI;
+        let launch_buy_budget_sompi = 10 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI;
         let launch_min = 1u128;
         let launch_token_out = cpmm_buy(
             max_supply,
             INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
             crate::liquidity_math::INITIAL_VIRTUAL_TOKEN_RESERVES,
-            launch_buy_sompi,
+            launch_buy_budget_sompi,
         )
         .expect("launch quote should work")
         .0;
+        let launch_buy_sompi = crate::liquidity_math::min_gross_input_for_token_out(
+            max_supply,
+            INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+            crate::liquidity_math::INITIAL_VIRTUAL_TOKEN_RESERVES,
+            launch_token_out,
+            0,
+        )
+        .expect("canonical launch buy should calculate");
 
         let create_auth_outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(1), 0);
         let create_payload = payload_create_liquidity(0, 1, max_supply, seed_reserve_sompi, launch_buy_sompi, launch_min);
@@ -3052,11 +3082,19 @@ mod tests {
         assert_ne!(create_event.details.amount, Some(launch_min));
 
         let pool = state.assets.get(&asset_id).and_then(|asset| asset.liquidity.clone()).expect("pool should exist");
-        let buy_in_sompi = 10 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI;
+        let buy_budget_sompi = 10 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI;
         let buy_token_out =
-            cpmm_buy(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, buy_in_sompi)
+            cpmm_buy(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, buy_budget_sompi)
                 .expect("buy quote should work")
                 .0;
+        let buy_in_sompi = crate::liquidity_math::min_gross_input_for_token_out(
+            pool.real_token_reserves,
+            pool.virtual_cpay_reserves_sompi,
+            pool.virtual_token_reserves,
+            buy_token_out,
+            pool.fee_bps,
+        )
+        .expect("canonical buy should calculate");
         let buy_auth_outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(2), 0);
         let buy_payload = payload_buy_liquidity(1, 2, asset_id, pool.pool_nonce, buy_in_sompi, 1);
         let buy_tx = tx_with_inputs_outputs(
@@ -3085,6 +3123,68 @@ mod tests {
     }
 
     #[test]
+    fn liquidity_buy_rejects_noncanonical_integer_overpay() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let owner_payload = vec![0x21; 32];
+        let owner = state.owner_id_from_address_components(0, owner_payload.as_slice()).expect("owner id should derive");
+        let asset_id = [0x21; 32];
+        let vault_outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(21), 0);
+        let overpay_in_sompi = 10 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI;
+
+        state.assets.insert(
+            asset_id,
+            TokenAsset {
+                asset_id,
+                creator_owner_id: owner,
+                asset_class: TokenAssetClass::Liquidity,
+                mint_authority_owner_id: [0u8; 32],
+                decimals: 0,
+                supply_mode: SupplyMode::Capped,
+                max_supply: crate::liquidity_math::LIQUIDITY_TOKEN_SUPPLY_RAW,
+                total_supply: 0,
+                name: b"Overpay".to_vec(),
+                symbol: b"OVR".to_vec(),
+                metadata: vec![],
+                platform_tag: Vec::new(),
+                created_block_hash: None,
+                created_daa_score: None,
+                created_at: None,
+                liquidity: Some(LiquidityPoolState {
+                    pool_nonce: 1,
+                    real_cpay_reserves_sompi: MIN_LIQUIDITY_SEED_RESERVE_SOMPI,
+                    real_token_reserves: crate::liquidity_math::LIQUIDITY_TOKEN_SUPPLY_RAW,
+                    virtual_cpay_reserves_sompi: INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                    virtual_token_reserves: crate::liquidity_math::INITIAL_VIRTUAL_TOKEN_RESERVES,
+                    unclaimed_fee_total_sompi: 0,
+                    fee_bps: 0,
+                    fee_recipients: vec![],
+                    vault_outpoint,
+                    vault_value_sompi: MIN_LIQUIDITY_SEED_RESERVE_SOMPI,
+                    unlock_target_sompi: 0,
+                    unlocked: true,
+                    holder_addresses: HashMap::new(),
+                }),
+            },
+        );
+
+        let buy_tx = tx_with_inputs_outputs(
+            vec![(vault_outpoint, 0)],
+            vec![TransactionOutput::new(MIN_LIQUIDITY_SEED_RESERVE_SOMPI + overpay_in_sompi, liquidity_vault_script())],
+            vec![],
+        );
+        let mut buy_auth_inputs = HashMap::new();
+        buy_auth_inputs.insert(vault_outpoint, UtxoEntry::new(MIN_LIQUIDITY_SEED_RESERVE_SOMPI, liquidity_vault_script(), 0, false));
+        let buyer_auth = AuthContext { owner_id: owner, address_version: 0, address_payload: owner_payload };
+        let buy_op = BuyLiquidityExactInOp { asset_id, expected_pool_nonce: 1, cpay_in_sompi: overpay_in_sompi, min_token_out: 1 };
+        let mut journal = JournalBuilder::default();
+
+        assert_eq!(
+            state.execute_buy_liquidity(&buy_tx, &buyer_auth, &buy_op, &buy_auth_inputs, &mut journal),
+            Err(NoopReason::InvalidAmount)
+        );
+    }
+
+    #[test]
     fn liquidity_lock_blocks_outflows_until_buy_reaches_target_then_stays_unlocked() {
         let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
         let owner_script = test_script(33);
@@ -3092,7 +3192,23 @@ mod tests {
         let owner = state.owner_id_from_address_components(0, owner_payload.as_slice()).expect("owner id should derive");
         let asset_id = [0x44; 32];
         let vault_outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(44), 0);
-        let buy_in_sompi = 10 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI;
+        let buy_budget_sompi = 10 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI;
+        let budget_token_out = cpmm_buy(
+            1_000,
+            INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+            crate::liquidity_math::INITIAL_VIRTUAL_TOKEN_RESERVES,
+            buy_budget_sompi,
+        )
+        .expect("buy quote should work")
+        .0;
+        let buy_in_sompi = crate::liquidity_math::min_gross_input_for_token_out(
+            1_000,
+            INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+            crate::liquidity_math::INITIAL_VIRTUAL_TOKEN_RESERVES,
+            budget_token_out,
+            0,
+        )
+        .expect("canonical buy should calculate");
         let target = MIN_LIQUIDITY_SEED_RESERVE_SOMPI + buy_in_sompi;
 
         state.assets.insert(

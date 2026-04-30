@@ -38,6 +38,8 @@ const LIQUIDITY_TOKEN_SUPPLY_RAW: u128 = 1_000_000;
 const DEFAULT_LIQUIDITY_TOKEN_SUPPLY_RAW: u128 = LIQUIDITY_TOKEN_SUPPLY_RAW;
 const MAX_LIQUIDITY_TOKEN_SUPPLY_RAW: u128 = 10_000_000;
 const MIN_LIQUIDITY_SEED_RESERVE_SOMPI: u64 = SOMPI_PER_CRYPTIX;
+const MIN_LIQUIDITY_REAL_TOKEN_RESERVE_RAW: u128 = 1;
+const INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 250_000_000_000_000;
 
 const DEFAULT_AUTH_INPUT_INDEX: u16 = 0;
 const LIQUIDITY_AUTH_INPUT_INDEX: u16 = 1;
@@ -396,15 +398,38 @@ impl Token {
             return Err(Error::custom("recipient addresses are required when feeBps is > 0"));
         }
 
-        let (sender_opt, metadata, launch_buy_sompi, launch_buy_min_token_out, platform_tag, liquidity_unlock_target_sompi) =
+        let (sender_opt, metadata, launch_buy_budget_sompi, launch_buy_min_token_out, platform_tag, liquidity_unlock_target_sompi) =
             Self::parse_create_liquidity_options(argv)?;
         Self::validate_asset_identity_fields(name.as_str(), symbol.as_str(), metadata.as_slice(), decimals)?;
-        if launch_buy_sompi == 0 && launch_buy_min_token_out != 0 {
+        if launch_buy_budget_sompi == 0 && launch_buy_min_token_out != 0 {
             return Err(Error::custom("launchBuyMinTokenOut must be 0 when launchBuySompi is 0"));
         }
-        if launch_buy_sompi > 0 && launch_buy_min_token_out == 0 {
+        if launch_buy_budget_sompi > 0 && launch_buy_min_token_out == 0 {
             return Err(Error::custom("launchBuyMinTokenOut must be > 0 when launchBuySompi is > 0"));
         }
+        let (launch_buy_sompi, launch_buy_token_out) = if launch_buy_budget_sompi > 0 {
+            let quoted_token_out = Self::quote_initial_liquidity_buy_token_out(max_supply, launch_buy_budget_sompi, fee_bps)?;
+            if quoted_token_out < launch_buy_min_token_out {
+                return Err(Error::custom(format!(
+                    "launchBuyMinTokenOut is above current launch quote: min={} quote={}",
+                    launch_buy_min_token_out, quoted_token_out
+                )));
+            }
+            let virtual_tokens = Self::initial_liquidity_virtual_token_reserves(max_supply)?;
+            let canonical = Self::min_liquidity_gross_input_for_token_out(
+                max_supply,
+                INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                virtual_tokens,
+                quoted_token_out,
+                fee_bps,
+            )?;
+            (canonical, quoted_token_out)
+        } else {
+            (0, 0)
+        };
+        let launch_buy_unused_budget_sompi = launch_buy_budget_sompi
+            .checked_sub(launch_buy_sompi)
+            .ok_or_else(|| Error::custom("canonical launch buy exceeds provided budget"))?;
 
         let sender_address = sender_opt.unwrap_or(account.receive_address()?);
         let sender_owner_id = Self::resolve_owner_id(&rpc, &sender_address, "--sender").await?;
@@ -448,6 +473,16 @@ impl Token {
             sender_address,
             nonce
         );
+        if launch_buy_budget_sompi > launch_buy_sompi {
+            tprintln!(
+                ctx,
+                "launch buy budget={} canonicalSpend={} unusedBudget={} quotedTokenOut={}",
+                launch_buy_budget_sompi,
+                launch_buy_sompi,
+                launch_buy_unused_budget_sompi,
+                launch_buy_token_out
+            );
+        }
         tprintln!(ctx, "liquidity vault output: value={} sompi script={} ", vault_value, hex::encode(LIQUIDITY_VAULT_SCRIPT));
         tprintln!(ctx, "create tx ids (assetId is txid):");
         for id in ids {
@@ -466,7 +501,7 @@ impl Token {
         let account = ctx.wallet().account()?;
         let rpc = ctx.wallet().rpc_api().clone();
         let asset_id = Self::normalize_asset_id(argv.remove(0).as_str());
-        let cpay_in_sompi = Self::parse_positive_u64(argv.remove(0).as_str(), "cpayInSompi")?;
+        let cpay_budget_sompi = Self::parse_positive_u64(argv.remove(0).as_str(), "cpayInSompi")?;
         let min_token_out = Self::parse_positive_u128(argv.remove(0).as_str(), "minTokenOutRaw")?;
         let sender_address =
             if let Some(sender) = argv.first() { Address::try_from(sender.as_str())? } else { account.receive_address()? };
@@ -479,12 +514,19 @@ impl Token {
                 GetLiquidityQuoteRequest {
                     asset_id: asset_id.clone(),
                     side: LIQUIDITY_QUOTE_SIDE_BUY,
-                    exact_in_amount: cpay_in_sompi.to_string(),
+                    exact_in_amount: cpay_budget_sompi.to_string(),
                     at_block_hash: None,
                 },
             )
             .await?;
         let quoted_token_out = Self::parse_u128(quote.amount_out.as_str(), "quote.amountOut")?;
+        let cpay_in_sompi = Self::parse_positive_u64(quote.exact_in_amount.as_str(), "quote.exactInAmount")?;
+        if cpay_in_sompi > cpay_budget_sompi {
+            return Err(Error::custom(format!(
+                "canonical buy input exceeds provided budget: canonical={} budget={}",
+                cpay_in_sompi, cpay_budget_sompi
+            )));
+        }
         if quoted_token_out < min_token_out {
             return Err(Error::custom(format!(
                 "minTokenOutRaw is above current quote: min={} quote={}",
@@ -523,6 +565,15 @@ impl Token {
             pool.pool_nonce,
             nonce
         );
+        if cpay_budget_sompi > cpay_in_sompi {
+            tprintln!(
+                ctx,
+                "buy budget={} canonicalSpend={} unusedBudget={}",
+                cpay_budget_sompi,
+                cpay_in_sompi,
+                cpay_budget_sompi - cpay_in_sompi
+            );
+        }
         tprintln!(ctx, "tx ids:");
         for id in ids {
             tprintln!(ctx, "  {id}");
@@ -1562,6 +1613,112 @@ impl Token {
             return Err(Error::custom(format!("seedReserveSompi must be exactly {MIN_LIQUIDITY_SEED_RESERVE_SOMPI} (1 CPAY)")));
         }
         Ok(())
+    }
+
+    fn initial_liquidity_virtual_token_reserves(max_supply: u128) -> Result<u128> {
+        if !(MIN_LIQUIDITY_TOKEN_SUPPLY_RAW..=MAX_LIQUIDITY_TOKEN_SUPPLY_RAW).contains(&max_supply) {
+            return Err(Error::custom(format!(
+                "maxSupplyRaw for liquidity tokens must be between {MIN_LIQUIDITY_TOKEN_SUPPLY_RAW} and {MAX_LIQUIDITY_TOKEN_SUPPLY_RAW}"
+            )));
+        }
+        max_supply
+            .checked_mul(6)
+            .and_then(|value| value.checked_div(5))
+            .ok_or_else(|| Error::custom("liquidity virtual token reserve overflow"))
+    }
+
+    fn liquidity_trade_fee(amount: u64, fee_bps: u16) -> Result<u64> {
+        let fee = u128::from(amount)
+            .checked_mul(u128::from(fee_bps))
+            .ok_or_else(|| Error::custom("liquidity fee multiplication overflow"))?
+            / 10_000u128;
+        u64::try_from(fee).map_err(|_| Error::custom("liquidity fee does not fit into u64"))
+    }
+
+    fn ceil_div_u128(numerator: u128, denominator: u128) -> Result<u128> {
+        if denominator == 0 {
+            return Err(Error::custom("division by zero"));
+        }
+        let quotient = numerator / denominator;
+        let remainder = numerator % denominator;
+        Ok(if remainder == 0 { quotient } else { quotient + 1 })
+    }
+
+    fn quote_liquidity_buy_token_out(
+        real_token_reserves: u128,
+        virtual_cpay_reserves_sompi: u64,
+        virtual_token_reserves: u128,
+        gross_in_sompi: u64,
+        fee_bps: u16,
+    ) -> Result<u128> {
+        let fee = Self::liquidity_trade_fee(gross_in_sompi, fee_bps)?;
+        let net_in = gross_in_sompi.checked_sub(fee).ok_or_else(|| Error::custom("liquidity buy fee underflow"))?;
+        if net_in == 0 || real_token_reserves <= MIN_LIQUIDITY_REAL_TOKEN_RESERVE_RAW {
+            return Err(Error::custom("liquidity buy produces zero output"));
+        }
+        let x_before = u128::from(virtual_cpay_reserves_sompi);
+        let x_after = x_before.checked_add(u128::from(net_in)).ok_or_else(|| Error::custom("liquidity buy x_after overflow"))?;
+        let k = x_before.checked_mul(virtual_token_reserves).ok_or_else(|| Error::custom("liquidity buy invariant overflow"))?;
+        let y_after = Self::ceil_div_u128(k, x_after)?;
+        let token_out =
+            virtual_token_reserves.checked_sub(y_after).ok_or_else(|| Error::custom("liquidity buy token_out underflow"))?;
+        if token_out == 0 || token_out > real_token_reserves.saturating_sub(MIN_LIQUIDITY_REAL_TOKEN_RESERVE_RAW) {
+            return Err(Error::custom("liquidity buy produces zero output"));
+        }
+        Ok(token_out)
+    }
+
+    fn quote_initial_liquidity_buy_token_out(max_supply: u128, gross_in_sompi: u64, fee_bps: u16) -> Result<u128> {
+        Self::quote_liquidity_buy_token_out(
+            max_supply,
+            INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+            Self::initial_liquidity_virtual_token_reserves(max_supply)?,
+            gross_in_sompi,
+            fee_bps,
+        )
+    }
+
+    fn min_liquidity_gross_input_for_net_input(net_in_sompi: u64, fee_bps: u16) -> Result<u64> {
+        if net_in_sompi == 0 || fee_bps >= 10_000 {
+            return Err(Error::custom("invalid liquidity net input or feeBps"));
+        }
+        if fee_bps == 0 {
+            return Ok(net_in_sompi);
+        }
+        let fee_denominator =
+            10_000u128.checked_sub(u128::from(fee_bps)).ok_or_else(|| Error::custom("liquidity fee denominator underflow"))?;
+        let gross = (u128::from(net_in_sompi).checked_sub(1).ok_or_else(|| Error::custom("liquidity net input underflow"))?)
+            .checked_mul(10_000u128)
+            .ok_or_else(|| Error::custom("liquidity gross input overflow"))?
+            .checked_div(fee_denominator)
+            .ok_or_else(|| Error::custom("liquidity fee denominator is zero"))?
+            .checked_add(1)
+            .ok_or_else(|| Error::custom("liquidity gross input overflow"))?;
+        u64::try_from(gross).map_err(|_| Error::custom("liquidity gross input does not fit into u64"))
+    }
+
+    fn min_liquidity_gross_input_for_token_out(
+        real_token_reserves: u128,
+        virtual_cpay_reserves_sompi: u64,
+        virtual_token_reserves: u128,
+        token_out: u128,
+        fee_bps: u16,
+    ) -> Result<u64> {
+        if token_out == 0 || token_out > real_token_reserves.saturating_sub(MIN_LIQUIDITY_REAL_TOKEN_RESERVE_RAW) {
+            return Err(Error::custom("invalid liquidity token_out"));
+        }
+        let y_after = virtual_token_reserves.checked_sub(token_out).ok_or_else(|| Error::custom("liquidity y_after underflow"))?;
+        if y_after == 0 {
+            return Err(Error::custom("liquidity y_after cannot be zero"));
+        }
+        let x_before = u128::from(virtual_cpay_reserves_sompi);
+        let k = x_before.checked_mul(virtual_token_reserves).ok_or_else(|| Error::custom("liquidity invariant overflow"))?;
+        let x_after = Self::ceil_div_u128(k, y_after)?;
+        if x_after <= x_before {
+            return Err(Error::custom("liquidity buy produces zero input"));
+        }
+        let net_in = u64::try_from(x_after - x_before).map_err(|_| Error::custom("liquidity net input does not fit into u64"))?;
+        Self::min_liquidity_gross_input_for_net_input(net_in, fee_bps)
     }
 
     fn build_buy_liquidity_payload(

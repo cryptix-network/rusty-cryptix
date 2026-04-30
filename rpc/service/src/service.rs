@@ -10,10 +10,10 @@ use blake2b_simd::Params as Blake2bParams;
 use cryptix_addresses::{Address, Version as AddressVersion};
 use cryptix_atomicindex::{
     liquidity_math::{
-        calculate_trade_fee, cpmm_buy, cpmm_sell, max_buy_in_sompi, max_tokens_out, LiquidityMathError,
-        INITIAL_REAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_TOKEN_RESERVES,
-        LIQUIDITY_MIN_PAYOUT_SOMPI, LIQUIDITY_TOKEN_DECIMALS, LIQUIDITY_TOKEN_SUPPLY_RAW, MIN_CPAY_RESERVE_SOMPI,
-        MIN_LIQUIDITY_SEED_RESERVE_SOMPI,
+        calculate_trade_fee, cpmm_buy, cpmm_sell, initial_virtual_token_reserves, max_buy_in_sompi, max_tokens_out,
+        min_gross_input_for_token_out, LiquidityMathError, INITIAL_REAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+        LIQUIDITY_MIN_PAYOUT_SOMPI, LIQUIDITY_TOKEN_DECIMALS, MAX_LIQUIDITY_SUPPLY_RAW, MIN_CPAY_RESERVE_SOMPI,
+        MIN_LIQUIDITY_SEED_RESERVE_SOMPI, MIN_LIQUIDITY_SUPPLY_RAW,
     },
     payload::{
         parse_atomic_token_payload, BuyLiquidityExactInOp, CreateAssetWithMintOp, CreateLiquidityAssetOp, NoopReason,
@@ -647,7 +647,7 @@ impl RpcCoreService {
         if op.decimals != LIQUIDITY_TOKEN_DECIMALS {
             return Some(NoopReason::BadDecimals);
         }
-        if op.max_supply != LIQUIDITY_TOKEN_SUPPLY_RAW {
+        if !(MIN_LIQUIDITY_SUPPLY_RAW..=MAX_LIQUIDITY_SUPPLY_RAW).contains(&op.max_supply) {
             return Some(NoopReason::BadMaxSupply);
         }
         if op.seed_reserve_sompi != MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
@@ -667,17 +667,30 @@ impl RpcCoreService {
         let Some(launch_buy_net) = op.launch_buy_sompi.checked_sub(fee_trade) else {
             return Some(NoopReason::SupplyUnderflow);
         };
-        let (token_out, _new_real_token_reserves, _new_virtual_cpay_reserves_sompi, _new_virtual_token_reserves) = match cpmm_buy(
-            LIQUIDITY_TOKEN_SUPPLY_RAW,
-            INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
-            INITIAL_VIRTUAL_TOKEN_RESERVES,
-            launch_buy_net,
-        ) {
-            Ok(state) => state,
+        let virtual_token_reserves = match initial_virtual_token_reserves(op.max_supply) {
+            Ok(value) => value,
             Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
         };
+        let (token_out, _new_real_token_reserves, _new_virtual_cpay_reserves_sompi, _new_virtual_token_reserves) =
+            match cpmm_buy(op.max_supply, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI, virtual_token_reserves, launch_buy_net) {
+                Ok(state) => state,
+                Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+            };
         if token_out < op.launch_buy_min_token_out {
             return Some(NoopReason::MinOutViolation);
+        }
+        let canonical_launch_buy = match min_gross_input_for_token_out(
+            op.max_supply,
+            INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+            virtual_token_reserves,
+            token_out,
+            op.fee_bps,
+        ) {
+            Ok(value) => value,
+            Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+        };
+        if op.launch_buy_sompi != canonical_launch_buy {
+            return Some(NoopReason::InvalidAmount);
         }
         let real_cpay_after = match INITIAL_REAL_CPAY_RESERVES_SOMPI.checked_add(launch_buy_net) {
             Some(value) => value,
@@ -709,6 +722,19 @@ impl RpcCoreService {
             };
         if token_out < op.min_token_out {
             return Some(NoopReason::MinOutViolation);
+        }
+        let canonical_cpay_in = match min_gross_input_for_token_out(
+            pool.real_token_reserves,
+            pool.virtual_cpay_reserves_sompi,
+            pool.virtual_token_reserves,
+            token_out,
+            pool.fee_bps,
+        ) {
+            Ok(value) => value,
+            Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+        };
+        if op.cpay_in_sompi != canonical_cpay_in {
+            return Some(NoopReason::InvalidAmount);
         }
         let Some(total_supply_after) = asset.total_supply.checked_add(token_out) else {
             return Some(NoopReason::SupplyOverflow);
@@ -2477,21 +2503,34 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         }
         let pool = asset.liquidity.as_ref().ok_or_else(|| RpcError::General("liquidity state missing for asset".to_string()))?;
 
-        let (fee_amount_sompi, net_in_amount, amount_out) = match side {
+        let (effective_exact_in_amount, fee_amount_sompi, net_in_amount, amount_out) = match side {
             LIQUIDITY_QUOTE_SIDE_BUY => {
-                let cpay_in = exact_in_amount
+                let cpay_budget = exact_in_amount
                     .parse::<u64>()
                     .map_err(|e| RpcError::General(format!("invalid `exactInAmount` for buy side: {e}")))?;
-                if cpay_in == 0 {
+                if cpay_budget == 0 {
                     return Err(Self::cat_error_with_detail(CAT_ERR_ZERO_OUTPUT, "buy exactInAmount must be > 0"));
                 }
-                let fee_trade = calculate_trade_fee(cpay_in, pool.fee_bps).map_err(Self::map_liquidity_math_error)?;
-                let cpay_net_in =
-                    cpay_in.checked_sub(fee_trade).ok_or_else(|| RpcError::General("liquidity quote underflow".to_string()))?;
+                let budget_fee_trade = calculate_trade_fee(cpay_budget, pool.fee_bps).map_err(Self::map_liquidity_math_error)?;
+                let cpay_net_in = cpay_budget
+                    .checked_sub(budget_fee_trade)
+                    .ok_or_else(|| RpcError::General("liquidity quote underflow".to_string()))?;
                 let (token_out, _, _, _) =
                     cpmm_buy(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, cpay_net_in)
                         .map_err(Self::map_liquidity_math_error)?;
-                (fee_trade.to_string(), cpay_net_in.to_string(), token_out.to_string())
+                let canonical_cpay_in = min_gross_input_for_token_out(
+                    pool.real_token_reserves,
+                    pool.virtual_cpay_reserves_sompi,
+                    pool.virtual_token_reserves,
+                    token_out,
+                    pool.fee_bps,
+                )
+                .map_err(Self::map_liquidity_math_error)?;
+                let fee_trade = calculate_trade_fee(canonical_cpay_in, pool.fee_bps).map_err(Self::map_liquidity_math_error)?;
+                let cpay_net_in = canonical_cpay_in
+                    .checked_sub(fee_trade)
+                    .ok_or_else(|| RpcError::General("liquidity quote underflow".to_string()))?;
+                (canonical_cpay_in.to_string(), fee_trade.to_string(), cpay_net_in.to_string(), token_out.to_string())
             }
             LIQUIDITY_QUOTE_SIDE_SELL => {
                 let token_in = exact_in_amount
@@ -2515,7 +2554,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                         format!("liquidity quote output below minimum payout: {cpay_out} < {LIQUIDITY_MIN_PAYOUT_SOMPI}"),
                     ));
                 }
-                (fee_trade.to_string(), token_in.to_string(), cpay_out.to_string())
+                (exact_in_amount.clone(), fee_trade.to_string(), token_in.to_string(), cpay_out.to_string())
             }
             _ => {
                 return Err(RpcError::General("invalid `side` (expected 0=buy or 1=sell)".to_string()));
@@ -2523,7 +2562,14 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         };
 
         let context = self.atomic_context(&view).await?;
-        Ok(GetLiquidityQuoteResponse { side, exact_in_amount, fee_amount_sompi, net_in_amount, amount_out, context })
+        Ok(GetLiquidityQuoteResponse {
+            side,
+            exact_in_amount: effective_exact_in_amount,
+            fee_amount_sompi,
+            net_in_amount,
+            amount_out,
+            context,
+        })
     }
 
     async fn get_liquidity_fee_state_call(
@@ -2884,6 +2930,7 @@ impl AsyncService for RpcCoreService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cryptix_atomicindex::liquidity_math::{INITIAL_VIRTUAL_TOKEN_RESERVES, LIQUIDITY_TOKEN_SUPPLY_RAW};
     use cryptix_consensus_core::{tx::TransactionOutpoint, Hash};
 
     fn sample_liquidity_pool(real_token_reserves: u128, real_cpay_reserves_sompi: u64, fee_bps: u16) -> LiquidityPoolState {
@@ -2975,11 +3022,23 @@ mod tests {
     fn simulate_buy_liquidity_detects_min_out_violation() {
         let pool = sample_liquidity_pool(900, 1_000, 0);
         let asset = sample_liquidity_asset(1_000, 100, pool.clone());
+        let budget_cpay_in_sompi = 10 * INITIAL_REAL_CPAY_RESERVES_SOMPI;
+        let (token_out, _, _, _) =
+            cpmm_buy(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, budget_cpay_in_sompi)
+                .expect("buy quote should work");
+        let canonical_cpay_in_sompi = min_gross_input_for_token_out(
+            pool.real_token_reserves,
+            pool.virtual_cpay_reserves_sompi,
+            pool.virtual_token_reserves,
+            token_out,
+            pool.fee_bps,
+        )
+        .expect("canonical buy should calculate");
         let op = BuyLiquidityExactInOp {
             asset_id: asset.asset_id,
             expected_pool_nonce: pool.pool_nonce,
-            cpay_in_sompi: INITIAL_REAL_CPAY_RESERVES_SOMPI,
-            min_token_out: u128::MAX,
+            cpay_in_sompi: canonical_cpay_in_sompi,
+            min_token_out: token_out + 1,
         };
 
         assert_eq!(RpcCoreService::simulate_buy_liquidity_noop_reason(&asset, &pool, &op), Some(NoopReason::MinOutViolation));

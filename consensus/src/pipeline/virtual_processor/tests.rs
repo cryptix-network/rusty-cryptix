@@ -503,6 +503,43 @@ fn quote_buy(
     (trade_fee, token_out)
 }
 
+fn min_gross_for_net_input(net_in: u64, fee_bps: u16) -> u64 {
+    if fee_bps == 0 {
+        return net_in;
+    }
+    let denominator = 10_000u128 - u128::from(fee_bps);
+    let gross = ((u128::from(net_in) - 1) * 10_000u128) / denominator + 1;
+    u64::try_from(gross).unwrap()
+}
+
+fn min_gross_for_token_out(
+    real_token_reserves: u128,
+    virtual_cpay_reserves_sompi: u64,
+    virtual_token_reserves: u128,
+    token_out: u128,
+    fee_bps: u16,
+) -> u64 {
+    assert!(token_out > 0);
+    assert!(token_out < real_token_reserves);
+    let y_after = virtual_token_reserves - token_out;
+    let x_before = u128::from(virtual_cpay_reserves_sompi);
+    let x_after = ceil_div(x_before * virtual_token_reserves, y_after);
+    min_gross_for_net_input(u64::try_from(x_after - x_before).unwrap(), fee_bps)
+}
+
+fn canonical_buy_from_budget(
+    real_token_reserves: u128,
+    virtual_cpay_reserves_sompi: u64,
+    virtual_token_reserves: u128,
+    budget_in_sompi: u64,
+    fee_bps: u16,
+) -> (u64, u128) {
+    let (_, token_out) = quote_buy(real_token_reserves, virtual_cpay_reserves_sompi, virtual_token_reserves, budget_in_sompi, fee_bps);
+    let canonical_in =
+        min_gross_for_token_out(real_token_reserves, virtual_cpay_reserves_sompi, virtual_token_reserves, token_out, fee_bps);
+    (canonical_in, token_out)
+}
+
 const INITIAL_LIQUIDITY_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 250_000_000_000_000;
 
 fn initial_liquidity_virtual_token_reserves(max_supply: u128) -> u128 {
@@ -564,15 +601,15 @@ async fn setup_dual_owner_liquidity_pool() -> (TestContext, DualOwnerLiquidityFi
     let max_supply = 1_000_000u128;
     let seed_reserve = SOMPI_PER_CRYPTIX;
     let fee_bps = 100u16;
-    let launch_buy = 10 * SOMPI_PER_CRYPTIX;
+    let launch_buy_budget = 10 * SOMPI_PER_CRYPTIX;
     let tx_fee = 10_000u64;
     let owner_anchor_value = 50 * SOMPI_PER_CRYPTIX;
     let second_owner_anchor_value = 50 * SOMPI_PER_CRYPTIX;
-    let (_, launch_token_out) = quote_buy(
+    let (launch_buy, launch_token_out) = canonical_buy_from_budget(
         max_supply,
         INITIAL_LIQUIDITY_VIRTUAL_CPAY_RESERVES_SOMPI,
         initial_liquidity_virtual_token_reserves(max_supply),
-        launch_buy,
+        launch_buy_budget,
         fee_bps,
     );
     let create_vault_value = seed_reserve + launch_buy;
@@ -631,11 +668,16 @@ fn build_liquidity_buy_tx(
     auth_script: &ScriptPublicKey,
     auth_signature_script: Vec<u8>,
     auth_nonce: u64,
-    buy_in: u64,
+    buy_in_budget: u64,
     tx_fee: u64,
 ) -> (Transaction, u128, u64) {
-    let (_, token_out) =
-        quote_buy(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, buy_in, pool.fee_bps);
+    let (buy_in, token_out) = canonical_buy_from_budget(
+        pool.real_token_reserves,
+        pool.virtual_cpay_reserves_sompi,
+        pool.virtual_token_reserves,
+        buy_in_budget,
+        pool.fee_bps,
+    );
     let vault_value = pool.vault_value_sompi + buy_in;
     let change_value = auth_anchor_value - buy_in - tx_fee;
     let tx = payload_tx(
@@ -713,13 +755,13 @@ async fn liquidity_consensus_e2e_create_buy_sell_claim_updates_vault_state() {
     let max_supply = 1_000_000u128;
     let seed_reserve = SOMPI_PER_CRYPTIX;
     let fee_bps = 100u16;
-    let launch_buy = 10 * SOMPI_PER_CRYPTIX;
+    let launch_buy_budget = 10 * SOMPI_PER_CRYPTIX;
     let tx_fee = 10_000u64;
-    let (_, launch_token_out) = quote_buy(
+    let (launch_buy, launch_token_out) = canonical_buy_from_budget(
         max_supply,
         INITIAL_LIQUIDITY_VIRTUAL_CPAY_RESERVES_SOMPI,
         initial_liquidity_virtual_token_reserves(max_supply),
-        launch_buy,
+        launch_buy_budget,
         fee_bps,
     );
     let create_vault_value = seed_reserve + launch_buy;
@@ -753,9 +795,32 @@ async fn liquidity_consensus_e2e_create_buy_sell_claim_updates_vault_state() {
     assert_eq!(pool.vault_value_sompi, create_vault_value);
     assert_eq!(pool.vault_value_sompi, pool.real_cpay_reserves_sompi + pool.unclaimed_fee_total_sompi);
 
-    let buy_in = 10 * SOMPI_PER_CRYPTIX;
-    let (_, buy_token_out) =
-        quote_buy(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, buy_in, fee_bps);
+    let buy_in_budget = 10 * SOMPI_PER_CRYPTIX;
+    let overpay_buy_tx = payload_tx(
+        vec![
+            TransactionInput::new(pool.vault_outpoint, vec![], 0, 0),
+            TransactionInput::new(owner_anchor, p2sh_signature_script(), 0, 0),
+        ],
+        vec![
+            TransactionOutput::new(pool.vault_value_sompi + buy_in_budget, liquidity_vault_script()),
+            TransactionOutput::new(owner_anchor_value - buy_in_budget - tx_fee, owner_script.clone()),
+        ],
+        payload_buy_liquidity(1, 2, asset_id, pool.pool_nonce, buy_in_budget, 1),
+    );
+    let mut overpay_mtx = MutableTransaction::from_tx(overpay_buy_tx);
+    let err = ctx
+        .consensus
+        .validate_mempool_transaction(&mut overpay_mtx, &TransactionValidationArgs::default())
+        .expect_err("overpaying buy should be rejected");
+    assert!(format!("{err:?}").contains("buy CPAY input is not canonical"), "unexpected overpay validation error: {err:?}");
+
+    let (buy_in, buy_token_out) = canonical_buy_from_budget(
+        pool.real_token_reserves,
+        pool.virtual_cpay_reserves_sompi,
+        pool.virtual_token_reserves,
+        buy_in_budget,
+        fee_bps,
+    );
     let buy_vault_value = pool.vault_value_sompi + buy_in;
     owner_anchor_value -= buy_in + tx_fee;
     let buy_payload = payload_buy_liquidity(1, 2, asset_id, pool.pool_nonce, buy_in, 1);
