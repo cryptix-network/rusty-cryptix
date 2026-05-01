@@ -170,6 +170,10 @@ declare! {
         assetId : string;
         poolNonce : bigint;
         curveVersion : number;
+        curveMode : number;
+        curveModeLabel : string;
+        individualVirtualCpayReservesSompi : string;
+        individualVirtualTokenMultiplierBps : number;
         feeBps : number;
         maxSupply : string;
         totalSupply : string;

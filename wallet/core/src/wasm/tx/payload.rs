@@ -15,6 +15,10 @@ const CAT_MAGIC: [u8; 3] = *b"CAT";
 const CAT_VERSION: u8 = 1;
 const CAT_CURRENT_TOKEN_VERSION: u8 = 1;
 const CAT_CURRENT_LIQUIDITY_CURVE_VERSION: u8 = 1;
+const CAT_LIQUIDITY_CURVE_MODE_BASIC: u8 = 0;
+const CAT_LIQUIDITY_CURVE_MODE_AGGRESSIVE: u8 = 1;
+const CAT_LIQUIDITY_CURVE_MODE_INDIVIDUAL: u8 = 2;
+const CAT_DEFAULT_LIQUIDITY_CURVE_MODE: u8 = CAT_LIQUIDITY_CURVE_MODE_BASIC;
 const CAT_MAX_TOKEN_VERSION: u8 = 99;
 const CAT_MAX_LIQUIDITY_CURVE_VERSION: u8 = 99;
 const CAT_FLAGS: u8 = 0;
@@ -32,6 +36,12 @@ const LIQUIDITY_TOKEN_SUPPLY_RAW: u128 = 1_000_000;
 const DEFAULT_LIQUIDITY_TOKEN_SUPPLY_RAW: u128 = LIQUIDITY_TOKEN_SUPPLY_RAW;
 const MAX_LIQUIDITY_TOKEN_SUPPLY_RAW: u128 = 10_000_000;
 const MIN_LIQUIDITY_SEED_RESERVE_SOMPI: u64 = SOMPI_PER_CRYPTIX;
+const INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 100_000_000_000_000;
+const INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 800_000_000_000_000;
+const INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI: u64 = 10_000_000_000_000;
+const INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS: u16 = 10_100;
+const INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS: u16 = 20_000;
+const INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS: u16 = 100;
 
 const CAT_OP_CREATE_ASSET: u8 = 0;
 const CAT_OP_TRANSFER: u8 = 1;
@@ -631,6 +641,9 @@ pub fn serialize_atomic_token_create_liquidity_asset_payload_js(
     launch_buy_min_token_out: String,
     platform_tag: Option<String>,
     liquidity_unlock_target_sompi: Option<BigInt>,
+    liquidity_curve_mode: Option<u32>,
+    individual_virtual_cpay_reserves_sompi: Option<BigInt>,
+    individual_virtual_token_multiplier_bps: Option<u32>,
 ) -> Result<Vec<u8>> {
     let nonce = parse_u64_bigint("nonce", nonce)?;
     let max_supply = parse_u128_decimal("maxSupply", max_supply.as_str())?;
@@ -677,6 +690,23 @@ pub fn serialize_atomic_token_create_liquidity_asset_payload_js(
     if liquidity_unlock_target_sompi > MAX_SOMPI {
         return Err(Error::custom(format!("liquidityUnlockTargetSompi must be 0 or <= MAX_SOMPI ({MAX_SOMPI})")));
     }
+    let liquidity_curve_mode = match liquidity_curve_mode {
+        Some(value) => parse_u8_from_u32("liquidityCurveMode", value)?,
+        None => CAT_DEFAULT_LIQUIDITY_CURVE_MODE,
+    };
+    let individual_virtual_cpay_reserves_sompi = match individual_virtual_cpay_reserves_sompi {
+        Some(value) => parse_u64_bigint("individualVirtualCpayReservesSompi", value)?,
+        None => 0,
+    };
+    let individual_virtual_token_multiplier_bps = match individual_virtual_token_multiplier_bps {
+        Some(value) => parse_u16_from_u32("individualVirtualTokenMultiplierBps", value)?,
+        None => 0,
+    };
+    validate_liquidity_curve_parameters(
+        liquidity_curve_mode,
+        individual_virtual_cpay_reserves_sompi,
+        individual_virtual_token_multiplier_bps,
+    )?;
 
     let mut payload = build_cat_header(CAT_OP_CREATE_LIQUIDITY_ASSET, auth_input_index, nonce)?;
     payload.push(CAT_CURRENT_TOKEN_VERSION);
@@ -698,11 +728,69 @@ pub fn serialize_atomic_token_create_liquidity_asset_payload_js(
     }
     payload.extend_from_slice(&launch_buy_sompi.to_le_bytes());
     payload.extend_from_slice(&launch_buy_min_token_out.to_le_bytes());
-    if !platform_tag.is_empty() || liquidity_unlock_target_sompi > 0 {
+    if !platform_tag.is_empty()
+        || liquidity_unlock_target_sompi > 0
+        || liquidity_curve_mode != CAT_DEFAULT_LIQUIDITY_CURVE_MODE
+        || individual_virtual_cpay_reserves_sompi != 0
+        || individual_virtual_token_multiplier_bps != 0
+    {
         append_platform_tag_tail(&mut payload, platform_tag.as_str())?;
         payload.extend_from_slice(&liquidity_unlock_target_sompi.to_le_bytes());
+        payload.push(liquidity_curve_mode);
+        if liquidity_curve_mode == CAT_LIQUIDITY_CURVE_MODE_INDIVIDUAL {
+            payload.extend_from_slice(&individual_virtual_cpay_reserves_sompi.to_le_bytes());
+            payload.extend_from_slice(&individual_virtual_token_multiplier_bps.to_le_bytes());
+        }
     }
     Ok(payload)
+}
+
+fn validate_liquidity_curve_mode(curve_mode: u8) -> Result<()> {
+    match curve_mode {
+        CAT_LIQUIDITY_CURVE_MODE_BASIC | CAT_LIQUIDITY_CURVE_MODE_AGGRESSIVE | CAT_LIQUIDITY_CURVE_MODE_INDIVIDUAL => Ok(()),
+        _ => Err(Error::custom("liquidityCurveMode must be 0/basic, 1/aggressive, or 2/individual")),
+    }
+}
+
+fn validate_individual_liquidity_curve_params(virtual_cpay_reserves_sompi: u64, virtual_token_multiplier_bps: u16) -> Result<()> {
+    if !(INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI..=INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI)
+        .contains(&virtual_cpay_reserves_sompi)
+    {
+        return Err(Error::custom("individualVirtualCpayReservesSompi must be between 1.0M and 8.0M CPAY"));
+    }
+    if virtual_cpay_reserves_sompi % INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI != 0 {
+        return Err(Error::custom("individualVirtualCpayReservesSompi must use 0.1M CPAY steps"));
+    }
+    if !(INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS..=INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS)
+        .contains(&virtual_token_multiplier_bps)
+    {
+        return Err(Error::custom("individualVirtualTokenMultiplierBps must be between 10100 and 20000"));
+    }
+    if virtual_token_multiplier_bps % INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS != 0 {
+        return Err(Error::custom("individualVirtualTokenMultiplierBps must use 100 bps steps"));
+    }
+    Ok(())
+}
+
+fn validate_liquidity_curve_parameters(
+    curve_mode: u8,
+    individual_virtual_cpay_reserves_sompi: u64,
+    individual_virtual_token_multiplier_bps: u16,
+) -> Result<()> {
+    validate_liquidity_curve_mode(curve_mode)?;
+    match curve_mode {
+        CAT_LIQUIDITY_CURVE_MODE_BASIC | CAT_LIQUIDITY_CURVE_MODE_AGGRESSIVE => {
+            if individual_virtual_cpay_reserves_sompi == 0 && individual_virtual_token_multiplier_bps == 0 {
+                Ok(())
+            } else {
+                Err(Error::custom("individual liquidity parameters are only allowed with individual curve mode"))
+            }
+        }
+        CAT_LIQUIDITY_CURVE_MODE_INDIVIDUAL => {
+            validate_individual_liquidity_curve_params(individual_virtual_cpay_reserves_sompi, individual_virtual_token_multiplier_bps)
+        }
+        _ => Err(Error::custom("liquidityCurveMode must be 0/basic, 1/aggressive, or 2/individual")),
+    }
 }
 
 fn validate_liquidity_create_parameters(decimals: u8, max_supply: u128, seed_reserve_sompi: u64) -> Result<()> {

@@ -63,8 +63,20 @@ const MAX_LIQUIDITY_SUPPLY_RAW: u128 = 10_000_000;
 const INITIAL_REAL_CPAY_RESERVES_SOMPI: u64 = SOMPI_PER_CRYPTIX;
 const MIN_CPAY_RESERVE_SOMPI: u64 = 1;
 const MIN_REAL_TOKEN_RESERVE: u128 = 1;
+const LIQUIDITY_CURVE_MODE_BASIC: u8 = 0;
+const LIQUIDITY_CURVE_MODE_AGGRESSIVE: u8 = 1;
+const LIQUIDITY_CURVE_MODE_INDIVIDUAL: u8 = 2;
+const DEFAULT_LIQUIDITY_CURVE_MODE: u8 = LIQUIDITY_CURVE_MODE_BASIC;
 const INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 250_000_000_000_000;
 const INITIAL_VIRTUAL_TOKEN_RESERVES: u128 = LIQUIDITY_TOKEN_SUPPLY_RAW * 6 / 5;
+const AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 200_000_000_000_000;
+const INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 100_000_000_000_000;
+const INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 800_000_000_000_000;
+const INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI: u64 = 10_000_000_000_000;
+const INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS: u16 = 10_100;
+const INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS: u16 = 20_000;
+const INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS: u16 = 100;
+const VIRTUAL_TOKEN_MULTIPLIER_BPS_DENOMINATOR: u16 = 10_000;
 
 #[derive(Clone, Copy, Debug)]
 struct VaultTransition {
@@ -310,15 +322,129 @@ fn ceil_div_u256(numerator: Uint256, denominator: Uint256) -> Uint256 {
 }
 
 fn initial_virtual_token_reserves(max_supply: u128) -> TxResult<u128> {
+    initial_virtual_token_reserves_for_mode(max_supply, DEFAULT_LIQUIDITY_CURVE_MODE)
+}
+
+fn validate_liquidity_curve_mode(mode: u8) -> TxResult<()> {
+    match mode {
+        LIQUIDITY_CURVE_MODE_BASIC | LIQUIDITY_CURVE_MODE_AGGRESSIVE | LIQUIDITY_CURVE_MODE_INDIVIDUAL => Ok(()),
+        _ => Err(TxRuleError::InvalidAtomicPayload(format!("unsupported liquidity curve mode `{mode}`"))),
+    }
+}
+
+fn validate_individual_liquidity_curve_params(virtual_cpay_reserves_sompi: u64, virtual_token_multiplier_bps: u16) -> TxResult<()> {
+    if !(INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI..=INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI)
+        .contains(&virtual_cpay_reserves_sompi)
+    {
+        return Err(TxRuleError::InvalidAtomicPayload(format!(
+            "individual liquidity fixed CPAY `{virtual_cpay_reserves_sompi}` is outside allowed range"
+        )));
+    }
+    if virtual_cpay_reserves_sompi % INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI != 0 {
+        return Err(TxRuleError::InvalidAtomicPayload(format!(
+            "individual liquidity fixed CPAY `{virtual_cpay_reserves_sompi}` is not on the allowed step"
+        )));
+    }
+    if !(INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS..=INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS)
+        .contains(&virtual_token_multiplier_bps)
+    {
+        return Err(TxRuleError::InvalidAtomicPayload(format!(
+            "individual liquidity multiplier `{virtual_token_multiplier_bps}` is outside allowed range"
+        )));
+    }
+    if virtual_token_multiplier_bps % INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS != 0 {
+        return Err(TxRuleError::InvalidAtomicPayload(format!(
+            "individual liquidity multiplier `{virtual_token_multiplier_bps}` is not on the allowed step"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_liquidity_curve_parameters(
+    mode: u8,
+    individual_virtual_cpay_reserves_sompi: u64,
+    individual_virtual_token_multiplier_bps: u16,
+) -> TxResult<()> {
+    match mode {
+        LIQUIDITY_CURVE_MODE_BASIC | LIQUIDITY_CURVE_MODE_AGGRESSIVE => {
+            if individual_virtual_cpay_reserves_sompi == 0 && individual_virtual_token_multiplier_bps == 0 {
+                Ok(())
+            } else {
+                Err(TxRuleError::InvalidAtomicPayload(
+                    "non-individual liquidity curve must not encode individual parameters".to_string(),
+                ))
+            }
+        }
+        LIQUIDITY_CURVE_MODE_INDIVIDUAL => {
+            validate_individual_liquidity_curve_params(individual_virtual_cpay_reserves_sompi, individual_virtual_token_multiplier_bps)
+        }
+        _ => Err(TxRuleError::InvalidAtomicPayload(format!("unsupported liquidity curve mode `{mode}`"))),
+    }
+}
+
+fn initial_virtual_cpay_reserves_sompi_for_mode(mode: u8) -> TxResult<u64> {
+    match mode {
+        LIQUIDITY_CURVE_MODE_BASIC => Ok(INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI),
+        LIQUIDITY_CURVE_MODE_AGGRESSIVE => Ok(AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI),
+        _ => Err(TxRuleError::InvalidAtomicPayload(format!("unsupported liquidity curve mode `{mode}`"))),
+    }
+}
+
+fn initial_virtual_cpay_reserves_sompi_for_curve(mode: u8, individual_virtual_cpay_reserves_sompi: u64) -> TxResult<u64> {
+    match mode {
+        LIQUIDITY_CURVE_MODE_INDIVIDUAL => {
+            validate_individual_liquidity_curve_params(
+                individual_virtual_cpay_reserves_sompi,
+                INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS,
+            )?;
+            Ok(individual_virtual_cpay_reserves_sompi)
+        }
+        LIQUIDITY_CURVE_MODE_BASIC | LIQUIDITY_CURVE_MODE_AGGRESSIVE => initial_virtual_cpay_reserves_sompi_for_mode(mode),
+        _ => Err(TxRuleError::InvalidAtomicPayload(format!("unsupported liquidity curve mode `{mode}`"))),
+    }
+}
+
+fn initial_virtual_token_reserves_for_mode(max_supply: u128, mode: u8) -> TxResult<u128> {
     if !(MIN_LIQUIDITY_SUPPLY_RAW..=MAX_LIQUIDITY_SUPPLY_RAW).contains(&max_supply) {
         return Err(TxRuleError::InvalidAtomicPayload(format!(
             "liquidity asset max_supply must be in `{MIN_LIQUIDITY_SUPPLY_RAW}..={MAX_LIQUIDITY_SUPPLY_RAW}`"
         )));
     }
+    let (numerator, denominator) = match mode {
+        LIQUIDITY_CURVE_MODE_BASIC => (6u128, 5u128),
+        LIQUIDITY_CURVE_MODE_AGGRESSIVE => (21u128, 20u128),
+        _ => return Err(TxRuleError::InvalidAtomicPayload(format!("unsupported liquidity curve mode `{mode}`"))),
+    };
     max_supply
-        .checked_mul(6)
-        .and_then(|value| value.checked_div(5))
+        .checked_mul(numerator)
+        .and_then(|value| value.checked_div(denominator))
         .ok_or_else(|| TxRuleError::InvalidAtomicPayload("liquidity virtual token reserve overflow".to_string()))
+}
+
+fn initial_virtual_token_reserves_for_curve(
+    max_supply: u128,
+    mode: u8,
+    individual_virtual_token_multiplier_bps: u16,
+) -> TxResult<u128> {
+    if !(MIN_LIQUIDITY_SUPPLY_RAW..=MAX_LIQUIDITY_SUPPLY_RAW).contains(&max_supply) {
+        return Err(TxRuleError::InvalidAtomicPayload(format!(
+            "liquidity asset max_supply must be in `{MIN_LIQUIDITY_SUPPLY_RAW}..={MAX_LIQUIDITY_SUPPLY_RAW}`"
+        )));
+    }
+    match mode {
+        LIQUIDITY_CURVE_MODE_INDIVIDUAL => {
+            validate_individual_liquidity_curve_params(
+                INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
+                individual_virtual_token_multiplier_bps,
+            )?;
+            max_supply
+                .checked_mul(u128::from(individual_virtual_token_multiplier_bps))
+                .and_then(|value| value.checked_div(u128::from(VIRTUAL_TOKEN_MULTIPLIER_BPS_DENOMINATOR)))
+                .ok_or_else(|| TxRuleError::InvalidAtomicPayload("liquidity virtual token reserve overflow".to_string()))
+        }
+        LIQUIDITY_CURVE_MODE_BASIC | LIQUIDITY_CURVE_MODE_AGGRESSIVE => initial_virtual_token_reserves_for_mode(max_supply, mode),
+        _ => Err(TxRuleError::InvalidAtomicPayload(format!("unsupported liquidity curve mode `{mode}`"))),
+    }
 }
 
 fn atomic_op_allows_liquidity_vault_output(op: &AtomicPayloadOp) -> bool {
@@ -868,6 +994,9 @@ impl VirtualStateProcessor {
             AtomicPayloadOp::CreateLiquidityAsset {
                 token_version,
                 curve_version,
+                curve_mode,
+                individual_virtual_cpay_reserves_sompi,
+                individual_virtual_token_multiplier_bps,
                 decimals,
                 max_supply,
                 name: _,
@@ -889,6 +1018,12 @@ impl VirtualStateProcessor {
                     )));
                 }
                 validate_liquidity_creation_parameters(decimals, max_supply, seed_reserve_sompi)?;
+                validate_liquidity_curve_mode(curve_mode)?;
+                validate_liquidity_curve_parameters(
+                    curve_mode,
+                    individual_virtual_cpay_reserves_sompi,
+                    individual_virtual_token_multiplier_bps,
+                )?;
                 validate_liquidity_unlock_target(liquidity_unlock_target_sompi)?;
                 let (vault_output_index, vault_output_value) = self.resolve_create_liquidity_vault_output(tx)?;
                 let expected_vault_value = seed_reserve_sompi
@@ -907,8 +1042,10 @@ impl VirtualStateProcessor {
 
                 let mut real_cpay_reserves_sompi = INITIAL_REAL_CPAY_RESERVES_SOMPI;
                 let mut real_token_reserves = max_supply;
-                let mut virtual_cpay_reserves_sompi = INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI;
-                let mut virtual_token_reserves = initial_virtual_token_reserves(max_supply)?;
+                let mut virtual_cpay_reserves_sompi =
+                    initial_virtual_cpay_reserves_sompi_for_curve(curve_mode, individual_virtual_cpay_reserves_sompi)?;
+                let mut virtual_token_reserves =
+                    initial_virtual_token_reserves_for_curve(max_supply, curve_mode, individual_virtual_token_multiplier_bps)?;
                 let mut unclaimed_fee_total_sompi = 0u64;
                 let mut total_supply = 0u128;
 
@@ -974,6 +1111,9 @@ impl VirtualStateProcessor {
                     liquidity: Some(AtomicLiquidityPoolState {
                         pool_nonce: 1,
                         curve_version,
+                        curve_mode,
+                        individual_virtual_cpay_reserves_sompi,
+                        individual_virtual_token_multiplier_bps,
                         real_cpay_reserves_sompi,
                         real_token_reserves,
                         virtual_cpay_reserves_sompi,
@@ -1652,6 +1792,12 @@ impl VirtualStateProcessor {
         if !matches!(asset.supply_mode, AtomicSupplyMode::Capped) {
             return Err(TxRuleError::InvalidAtomicPayload("liquidity assets must always use capped supply mode".to_string()));
         }
+        validate_liquidity_curve_mode(pool.curve_mode)?;
+        validate_liquidity_curve_parameters(
+            pool.curve_mode,
+            pool.individual_virtual_cpay_reserves_sompi,
+            pool.individual_virtual_token_multiplier_bps,
+        )?;
         validate_liquidity_unlock_target(pool.unlock_target_sompi)?;
         if pool.unlock_target_sompi == 0 && !pool.unlocked {
             return Err(TxRuleError::InvalidAtomicPayload("liquidity lock disabled pools must be marked unlocked".to_string()));

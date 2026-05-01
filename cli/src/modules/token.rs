@@ -14,6 +14,10 @@ const CAT_MAGIC: [u8; 3] = *b"CAT";
 const CAT_VERSION: u8 = 1;
 const CAT_CURRENT_TOKEN_VERSION: u8 = 1;
 const CAT_CURRENT_LIQUIDITY_CURVE_VERSION: u8 = 1;
+const CAT_LIQUIDITY_CURVE_MODE_BASIC: u8 = 0;
+const CAT_LIQUIDITY_CURVE_MODE_AGGRESSIVE: u8 = 1;
+const CAT_LIQUIDITY_CURVE_MODE_INDIVIDUAL: u8 = 2;
+const CAT_DEFAULT_LIQUIDITY_CURVE_MODE: u8 = CAT_LIQUIDITY_CURVE_MODE_BASIC;
 const CAT_FLAGS: u8 = 0;
 
 const CAT_OP_CREATE_ASSET: u8 = 0;
@@ -42,6 +46,14 @@ const MAX_LIQUIDITY_TOKEN_SUPPLY_RAW: u128 = 10_000_000;
 const MIN_LIQUIDITY_SEED_RESERVE_SOMPI: u64 = SOMPI_PER_CRYPTIX;
 const MIN_LIQUIDITY_REAL_TOKEN_RESERVE_RAW: u128 = 1;
 const INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 250_000_000_000_000;
+const AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 200_000_000_000_000;
+const INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 100_000_000_000_000;
+const INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 800_000_000_000_000;
+const INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI: u64 = 10_000_000_000_000;
+const INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS: u16 = 10_100;
+const INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS: u16 = 20_000;
+const INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS: u16 = 100;
+const VIRTUAL_TOKEN_MULTIPLIER_BPS_DENOMINATOR: u16 = 10_000;
 
 const DEFAULT_AUTH_INPUT_INDEX: u16 = 0;
 const LIQUIDITY_AUTH_INPUT_INDEX: u16 = 1;
@@ -57,6 +69,18 @@ const LIQUIDITY_VAULT_SCRIPT: [u8; 7] = [0x04, b'C', b'L', b'V', b'1', 0x75, 0x5
 struct LiquidityRecipient {
     address_version: u8,
     address_payload: Vec<u8>,
+}
+
+struct CreateLiquidityOptions {
+    sender: Option<Address>,
+    metadata: Vec<u8>,
+    launch_buy_budget_sompi: u64,
+    launch_buy_min_token_out: u128,
+    platform_tag: String,
+    liquidity_unlock_target_sompi: u64,
+    curve_mode: u8,
+    individual_virtual_cpay_reserves_sompi: u64,
+    individual_virtual_token_multiplier_bps: u16,
 }
 
 struct TokenSnapshot {
@@ -358,7 +382,7 @@ impl Token {
         if argv.len() < 6 {
             tprintln!(
                 ctx,
-                "usage: token create-liquidity <name> <symbol> <decimals=0> <maxSupplyRaw:{MIN_LIQUIDITY_TOKEN_SUPPLY_RAW}..={MAX_LIQUIDITY_TOKEN_SUPPLY_RAW}> <seedReserveSompi={MIN_LIQUIDITY_SEED_RESERVE_SOMPI}> <feeBps> [recipientAddress[,recipientAddress2]] [--launch-buy-sompi=<sompi>] [--launch-buy-min-token-out=<amountRaw>] [--sender=<address>] [--metadata-hex=<hex>] [--platform-tag=<tag>] [--liquidity-unlock-target-sompi=<sompi>]"
+                "usage: token create-liquidity <name> <symbol> <decimals=0> <maxSupplyRaw:{MIN_LIQUIDITY_TOKEN_SUPPLY_RAW}..={MAX_LIQUIDITY_TOKEN_SUPPLY_RAW}> <seedReserveSompi={MIN_LIQUIDITY_SEED_RESERVE_SOMPI}> <feeBps> [recipientAddress[,recipientAddress2]] [--launch-buy-sompi=<sompi>] [--launch-buy-min-token-out=<amountRaw>] [--sender=<address>] [--metadata-hex=<hex>] [--platform-tag=<tag>] [--liquidity-unlock-target-sompi=<sompi>] [--liquidity-mode=basic|aggressive|individual] [--liquidity-individual-fixed-cpay-million=<1.0..8.0>] [--liquidity-individual-supply-multiplier=<1.01..2.00>]"
             );
             tprintln!(ctx, "defaults: maxSupplyRaw={DEFAULT_LIQUIDITY_TOKEN_SUPPLY_RAW}, decimals=0, seedReserveSompi=1 CPAY");
             return Ok(());
@@ -400,40 +424,48 @@ impl Token {
             return Err(Error::custom("recipient addresses are required when feeBps is > 0"));
         }
 
-        let (sender_opt, metadata, launch_buy_budget_sompi, launch_buy_min_token_out, platform_tag, liquidity_unlock_target_sompi) =
-            Self::parse_create_liquidity_options(argv)?;
-        Self::validate_asset_identity_fields(name.as_str(), symbol.as_str(), metadata.as_slice(), decimals)?;
-        if launch_buy_budget_sompi == 0 && launch_buy_min_token_out != 0 {
+        let options = Self::parse_create_liquidity_options(argv)?;
+        Self::validate_asset_identity_fields(name.as_str(), symbol.as_str(), options.metadata.as_slice(), decimals)?;
+        if options.launch_buy_budget_sompi == 0 && options.launch_buy_min_token_out != 0 {
             return Err(Error::custom("launchBuyMinTokenOut must be 0 when launchBuySompi is 0"));
         }
-        if launch_buy_budget_sompi > 0 && launch_buy_min_token_out == 0 {
+        if options.launch_buy_budget_sompi > 0 && options.launch_buy_min_token_out == 0 {
             return Err(Error::custom("launchBuyMinTokenOut must be > 0 when launchBuySompi is > 0"));
         }
-        let (launch_buy_sompi, launch_buy_token_out) = if launch_buy_budget_sompi > 0 {
-            let quoted_token_out = Self::quote_initial_liquidity_buy_token_out(max_supply, launch_buy_budget_sompi, fee_bps)?;
-            if quoted_token_out < launch_buy_min_token_out {
+        let (launch_buy_sompi, launch_buy_token_out) = if options.launch_buy_budget_sompi > 0 {
+            let quoted_token_out = Self::quote_initial_liquidity_buy_token_out(
+                max_supply,
+                options.launch_buy_budget_sompi,
+                fee_bps,
+                options.curve_mode,
+                options.individual_virtual_cpay_reserves_sompi,
+                options.individual_virtual_token_multiplier_bps,
+            )?;
+            if quoted_token_out < options.launch_buy_min_token_out {
                 return Err(Error::custom(format!(
                     "launchBuyMinTokenOut is above current launch quote: min={} quote={}",
-                    launch_buy_min_token_out, quoted_token_out
+                    options.launch_buy_min_token_out, quoted_token_out
                 )));
             }
-            let virtual_tokens = Self::initial_liquidity_virtual_token_reserves(max_supply)?;
-            let canonical = Self::min_liquidity_gross_input_for_token_out(
+            let virtual_cpay =
+                Self::initial_liquidity_virtual_cpay_reserves(options.curve_mode, options.individual_virtual_cpay_reserves_sompi)?;
+            let virtual_tokens = Self::initial_liquidity_virtual_token_reserves(
                 max_supply,
-                INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
-                virtual_tokens,
-                quoted_token_out,
-                fee_bps,
+                options.curve_mode,
+                options.individual_virtual_token_multiplier_bps,
             )?;
+            let canonical =
+                Self::min_liquidity_gross_input_for_token_out(max_supply, virtual_cpay, virtual_tokens, quoted_token_out, fee_bps)?;
             (canonical, quoted_token_out)
         } else {
             (0, 0)
         };
-        let launch_buy_unused_budget_sompi = launch_buy_budget_sompi
+        let launch_buy_unused_budget_sompi = options
+            .launch_buy_budget_sompi
             .checked_sub(launch_buy_sompi)
             .ok_or_else(|| Error::custom("canonical launch buy exceeds provided budget"))?;
 
-        let sender_address = sender_opt.unwrap_or(account.receive_address()?);
+        let sender_address = options.sender.unwrap_or(account.receive_address()?);
         let sender_owner_id = Self::resolve_owner_id(&rpc, &sender_address, "--sender").await?;
         let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str()).await?;
         let payload = Self::build_create_liquidity_asset_payload(
@@ -441,14 +473,17 @@ impl Token {
             symbol.as_str(),
             decimals,
             max_supply,
-            metadata.as_slice(),
+            options.metadata.as_slice(),
             seed_reserve_sompi,
             fee_bps,
             recipients.as_slice(),
             launch_buy_sompi,
-            launch_buy_min_token_out,
-            platform_tag.as_str(),
-            liquidity_unlock_target_sompi,
+            options.launch_buy_min_token_out,
+            options.platform_tag.as_str(),
+            options.liquidity_unlock_target_sompi,
+            options.curve_mode,
+            options.individual_virtual_cpay_reserves_sompi,
+            options.individual_virtual_token_multiplier_bps,
             nonce,
             DEFAULT_AUTH_INPUT_INDEX,
         )?;
@@ -463,23 +498,32 @@ impl Token {
         tprintln!(ctx, "Token create-liquidity - {summary}");
         tprintln!(
             ctx,
-            "name='{}' symbol='{}' decimals={} maxSupply={} seedReserveSompi={} feeBps={} launchBuySompi={} launchBuyMinTokenOut={} sender={} nonce={}",
+            "name='{}' symbol='{}' decimals={} maxSupply={} seedReserveSompi={} feeBps={} liquidityMode={} launchBuySompi={} launchBuyMinTokenOut={} sender={} nonce={}",
             name,
             symbol,
             decimals,
             max_supply,
             seed_reserve_sompi,
             fee_bps,
+            Self::liquidity_curve_mode_label(options.curve_mode),
             launch_buy_sompi,
-            launch_buy_min_token_out,
+            options.launch_buy_min_token_out,
             sender_address,
             nonce
         );
-        if launch_buy_budget_sompi > launch_buy_sompi {
+        if options.curve_mode == CAT_LIQUIDITY_CURVE_MODE_INDIVIDUAL {
+            tprintln!(
+                ctx,
+                "individualCurve fixedCpaySompi={} multiplierBps={}",
+                options.individual_virtual_cpay_reserves_sompi,
+                options.individual_virtual_token_multiplier_bps
+            );
+        }
+        if options.launch_buy_budget_sompi > launch_buy_sompi {
             tprintln!(
                 ctx,
                 "launch buy budget={} canonicalSpend={} unusedBudget={} quotedTokenOut={}",
-                launch_buy_budget_sompi,
+                options.launch_buy_budget_sompi,
                 launch_buy_sompi,
                 launch_buy_unused_budget_sompi,
                 launch_buy_token_out
@@ -1209,16 +1253,20 @@ impl Token {
         Ok((sender, mint_authority, metadata, platform_tag.unwrap_or_default()))
     }
 
-    fn parse_create_liquidity_options(mut argv: Vec<String>) -> Result<(Option<Address>, Vec<u8>, u64, u128, String, u64)> {
+    fn parse_create_liquidity_options(mut argv: Vec<String>) -> Result<CreateLiquidityOptions> {
         let mut sender = None;
         let mut metadata = Vec::new();
         let mut launch_buy_sompi = 0u64;
         let mut launch_buy_min_token_out = 0u128;
         let mut platform_tag = None;
         let mut liquidity_unlock_target_sompi = 0u64;
+        let mut curve_mode = CAT_DEFAULT_LIQUIDITY_CURVE_MODE;
+        let mut individual_virtual_cpay_reserves_sompi = None;
+        let mut individual_virtual_token_multiplier_bps = None;
         let mut launch_buy_sompi_set = false;
         let mut launch_buy_min_set = false;
         let mut unlock_target_set = false;
+        let mut curve_mode_set = false;
 
         while !argv.is_empty() {
             let arg = argv.remove(0);
@@ -1263,9 +1311,25 @@ impl Token {
                 if liquidity_unlock_target_sompi > MAX_SOMPI {
                     return Err(Error::custom(format!("--liquidity-unlock-target-sompi must be 0 or <= MAX_SOMPI ({MAX_SOMPI})")));
                 }
+            } else if let Some(raw) = arg.strip_prefix("--liquidity-mode=") {
+                if curve_mode_set {
+                    return Err(Error::custom("--liquidity-mode provided more than once"));
+                }
+                curve_mode_set = true;
+                curve_mode = Self::parse_liquidity_curve_mode(raw)?;
+            } else if let Some(raw) = arg.strip_prefix("--liquidity-individual-fixed-cpay-million=") {
+                if individual_virtual_cpay_reserves_sompi.is_some() {
+                    return Err(Error::custom("--liquidity-individual-fixed-cpay-million provided more than once"));
+                }
+                individual_virtual_cpay_reserves_sompi = Some(Self::parse_individual_fixed_cpay_million(raw)?);
+            } else if let Some(raw) = arg.strip_prefix("--liquidity-individual-supply-multiplier=") {
+                if individual_virtual_token_multiplier_bps.is_some() {
+                    return Err(Error::custom("--liquidity-individual-supply-multiplier provided more than once"));
+                }
+                individual_virtual_token_multiplier_bps = Some(Self::parse_individual_supply_multiplier_bps(raw)?);
             } else {
                 return Err(Error::custom(format!(
-                    "unknown option `{arg}`. supported: --sender=, --metadata-hex=, --launch-buy-sompi=, --launch-buy-min-token-out=, --platform-tag=, --liquidity-unlock-target-sompi="
+                    "unknown option `{arg}`. supported: --sender=, --metadata-hex=, --launch-buy-sompi=, --launch-buy-min-token-out=, --platform-tag=, --liquidity-unlock-target-sompi=, --liquidity-mode=, --liquidity-individual-fixed-cpay-million=, --liquidity-individual-supply-multiplier="
                 )));
             }
         }
@@ -1274,14 +1338,86 @@ impl Token {
             return Err(Error::custom("--launch-buy-sompi and --launch-buy-min-token-out must be provided together"));
         }
 
-        Ok((
+        let individual_virtual_cpay_reserves_sompi = individual_virtual_cpay_reserves_sompi.unwrap_or(0);
+        let individual_virtual_token_multiplier_bps = individual_virtual_token_multiplier_bps.unwrap_or(0);
+        Self::validate_liquidity_curve_parameters(
+            curve_mode,
+            individual_virtual_cpay_reserves_sompi,
+            individual_virtual_token_multiplier_bps,
+        )?;
+
+        Ok(CreateLiquidityOptions {
             sender,
             metadata,
-            launch_buy_sompi,
+            launch_buy_budget_sompi: launch_buy_sompi,
             launch_buy_min_token_out,
-            platform_tag.unwrap_or_default(),
+            platform_tag: platform_tag.unwrap_or_default(),
             liquidity_unlock_target_sompi,
-        ))
+            curve_mode,
+            individual_virtual_cpay_reserves_sompi,
+            individual_virtual_token_multiplier_bps,
+        })
+    }
+
+    fn parse_liquidity_curve_mode(value: &str) -> Result<u8> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "basic" | "0" => Ok(CAT_LIQUIDITY_CURVE_MODE_BASIC),
+            "aggressive" | "aggressive mode" | "1" => Ok(CAT_LIQUIDITY_CURVE_MODE_AGGRESSIVE),
+            "individual" | "individual mode" | "2" => Ok(CAT_LIQUIDITY_CURVE_MODE_INDIVIDUAL),
+            _ => Err(Error::custom("--liquidity-mode must be `basic`, `aggressive`, or `individual`")),
+        }
+    }
+
+    fn liquidity_curve_mode_label(mode: u8) -> &'static str {
+        match mode {
+            CAT_LIQUIDITY_CURVE_MODE_AGGRESSIVE => "aggressive",
+            CAT_LIQUIDITY_CURVE_MODE_INDIVIDUAL => "individual",
+            _ => "basic",
+        }
+    }
+
+    fn parse_individual_fixed_cpay_million(value: &str) -> Result<u64> {
+        let tenths = Self::parse_fixed_decimal_steps(value, 1, "--liquidity-individual-fixed-cpay-million")?;
+        if !(10..=80).contains(&tenths) {
+            return Err(Error::custom("--liquidity-individual-fixed-cpay-million must be between 1.0 and 8.0"));
+        }
+        tenths.checked_mul(INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI).ok_or_else(|| Error::custom("individual fixed CPAY overflows"))
+    }
+
+    fn parse_individual_supply_multiplier_bps(value: &str) -> Result<u16> {
+        let hundredths = Self::parse_fixed_decimal_steps(value, 2, "--liquidity-individual-supply-multiplier")?;
+        if !(101..=200).contains(&hundredths) {
+            return Err(Error::custom("--liquidity-individual-supply-multiplier must be between 1.01 and 2.00"));
+        }
+        let bps = hundredths.checked_mul(100).ok_or_else(|| Error::custom("individual supply multiplier overflows"))?;
+        u16::try_from(bps).map_err(|_| Error::custom("individual supply multiplier does not fit into u16"))
+    }
+
+    fn parse_fixed_decimal_steps(value: &str, scale_digits: usize, label: &str) -> Result<u64> {
+        let raw = value.trim();
+        if raw.is_empty() {
+            return Err(Error::custom(format!("{label} must not be empty")));
+        }
+        let (whole_raw, frac_raw) = raw.split_once('.').unwrap_or((raw, ""));
+        if whole_raw.is_empty() || !whole_raw.chars().all(|ch| ch.is_ascii_digit()) {
+            return Err(Error::custom(format!("{label} must be a decimal number")));
+        }
+        if frac_raw.len() > scale_digits || !frac_raw.chars().all(|ch| ch.is_ascii_digit()) {
+            return Err(Error::custom(format!("{label} must use at most {scale_digits} decimal places")));
+        }
+        let whole = whole_raw.parse::<u64>().map_err(|err| Error::custom(format!("{label} has an invalid whole part: {err}")))?;
+        let mut frac = if frac_raw.is_empty() {
+            0
+        } else {
+            frac_raw.parse::<u64>().map_err(|err| Error::custom(format!("{label} has an invalid fractional part: {err}")))?
+        };
+        for _ in frac_raw.len()..scale_digits {
+            frac = frac.checked_mul(10).ok_or_else(|| Error::custom(format!("{label} overflows")))?;
+        }
+        let scale = 10u64
+            .checked_pow(u32::try_from(scale_digits).map_err(|_| Error::custom(format!("{label} scale is invalid")))?)
+            .ok_or_else(|| Error::custom(format!("{label} scale overflows")))?;
+        whole.checked_mul(scale).and_then(|value| value.checked_add(frac)).ok_or_else(|| Error::custom(format!("{label} overflows")))
     }
 
     fn parse_liquidity_recipients_csv(csv: &str) -> Result<Vec<LiquidityRecipient>> {
@@ -1560,6 +1696,9 @@ impl Token {
         launch_buy_min_token_out: u128,
         platform_tag: &str,
         liquidity_unlock_target_sompi: u64,
+        curve_mode: u8,
+        individual_virtual_cpay_reserves_sompi: u64,
+        individual_virtual_token_multiplier_bps: u16,
         nonce: u64,
         auth_input_index: u16,
     ) -> Result<Vec<u8>> {
@@ -1573,6 +1712,11 @@ impl Token {
         if liquidity_unlock_target_sompi > MAX_SOMPI {
             return Err(Error::custom(format!("liquidityUnlockTargetSompi must be 0 or <= MAX_SOMPI ({MAX_SOMPI})")));
         }
+        Self::validate_liquidity_curve_parameters(
+            curve_mode,
+            individual_virtual_cpay_reserves_sompi,
+            individual_virtual_token_multiplier_bps,
+        )?;
         Self::validate_liquidity_create_parameters(decimals, max_supply, seed_reserve_sompi)?;
         if recipients.len() > CAT_MAX_LIQUIDITY_RECIPIENTS {
             return Err(Error::custom(format!("recipient list supports at most {CAT_MAX_LIQUIDITY_RECIPIENTS} entries")));
@@ -1598,11 +1742,70 @@ impl Token {
         }
         payload.extend_from_slice(&launch_buy_sompi.to_le_bytes());
         payload.extend_from_slice(&launch_buy_min_token_out.to_le_bytes());
-        if !platform_tag.is_empty() || liquidity_unlock_target_sompi > 0 {
+        if !platform_tag.is_empty()
+            || liquidity_unlock_target_sompi > 0
+            || curve_mode != CAT_DEFAULT_LIQUIDITY_CURVE_MODE
+            || individual_virtual_cpay_reserves_sompi != 0
+            || individual_virtual_token_multiplier_bps != 0
+        {
             Self::append_platform_tag_tail(&mut payload, platform_tag)?;
             payload.extend_from_slice(&liquidity_unlock_target_sompi.to_le_bytes());
+            payload.push(curve_mode);
+            if curve_mode == CAT_LIQUIDITY_CURVE_MODE_INDIVIDUAL {
+                payload.extend_from_slice(&individual_virtual_cpay_reserves_sompi.to_le_bytes());
+                payload.extend_from_slice(&individual_virtual_token_multiplier_bps.to_le_bytes());
+            }
         }
         Ok(payload)
+    }
+
+    fn validate_liquidity_curve_mode(curve_mode: u8) -> Result<()> {
+        match curve_mode {
+            CAT_LIQUIDITY_CURVE_MODE_BASIC | CAT_LIQUIDITY_CURVE_MODE_AGGRESSIVE | CAT_LIQUIDITY_CURVE_MODE_INDIVIDUAL => Ok(()),
+            _ => Err(Error::custom("liquidity curve mode must be basic, aggressive, or individual")),
+        }
+    }
+
+    fn validate_individual_liquidity_curve_params(virtual_cpay_reserves_sompi: u64, virtual_token_multiplier_bps: u16) -> Result<()> {
+        if !(INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI..=INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI)
+            .contains(&virtual_cpay_reserves_sompi)
+        {
+            return Err(Error::custom("individual fixed CPAY must be between 1.0M and 8.0M CPAY"));
+        }
+        if virtual_cpay_reserves_sompi % INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI != 0 {
+            return Err(Error::custom("individual fixed CPAY must use 0.1M CPAY steps"));
+        }
+        if !(INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS..=INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS)
+            .contains(&virtual_token_multiplier_bps)
+        {
+            return Err(Error::custom("individual supply multiplier must be between 1.01x and 2.00x"));
+        }
+        if virtual_token_multiplier_bps % INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS != 0 {
+            return Err(Error::custom("individual supply multiplier must use 0.01x steps"));
+        }
+        Ok(())
+    }
+
+    fn validate_liquidity_curve_parameters(
+        curve_mode: u8,
+        individual_virtual_cpay_reserves_sompi: u64,
+        individual_virtual_token_multiplier_bps: u16,
+    ) -> Result<()> {
+        Self::validate_liquidity_curve_mode(curve_mode)?;
+        match curve_mode {
+            CAT_LIQUIDITY_CURVE_MODE_BASIC | CAT_LIQUIDITY_CURVE_MODE_AGGRESSIVE => {
+                if individual_virtual_cpay_reserves_sompi == 0 && individual_virtual_token_multiplier_bps == 0 {
+                    Ok(())
+                } else {
+                    Err(Error::custom("individual curve parameters are only allowed with --liquidity-mode=individual"))
+                }
+            }
+            CAT_LIQUIDITY_CURVE_MODE_INDIVIDUAL => Self::validate_individual_liquidity_curve_params(
+                individual_virtual_cpay_reserves_sompi,
+                individual_virtual_token_multiplier_bps,
+            ),
+            _ => Err(Error::custom("liquidity curve mode must be basic, aggressive, or individual")),
+        }
     }
 
     fn validate_liquidity_create_parameters(decimals: u8, max_supply: u128, seed_reserve_sompi: u64) -> Result<()> {
@@ -1620,15 +1823,46 @@ impl Token {
         Ok(())
     }
 
-    fn initial_liquidity_virtual_token_reserves(max_supply: u128) -> Result<u128> {
+    fn initial_liquidity_virtual_cpay_reserves(curve_mode: u8, individual_virtual_cpay_reserves_sompi: u64) -> Result<u64> {
+        match curve_mode {
+            CAT_LIQUIDITY_CURVE_MODE_BASIC => Ok(INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI),
+            CAT_LIQUIDITY_CURVE_MODE_AGGRESSIVE => Ok(AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI),
+            CAT_LIQUIDITY_CURVE_MODE_INDIVIDUAL => {
+                Self::validate_individual_liquidity_curve_params(
+                    individual_virtual_cpay_reserves_sompi,
+                    INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS,
+                )?;
+                Ok(individual_virtual_cpay_reserves_sompi)
+            }
+            _ => Err(Error::custom("liquidity curve mode must be basic, aggressive, or individual")),
+        }
+    }
+
+    fn initial_liquidity_virtual_token_reserves(
+        max_supply: u128,
+        curve_mode: u8,
+        individual_virtual_token_multiplier_bps: u16,
+    ) -> Result<u128> {
         if !(MIN_LIQUIDITY_TOKEN_SUPPLY_RAW..=MAX_LIQUIDITY_TOKEN_SUPPLY_RAW).contains(&max_supply) {
             return Err(Error::custom(format!(
                 "maxSupplyRaw for liquidity tokens must be between {MIN_LIQUIDITY_TOKEN_SUPPLY_RAW} and {MAX_LIQUIDITY_TOKEN_SUPPLY_RAW}"
             )));
         }
+        let (numerator, denominator) = match curve_mode {
+            CAT_LIQUIDITY_CURVE_MODE_BASIC => (6u128, 5u128),
+            CAT_LIQUIDITY_CURVE_MODE_AGGRESSIVE => (21u128, 20u128),
+            CAT_LIQUIDITY_CURVE_MODE_INDIVIDUAL => {
+                Self::validate_individual_liquidity_curve_params(
+                    INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
+                    individual_virtual_token_multiplier_bps,
+                )?;
+                (u128::from(individual_virtual_token_multiplier_bps), u128::from(VIRTUAL_TOKEN_MULTIPLIER_BPS_DENOMINATOR))
+            }
+            _ => return Err(Error::custom("liquidity curve mode must be basic, aggressive, or individual")),
+        };
         max_supply
-            .checked_mul(6)
-            .and_then(|value| value.checked_div(5))
+            .checked_mul(numerator)
+            .and_then(|value| value.checked_div(denominator))
             .ok_or_else(|| Error::custom("liquidity virtual token reserve overflow"))
     }
 
@@ -1673,11 +1907,18 @@ impl Token {
         Ok(token_out)
     }
 
-    fn quote_initial_liquidity_buy_token_out(max_supply: u128, gross_in_sompi: u64, fee_bps: u16) -> Result<u128> {
+    fn quote_initial_liquidity_buy_token_out(
+        max_supply: u128,
+        gross_in_sompi: u64,
+        fee_bps: u16,
+        curve_mode: u8,
+        individual_virtual_cpay_reserves_sompi: u64,
+        individual_virtual_token_multiplier_bps: u16,
+    ) -> Result<u128> {
         Self::quote_liquidity_buy_token_out(
             max_supply,
-            INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
-            Self::initial_liquidity_virtual_token_reserves(max_supply)?,
+            Self::initial_liquidity_virtual_cpay_reserves(curve_mode, individual_virtual_cpay_reserves_sompi)?,
+            Self::initial_liquidity_virtual_token_reserves(max_supply, curve_mode, individual_virtual_token_multiplier_bps)?,
             gross_in_sompi,
             fee_bps,
         )
@@ -1801,7 +2042,7 @@ impl Token {
         tprintln!(ctx, "    Create CAT token and mint in same operation. Asset id equals create txid.");
         tprintln!(
             ctx,
-            "  create-liquidity <name> <symbol> <decimals> <maxSupplyRaw> <seedReserveSompi> <feeBps> [recipientAddress[,recipientAddress2]] [--launch-buy-sompi=<sompi>] [--launch-buy-min-token-out=<amountRaw>] [--sender=<address>] [--metadata-hex=<hex>] [--platform-tag=<tag>] [--liquidity-unlock-target-sompi=<sompi>]"
+            "  create-liquidity <name> <symbol> <decimals> <maxSupplyRaw> <seedReserveSompi> <feeBps> [recipientAddress[,recipientAddress2]] [--launch-buy-sompi=<sompi>] [--launch-buy-min-token-out=<amountRaw>] [--sender=<address>] [--metadata-hex=<hex>] [--platform-tag=<tag>] [--liquidity-unlock-target-sompi=<sompi>] [--liquidity-mode=basic|aggressive|individual] [--liquidity-individual-fixed-cpay-million=<1.0..8.0>] [--liquidity-individual-supply-multiplier=<1.01..2.00>]"
         );
         tprintln!(ctx, "    Create CAT liquidity asset (vault value = seedReserveSompi + launchBuySompi).");
         tprintln!(ctx, "  buy-liquidity <assetId> <cpayInSompi> <minTokenOutRaw> [senderAddress]");

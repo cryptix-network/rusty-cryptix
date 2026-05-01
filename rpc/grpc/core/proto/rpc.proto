@@ -1208,6 +1208,10 @@ message RpcLiquidityPoolStateMessage {
   string circulatingMcapCpaySompi = 24;
   string fdvMcapCpaySompi = 25;
   uint32 curveVersion = 26;
+  uint32 curveMode = 27;
+  string curveModeLabel = 28;
+  string individualVirtualCpayReservesSompi = 29;
+  uint32 individualVirtualTokenMultiplierBps = 30;
 }
 
 message GetLiquidityPoolStateRequestMessage {

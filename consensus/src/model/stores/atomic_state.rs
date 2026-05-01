@@ -19,6 +19,16 @@ const ATOMIC_CONSENSUS_STATE_HASH_DOMAIN: &[u8] = b"cryptix-atomic-consensus-sta
 const ATOMIC_STATE_COMMITMENT_DOMAIN: &[u8] = b"cryptix-utxo-atomic-state-commitment-v1";
 pub const ATOMIC_CURRENT_TOKEN_VERSION: u8 = 1;
 pub const ATOMIC_CURRENT_LIQUIDITY_CURVE_VERSION: u8 = 1;
+pub const ATOMIC_LIQUIDITY_CURVE_MODE_BASIC: u8 = 0;
+pub const ATOMIC_LIQUIDITY_CURVE_MODE_AGGRESSIVE: u8 = 1;
+pub const ATOMIC_LIQUIDITY_CURVE_MODE_INDIVIDUAL: u8 = 2;
+pub const ATOMIC_DEFAULT_LIQUIDITY_CURVE_MODE: u8 = ATOMIC_LIQUIDITY_CURVE_MODE_BASIC;
+const ATOMIC_INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 100_000_000_000_000;
+const ATOMIC_INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 800_000_000_000_000;
+const ATOMIC_INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI: u64 = 10_000_000_000_000;
+const ATOMIC_INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS: u16 = 10_100;
+const ATOMIC_INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS: u16 = 20_000;
+const ATOMIC_INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS: u16 = 100;
 const ATOMIC_MAX_TOKEN_VERSION: u8 = 99;
 const ATOMIC_MAX_LIQUIDITY_CURVE_VERSION: u8 = 99;
 const ATOMIC_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
@@ -62,6 +72,12 @@ pub struct AtomicLiquidityPoolState {
     pub pool_nonce: u64,
     #[serde(default = "default_atomic_liquidity_curve_version")]
     pub curve_version: u8,
+    #[serde(default = "default_atomic_liquidity_curve_mode")]
+    pub curve_mode: u8,
+    #[serde(default)]
+    pub individual_virtual_cpay_reserves_sompi: u64,
+    #[serde(default)]
+    pub individual_virtual_token_multiplier_bps: u16,
     pub real_cpay_reserves_sompi: u64,
     pub real_token_reserves: u128,
     pub virtual_cpay_reserves_sompi: u64,
@@ -117,6 +133,10 @@ fn default_atomic_token_version() -> u8 {
 
 fn default_atomic_liquidity_curve_version() -> u8 {
     ATOMIC_CURRENT_LIQUIDITY_CURVE_VERSION
+}
+
+fn default_atomic_liquidity_curve_mode() -> u8 {
+    ATOMIC_DEFAULT_LIQUIDITY_CURVE_MODE
 }
 
 impl AtomicConsensusState {
@@ -363,6 +383,12 @@ fn validate_liquidity_asset_normalized(
         return Err(format!("liquidity asset `{}` has zero pool nonce", faster_hex::hex_string(&asset_id)));
     }
     validate_liquidity_curve_version(pool.curve_version)?;
+    validate_liquidity_curve_mode(pool.curve_mode)?;
+    validate_liquidity_curve_parameters(
+        pool.curve_mode,
+        pool.individual_virtual_cpay_reserves_sompi,
+        pool.individual_virtual_token_multiplier_bps,
+    )?;
     if pool.unlock_target_sompi == 0 && !pool.unlocked {
         return Err(format!("liquidity asset `{}` has disabled lock but is not marked unlocked", faster_hex::hex_string(&asset_id)));
     }
@@ -471,6 +497,56 @@ fn validate_liquidity_curve_version(version: u8) -> Result<(), String> {
     }
 }
 
+fn validate_liquidity_curve_mode(mode: u8) -> Result<(), String> {
+    match mode {
+        ATOMIC_LIQUIDITY_CURVE_MODE_BASIC | ATOMIC_LIQUIDITY_CURVE_MODE_AGGRESSIVE | ATOMIC_LIQUIDITY_CURVE_MODE_INDIVIDUAL => Ok(()),
+        _ => Err(format!("unsupported atomic liquidity curve mode `{mode}`")),
+    }
+}
+
+fn validate_individual_liquidity_curve_params(
+    virtual_cpay_reserves_sompi: u64,
+    virtual_token_multiplier_bps: u16,
+) -> Result<(), String> {
+    if !(ATOMIC_INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI..=ATOMIC_INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI)
+        .contains(&virtual_cpay_reserves_sompi)
+    {
+        return Err(format!("individual liquidity fixed CPAY `{virtual_cpay_reserves_sompi}` is outside allowed range"));
+    }
+    if virtual_cpay_reserves_sompi % ATOMIC_INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI != 0 {
+        return Err(format!("individual liquidity fixed CPAY `{virtual_cpay_reserves_sompi}` is not on the allowed step"));
+    }
+    if !(ATOMIC_INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS..=ATOMIC_INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS)
+        .contains(&virtual_token_multiplier_bps)
+    {
+        return Err(format!("individual liquidity multiplier `{virtual_token_multiplier_bps}` is outside allowed range"));
+    }
+    if virtual_token_multiplier_bps % ATOMIC_INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS != 0 {
+        return Err(format!("individual liquidity multiplier `{virtual_token_multiplier_bps}` is not on the allowed step"));
+    }
+    Ok(())
+}
+
+fn validate_liquidity_curve_parameters(
+    mode: u8,
+    individual_virtual_cpay_reserves_sompi: u64,
+    individual_virtual_token_multiplier_bps: u16,
+) -> Result<(), String> {
+    match mode {
+        ATOMIC_LIQUIDITY_CURVE_MODE_BASIC | ATOMIC_LIQUIDITY_CURVE_MODE_AGGRESSIVE => {
+            if individual_virtual_cpay_reserves_sompi == 0 && individual_virtual_token_multiplier_bps == 0 {
+                Ok(())
+            } else {
+                Err("non-individual liquidity curve must not encode individual parameters".to_string())
+            }
+        }
+        ATOMIC_LIQUIDITY_CURVE_MODE_INDIVIDUAL => {
+            validate_individual_liquidity_curve_params(individual_virtual_cpay_reserves_sompi, individual_virtual_token_multiplier_bps)
+        }
+        _ => Err(format!("unsupported atomic liquidity curve mode `{mode}`")),
+    }
+}
+
 fn atomic_owner_id_from_address_components(address_version: u8, address_payload: &[u8]) -> Option<[u8; 32]> {
     let auth_scheme = match address_version {
         0 if address_payload.len() == 32 => OWNER_AUTH_SCHEME_PUBKEY,
@@ -535,6 +611,9 @@ fn write_asset(out: &mut Vec<u8>, asset: &AtomicAssetState) {
 fn write_liquidity_pool(out: &mut Vec<u8>, pool: &AtomicLiquidityPoolState) {
     write_u64(out, pool.pool_nonce);
     write_u8(out, pool.curve_version);
+    write_u8(out, pool.curve_mode);
+    write_u64(out, pool.individual_virtual_cpay_reserves_sompi);
+    write_u16(out, pool.individual_virtual_token_multiplier_bps);
     write_u64(out, pool.real_cpay_reserves_sompi);
     write_u128(out, pool.real_token_reserves);
     write_u64(out, pool.virtual_cpay_reserves_sompi);
@@ -674,6 +753,15 @@ impl<'a> AtomicStateReader<'a> {
         let pool_nonce = self.read_u64()?;
         let curve_version = self.read_u8()?;
         validate_liquidity_curve_version(curve_version)?;
+        let curve_mode = self.read_u8()?;
+        validate_liquidity_curve_mode(curve_mode)?;
+        let individual_virtual_cpay_reserves_sompi = self.read_u64()?;
+        let individual_virtual_token_multiplier_bps = self.read_u16()?;
+        validate_liquidity_curve_parameters(
+            curve_mode,
+            individual_virtual_cpay_reserves_sompi,
+            individual_virtual_token_multiplier_bps,
+        )?;
         let real_cpay_reserves_sompi = self.read_u64()?;
         let real_token_reserves = self.read_u128()?;
         let virtual_cpay_reserves_sompi = self.read_u64()?;
@@ -704,6 +792,9 @@ impl<'a> AtomicStateReader<'a> {
         Ok(AtomicLiquidityPoolState {
             pool_nonce,
             curve_version,
+            curve_mode,
+            individual_virtual_cpay_reserves_sompi,
+            individual_virtual_token_multiplier_bps,
             real_cpay_reserves_sompi,
             real_token_reserves,
             virtual_cpay_reserves_sompi,
@@ -877,6 +968,9 @@ mod tests {
             liquidity: Some(AtomicLiquidityPoolState {
                 pool_nonce: 17,
                 curve_version: ATOMIC_CURRENT_LIQUIDITY_CURVE_VERSION,
+                curve_mode: ATOMIC_DEFAULT_LIQUIDITY_CURVE_MODE,
+                individual_virtual_cpay_reserves_sompi: 0,
+                individual_virtual_token_multiplier_bps: 0,
                 real_cpay_reserves_sompi: 123_456_789,
                 real_token_reserves: liquidity_remaining,
                 virtual_cpay_reserves_sompi: 1_000_000_000_000,
@@ -986,6 +1080,9 @@ mod tests {
             liquidity: Some(AtomicLiquidityPoolState {
                 pool_nonce: 7,
                 curve_version: ATOMIC_CURRENT_LIQUIDITY_CURVE_VERSION,
+                curve_mode: ATOMIC_DEFAULT_LIQUIDITY_CURVE_MODE,
+                individual_virtual_cpay_reserves_sompi: 0,
+                individual_virtual_token_multiplier_bps: 0,
                 real_cpay_reserves_sompi: 250,
                 real_token_reserves: 9_500,
                 virtual_cpay_reserves_sompi: 1_000_000_000_000,

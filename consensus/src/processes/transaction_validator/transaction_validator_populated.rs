@@ -229,6 +229,16 @@ pub(crate) const CAT_MAGIC: [u8; 3] = *b"CAT";
 const CAT_VERSION: u8 = 1;
 const CAT_CURRENT_TOKEN_VERSION: u8 = 1;
 const CAT_CURRENT_LIQUIDITY_CURVE_VERSION: u8 = 1;
+const CAT_LIQUIDITY_CURVE_MODE_BASIC: u8 = 0;
+const CAT_LIQUIDITY_CURVE_MODE_AGGRESSIVE: u8 = 1;
+const CAT_LIQUIDITY_CURVE_MODE_INDIVIDUAL: u8 = 2;
+const CAT_DEFAULT_LIQUIDITY_CURVE_MODE: u8 = CAT_LIQUIDITY_CURVE_MODE_BASIC;
+const CAT_INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 100_000_000_000_000;
+const CAT_INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 800_000_000_000_000;
+const CAT_INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI: u64 = 10_000_000_000_000;
+const CAT_INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS: u16 = 10_100;
+const CAT_INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS: u16 = 20_000;
+const CAT_INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS: u16 = 100;
 const CAT_MAX_TOKEN_VERSION: u8 = 99;
 const CAT_MAX_LIQUIDITY_CURVE_VERSION: u8 = 99;
 const CAT_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
@@ -297,6 +307,9 @@ pub(crate) enum AtomicPayloadOp {
     CreateLiquidityAsset {
         token_version: u8,
         curve_version: u8,
+        curve_mode: u8,
+        individual_virtual_cpay_reserves_sompi: u64,
+        individual_virtual_token_multiplier_bps: u16,
         decimals: u8,
         max_supply: u128,
         name: Vec<u8>,
@@ -562,11 +575,20 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
             if launch_buy_sompi > 0 && launch_buy_min_token_out == 0 {
                 return Err("launch_buy_min_token_out must be >0 when launch_buy_sompi is >0".to_string());
             }
-            let (platform_tag, liquidity_unlock_target_sompi) = parse_optional_liquidity_create_tail(payload, &mut cursor)?;
+            let (
+                platform_tag,
+                liquidity_unlock_target_sompi,
+                curve_mode,
+                individual_virtual_cpay_reserves_sompi,
+                individual_virtual_token_multiplier_bps,
+            ) = parse_optional_liquidity_create_tail(payload, &mut cursor)?;
 
             AtomicPayloadOp::CreateLiquidityAsset {
                 token_version,
                 curve_version,
+                curve_mode,
+                individual_virtual_cpay_reserves_sompi,
+                individual_virtual_token_multiplier_bps,
                 decimals,
                 max_supply,
                 name,
@@ -710,6 +732,56 @@ fn validate_liquidity_curve_version(version: u8) -> Result<(), String> {
     }
 }
 
+fn validate_liquidity_curve_mode(mode: u8) -> Result<(), String> {
+    match mode {
+        CAT_LIQUIDITY_CURVE_MODE_BASIC | CAT_LIQUIDITY_CURVE_MODE_AGGRESSIVE | CAT_LIQUIDITY_CURVE_MODE_INDIVIDUAL => Ok(()),
+        _ => Err(format!("unsupported CAT liquidity curve mode `{mode}`")),
+    }
+}
+
+fn validate_individual_liquidity_curve_params(
+    virtual_cpay_reserves_sompi: u64,
+    virtual_token_multiplier_bps: u16,
+) -> Result<(), String> {
+    if !(CAT_INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI..=CAT_INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI)
+        .contains(&virtual_cpay_reserves_sompi)
+    {
+        return Err(format!("individual liquidity fixed CPAY `{virtual_cpay_reserves_sompi}` is outside allowed range"));
+    }
+    if virtual_cpay_reserves_sompi % CAT_INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI != 0 {
+        return Err(format!("individual liquidity fixed CPAY `{virtual_cpay_reserves_sompi}` is not on the allowed step"));
+    }
+    if !(CAT_INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS..=CAT_INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS)
+        .contains(&virtual_token_multiplier_bps)
+    {
+        return Err(format!("individual liquidity multiplier `{virtual_token_multiplier_bps}` is outside allowed range"));
+    }
+    if virtual_token_multiplier_bps % CAT_INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS != 0 {
+        return Err(format!("individual liquidity multiplier `{virtual_token_multiplier_bps}` is not on the allowed step"));
+    }
+    Ok(())
+}
+
+fn validate_liquidity_curve_parameters(
+    mode: u8,
+    individual_virtual_cpay_reserves_sompi: u64,
+    individual_virtual_token_multiplier_bps: u16,
+) -> Result<(), String> {
+    match mode {
+        CAT_LIQUIDITY_CURVE_MODE_BASIC | CAT_LIQUIDITY_CURVE_MODE_AGGRESSIVE => {
+            if individual_virtual_cpay_reserves_sompi == 0 && individual_virtual_token_multiplier_bps == 0 {
+                Ok(())
+            } else {
+                Err("non-individual liquidity curve must not encode individual parameters".to_string())
+            }
+        }
+        CAT_LIQUIDITY_CURVE_MODE_INDIVIDUAL => {
+            validate_individual_liquidity_curve_params(individual_virtual_cpay_reserves_sompi, individual_virtual_token_multiplier_bps)
+        }
+        _ => Err(format!("unsupported CAT liquidity curve mode `{mode}`")),
+    }
+}
+
 fn parse_optional_platform_tag_tail(payload: &[u8], cursor: &mut usize) -> Result<Vec<u8>, String> {
     if *cursor == payload.len() {
         return Ok(Vec::new());
@@ -717,9 +789,9 @@ fn parse_optional_platform_tag_tail(payload: &[u8], cursor: &mut usize) -> Resul
     parse_platform_tag(payload, cursor)
 }
 
-fn parse_optional_liquidity_create_tail(payload: &[u8], cursor: &mut usize) -> Result<(Vec<u8>, u64), String> {
+fn parse_optional_liquidity_create_tail(payload: &[u8], cursor: &mut usize) -> Result<(Vec<u8>, u64, u8, u64, u16), String> {
     if *cursor == payload.len() {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, CAT_DEFAULT_LIQUIDITY_CURVE_MODE, 0, 0));
     }
     let platform_tag = parse_platform_tag(payload, cursor)?;
     let liquidity_unlock_target_sompi =
@@ -727,7 +799,30 @@ fn parse_optional_liquidity_create_tail(payload: &[u8], cursor: &mut usize) -> R
     if liquidity_unlock_target_sompi > MAX_SOMPI {
         return Err(format!("liquidity unlock target exceeds MAX_SOMPI `{MAX_SOMPI}`"));
     }
-    Ok((platform_tag, liquidity_unlock_target_sompi))
+    let (curve_mode, individual_virtual_cpay_reserves_sompi, individual_virtual_token_multiplier_bps) = if *cursor == payload.len() {
+        (CAT_DEFAULT_LIQUIDITY_CURVE_MODE, 0, 0)
+    } else {
+        let mode = take_u8(payload, cursor).ok_or_else(|| "truncated CAT liquidity curve mode".to_string())?;
+        validate_liquidity_curve_mode(mode)?;
+        if mode == CAT_LIQUIDITY_CURVE_MODE_INDIVIDUAL {
+            let fixed_cpay =
+                take_u64_le(payload, cursor).ok_or_else(|| "truncated CAT individual liquidity fixed CPAY".to_string())?;
+            let multiplier =
+                take_u16_le(payload, cursor).ok_or_else(|| "truncated CAT individual liquidity multiplier".to_string())?;
+            validate_liquidity_curve_parameters(mode, fixed_cpay, multiplier)?;
+            (mode, fixed_cpay, multiplier)
+        } else {
+            validate_liquidity_curve_parameters(mode, 0, 0)?;
+            (mode, 0, 0)
+        }
+    };
+    Ok((
+        platform_tag,
+        liquidity_unlock_target_sompi,
+        curve_mode,
+        individual_virtual_cpay_reserves_sompi,
+        individual_virtual_token_multiplier_bps,
+    ))
 }
 
 fn parse_platform_tag(payload: &[u8], cursor: &mut usize) -> Result<Vec<u8>, String> {

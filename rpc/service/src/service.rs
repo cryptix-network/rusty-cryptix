@@ -10,10 +10,11 @@ use blake2b_simd::Params as Blake2bParams;
 use cryptix_addresses::{Address, Version as AddressVersion};
 use cryptix_atomicindex::{
     liquidity_math::{
-        calculate_trade_fee, cpmm_buy, cpmm_sell, initial_virtual_token_reserves, max_buy_in_sompi, max_tokens_out,
-        min_gross_input_for_token_out, LiquidityMathError, INITIAL_REAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
-        LIQUIDITY_MIN_PAYOUT_SOMPI, LIQUIDITY_TOKEN_DECIMALS, MAX_LIQUIDITY_SUPPLY_RAW, MIN_CPAY_RESERVE_SOMPI,
-        MIN_LIQUIDITY_SEED_RESERVE_SOMPI, MIN_LIQUIDITY_SUPPLY_RAW,
+        calculate_trade_fee, cpmm_buy, cpmm_sell, initial_virtual_cpay_reserves_sompi_for_curve,
+        initial_virtual_token_reserves_for_curve, liquidity_curve_mode_label, max_buy_in_sompi, max_tokens_out,
+        min_gross_input_for_token_out, validate_liquidity_curve_mode, validate_liquidity_curve_parameters, LiquidityMathError,
+        INITIAL_REAL_CPAY_RESERVES_SOMPI, LIQUIDITY_MIN_PAYOUT_SOMPI, LIQUIDITY_TOKEN_DECIMALS, MAX_LIQUIDITY_SUPPLY_RAW,
+        MIN_CPAY_RESERVE_SOMPI, MIN_LIQUIDITY_SEED_RESERVE_SOMPI, MIN_LIQUIDITY_SUPPLY_RAW,
     },
     payload::{
         parse_atomic_token_payload, BuyLiquidityExactInOp, CreateAssetWithMintOp, CreateLiquidityAssetOp, NoopReason,
@@ -586,6 +587,10 @@ impl RpcCoreService {
             asset_id: asset.asset_id.as_slice().to_hex(),
             pool_nonce: pool.pool_nonce,
             curve_version: u32::from(pool.curve_version),
+            curve_mode: u32::from(pool.curve_mode),
+            curve_mode_label: liquidity_curve_mode_label(pool.curve_mode).to_string(),
+            individual_virtual_cpay_reserves_sompi: pool.individual_virtual_cpay_reserves_sompi.to_string(),
+            individual_virtual_token_multiplier_bps: u32::from(pool.individual_virtual_token_multiplier_bps),
             fee_bps: u32::from(pool.fee_bps),
             max_supply: asset.max_supply.to_string(),
             total_supply: asset.total_supply.to_string(),
@@ -669,6 +674,18 @@ impl RpcCoreService {
         if op.seed_reserve_sompi != MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
             return Some(NoopReason::InvalidAmount);
         }
+        if validate_liquidity_curve_mode(op.curve_mode).is_err() {
+            return Some(NoopReason::BadLiquidityCurveMode);
+        }
+        if validate_liquidity_curve_parameters(
+            op.curve_mode,
+            op.individual_virtual_cpay_reserves_sompi,
+            op.individual_virtual_token_multiplier_bps,
+        )
+        .is_err()
+        {
+            return Some(NoopReason::BadLiquidityCurveMode);
+        }
         if op.liquidity_unlock_target_sompi > MAX_SOMPI {
             return Some(NoopReason::BadLiquidityUnlockTarget);
         }
@@ -683,12 +700,18 @@ impl RpcCoreService {
         let Some(launch_buy_net) = op.launch_buy_sompi.checked_sub(fee_trade) else {
             return Some(NoopReason::SupplyUnderflow);
         };
-        let virtual_token_reserves = match initial_virtual_token_reserves(op.max_supply) {
-            Ok(value) => value,
-            Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
-        };
+        let virtual_cpay_reserves_sompi =
+            match initial_virtual_cpay_reserves_sompi_for_curve(op.curve_mode, op.individual_virtual_cpay_reserves_sompi) {
+                Ok(value) => value,
+                Err(_) => return Some(NoopReason::BadLiquidityCurveMode),
+            };
+        let virtual_token_reserves =
+            match initial_virtual_token_reserves_for_curve(op.max_supply, op.curve_mode, op.individual_virtual_token_multiplier_bps) {
+                Ok(value) => value,
+                Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+            };
         let (token_out, _new_real_token_reserves, _new_virtual_cpay_reserves_sompi, _new_virtual_token_reserves) =
-            match cpmm_buy(op.max_supply, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI, virtual_token_reserves, launch_buy_net) {
+            match cpmm_buy(op.max_supply, virtual_cpay_reserves_sompi, virtual_token_reserves, launch_buy_net) {
                 Ok(state) => state,
                 Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
             };
@@ -697,7 +720,7 @@ impl RpcCoreService {
         }
         let canonical_launch_buy = match min_gross_input_for_token_out(
             op.max_supply,
-            INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+            virtual_cpay_reserves_sompi,
             virtual_token_reserves,
             token_out,
             op.fee_bps,
@@ -2947,7 +2970,10 @@ impl AsyncService for RpcCoreService {
 mod tests {
     use super::*;
     use cryptix_atomicindex::{
-        liquidity_math::{INITIAL_VIRTUAL_TOKEN_RESERVES, LIQUIDITY_TOKEN_SUPPLY_RAW},
+        liquidity_math::{
+            DEFAULT_LIQUIDITY_CURVE_MODE, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_TOKEN_RESERVES,
+            LIQUIDITY_TOKEN_SUPPLY_RAW,
+        },
         payload::{CURRENT_LIQUIDITY_CURVE_VERSION, CURRENT_TOKEN_VERSION},
     };
     use cryptix_consensus_core::{tx::TransactionOutpoint, Hash};
@@ -2956,6 +2982,9 @@ mod tests {
         LiquidityPoolState {
             pool_nonce: 7,
             curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
+            curve_mode: DEFAULT_LIQUIDITY_CURVE_MODE,
+            individual_virtual_cpay_reserves_sompi: 0,
+            individual_virtual_token_multiplier_bps: 0,
             real_cpay_reserves_sompi,
             real_token_reserves,
             virtual_cpay_reserves_sompi: INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
@@ -3025,6 +3054,9 @@ mod tests {
         let op = CreateLiquidityAssetOp {
             token_version: CURRENT_TOKEN_VERSION,
             curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
+            curve_mode: DEFAULT_LIQUIDITY_CURVE_MODE,
+            individual_virtual_cpay_reserves_sompi: 0,
+            individual_virtual_token_multiplier_bps: 0,
             decimals: 0,
             max_supply: LIQUIDITY_TOKEN_SUPPLY_RAW,
             name: b"Pool".to_vec(),

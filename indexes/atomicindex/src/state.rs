@@ -1,10 +1,11 @@
 use crate::{
     error::{AtomicTokenError, AtomicTokenResult},
     liquidity_math::{
-        calculate_trade_fee, cpmm_buy, cpmm_sell, initial_virtual_token_reserves, min_gross_input_for_token_out, LiquidityMathError,
-        INITIAL_REAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI, LIQUIDITY_MIN_PAYOUT_SOMPI, LIQUIDITY_TOKEN_DECIMALS,
-        MAX_LIQUIDITY_SUPPLY_RAW, MIN_CPAY_RESERVE_SOMPI, MIN_LIQUIDITY_SEED_RESERVE_SOMPI, MIN_LIQUIDITY_SUPPLY_RAW,
-        MIN_REAL_TOKEN_RESERVE,
+        calculate_trade_fee, cpmm_buy, cpmm_sell, initial_virtual_cpay_reserves_sompi_for_curve,
+        initial_virtual_token_reserves_for_curve, min_gross_input_for_token_out, validate_liquidity_curve_mode,
+        validate_liquidity_curve_parameters, LiquidityMathError, DEFAULT_LIQUIDITY_CURVE_MODE, INITIAL_REAL_CPAY_RESERVES_SOMPI,
+        LIQUIDITY_MIN_PAYOUT_SOMPI, LIQUIDITY_TOKEN_DECIMALS, MAX_LIQUIDITY_SUPPLY_RAW, MIN_CPAY_RESERVE_SOMPI,
+        MIN_LIQUIDITY_SEED_RESERVE_SOMPI, MIN_LIQUIDITY_SUPPLY_RAW, MIN_REAL_TOKEN_RESERVE,
     },
     payload::{
         parse_atomic_token_payload, ApplyStatus, BuyLiquidityExactInOp, ClaimLiquidityFeesOp, CreateAssetOp, CreateAssetWithMintOp,
@@ -198,6 +199,12 @@ pub struct LiquidityPoolState {
     pub pool_nonce: u64,
     #[serde(default = "default_liquidity_curve_version")]
     pub curve_version: u8,
+    #[serde(default = "default_liquidity_curve_mode")]
+    pub curve_mode: u8,
+    #[serde(default)]
+    pub individual_virtual_cpay_reserves_sompi: u64,
+    #[serde(default)]
+    pub individual_virtual_token_multiplier_bps: u16,
     pub real_cpay_reserves_sompi: u64,
     pub real_token_reserves: u128,
     pub virtual_cpay_reserves_sompi: u64,
@@ -221,6 +228,10 @@ fn default_liquidity_unlocked() -> bool {
 
 fn default_liquidity_curve_version() -> u8 {
     CURRENT_LIQUIDITY_CURVE_VERSION
+}
+
+fn default_liquidity_curve_mode() -> u8 {
+    DEFAULT_LIQUIDITY_CURVE_MODE
 }
 
 fn default_token_version() -> u8 {
@@ -1302,6 +1313,13 @@ impl AtomicTokenState {
         if op.curve_version != CURRENT_LIQUIDITY_CURVE_VERSION {
             return Err(NoopReason::BadLiquidityCurveVersion);
         }
+        validate_liquidity_curve_mode(op.curve_mode).map_err(|_| NoopReason::BadLiquidityCurveMode)?;
+        validate_liquidity_curve_parameters(
+            op.curve_mode,
+            op.individual_virtual_cpay_reserves_sompi,
+            op.individual_virtual_token_multiplier_bps,
+        )
+        .map_err(|_| NoopReason::BadLiquidityCurveMode)?;
         if op.decimals != LIQUIDITY_TOKEN_DECIMALS {
             return Err(NoopReason::BadDecimals);
         }
@@ -1322,8 +1340,12 @@ impl AtomicTokenState {
         let mut fee_recipients = self.build_fee_recipient_state(&op.recipients)?;
         let mut real_cpay_reserves_sompi = INITIAL_REAL_CPAY_RESERVES_SOMPI;
         let mut real_token_reserves = op.max_supply;
-        let mut virtual_cpay_reserves_sompi = INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI;
-        let mut virtual_token_reserves = initial_virtual_token_reserves(op.max_supply).map_err(|_| NoopReason::BadMaxSupply)?;
+        let mut virtual_cpay_reserves_sompi =
+            initial_virtual_cpay_reserves_sompi_for_curve(op.curve_mode, op.individual_virtual_cpay_reserves_sompi)
+                .map_err(|_| NoopReason::BadLiquidityCurveMode)?;
+        let mut virtual_token_reserves =
+            initial_virtual_token_reserves_for_curve(op.max_supply, op.curve_mode, op.individual_virtual_token_multiplier_bps)
+                .map_err(|_| NoopReason::BadMaxSupply)?;
         let mut unclaimed_fee_total_sompi = 0u64;
         let mut total_supply = 0u128;
         let mut holder_addresses: HashMap<[u8; 32], LiquidityHolderAddressState> = HashMap::new();
@@ -1391,6 +1413,9 @@ impl AtomicTokenState {
             liquidity: Some(LiquidityPoolState {
                 pool_nonce: 1,
                 curve_version: op.curve_version,
+                curve_mode: op.curve_mode,
+                individual_virtual_cpay_reserves_sompi: op.individual_virtual_cpay_reserves_sompi,
+                individual_virtual_token_multiplier_bps: op.individual_virtual_token_multiplier_bps,
                 real_cpay_reserves_sompi,
                 real_token_reserves,
                 virtual_cpay_reserves_sompi,
@@ -1787,6 +1812,13 @@ impl AtomicTokenState {
             return Ok(());
         }
         let pool = asset.liquidity.as_ref().ok_or(NoopReason::AssetNotFound)?;
+        validate_liquidity_curve_mode(pool.curve_mode).map_err(|_| NoopReason::BadLiquidityCurveMode)?;
+        validate_liquidity_curve_parameters(
+            pool.curve_mode,
+            pool.individual_virtual_cpay_reserves_sompi,
+            pool.individual_virtual_token_multiplier_bps,
+        )
+        .map_err(|_| NoopReason::BadLiquidityCurveMode)?;
         validate_liquidity_unlock_target(pool.unlock_target_sompi)?;
         if pool.unlock_target_sompi == 0 && !pool.unlocked {
             return Err(NoopReason::InternalMalformedAcceptance);
@@ -2659,6 +2691,9 @@ impl AtomicTokenState {
                     hasher.update(&[1u8]);
                     hasher.update(&pool.pool_nonce.to_le_bytes());
                     hasher.update(&[pool.curve_version]);
+                    hasher.update(&[pool.curve_mode]);
+                    hasher.update(&pool.individual_virtual_cpay_reserves_sompi.to_le_bytes());
+                    hasher.update(&pool.individual_virtual_token_multiplier_bps.to_le_bytes());
                     hasher.update(&pool.real_cpay_reserves_sompi.to_le_bytes());
                     hasher.update(&pool.real_token_reserves.to_le_bytes());
                     hasher.update(&pool.virtual_cpay_reserves_sompi.to_le_bytes());
@@ -2752,6 +2787,7 @@ fn map_liquidity_math_error(err: LiquidityMathError) -> NoopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::liquidity_math::INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI;
     use crate::payload::TokenOpCode;
     use cryptix_consensus_core::{
         constants::TX_VERSION,
@@ -3026,6 +3062,9 @@ mod tests {
                 liquidity: Some(LiquidityPoolState {
                     pool_nonce: 1,
                     curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
+                    curve_mode: DEFAULT_LIQUIDITY_CURVE_MODE,
+                    individual_virtual_cpay_reserves_sompi: 0,
+                    individual_virtual_token_multiplier_bps: 0,
                     real_cpay_reserves_sompi: 1_000_000,
                     real_token_reserves: 900,
                     virtual_cpay_reserves_sompi: INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
@@ -3187,6 +3226,9 @@ mod tests {
                 liquidity: Some(LiquidityPoolState {
                     pool_nonce: 1,
                     curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
+                    curve_mode: DEFAULT_LIQUIDITY_CURVE_MODE,
+                    individual_virtual_cpay_reserves_sompi: 0,
+                    individual_virtual_token_multiplier_bps: 0,
                     real_cpay_reserves_sompi: MIN_LIQUIDITY_SEED_RESERVE_SOMPI,
                     real_token_reserves: crate::liquidity_math::LIQUIDITY_TOKEN_SUPPLY_RAW,
                     virtual_cpay_reserves_sompi: INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
@@ -3269,6 +3311,9 @@ mod tests {
                 liquidity: Some(LiquidityPoolState {
                     pool_nonce: 1,
                     curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
+                    curve_mode: DEFAULT_LIQUIDITY_CURVE_MODE,
+                    individual_virtual_cpay_reserves_sompi: 0,
+                    individual_virtual_token_multiplier_bps: 0,
                     real_cpay_reserves_sompi: MIN_LIQUIDITY_SEED_RESERVE_SOMPI,
                     real_token_reserves: 1_000,
                     virtual_cpay_reserves_sompi: INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
@@ -3393,6 +3438,9 @@ mod tests {
             liquidity: Some(LiquidityPoolState {
                 pool_nonce: 1,
                 curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
+                curve_mode: DEFAULT_LIQUIDITY_CURVE_MODE,
+                individual_virtual_cpay_reserves_sompi: 0,
+                individual_virtual_token_multiplier_bps: 0,
                 real_cpay_reserves_sompi: 50_000,
                 real_token_reserves: 400,
                 virtual_cpay_reserves_sompi: INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
@@ -3435,6 +3483,9 @@ mod tests {
             liquidity: Some(LiquidityPoolState {
                 pool_nonce: 1,
                 curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
+                curve_mode: DEFAULT_LIQUIDITY_CURVE_MODE,
+                individual_virtual_cpay_reserves_sompi: 0,
+                individual_virtual_token_multiplier_bps: 0,
                 real_cpay_reserves_sompi: 0,
                 real_token_reserves: 499,
                 virtual_cpay_reserves_sompi: INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
@@ -3494,6 +3545,9 @@ mod tests {
                 liquidity: Some(LiquidityPoolState {
                     pool_nonce: 1,
                     curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
+                    curve_mode: DEFAULT_LIQUIDITY_CURVE_MODE,
+                    individual_virtual_cpay_reserves_sompi: 0,
+                    individual_virtual_token_multiplier_bps: 0,
                     real_cpay_reserves_sompi: 50_000,
                     real_token_reserves: 900,
                     virtual_cpay_reserves_sompi: INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,

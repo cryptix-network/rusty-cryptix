@@ -12,8 +12,21 @@ pub const MIN_LIQUIDITY_SEED_RESERVE_SOMPI: u64 = SOMPI_PER_CRYPTIX;
 pub const INITIAL_REAL_CPAY_RESERVES_SOMPI: u64 = SOMPI_PER_CRYPTIX;
 pub const MIN_CPAY_RESERVE_SOMPI: u64 = 1;
 pub const MIN_REAL_TOKEN_RESERVE: u128 = 1;
+pub const LIQUIDITY_CURVE_MODE_BASIC: u8 = 0;
+pub const LIQUIDITY_CURVE_MODE_AGGRESSIVE: u8 = 1;
+pub const LIQUIDITY_CURVE_MODE_INDIVIDUAL: u8 = 2;
+pub const DEFAULT_LIQUIDITY_CURVE_MODE: u8 = LIQUIDITY_CURVE_MODE_BASIC;
 pub const INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 250_000_000_000_000;
 pub const INITIAL_VIRTUAL_TOKEN_RESERVES: u128 = LIQUIDITY_TOKEN_SUPPLY_RAW * 6 / 5;
+pub const AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 200_000_000_000_000;
+pub const AGGRESSIVE_INITIAL_VIRTUAL_TOKEN_RESERVES: u128 = LIQUIDITY_TOKEN_SUPPLY_RAW * 21 / 20;
+pub const INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 100_000_000_000_000;
+pub const INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 800_000_000_000_000;
+pub const INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI: u64 = 10_000_000_000_000;
+pub const INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS: u16 = 10_100;
+pub const INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS: u16 = 20_000;
+pub const INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS: u16 = 100;
+pub const VIRTUAL_TOKEN_MULTIPLIER_BPS_DENOMINATOR: u16 = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LiquidityMathError {
@@ -23,11 +36,138 @@ pub enum LiquidityMathError {
     ZeroOutput,
 }
 
+pub fn validate_liquidity_curve_mode(mode: u8) -> Result<(), LiquidityMathError> {
+    match mode {
+        LIQUIDITY_CURVE_MODE_BASIC | LIQUIDITY_CURVE_MODE_AGGRESSIVE | LIQUIDITY_CURVE_MODE_INDIVIDUAL => Ok(()),
+        _ => Err(LiquidityMathError::InvalidInput),
+    }
+}
+
+pub fn liquidity_curve_mode_label(mode: u8) -> &'static str {
+    match mode {
+        LIQUIDITY_CURVE_MODE_AGGRESSIVE => "aggressive",
+        LIQUIDITY_CURVE_MODE_INDIVIDUAL => "individual",
+        _ => "basic",
+    }
+}
+
+pub fn default_liquidity_curve_custom_params(mode: u8) -> (u64, u16) {
+    match mode {
+        LIQUIDITY_CURVE_MODE_INDIVIDUAL => (
+            AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+            INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS + (4 * INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS),
+        ),
+        _ => (0, 0),
+    }
+}
+
+pub fn validate_individual_liquidity_curve_params(
+    virtual_cpay_reserves_sompi: u64,
+    virtual_token_multiplier_bps: u16,
+) -> Result<(), LiquidityMathError> {
+    if !(INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI..=INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI)
+        .contains(&virtual_cpay_reserves_sompi)
+    {
+        return Err(LiquidityMathError::InvalidInput);
+    }
+    if virtual_cpay_reserves_sompi % INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI != 0 {
+        return Err(LiquidityMathError::InvalidInput);
+    }
+    if !(INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS..=INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS)
+        .contains(&virtual_token_multiplier_bps)
+    {
+        return Err(LiquidityMathError::InvalidInput);
+    }
+    if virtual_token_multiplier_bps % INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS != 0 {
+        return Err(LiquidityMathError::InvalidInput);
+    }
+    Ok(())
+}
+
+pub fn validate_liquidity_curve_parameters(
+    mode: u8,
+    individual_virtual_cpay_reserves_sompi: u64,
+    individual_virtual_token_multiplier_bps: u16,
+) -> Result<(), LiquidityMathError> {
+    match mode {
+        LIQUIDITY_CURVE_MODE_BASIC | LIQUIDITY_CURVE_MODE_AGGRESSIVE => {
+            if individual_virtual_cpay_reserves_sompi == 0 && individual_virtual_token_multiplier_bps == 0 {
+                Ok(())
+            } else {
+                Err(LiquidityMathError::InvalidInput)
+            }
+        }
+        LIQUIDITY_CURVE_MODE_INDIVIDUAL => {
+            validate_individual_liquidity_curve_params(individual_virtual_cpay_reserves_sompi, individual_virtual_token_multiplier_bps)
+        }
+        _ => Err(LiquidityMathError::InvalidInput),
+    }
+}
+
+pub fn initial_virtual_cpay_reserves_sompi_for_mode(mode: u8) -> Result<u64, LiquidityMathError> {
+    match mode {
+        LIQUIDITY_CURVE_MODE_BASIC => Ok(INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI),
+        LIQUIDITY_CURVE_MODE_AGGRESSIVE => Ok(AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI),
+        _ => Err(LiquidityMathError::InvalidInput),
+    }
+}
+
+pub fn initial_virtual_cpay_reserves_sompi_for_curve(
+    mode: u8,
+    individual_virtual_cpay_reserves_sompi: u64,
+) -> Result<u64, LiquidityMathError> {
+    match mode {
+        LIQUIDITY_CURVE_MODE_INDIVIDUAL => {
+            validate_individual_liquidity_curve_params(
+                individual_virtual_cpay_reserves_sompi,
+                INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS,
+            )?;
+            Ok(individual_virtual_cpay_reserves_sompi)
+        }
+        LIQUIDITY_CURVE_MODE_BASIC | LIQUIDITY_CURVE_MODE_AGGRESSIVE => initial_virtual_cpay_reserves_sompi_for_mode(mode),
+        _ => Err(LiquidityMathError::InvalidInput),
+    }
+}
+
 pub fn initial_virtual_token_reserves(max_supply: u128) -> Result<u128, LiquidityMathError> {
+    initial_virtual_token_reserves_for_mode(max_supply, LIQUIDITY_CURVE_MODE_BASIC)
+}
+
+pub fn initial_virtual_token_reserves_for_mode(max_supply: u128, mode: u8) -> Result<u128, LiquidityMathError> {
     if !(MIN_LIQUIDITY_SUPPLY_RAW..=MAX_LIQUIDITY_SUPPLY_RAW).contains(&max_supply) {
         return Err(LiquidityMathError::InvalidInput);
     }
-    max_supply.checked_mul(6).ok_or(LiquidityMathError::Overflow)?.checked_div(5).ok_or(LiquidityMathError::Overflow)
+    let (numerator, denominator) = match mode {
+        LIQUIDITY_CURVE_MODE_BASIC => (6u128, 5u128),
+        LIQUIDITY_CURVE_MODE_AGGRESSIVE => (21u128, 20u128),
+        _ => return Err(LiquidityMathError::InvalidInput),
+    };
+    max_supply.checked_mul(numerator).ok_or(LiquidityMathError::Overflow)?.checked_div(denominator).ok_or(LiquidityMathError::Overflow)
+}
+
+pub fn initial_virtual_token_reserves_for_curve(
+    max_supply: u128,
+    mode: u8,
+    individual_virtual_token_multiplier_bps: u16,
+) -> Result<u128, LiquidityMathError> {
+    if !(MIN_LIQUIDITY_SUPPLY_RAW..=MAX_LIQUIDITY_SUPPLY_RAW).contains(&max_supply) {
+        return Err(LiquidityMathError::InvalidInput);
+    }
+    match mode {
+        LIQUIDITY_CURVE_MODE_INDIVIDUAL => {
+            validate_individual_liquidity_curve_params(
+                INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
+                individual_virtual_token_multiplier_bps,
+            )?;
+            max_supply
+                .checked_mul(u128::from(individual_virtual_token_multiplier_bps))
+                .ok_or(LiquidityMathError::Overflow)?
+                .checked_div(u128::from(VIRTUAL_TOKEN_MULTIPLIER_BPS_DENOMINATOR))
+                .ok_or(LiquidityMathError::Overflow)
+        }
+        LIQUIDITY_CURVE_MODE_BASIC | LIQUIDITY_CURVE_MODE_AGGRESSIVE => initial_virtual_token_reserves_for_mode(max_supply, mode),
+        _ => Err(LiquidityMathError::InvalidInput),
+    }
 }
 
 pub fn calculate_trade_fee(amount: u64, fee_bps: u16) -> Result<u64, LiquidityMathError> {
@@ -312,6 +452,228 @@ mod tests {
     }
 
     #[test]
+    fn aggressive_mode_uses_smaller_virtual_reserves() {
+        assert_eq!(
+            initial_virtual_cpay_reserves_sompi_for_mode(LIQUIDITY_CURVE_MODE_AGGRESSIVE),
+            Ok(AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI)
+        );
+        let cases =
+            [(MIN_LIQUIDITY_SUPPLY_RAW, 105_000), (LIQUIDITY_TOKEN_SUPPLY_RAW, 1_050_000), (MAX_LIQUIDITY_SUPPLY_RAW, 10_500_000)];
+        for (max_supply, expected) in cases {
+            assert_eq!(initial_virtual_token_reserves_for_mode(max_supply, LIQUIDITY_CURVE_MODE_AGGRESSIVE), Ok(expected));
+        }
+        assert_eq!(validate_liquidity_curve_mode(99), Err(LiquidityMathError::InvalidInput));
+    }
+
+    #[test]
+    fn individual_mode_uses_strict_integer_curve_params() {
+        assert_eq!(
+            validate_liquidity_curve_parameters(
+                LIQUIDITY_CURVE_MODE_INDIVIDUAL,
+                AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                10_500
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_liquidity_curve_parameters(LIQUIDITY_CURVE_MODE_INDIVIDUAL, INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI, 20_000),
+            Ok(())
+        );
+        assert_eq!(
+            initial_virtual_cpay_reserves_sompi_for_curve(
+                LIQUIDITY_CURVE_MODE_INDIVIDUAL,
+                AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI
+            ),
+            Ok(AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI)
+        );
+        assert_eq!(
+            initial_virtual_token_reserves_for_curve(LIQUIDITY_TOKEN_SUPPLY_RAW, LIQUIDITY_CURVE_MODE_INDIVIDUAL, 10_500),
+            Ok(1_050_000)
+        );
+        assert_eq!(
+            validate_liquidity_curve_parameters(LIQUIDITY_CURVE_MODE_BASIC, AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI, 10_500),
+            Err(LiquidityMathError::InvalidInput)
+        );
+        assert_eq!(
+            validate_liquidity_curve_parameters(
+                LIQUIDITY_CURVE_MODE_INDIVIDUAL,
+                INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI + 1,
+                10_500
+            ),
+            Err(LiquidityMathError::InvalidInput)
+        );
+        assert_eq!(
+            validate_liquidity_curve_parameters(
+                LIQUIDITY_CURVE_MODE_INDIVIDUAL,
+                AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                10_550
+            ),
+            Err(LiquidityMathError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn individual_mode_trade_vectors_are_exact_across_range() {
+        let buy_cases = [
+            (
+                "individual_min_buy_1000_cpay_100bps",
+                LIQUIDITY_TOKEN_SUPPLY_RAW,
+                INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
+                10_100,
+                1_000 * SOMPI_PER_CRYPTIX,
+                100,
+                1_000_000_000,
+                99_000_000_000,
+                998,
+                999_002,
+                100_099_000_000_000,
+                1_009_002,
+            ),
+            (
+                "individual_default_buy_1000_cpay_100bps",
+                LIQUIDITY_TOKEN_SUPPLY_RAW,
+                AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                10_500,
+                1_000 * SOMPI_PER_CRYPTIX,
+                100,
+                1_000_000_000,
+                99_000_000_000,
+                519,
+                999_481,
+                200_099_000_000_000,
+                1_049_481,
+            ),
+            (
+                "individual_max_buy_1000_cpay_100bps",
+                LIQUIDITY_TOKEN_SUPPLY_RAW,
+                INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI,
+                20_000,
+                1_000 * SOMPI_PER_CRYPTIX,
+                100,
+                1_000_000_000,
+                99_000_000_000,
+                247,
+                999_753,
+                800_099_000_000_000,
+                1_999_753,
+            ),
+            (
+                "individual_custom_buy_12345_cpay_40bps",
+                5_000_000,
+                330_000_000_000_000,
+                14_600,
+                12_345 * SOMPI_PER_CRYPTIX,
+                40,
+                4_938_000_000,
+                1_229_562_000_000,
+                27_098,
+                4_972_902,
+                331_229_562_000_000,
+                7_272_902,
+            ),
+        ];
+
+        for (
+            name,
+            max_supply,
+            fixed_cpay,
+            multiplier_bps,
+            gross_in,
+            fee_bps,
+            expected_fee,
+            expected_net,
+            expected_token_out,
+            expected_real_token_reserves,
+            expected_virtual_cpay,
+            expected_virtual_tokens,
+        ) in buy_cases
+        {
+            let virtual_cpay = initial_virtual_cpay_reserves_sompi_for_curve(LIQUIDITY_CURVE_MODE_INDIVIDUAL, fixed_cpay).expect(name);
+            let virtual_tokens =
+                initial_virtual_token_reserves_for_curve(max_supply, LIQUIDITY_CURVE_MODE_INDIVIDUAL, multiplier_bps).expect(name);
+            let (fee, net, token_out, real_token_reserves, new_virtual_cpay, new_virtual_tokens) =
+                buy_with_gross(max_supply, virtual_cpay, virtual_tokens, gross_in, fee_bps).expect(name);
+            assert_eq!(fee, expected_fee, "{name} fee");
+            assert_eq!(net, expected_net, "{name} net");
+            assert_eq!(token_out, expected_token_out, "{name} token_out");
+            assert_eq!(real_token_reserves, expected_real_token_reserves, "{name} real tokens");
+            assert_eq!(new_virtual_cpay, expected_virtual_cpay, "{name} virtual cpay");
+            assert_eq!(new_virtual_tokens, expected_virtual_tokens, "{name} virtual tokens");
+        }
+
+        let sell_cases = [
+            (
+                "individual_min_sell_250_tokens_100bps",
+                99_100_000_000,
+                100_099_000_000_000,
+                1_009_002,
+                250,
+                100,
+                24_795_343_483,
+                247_953_434,
+                24_547_390_049,
+                74_304_656_517,
+                100_074_204_656_517,
+                1_009_252,
+            ),
+            (
+                "individual_max_sell_247_tokens_100bps",
+                99_100_000_000,
+                800_099_000_000_000,
+                1_999_753,
+                247,
+                100,
+                98_812_226_500,
+                988_122_265,
+                97_824_104_235,
+                287_773_500,
+                800_000_187_773_500,
+                2_000_000,
+            ),
+            (
+                "individual_custom_sell_7777_tokens_40bps",
+                1_229_662_000_000,
+                331_229_562_000_000,
+                7_272_902,
+                7_777,
+                40,
+                353_809_349_880,
+                1_415_237_399,
+                352_394_112_481,
+                875_852_650_120,
+                330_875_752_650_120,
+                7_280_679,
+            ),
+        ];
+
+        for (
+            name,
+            real_cpay,
+            virtual_cpay,
+            virtual_tokens,
+            token_in,
+            fee_bps,
+            expected_gross_out,
+            expected_fee,
+            expected_cpay_out,
+            expected_real_cpay,
+            expected_virtual_cpay,
+            expected_virtual_tokens,
+        ) in sell_cases
+        {
+            let (gross_out, new_real_cpay, new_virtual_cpay, new_virtual_tokens) =
+                cpmm_sell(real_cpay, virtual_cpay, virtual_tokens, token_in).expect(name);
+            let fee = calculate_trade_fee(gross_out, fee_bps).expect(name);
+            assert_eq!(gross_out, expected_gross_out, "{name} gross_out");
+            assert_eq!(fee, expected_fee, "{name} fee");
+            assert_eq!(gross_out - fee, expected_cpay_out, "{name} cpay_out");
+            assert_eq!(new_real_cpay, expected_real_cpay, "{name} real cpay");
+            assert_eq!(new_virtual_cpay, expected_virtual_cpay, "{name} virtual cpay");
+            assert_eq!(new_virtual_tokens, expected_virtual_tokens, "{name} virtual tokens");
+        }
+    }
+
+    #[test]
     fn min_gross_input_for_token_out_removes_integer_overpay() {
         let budget = 10 * SOMPI_PER_CRYPTIX;
         let (budget_token_out, _, _, _) =
@@ -446,6 +808,20 @@ mod tests {
                 999_525,
                 250_099_000_000_000,
                 1_199_525,
+            ),
+            (
+                "aggressive_initial_buy_1000_cpay_100bps",
+                LIQUIDITY_TOKEN_SUPPLY_RAW,
+                AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                AGGRESSIVE_INITIAL_VIRTUAL_TOKEN_RESERVES,
+                1_000 * SOMPI_PER_CRYPTIX,
+                100,
+                1_000_000_000,
+                99_000_000_000,
+                519,
+                999_481,
+                200_099_000_000_000,
+                1_049_481,
             ),
             (
                 "custom_buy_fee_250bps",

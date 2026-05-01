@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use cryptix_consensus_core::constants::MAX_SOMPI;
 
 use crate::liquidity_math::{
-    LIQUIDITY_TOKEN_DECIMALS, MAX_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SEED_RESERVE_SOMPI, MIN_LIQUIDITY_SUPPLY_RAW,
+    validate_liquidity_curve_mode as validate_liquidity_math_curve_mode, validate_liquidity_curve_parameters,
+    DEFAULT_LIQUIDITY_CURVE_MODE, LIQUIDITY_CURVE_MODE_INDIVIDUAL, LIQUIDITY_TOKEN_DECIMALS, MAX_LIQUIDITY_SUPPLY_RAW,
+    MIN_LIQUIDITY_SEED_RESERVE_SOMPI, MIN_LIQUIDITY_SUPPLY_RAW,
 };
 
 pub const CRYPTIX_ATOMIC_TOKEN_MAGIC: [u8; 3] = *b"CAT";
@@ -104,6 +106,7 @@ pub enum NoopReason {
     LiquiditySellLocked = 40,
     BadTokenVersion = 41,
     BadLiquidityCurveVersion = 42,
+    BadLiquidityCurveMode = 43,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,6 +176,12 @@ pub struct LiquidityRecipientAddress {
 pub struct CreateLiquidityAssetOp {
     pub token_version: u8,
     pub curve_version: u8,
+    #[serde(default = "default_liquidity_curve_mode")]
+    pub curve_mode: u8,
+    #[serde(default)]
+    pub individual_virtual_cpay_reserves_sompi: u64,
+    #[serde(default)]
+    pub individual_virtual_token_multiplier_bps: u16,
     pub decimals: u8,
     pub max_supply: u128,
     pub name: Vec<u8>,
@@ -187,6 +196,10 @@ pub struct CreateLiquidityAssetOp {
     pub platform_tag: Vec<u8>,
     #[serde(default)]
     pub liquidity_unlock_target_sompi: u64,
+}
+
+fn default_liquidity_curve_mode() -> u8 {
+    DEFAULT_LIQUIDITY_CURVE_MODE
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -462,11 +475,20 @@ fn parse_create_liquidity_asset_op(payload: &[u8], cursor: &mut usize) -> Result
         return Err(NoopReason::BadLaunchBuyFields);
     }
 
-    let (platform_tag, liquidity_unlock_target_sompi) = parse_optional_liquidity_create_tail(payload, cursor)?;
+    let (
+        platform_tag,
+        liquidity_unlock_target_sompi,
+        curve_mode,
+        individual_virtual_cpay_reserves_sompi,
+        individual_virtual_token_multiplier_bps,
+    ) = parse_optional_liquidity_create_tail(payload, cursor)?;
 
     Ok(CreateLiquidityAssetOp {
         token_version,
         curve_version,
+        curve_mode,
+        individual_virtual_cpay_reserves_sompi,
+        individual_virtual_token_multiplier_bps,
         decimals,
         max_supply,
         name,
@@ -598,6 +620,10 @@ fn validate_liquidity_curve_version(version: u8) -> Result<(), NoopReason> {
     }
 }
 
+fn validate_liquidity_curve_mode(mode: u8) -> Result<(), NoopReason> {
+    validate_liquidity_math_curve_mode(mode).map_err(|_| NoopReason::BadLiquidityCurveMode)
+}
+
 fn parse_optional_platform_tag_tail(payload: &[u8], cursor: &mut usize) -> Result<Vec<u8>, NoopReason> {
     if *cursor == payload.len() {
         return Ok(Vec::new());
@@ -605,14 +631,35 @@ fn parse_optional_platform_tag_tail(payload: &[u8], cursor: &mut usize) -> Resul
     parse_platform_tag(payload, cursor)
 }
 
-fn parse_optional_liquidity_create_tail(payload: &[u8], cursor: &mut usize) -> Result<(Vec<u8>, u64), NoopReason> {
+fn parse_optional_liquidity_create_tail(payload: &[u8], cursor: &mut usize) -> Result<(Vec<u8>, u64, u8, u64, u16), NoopReason> {
     if *cursor == payload.len() {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, DEFAULT_LIQUIDITY_CURVE_MODE, 0, 0));
     }
     let platform_tag = parse_platform_tag(payload, cursor)?;
     let liquidity_unlock_target_sompi = take_u64_le(payload, cursor).ok_or(NoopReason::BadLength)?;
     validate_liquidity_unlock_target(liquidity_unlock_target_sompi)?;
-    Ok((platform_tag, liquidity_unlock_target_sompi))
+    let (curve_mode, individual_virtual_cpay_reserves_sompi, individual_virtual_token_multiplier_bps) = if *cursor == payload.len() {
+        (DEFAULT_LIQUIDITY_CURVE_MODE, 0, 0)
+    } else {
+        let mode = take_u8(payload, cursor).ok_or(NoopReason::BadLength)?;
+        validate_liquidity_curve_mode(mode)?;
+        if mode == LIQUIDITY_CURVE_MODE_INDIVIDUAL {
+            let fixed_cpay = take_u64_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+            let multiplier_bps = take_u16_le(payload, cursor).ok_or(NoopReason::BadLength)?;
+            validate_liquidity_curve_parameters(mode, fixed_cpay, multiplier_bps).map_err(|_| NoopReason::BadLiquidityCurveMode)?;
+            (mode, fixed_cpay, multiplier_bps)
+        } else {
+            validate_liquidity_curve_parameters(mode, 0, 0).map_err(|_| NoopReason::BadLiquidityCurveMode)?;
+            (mode, 0, 0)
+        }
+    };
+    Ok((
+        platform_tag,
+        liquidity_unlock_target_sompi,
+        curve_mode,
+        individual_virtual_cpay_reserves_sompi,
+        individual_virtual_token_multiplier_bps,
+    ))
 }
 
 fn parse_platform_tag(payload: &[u8], cursor: &mut usize) -> Result<Vec<u8>, NoopReason> {
@@ -813,6 +860,7 @@ mod tests {
             TokenOp::CreateLiquidityAsset(op) => {
                 assert_eq!(op.token_version, CURRENT_TOKEN_VERSION);
                 assert_eq!(op.curve_version, CURRENT_LIQUIDITY_CURVE_VERSION);
+                assert_eq!(op.curve_mode, DEFAULT_LIQUIDITY_CURVE_MODE);
                 assert!(op.platform_tag.is_empty());
                 assert_eq!(op.liquidity_unlock_target_sompi, 0);
             }
@@ -828,9 +876,70 @@ mod tests {
             TokenOp::CreateLiquidityAsset(op) => {
                 assert_eq!(op.platform_tag, b"Bridge");
                 assert_eq!(op.liquidity_unlock_target_sompi, MAX_SOMPI);
+                assert_eq!(op.curve_mode, DEFAULT_LIQUIDITY_CURVE_MODE);
             }
             _ => panic!("expected liquidity create asset"),
         }
+
+        let mut aggressive = build_create_liquidity_payload();
+        aggressive.push(0);
+        aggressive.extend_from_slice(&0u64.to_le_bytes());
+        aggressive.push(crate::liquidity_math::LIQUIDITY_CURVE_MODE_AGGRESSIVE);
+        let parsed = parse_atomic_token_payload(&aggressive).unwrap().unwrap();
+        match parsed.op {
+            TokenOp::CreateLiquidityAsset(op) => {
+                assert!(op.platform_tag.is_empty());
+                assert_eq!(op.liquidity_unlock_target_sompi, 0);
+                assert_eq!(op.curve_mode, crate::liquidity_math::LIQUIDITY_CURVE_MODE_AGGRESSIVE);
+            }
+            _ => panic!("expected liquidity create asset"),
+        }
+
+        let mut individual = build_create_liquidity_payload();
+        individual.push(0);
+        individual.extend_from_slice(&0u64.to_le_bytes());
+        individual.push(crate::liquidity_math::LIQUIDITY_CURVE_MODE_INDIVIDUAL);
+        individual.extend_from_slice(&crate::liquidity_math::AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI.to_le_bytes());
+        individual.extend_from_slice(&10_500u16.to_le_bytes());
+        let parsed = parse_atomic_token_payload(&individual).unwrap().unwrap();
+        match parsed.op {
+            TokenOp::CreateLiquidityAsset(op) => {
+                assert_eq!(op.curve_mode, crate::liquidity_math::LIQUIDITY_CURVE_MODE_INDIVIDUAL);
+                assert_eq!(
+                    op.individual_virtual_cpay_reserves_sompi,
+                    crate::liquidity_math::AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI
+                );
+                assert_eq!(op.individual_virtual_token_multiplier_bps, 10_500);
+            }
+            _ => panic!("expected liquidity create asset"),
+        }
+    }
+
+    #[test]
+    fn parse_liquidity_create_rejects_bad_curve_mode() {
+        let mut payload = build_create_liquidity_payload();
+        payload.push(0);
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.push(99);
+
+        assert_eq!(parse_atomic_token_payload(&payload).unwrap().unwrap_err(), NoopReason::BadLiquidityCurveMode);
+    }
+
+    #[test]
+    fn parse_liquidity_create_rejects_bad_individual_curve_params() {
+        let mut missing_params = build_create_liquidity_payload();
+        missing_params.push(0);
+        missing_params.extend_from_slice(&0u64.to_le_bytes());
+        missing_params.push(crate::liquidity_math::LIQUIDITY_CURVE_MODE_INDIVIDUAL);
+        assert_eq!(parse_atomic_token_payload(&missing_params).unwrap().unwrap_err(), NoopReason::BadLength);
+
+        let mut bad_step = build_create_liquidity_payload();
+        bad_step.push(0);
+        bad_step.extend_from_slice(&0u64.to_le_bytes());
+        bad_step.push(crate::liquidity_math::LIQUIDITY_CURVE_MODE_INDIVIDUAL);
+        bad_step.extend_from_slice(&(crate::liquidity_math::INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI + 1).to_le_bytes());
+        bad_step.extend_from_slice(&10_500u16.to_le_bytes());
+        assert_eq!(parse_atomic_token_payload(&bad_step).unwrap().unwrap_err(), NoopReason::BadLiquidityCurveMode);
     }
 
     #[test]

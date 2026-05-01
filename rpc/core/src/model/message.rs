@@ -3273,6 +3273,10 @@ pub struct RpcLiquidityPoolState {
     pub asset_id: String,
     pub pool_nonce: u64,
     pub curve_version: u32,
+    pub curve_mode: u32,
+    pub curve_mode_label: String,
+    pub individual_virtual_cpay_reserves_sompi: String,
+    pub individual_virtual_token_multiplier_bps: u32,
     pub fee_bps: u32,
     pub max_supply: String,
     pub total_supply: String,
@@ -3300,10 +3304,14 @@ pub struct RpcLiquidityPoolState {
 
 impl Serializer for RpcLiquidityPoolState {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &4, writer)?;
+        store!(u16, &6, writer)?;
         store!(String, &self.asset_id, writer)?;
         store!(u64, &self.pool_nonce, writer)?;
         store!(u32, &self.curve_version, writer)?;
+        store!(u32, &self.curve_mode, writer)?;
+        store!(String, &self.curve_mode_label, writer)?;
+        store!(String, &self.individual_virtual_cpay_reserves_sompi, writer)?;
+        store!(u32, &self.individual_virtual_token_multiplier_bps, writer)?;
         store!(u32, &self.fee_bps, writer)?;
         store!(String, &self.max_supply, writer)?;
         store!(String, &self.total_supply, writer)?;
@@ -3337,6 +3345,10 @@ impl Deserializer for RpcLiquidityPoolState {
         let asset_id = load!(String, reader)?;
         let pool_nonce = load!(u64, reader)?;
         let curve_version = if version >= 4 { load!(u32, reader)? } else { 1 };
+        let curve_mode = if version >= 5 { load!(u32, reader)? } else { 0 };
+        let curve_mode_label = if version >= 5 { load!(String, reader)? } else { "basic".to_string() };
+        let individual_virtual_cpay_reserves_sompi = if version >= 6 { load!(String, reader)? } else { "0".to_string() };
+        let individual_virtual_token_multiplier_bps = if version >= 6 { load!(u32, reader)? } else { 0 };
         let fee_bps = load!(u32, reader)?;
         let max_supply = load!(String, reader)?;
         let total_supply = load!(String, reader)?;
@@ -3364,6 +3376,10 @@ impl Deserializer for RpcLiquidityPoolState {
             asset_id,
             pool_nonce,
             curve_version,
+            curve_mode,
+            curve_mode_label,
+            individual_virtual_cpay_reserves_sompi,
+            individual_virtual_token_multiplier_bps,
             fee_bps,
             max_supply,
             total_supply,
