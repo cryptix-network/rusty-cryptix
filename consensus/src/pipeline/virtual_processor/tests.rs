@@ -372,6 +372,8 @@ fn payload_create_liquidity(
     launch_buy_min_token_out: u128,
 ) -> Vec<u8> {
     let mut payload = cat_header(5, auth_input_index, nonce);
+    payload.push(1);
+    payload.push(1);
     payload.push(0);
     payload.extend_from_slice(&max_supply.to_le_bytes());
     payload.push(4);

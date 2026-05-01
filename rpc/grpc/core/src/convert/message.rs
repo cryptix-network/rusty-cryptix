@@ -643,6 +643,7 @@ from!(item: &cryptix_rpc_core::RpcTokenAsset, protowire::RpcTokenAssetMessage, {
     Self {
         asset_id: item.asset_id.clone(),
         creator_owner_id: item.creator_owner_id.clone(),
+        token_version: item.token_version,
         mint_authority_owner_id: item.mint_authority_owner_id.clone(),
         decimals: item.decimals,
         supply_mode: item.supply_mode,
@@ -692,6 +693,7 @@ from!(item: &cryptix_rpc_core::RpcLiquidityPoolState, protowire::RpcLiquidityPoo
     Self {
         asset_id: item.asset_id.clone(),
         pool_nonce: item.pool_nonce,
+        curve_version: item.curve_version,
         fee_bps: item.fee_bps,
         max_supply: item.max_supply.clone(),
         total_supply: item.total_supply.clone(),
@@ -1639,6 +1641,7 @@ try_from!(item: &protowire::RpcTokenAssetMessage, cryptix_rpc_core::RpcTokenAsse
     Self {
         asset_id: item.asset_id.clone(),
         creator_owner_id: item.creator_owner_id.clone(),
+        token_version: item.token_version,
         mint_authority_owner_id: item.mint_authority_owner_id.clone(),
         decimals: item.decimals,
         supply_mode: item.supply_mode,
@@ -1688,6 +1691,7 @@ try_from!(item: &protowire::RpcLiquidityPoolStateMessage, cryptix_rpc_core::RpcL
     Self {
         asset_id: item.asset_id.clone(),
         pool_nonce: item.pool_nonce,
+        curve_version: item.curve_version,
         fee_bps: item.fee_bps,
         max_supply: item.max_supply.clone(),
         total_supply: item.total_supply.clone(),

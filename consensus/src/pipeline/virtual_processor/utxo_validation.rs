@@ -771,6 +771,7 @@ impl VirtualStateProcessor {
     ) -> TxResult<()> {
         match op {
             AtomicPayloadOp::CreateAsset {
+                token_version,
                 decimals: _,
                 supply_mode,
                 max_supply,
@@ -796,6 +797,7 @@ impl VirtualStateProcessor {
                     asset_id,
                     AtomicAssetState {
                         asset_class: AtomicAssetClass::Standard,
+                        token_version,
                         mint_authority_owner_id,
                         supply_mode,
                         max_supply,
@@ -806,6 +808,7 @@ impl VirtualStateProcessor {
                 )?;
             }
             AtomicPayloadOp::CreateAssetWithMint {
+                token_version,
                 decimals: _,
                 supply_mode,
                 max_supply,
@@ -852,6 +855,7 @@ impl VirtualStateProcessor {
                     asset_id,
                     AtomicAssetState {
                         asset_class: AtomicAssetClass::Standard,
+                        token_version,
                         mint_authority_owner_id,
                         supply_mode,
                         max_supply,
@@ -862,6 +866,8 @@ impl VirtualStateProcessor {
                 )?;
             }
             AtomicPayloadOp::CreateLiquidityAsset {
+                token_version,
+                curve_version,
                 decimals,
                 max_supply,
                 name: _,
@@ -959,6 +965,7 @@ impl VirtualStateProcessor {
                 let unlocked = liquidity_unlock_target_sompi == 0 || real_cpay_reserves_sompi >= liquidity_unlock_target_sompi;
                 let asset = AtomicAssetState {
                     asset_class: AtomicAssetClass::Liquidity,
+                    token_version,
                     mint_authority_owner_id: [0u8; 32],
                     supply_mode: AtomicSupplyMode::Capped,
                     max_supply,
@@ -966,6 +973,7 @@ impl VirtualStateProcessor {
                     platform_tag,
                     liquidity: Some(AtomicLiquidityPoolState {
                         pool_nonce: 1,
+                        curve_version,
                         real_cpay_reserves_sompi,
                         real_token_reserves,
                         virtual_cpay_reserves_sompi,

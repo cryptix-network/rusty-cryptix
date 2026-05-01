@@ -227,6 +227,10 @@ fn map_script_err(script_err: TxScriptError, input: &TransactionInput) -> TxRule
 
 pub(crate) const CAT_MAGIC: [u8; 3] = *b"CAT";
 const CAT_VERSION: u8 = 1;
+const CAT_CURRENT_TOKEN_VERSION: u8 = 1;
+const CAT_CURRENT_LIQUIDITY_CURVE_VERSION: u8 = 1;
+const CAT_MAX_TOKEN_VERSION: u8 = 99;
+const CAT_MAX_LIQUIDITY_CURVE_VERSION: u8 = 99;
 const CAT_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
 const OWNER_AUTH_SCHEME_PUBKEY: u8 = 0;
 const OWNER_AUTH_SCHEME_PUBKEY_ECDSA: u8 = 1;
@@ -253,6 +257,7 @@ pub(crate) enum AtomicPayloadSupplyMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AtomicPayloadOp {
     CreateAsset {
+        token_version: u8,
         decimals: u8,
         supply_mode: AtomicPayloadSupplyMode,
         max_supply: u128,
@@ -277,6 +282,7 @@ pub(crate) enum AtomicPayloadOp {
         amount: u128,
     },
     CreateAssetWithMint {
+        token_version: u8,
         decimals: u8,
         supply_mode: AtomicPayloadSupplyMode,
         max_supply: u128,
@@ -289,6 +295,8 @@ pub(crate) enum AtomicPayloadOp {
         platform_tag: Vec<u8>,
     },
     CreateLiquidityAsset {
+        token_version: u8,
+        curve_version: u8,
         decimals: u8,
         max_supply: u128,
         name: Vec<u8>,
@@ -371,6 +379,9 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
 
     let op = match op {
         0 => {
+            let token_version = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT token version".to_string())?;
+            validate_token_version(token_version)?;
+
             let decimals = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT decimals".to_string())?;
             if decimals > CAT_MAX_DECIMALS {
                 return Err(format!("decimals `{decimals}` above max `{CAT_MAX_DECIMALS}`"));
@@ -414,6 +425,7 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
             let platform_tag = parse_optional_platform_tag_tail(payload, &mut cursor)?;
 
             AtomicPayloadOp::CreateAsset {
+                token_version,
                 decimals,
                 supply_mode,
                 max_supply,
@@ -451,7 +463,7 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
             AtomicPayloadOp::Burn { asset_id, amount }
         }
         4 => {
-            let (decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata) =
+            let (token_version, decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata) =
                 parse_create_asset_common(payload, &mut cursor)?;
             let initial_mint_amount =
                 take_u128_le(payload, &mut cursor).ok_or_else(|| "truncated CAT initial mint amount".to_string())?;
@@ -465,6 +477,7 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
             }
             let platform_tag = parse_optional_platform_tag_tail(payload, &mut cursor)?;
             AtomicPayloadOp::CreateAssetWithMint {
+                token_version,
                 decimals,
                 supply_mode,
                 max_supply,
@@ -478,6 +491,11 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
             }
         }
         5 => {
+            let token_version = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT token version".to_string())?;
+            validate_token_version(token_version)?;
+            let curve_version = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT liquidity curve version".to_string())?;
+            validate_liquidity_curve_version(curve_version)?;
+
             let decimals = take_u8(payload, &mut cursor).ok_or_else(|| "truncated CAT decimals".to_string())?;
             if decimals != CAT_LIQUIDITY_TOKEN_DECIMALS {
                 return Err(format!("liquidity asset decimals must be `{CAT_LIQUIDITY_TOKEN_DECIMALS}`"));
@@ -547,6 +565,8 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
             let (platform_tag, liquidity_unlock_target_sompi) = parse_optional_liquidity_create_tail(payload, &mut cursor)?;
 
             AtomicPayloadOp::CreateLiquidityAsset {
+                token_version,
+                curve_version,
                 decimals,
                 max_supply,
                 name,
@@ -638,7 +658,10 @@ pub(crate) fn parse_atomic_payload(payload: &[u8]) -> Result<Option<ParsedAtomic
 fn parse_create_asset_common(
     payload: &[u8],
     cursor: &mut usize,
-) -> Result<(u8, AtomicPayloadSupplyMode, u128, [u8; 32], Vec<u8>, Vec<u8>, Vec<u8>), String> {
+) -> Result<(u8, u8, AtomicPayloadSupplyMode, u128, [u8; 32], Vec<u8>, Vec<u8>, Vec<u8>), String> {
+    let token_version = take_u8(payload, cursor).ok_or_else(|| "truncated CAT token version".to_string())?;
+    validate_token_version(token_version)?;
+
     let decimals = take_u8(payload, cursor).ok_or_else(|| "truncated CAT decimals".to_string())?;
     if decimals > CAT_MAX_DECIMALS {
         return Err(format!("decimals `{decimals}` above max `{CAT_MAX_DECIMALS}`"));
@@ -668,7 +691,23 @@ fn parse_create_asset_common(
         AtomicPayloadSupplyMode::Uncapped if max_supply != 0 => return Err("uncapped assets must encode max_supply=0".to_string()),
         _ => {}
     }
-    Ok((decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata))
+    Ok((token_version, decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata))
+}
+
+fn validate_token_version(version: u8) -> Result<(), String> {
+    if (1..=CAT_MAX_TOKEN_VERSION).contains(&version) && version == CAT_CURRENT_TOKEN_VERSION {
+        Ok(())
+    } else {
+        Err(format!("unsupported CAT token version `{version}`"))
+    }
+}
+
+fn validate_liquidity_curve_version(version: u8) -> Result<(), String> {
+    if (1..=CAT_MAX_LIQUIDITY_CURVE_VERSION).contains(&version) && version == CAT_CURRENT_LIQUIDITY_CURVE_VERSION {
+        Ok(())
+    } else {
+        Err(format!("unsupported CAT liquidity curve version `{version}`"))
+    }
 }
 
 fn parse_optional_platform_tag_tail(payload: &[u8], cursor: &mut usize) -> Result<Vec<u8>, String> {

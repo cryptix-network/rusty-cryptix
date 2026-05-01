@@ -464,6 +464,7 @@ mod tests {
         bad_create_payload.push(0); // flags
         bad_create_payload.extend_from_slice(&0u16.to_le_bytes()); // auth_input_index
         bad_create_payload.extend_from_slice(&2u64.to_le_bytes()); // nonce
+        bad_create_payload.push(1); // token version
         bad_create_payload.push(8); // decimals
         bad_create_payload.push(1); // Capped
         bad_create_payload.extend_from_slice(&0u128.to_le_bytes()); // invalid max_supply for capped assets

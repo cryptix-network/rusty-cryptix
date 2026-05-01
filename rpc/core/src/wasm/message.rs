@@ -57,6 +57,7 @@ declare! {
     export interface IRpcTokenAsset {
         assetId : string;
         creatorOwnerId : string;
+        tokenVersion : number;
         mintAuthorityOwnerId : string;
         decimals : number;
         supplyMode : number;
@@ -168,6 +169,7 @@ declare! {
     export interface IRpcLiquidityPoolState {
         assetId : string;
         poolNonce : bigint;
+        curveVersion : number;
         feeBps : number;
         maxSupply : string;
         totalSupply : string;

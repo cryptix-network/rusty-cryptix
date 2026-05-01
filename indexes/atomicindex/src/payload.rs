@@ -8,6 +8,10 @@ use crate::liquidity_math::{
 
 pub const CRYPTIX_ATOMIC_TOKEN_MAGIC: [u8; 3] = *b"CAT";
 pub const CRYPTIX_ATOMIC_TOKEN_VERSION: u8 = 1;
+pub const CURRENT_TOKEN_VERSION: u8 = 1;
+pub const CURRENT_LIQUIDITY_CURVE_VERSION: u8 = 1;
+pub const MAX_TOKEN_VERSION: u8 = 99;
+pub const MAX_LIQUIDITY_CURVE_VERSION: u8 = 99;
 
 pub const MAX_NAME_LEN: usize = 32;
 pub const MAX_SYMBOL_LEN: usize = 10;
@@ -98,6 +102,8 @@ pub enum NoopReason {
     BadPlatformTag = 38,
     BadLiquidityUnlockTarget = 39,
     LiquiditySellLocked = 40,
+    BadTokenVersion = 41,
+    BadLiquidityCurveVersion = 42,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +115,7 @@ pub struct TokenOpHeader {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateAssetOp {
+    pub token_version: u8,
     pub decimals: u8,
     pub supply_mode: SupplyMode,
     pub max_supply: u128,
@@ -122,6 +129,7 @@ pub struct CreateAssetOp {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateAssetWithMintOp {
+    pub token_version: u8,
     pub decimals: u8,
     pub supply_mode: SupplyMode,
     pub max_supply: u128,
@@ -163,6 +171,8 @@ pub struct LiquidityRecipientAddress {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateLiquidityAssetOp {
+    pub token_version: u8,
+    pub curve_version: u8,
     pub decimals: u8,
     pub max_supply: u128,
     pub name: Vec<u8>,
@@ -299,10 +309,20 @@ fn parse_atomic_token_payload_strict(payload: &[u8]) -> Result<ParsedTokenPayloa
 }
 
 fn parse_create_asset_op(payload: &[u8], cursor: &mut usize) -> Result<CreateAssetOp, NoopReason> {
-    let (decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata) =
+    let (token_version, decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata) =
         parse_create_asset_common(payload, cursor)?;
     let platform_tag = parse_optional_platform_tag_tail(payload, cursor)?;
-    Ok(CreateAssetOp { decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata, platform_tag })
+    Ok(CreateAssetOp {
+        token_version,
+        decimals,
+        supply_mode,
+        max_supply,
+        mint_authority_owner_id,
+        name,
+        symbol,
+        metadata,
+        platform_tag,
+    })
 }
 
 fn parse_transfer_op(payload: &[u8], cursor: &mut usize) -> Result<TransferOp, NoopReason> {
@@ -341,7 +361,7 @@ fn parse_burn_op(payload: &[u8], cursor: &mut usize) -> Result<BurnOp, NoopReaso
 }
 
 fn parse_create_asset_with_mint_op(payload: &[u8], cursor: &mut usize) -> Result<CreateAssetWithMintOp, NoopReason> {
-    let (decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata) =
+    let (token_version, decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata) =
         parse_create_asset_common(payload, cursor)?;
     let initial_mint_amount = take_u128_le(payload, cursor).ok_or(NoopReason::BadLength)?;
     let initial_mint_to_owner_id = take_32(payload, cursor).ok_or(NoopReason::BadLength)?;
@@ -355,6 +375,7 @@ fn parse_create_asset_with_mint_op(payload: &[u8], cursor: &mut usize) -> Result
     let platform_tag = parse_optional_platform_tag_tail(payload, cursor)?;
 
     Ok(CreateAssetWithMintOp {
+        token_version,
         decimals,
         supply_mode,
         max_supply,
@@ -369,6 +390,11 @@ fn parse_create_asset_with_mint_op(payload: &[u8], cursor: &mut usize) -> Result
 }
 
 fn parse_create_liquidity_asset_op(payload: &[u8], cursor: &mut usize) -> Result<CreateLiquidityAssetOp, NoopReason> {
+    let token_version = take_u8(payload, cursor).ok_or(NoopReason::BadLength)?;
+    validate_token_version(token_version)?;
+    let curve_version = take_u8(payload, cursor).ok_or(NoopReason::BadLength)?;
+    validate_liquidity_curve_version(curve_version)?;
+
     let decimals = take_u8(payload, cursor).ok_or(NoopReason::BadLength)?;
     if decimals != LIQUIDITY_TOKEN_DECIMALS {
         return Err(NoopReason::BadDecimals);
@@ -439,6 +465,8 @@ fn parse_create_liquidity_asset_op(payload: &[u8], cursor: &mut usize) -> Result
     let (platform_tag, liquidity_unlock_target_sompi) = parse_optional_liquidity_create_tail(payload, cursor)?;
 
     Ok(CreateLiquidityAssetOp {
+        token_version,
+        curve_version,
         decimals,
         max_supply,
         name,
@@ -513,7 +541,10 @@ fn parse_claim_liquidity_fees_op(payload: &[u8], cursor: &mut usize) -> Result<C
 fn parse_create_asset_common(
     payload: &[u8],
     cursor: &mut usize,
-) -> Result<(u8, SupplyMode, u128, [u8; 32], Vec<u8>, Vec<u8>, Vec<u8>), NoopReason> {
+) -> Result<(u8, u8, SupplyMode, u128, [u8; 32], Vec<u8>, Vec<u8>, Vec<u8>), NoopReason> {
+    let token_version = take_u8(payload, cursor).ok_or(NoopReason::BadLength)?;
+    validate_token_version(token_version)?;
+
     let decimals = take_u8(payload, cursor).ok_or(NoopReason::BadLength)?;
     if decimals > MAX_DECIMALS {
         return Err(NoopReason::BadDecimals);
@@ -548,7 +579,23 @@ fn parse_create_asset_common(
         _ => {}
     }
 
-    Ok((decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata))
+    Ok((token_version, decimals, supply_mode, max_supply, mint_authority_owner_id, name, symbol, metadata))
+}
+
+fn validate_token_version(version: u8) -> Result<(), NoopReason> {
+    if (1..=MAX_TOKEN_VERSION).contains(&version) && version == CURRENT_TOKEN_VERSION {
+        Ok(())
+    } else {
+        Err(NoopReason::BadTokenVersion)
+    }
+}
+
+fn validate_liquidity_curve_version(version: u8) -> Result<(), NoopReason> {
+    if (1..=MAX_LIQUIDITY_CURVE_VERSION).contains(&version) && version == CURRENT_LIQUIDITY_CURVE_VERSION {
+        Ok(())
+    } else {
+        Err(NoopReason::BadLiquidityCurveVersion)
+    }
 }
 
 fn parse_optional_platform_tag_tail(payload: &[u8], cursor: &mut usize) -> Result<Vec<u8>, NoopReason> {
@@ -679,6 +726,7 @@ mod tests {
 
     fn build_create_asset_payload() -> Vec<u8> {
         let mut payload = build_header(0, 3, 7);
+        payload.push(CURRENT_TOKEN_VERSION);
         payload.push(8);
         payload.push(1);
         payload.extend_from_slice(&100u128.to_le_bytes());
@@ -694,6 +742,8 @@ mod tests {
 
     fn build_create_liquidity_payload() -> Vec<u8> {
         let mut payload = build_header(5, 3, 7);
+        payload.push(CURRENT_TOKEN_VERSION);
+        payload.push(CURRENT_LIQUIDITY_CURVE_VERSION);
         payload.push(LIQUIDITY_TOKEN_DECIMALS);
         payload.extend_from_slice(&crate::liquidity_math::DEFAULT_LIQUIDITY_SUPPLY_RAW.to_le_bytes());
         payload.push(4);
@@ -716,6 +766,7 @@ mod tests {
         let parsed = parse_atomic_token_payload(&payload).unwrap().unwrap();
         match parsed.op {
             TokenOp::CreateAsset(op) => {
+                assert_eq!(op.token_version, CURRENT_TOKEN_VERSION);
                 assert_eq!(op.decimals, 8);
                 assert_eq!(op.supply_mode, SupplyMode::Capped);
                 assert_eq!(op.max_supply, 100);
@@ -760,6 +811,8 @@ mod tests {
         let parsed = parse_atomic_token_payload(&payload).unwrap().unwrap();
         match parsed.op {
             TokenOp::CreateLiquidityAsset(op) => {
+                assert_eq!(op.token_version, CURRENT_TOKEN_VERSION);
+                assert_eq!(op.curve_version, CURRENT_LIQUIDITY_CURVE_VERSION);
                 assert!(op.platform_tag.is_empty());
                 assert_eq!(op.liquidity_unlock_target_sompi, 0);
             }

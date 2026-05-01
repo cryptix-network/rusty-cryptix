@@ -14,9 +14,13 @@ use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::Arc;
 
-const ATOMIC_CONSENSUS_STATE_MAGIC: &[u8; 8] = b"CATCS003";
-const ATOMIC_CONSENSUS_STATE_HASH_DOMAIN: &[u8] = b"cryptix-atomic-consensus-state-v3";
+const ATOMIC_CONSENSUS_STATE_MAGIC: &[u8; 8] = b"CATCS004";
+const ATOMIC_CONSENSUS_STATE_HASH_DOMAIN: &[u8] = b"cryptix-atomic-consensus-state-v4";
 const ATOMIC_STATE_COMMITMENT_DOMAIN: &[u8] = b"cryptix-utxo-atomic-state-commitment-v1";
+pub const ATOMIC_CURRENT_TOKEN_VERSION: u8 = 1;
+pub const ATOMIC_CURRENT_LIQUIDITY_CURVE_VERSION: u8 = 1;
+const ATOMIC_MAX_TOKEN_VERSION: u8 = 99;
+const ATOMIC_MAX_LIQUIDITY_CURVE_VERSION: u8 = 99;
 const ATOMIC_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
 const OWNER_AUTH_SCHEME_PUBKEY: u8 = 0;
 const OWNER_AUTH_SCHEME_PUBKEY_ECDSA: u8 = 1;
@@ -56,6 +60,8 @@ pub struct AtomicLiquidityFeeRecipientState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AtomicLiquidityPoolState {
     pub pool_nonce: u64,
+    #[serde(default = "default_atomic_liquidity_curve_version")]
+    pub curve_version: u8,
     pub real_cpay_reserves_sompi: u64,
     pub real_token_reserves: u128,
     pub virtual_cpay_reserves_sompi: u64,
@@ -75,6 +81,8 @@ pub struct AtomicLiquidityPoolState {
 pub struct AtomicAssetState {
     #[serde(default)]
     pub asset_class: AtomicAssetClass,
+    #[serde(default = "default_atomic_token_version")]
+    pub token_version: u8,
     pub mint_authority_owner_id: [u8; 32],
     pub supply_mode: AtomicSupplyMode,
     pub max_supply: u128,
@@ -101,6 +109,14 @@ pub struct AtomicConsensusState {
 
 fn default_atomic_liquidity_unlocked() -> bool {
     true
+}
+
+fn default_atomic_token_version() -> u8 {
+    ATOMIC_CURRENT_TOKEN_VERSION
+}
+
+fn default_atomic_liquidity_curve_version() -> u8 {
+    ATOMIC_CURRENT_LIQUIDITY_CURVE_VERSION
 }
 
 impl AtomicConsensusState {
@@ -278,6 +294,7 @@ impl AtomicConsensusState {
 
         let mut expected_vault_index = HashMap::new();
         for (asset_id, asset) in self.assets.iter() {
+            validate_token_version(asset.token_version)?;
             if asset.platform_tag.len() > MAX_ATOMIC_PLATFORM_TAG_LEN {
                 return Err(format!("atomic asset `{}` platform tag exceeds max length", faster_hex::hex_string(asset_id)));
             }
@@ -345,6 +362,7 @@ fn validate_liquidity_asset_normalized(
     if pool.pool_nonce == 0 {
         return Err(format!("liquidity asset `{}` has zero pool nonce", faster_hex::hex_string(&asset_id)));
     }
+    validate_liquidity_curve_version(pool.curve_version)?;
     if pool.unlock_target_sompi == 0 && !pool.unlocked {
         return Err(format!("liquidity asset `{}` has disabled lock but is not marked unlocked", faster_hex::hex_string(&asset_id)));
     }
@@ -437,6 +455,22 @@ fn validate_fee_recipients_normalized(asset_id: [u8; 32], pool: &AtomicLiquidity
     Ok(())
 }
 
+fn validate_token_version(version: u8) -> Result<(), String> {
+    if (1..=ATOMIC_MAX_TOKEN_VERSION).contains(&version) && version == ATOMIC_CURRENT_TOKEN_VERSION {
+        Ok(())
+    } else {
+        Err(format!("unsupported atomic token version `{version}`"))
+    }
+}
+
+fn validate_liquidity_curve_version(version: u8) -> Result<(), String> {
+    if (1..=ATOMIC_MAX_LIQUIDITY_CURVE_VERSION).contains(&version) && version == ATOMIC_CURRENT_LIQUIDITY_CURVE_VERSION {
+        Ok(())
+    } else {
+        Err(format!("unsupported atomic liquidity curve version `{version}`"))
+    }
+}
+
 fn atomic_owner_id_from_address_components(address_version: u8, address_payload: &[u8]) -> Option<[u8; 32]> {
     let auth_scheme = match address_version {
         0 if address_payload.len() == 32 => OWNER_AUTH_SCHEME_PUBKEY,
@@ -482,6 +516,7 @@ fn write_u128(out: &mut Vec<u8>, value: u128) {
 
 fn write_asset(out: &mut Vec<u8>, asset: &AtomicAssetState) {
     write_u8(out, atomic_asset_class_to_u8(asset.asset_class));
+    write_u8(out, asset.token_version);
     out.extend_from_slice(&asset.mint_authority_owner_id);
     write_u8(out, atomic_supply_mode_to_u8(asset.supply_mode));
     write_u128(out, asset.max_supply);
@@ -499,6 +534,7 @@ fn write_asset(out: &mut Vec<u8>, asset: &AtomicAssetState) {
 
 fn write_liquidity_pool(out: &mut Vec<u8>, pool: &AtomicLiquidityPoolState) {
     write_u64(out, pool.pool_nonce);
+    write_u8(out, pool.curve_version);
     write_u64(out, pool.real_cpay_reserves_sompi);
     write_u128(out, pool.real_token_reserves);
     write_u64(out, pool.virtual_cpay_reserves_sompi);
@@ -599,6 +635,8 @@ impl<'a> AtomicStateReader<'a> {
             1 => AtomicAssetClass::Liquidity,
             other => return Err(format!("invalid atomic asset class `{other}`")),
         };
+        let token_version = self.read_u8()?;
+        validate_token_version(token_version)?;
         let mint_authority_owner_id = self.read_32()?;
         let supply_mode = match self.read_u8()? {
             0 => AtomicSupplyMode::Uncapped,
@@ -620,11 +658,22 @@ impl<'a> AtomicStateReader<'a> {
             1 => Some(self.read_liquidity_pool()?),
             other => return Err(format!("invalid atomic liquidity presence flag `{other}`")),
         };
-        Ok(AtomicAssetState { asset_class, mint_authority_owner_id, supply_mode, max_supply, total_supply, platform_tag, liquidity })
+        Ok(AtomicAssetState {
+            asset_class,
+            token_version,
+            mint_authority_owner_id,
+            supply_mode,
+            max_supply,
+            total_supply,
+            platform_tag,
+            liquidity,
+        })
     }
 
     fn read_liquidity_pool(&mut self) -> Result<AtomicLiquidityPoolState, String> {
         let pool_nonce = self.read_u64()?;
+        let curve_version = self.read_u8()?;
+        validate_liquidity_curve_version(curve_version)?;
         let real_cpay_reserves_sompi = self.read_u64()?;
         let real_token_reserves = self.read_u128()?;
         let virtual_cpay_reserves_sompi = self.read_u64()?;
@@ -654,6 +703,7 @@ impl<'a> AtomicStateReader<'a> {
         };
         Ok(AtomicLiquidityPoolState {
             pool_nonce,
+            curve_version,
             real_cpay_reserves_sompi,
             real_token_reserves,
             virtual_cpay_reserves_sompi,
@@ -808,6 +858,7 @@ mod tests {
 
         let standard_asset = AtomicAssetState {
             asset_class: AtomicAssetClass::Standard,
+            token_version: ATOMIC_CURRENT_TOKEN_VERSION,
             mint_authority_owner_id: owner(0xA1),
             supply_mode: AtomicSupplyMode::Capped,
             max_supply: u128_from_words(0x0200, 9_999),
@@ -817,6 +868,7 @@ mod tests {
         };
         let liquidity_asset = AtomicAssetState {
             asset_class: AtomicAssetClass::Liquidity,
+            token_version: ATOMIC_CURRENT_TOKEN_VERSION,
             mint_authority_owner_id: [0; 32],
             supply_mode: AtomicSupplyMode::Capped,
             max_supply: liquidity_max_supply,
@@ -824,6 +876,7 @@ mod tests {
             platform_tag: Vec::new(),
             liquidity: Some(AtomicLiquidityPoolState {
                 pool_nonce: 17,
+                curve_version: ATOMIC_CURRENT_LIQUIDITY_CURVE_VERSION,
                 real_cpay_reserves_sompi: 123_456_789,
                 real_token_reserves: liquidity_remaining,
                 virtual_cpay_reserves_sompi: 1_000_000_000_000,
@@ -911,6 +964,7 @@ mod tests {
 
         let standard_asset = AtomicAssetState {
             asset_class: AtomicAssetClass::Standard,
+            token_version: ATOMIC_CURRENT_TOKEN_VERSION,
             mint_authority_owner_id: owner(1),
             supply_mode: AtomicSupplyMode::Capped,
             max_supply: 1_000,
@@ -923,6 +977,7 @@ mod tests {
             atomic_owner_id_from_address_components(0, &fee_recipient_payload).expect("test recipient owner should derive");
         let liquidity_asset = AtomicAssetState {
             asset_class: AtomicAssetClass::Liquidity,
+            token_version: ATOMIC_CURRENT_TOKEN_VERSION,
             mint_authority_owner_id: [0; 32],
             supply_mode: AtomicSupplyMode::Capped,
             max_supply: 10_000,
@@ -930,6 +985,7 @@ mod tests {
             platform_tag: Vec::new(),
             liquidity: Some(AtomicLiquidityPoolState {
                 pool_nonce: 7,
+                curve_version: ATOMIC_CURRENT_LIQUIDITY_CURVE_VERSION,
                 real_cpay_reserves_sompi: 250,
                 real_token_reserves: 9_500,
                 virtual_cpay_reserves_sompi: 1_000_000_000_000,

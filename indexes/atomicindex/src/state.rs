@@ -9,7 +9,7 @@ use crate::{
     payload::{
         parse_atomic_token_payload, ApplyStatus, BuyLiquidityExactInOp, ClaimLiquidityFeesOp, CreateAssetOp, CreateAssetWithMintOp,
         CreateLiquidityAssetOp, EventType, LiquidityRecipientAddress, MintOp, NoopReason, ParsedTokenPayload, SellLiquidityExactInOp,
-        SupplyMode, TokenOp, TokenOpCode,
+        SupplyMode, TokenOp, TokenOpCode, CURRENT_LIQUIDITY_CURVE_VERSION, CURRENT_TOKEN_VERSION,
     },
 };
 use blake2b_simd::Params as Blake2bParams;
@@ -196,6 +196,8 @@ pub struct LiquidityHolderAddressState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiquidityPoolState {
     pub pool_nonce: u64,
+    #[serde(default = "default_liquidity_curve_version")]
+    pub curve_version: u8,
     pub real_cpay_reserves_sompi: u64,
     pub real_token_reserves: u128,
     pub virtual_cpay_reserves_sompi: u64,
@@ -217,12 +219,22 @@ fn default_liquidity_unlocked() -> bool {
     true
 }
 
+fn default_liquidity_curve_version() -> u8 {
+    CURRENT_LIQUIDITY_CURVE_VERSION
+}
+
+fn default_token_version() -> u8 {
+    CURRENT_TOKEN_VERSION
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenAsset {
     pub asset_id: [u8; 32],
     pub creator_owner_id: [u8; 32],
     #[serde(default)]
     pub asset_class: TokenAssetClass,
+    #[serde(default = "default_token_version")]
+    pub token_version: u8,
     pub mint_authority_owner_id: [u8; 32],
     pub decimals: u8,
     pub supply_mode: SupplyMode,
@@ -1067,6 +1079,10 @@ impl AtomicTokenState {
             return Err(NoopReason::AssetAlreadyExists);
         }
 
+        if op.token_version != CURRENT_TOKEN_VERSION {
+            return Err(NoopReason::BadTokenVersion);
+        }
+
         if op.decimals > crate::payload::MAX_DECIMALS {
             return Err(NoopReason::BadDecimals);
         }
@@ -1084,6 +1100,7 @@ impl AtomicTokenState {
                 asset_id: txid_bytes,
                 creator_owner_id,
                 asset_class: TokenAssetClass::Standard,
+                token_version: op.token_version,
                 mint_authority_owner_id: op.mint_authority_owner_id,
                 decimals: op.decimals,
                 supply_mode: op.supply_mode,
@@ -1113,6 +1130,7 @@ impl AtomicTokenState {
         journal: &mut JournalBuilder,
     ) -> Result<(), NoopReason> {
         let create = CreateAssetOp {
+            token_version: op.token_version,
             decimals: op.decimals,
             supply_mode: op.supply_mode,
             max_supply: op.max_supply,
@@ -1278,6 +1296,12 @@ impl AtomicTokenState {
         if self.assets.contains_key(&asset_id) {
             return Err(NoopReason::AssetAlreadyExists);
         }
+        if op.token_version != CURRENT_TOKEN_VERSION {
+            return Err(NoopReason::BadTokenVersion);
+        }
+        if op.curve_version != CURRENT_LIQUIDITY_CURVE_VERSION {
+            return Err(NoopReason::BadLiquidityCurveVersion);
+        }
         if op.decimals != LIQUIDITY_TOKEN_DECIMALS {
             return Err(NoopReason::BadDecimals);
         }
@@ -1351,6 +1375,7 @@ impl AtomicTokenState {
             asset_id,
             creator_owner_id,
             asset_class: TokenAssetClass::Liquidity,
+            token_version: op.token_version,
             mint_authority_owner_id: [0u8; 32],
             decimals: op.decimals,
             supply_mode: SupplyMode::Capped,
@@ -1365,6 +1390,7 @@ impl AtomicTokenState {
             created_at: Some(accepting_block_time),
             liquidity: Some(LiquidityPoolState {
                 pool_nonce: 1,
+                curve_version: op.curve_version,
                 real_cpay_reserves_sompi,
                 real_token_reserves,
                 virtual_cpay_reserves_sompi,
@@ -2615,6 +2641,7 @@ impl AtomicTokenState {
                 hasher.update(&asset.asset_id);
                 hasher.update(&asset.creator_owner_id);
                 hasher.update(&[asset.asset_class as u8]);
+                hasher.update(&[asset.token_version]);
                 hasher.update(&asset.mint_authority_owner_id);
                 hasher.update(&[asset.decimals]);
                 hasher.update(&[asset.supply_mode as u8]);
@@ -2631,6 +2658,7 @@ impl AtomicTokenState {
                 if let Some(pool) = asset.liquidity.as_ref() {
                     hasher.update(&[1u8]);
                     hasher.update(&pool.pool_nonce.to_le_bytes());
+                    hasher.update(&[pool.curve_version]);
                     hasher.update(&pool.real_cpay_reserves_sompi.to_le_bytes());
                     hasher.update(&pool.real_token_reserves.to_le_bytes());
                     hasher.update(&pool.virtual_cpay_reserves_sompi.to_le_bytes());
@@ -2771,6 +2799,7 @@ mod tests {
         metadata: &[u8],
     ) -> Vec<u8> {
         let mut payload = base_header(TokenOpCode::CreateAsset, auth_input_index, nonce);
+        payload.push(CURRENT_TOKEN_VERSION);
         payload.push(decimals);
         payload.push(SupplyMode::Uncapped as u8);
         payload.extend_from_slice(&0u128.to_le_bytes());
@@ -2816,6 +2845,8 @@ mod tests {
         launch_buy_min_token_out: u128,
     ) -> Vec<u8> {
         let mut payload = base_header(TokenOpCode::CreateLiquidityAsset, auth_input_index, nonce);
+        payload.push(CURRENT_TOKEN_VERSION);
+        payload.push(CURRENT_LIQUIDITY_CURVE_VERSION);
         payload.push(0);
         payload.extend_from_slice(&max_supply.to_le_bytes());
         payload.push(4);
@@ -2930,6 +2961,7 @@ mod tests {
                 asset_id,
                 creator_owner_id: creator,
                 asset_class: TokenAssetClass::Standard,
+                token_version: CURRENT_TOKEN_VERSION,
                 mint_authority_owner_id: authority,
                 decimals: 8,
                 supply_mode: SupplyMode::Uncapped,
@@ -2950,7 +2982,7 @@ mod tests {
 
         let hash = state.compute_state_hash();
         let hash_hex = to_hex(&hash);
-        assert_eq!(hash_hex, "82adad80dcc568b7e71b2ca202bf43d0f7b199425a8a3ee8ab18b065ee5a4ed4");
+        assert_eq!(hash_hex, "c02fc311047bb392ece09c21611f85d206275fef189d0f466740db52c3d8eb3a");
     }
 
     #[test]
@@ -2978,6 +3010,7 @@ mod tests {
                 asset_id,
                 creator_owner_id: creator_owner,
                 asset_class: TokenAssetClass::Liquidity,
+                token_version: CURRENT_TOKEN_VERSION,
                 mint_authority_owner_id: [0u8; 32],
                 decimals: 8,
                 supply_mode: SupplyMode::Capped,
@@ -2992,6 +3025,7 @@ mod tests {
                 created_at: None,
                 liquidity: Some(LiquidityPoolState {
                     pool_nonce: 1,
+                    curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
                     real_cpay_reserves_sompi: 1_000_000,
                     real_token_reserves: 900,
                     virtual_cpay_reserves_sompi: INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
@@ -3137,6 +3171,7 @@ mod tests {
                 asset_id,
                 creator_owner_id: owner,
                 asset_class: TokenAssetClass::Liquidity,
+                token_version: CURRENT_TOKEN_VERSION,
                 mint_authority_owner_id: [0u8; 32],
                 decimals: 0,
                 supply_mode: SupplyMode::Capped,
@@ -3151,6 +3186,7 @@ mod tests {
                 created_at: None,
                 liquidity: Some(LiquidityPoolState {
                     pool_nonce: 1,
+                    curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
                     real_cpay_reserves_sompi: MIN_LIQUIDITY_SEED_RESERVE_SOMPI,
                     real_token_reserves: crate::liquidity_math::LIQUIDITY_TOKEN_SUPPLY_RAW,
                     virtual_cpay_reserves_sompi: INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
@@ -3217,6 +3253,7 @@ mod tests {
                 asset_id,
                 creator_owner_id: owner,
                 asset_class: TokenAssetClass::Liquidity,
+                token_version: CURRENT_TOKEN_VERSION,
                 mint_authority_owner_id: [0u8; 32],
                 decimals: 0,
                 supply_mode: SupplyMode::Capped,
@@ -3231,6 +3268,7 @@ mod tests {
                 created_at: None,
                 liquidity: Some(LiquidityPoolState {
                     pool_nonce: 1,
+                    curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
                     real_cpay_reserves_sompi: MIN_LIQUIDITY_SEED_RESERVE_SOMPI,
                     real_token_reserves: 1_000,
                     virtual_cpay_reserves_sompi: INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
@@ -3339,6 +3377,7 @@ mod tests {
             asset_id,
             creator_owner_id: creator_owner,
             asset_class: TokenAssetClass::Liquidity,
+            token_version: CURRENT_TOKEN_VERSION,
             mint_authority_owner_id: [0u8; 32],
             decimals: 8,
             supply_mode: SupplyMode::Capped,
@@ -3353,6 +3392,7 @@ mod tests {
             created_at: None,
             liquidity: Some(LiquidityPoolState {
                 pool_nonce: 1,
+                curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
                 real_cpay_reserves_sompi: 50_000,
                 real_token_reserves: 400,
                 virtual_cpay_reserves_sompi: INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
@@ -3379,6 +3419,7 @@ mod tests {
             asset_id: [0xAB; 32],
             creator_owner_id: [0xBC; 32],
             asset_class: TokenAssetClass::Liquidity,
+            token_version: CURRENT_TOKEN_VERSION,
             mint_authority_owner_id: [0u8; 32],
             decimals: 8,
             supply_mode: SupplyMode::Capped,
@@ -3393,6 +3434,7 @@ mod tests {
             created_at: None,
             liquidity: Some(LiquidityPoolState {
                 pool_nonce: 1,
+                curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
                 real_cpay_reserves_sompi: 0,
                 real_token_reserves: 499,
                 virtual_cpay_reserves_sompi: INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
@@ -3436,6 +3478,7 @@ mod tests {
                 asset_id,
                 creator_owner_id: sender_owner,
                 asset_class: TokenAssetClass::Liquidity,
+                token_version: CURRENT_TOKEN_VERSION,
                 mint_authority_owner_id: [0u8; 32],
                 decimals: 8,
                 supply_mode: SupplyMode::Capped,
@@ -3450,6 +3493,7 @@ mod tests {
                 created_at: None,
                 liquidity: Some(LiquidityPoolState {
                     pool_nonce: 1,
+                    curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
                     real_cpay_reserves_sompi: 50_000,
                     real_token_reserves: 900,
                     virtual_cpay_reserves_sompi: INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,

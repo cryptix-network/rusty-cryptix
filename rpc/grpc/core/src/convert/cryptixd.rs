@@ -20,7 +20,7 @@ impl AsRef<CryptixdResponse> for CryptixdResponse {
 
 pub mod cryptixd_request_convert {
     use crate::protowire::*;
-    use cryptix_rpc_core::{RpcError, RpcResult};
+    use cryptix_rpc_core::{RpcError as CoreRpcError, RpcResult};
 
     impl_into_cryptixd_request!(Shutdown);
     impl_into_cryptixd_request!(SubmitBlock);
@@ -150,22 +150,22 @@ pub mod cryptixd_request_convert {
             // ----------------------------------------------------------------------------
 
             impl TryFrom<&cryptixd_request::Payload> for $core_struct {
-                type Error = RpcError;
+                type Error = CoreRpcError;
                 fn try_from(item: &cryptixd_request::Payload) -> RpcResult<Self> {
                     if let cryptixd_request::Payload::$variant(request) = item {
                         request.try_into()
                     } else {
-                        Err(RpcError::MissingRpcFieldError("Payload".to_string(), stringify!($variant).to_string()))
+                        Err(CoreRpcError::MissingRpcFieldError("Payload".to_string(), stringify!($variant).to_string()))
                     }
                 }
             }
 
             impl TryFrom<&CryptixdRequest> for $core_struct {
-                type Error = RpcError;
+                type Error = CoreRpcError;
                 fn try_from(item: &CryptixdRequest) -> RpcResult<Self> {
                     item.payload
                         .as_ref()
-                        .ok_or(RpcError::MissingRpcFieldError("CryptixRequest".to_string(), "Payload".to_string()))?
+                        .ok_or(CoreRpcError::MissingRpcFieldError("CryptixRequest".to_string(), "Payload".to_string()))?
                         .try_into()
                 }
             }
@@ -188,7 +188,7 @@ pub mod cryptixd_request_convert {
 
 pub mod cryptixd_response_convert {
     use crate::protowire::*;
-    use cryptix_rpc_core::{RpcError, RpcResult};
+    use cryptix_rpc_core::{RpcError as CoreRpcError, RpcResult};
 
     impl_into_cryptixd_response!(Shutdown);
     impl_into_cryptixd_response!(SubmitBlock);
@@ -301,8 +301,8 @@ pub mod cryptixd_response_convert {
                 }
             }
 
-            impl From<RpcError> for $protowire_struct {
-                fn from(item: RpcError) -> Self {
+            impl From<CoreRpcError> for $protowire_struct {
+                fn from(item: CoreRpcError) -> Self {
                     let x: RpcResult<&$core_struct> = Err(item);
                     x.into()
                 }
@@ -360,22 +360,22 @@ pub mod cryptixd_response_convert {
             // ----------------------------------------------------------------------------
 
             impl TryFrom<&cryptixd_response::Payload> for $core_struct {
-                type Error = RpcError;
+                type Error = CoreRpcError;
                 fn try_from(item: &cryptixd_response::Payload) -> RpcResult<Self> {
                     if let cryptixd_response::Payload::$variant(response) = item {
                         response.try_into()
                     } else {
-                        Err(RpcError::MissingRpcFieldError("Payload".to_string(), stringify!($variant).to_string()))
+                        Err(CoreRpcError::MissingRpcFieldError("Payload".to_string(), stringify!($variant).to_string()))
                     }
                 }
             }
 
             impl TryFrom<&CryptixdResponse> for $core_struct {
-                type Error = RpcError;
+                type Error = CoreRpcError;
                 fn try_from(item: &CryptixdResponse) -> RpcResult<Self> {
                     item.payload
                         .as_ref()
-                        .ok_or(RpcError::MissingRpcFieldError("CryptixResponse".to_string(), "Payload".to_string()))?
+                        .ok_or(CoreRpcError::MissingRpcFieldError("CryptixResponse".to_string(), "Payload".to_string()))?
                         .try_into()
                 }
             }
@@ -409,7 +409,7 @@ pub mod cryptixd_response_convert {
 
             impl<T> From<Result<(), T>> for $protowire_struct
             where
-                T: Into<RpcError>,
+                T: Into<CoreRpcError>,
             {
                 fn from(item: Result<(), T>) -> Self {
                     item

@@ -2817,6 +2817,7 @@ impl Deserializer for GetTokenNonceResponse {
 pub struct RpcTokenAsset {
     pub asset_id: String,
     pub creator_owner_id: String,
+    pub token_version: u32,
     pub mint_authority_owner_id: String,
     pub decimals: u32,
     pub supply_mode: u32,
@@ -2833,9 +2834,10 @@ pub struct RpcTokenAsset {
 
 impl Serializer for RpcTokenAsset {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &3, writer)?;
+        store!(u16, &4, writer)?;
         store!(String, &self.asset_id, writer)?;
         store!(String, &self.creator_owner_id, writer)?;
+        store!(u32, &self.token_version, writer)?;
         store!(String, &self.mint_authority_owner_id, writer)?;
         store!(u32, &self.decimals, writer)?;
         store!(u32, &self.supply_mode, writer)?;
@@ -2857,6 +2859,7 @@ impl Deserializer for RpcTokenAsset {
         let version = load!(u16, reader)?;
         let asset_id = load!(String, reader)?;
         let creator_owner_id = load!(String, reader)?;
+        let token_version = if version >= 4 { load!(u32, reader)? } else { 1 };
         let mint_authority_owner_id = load!(String, reader)?;
         let decimals = load!(u32, reader)?;
         let supply_mode = load!(u32, reader)?;
@@ -2872,6 +2875,7 @@ impl Deserializer for RpcTokenAsset {
         Ok(Self {
             asset_id,
             creator_owner_id,
+            token_version,
             mint_authority_owner_id,
             decimals,
             supply_mode,
@@ -3268,6 +3272,7 @@ impl Deserializer for RpcLiquidityFeeRecipient {
 pub struct RpcLiquidityPoolState {
     pub asset_id: String,
     pub pool_nonce: u64,
+    pub curve_version: u32,
     pub fee_bps: u32,
     pub max_supply: String,
     pub total_supply: String,
@@ -3295,9 +3300,10 @@ pub struct RpcLiquidityPoolState {
 
 impl Serializer for RpcLiquidityPoolState {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &3, writer)?;
+        store!(u16, &4, writer)?;
         store!(String, &self.asset_id, writer)?;
         store!(u64, &self.pool_nonce, writer)?;
+        store!(u32, &self.curve_version, writer)?;
         store!(u32, &self.fee_bps, writer)?;
         store!(String, &self.max_supply, writer)?;
         store!(String, &self.total_supply, writer)?;
@@ -3330,6 +3336,7 @@ impl Deserializer for RpcLiquidityPoolState {
         let version = load!(u16, reader)?;
         let asset_id = load!(String, reader)?;
         let pool_nonce = load!(u64, reader)?;
+        let curve_version = if version >= 4 { load!(u32, reader)? } else { 1 };
         let fee_bps = load!(u32, reader)?;
         let max_supply = load!(String, reader)?;
         let total_supply = load!(String, reader)?;
@@ -3356,6 +3363,7 @@ impl Deserializer for RpcLiquidityPoolState {
         Ok(Self {
             asset_id,
             pool_nonce,
+            curve_version,
             fee_bps,
             max_supply,
             total_supply,

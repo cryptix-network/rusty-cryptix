@@ -488,6 +488,7 @@ impl RpcCoreService {
         RpcTokenAsset {
             asset_id: asset.asset_id.as_slice().to_hex(),
             creator_owner_id: asset.creator_owner_id.as_slice().to_hex(),
+            token_version: u32::from(asset.token_version),
             mint_authority_owner_id: asset.mint_authority_owner_id.as_slice().to_hex(),
             decimals: asset.decimals as u32,
             supply_mode: asset.supply_mode as u32,
@@ -584,6 +585,7 @@ impl RpcCoreService {
         RpcLiquidityPoolState {
             asset_id: asset.asset_id.as_slice().to_hex(),
             pool_nonce: pool.pool_nonce,
+            curve_version: u32::from(pool.curve_version),
             fee_bps: u32::from(pool.fee_bps),
             max_supply: asset.max_supply.to_string(),
             total_supply: asset.total_supply.to_string(),
@@ -2944,12 +2946,16 @@ impl AsyncService for RpcCoreService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cryptix_atomicindex::liquidity_math::{INITIAL_VIRTUAL_TOKEN_RESERVES, LIQUIDITY_TOKEN_SUPPLY_RAW};
+    use cryptix_atomicindex::{
+        liquidity_math::{INITIAL_VIRTUAL_TOKEN_RESERVES, LIQUIDITY_TOKEN_SUPPLY_RAW},
+        payload::{CURRENT_LIQUIDITY_CURVE_VERSION, CURRENT_TOKEN_VERSION},
+    };
     use cryptix_consensus_core::{tx::TransactionOutpoint, Hash};
 
     fn sample_liquidity_pool(real_token_reserves: u128, real_cpay_reserves_sompi: u64, fee_bps: u16) -> LiquidityPoolState {
         LiquidityPoolState {
             pool_nonce: 7,
+            curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
             real_cpay_reserves_sompi,
             real_token_reserves,
             virtual_cpay_reserves_sompi: INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
@@ -2970,6 +2976,7 @@ mod tests {
             asset_id: [0x11; 32],
             creator_owner_id: [0x22; 32],
             asset_class: TokenAssetClass::Liquidity,
+            token_version: CURRENT_TOKEN_VERSION,
             mint_authority_owner_id: [0u8; 32],
             decimals: 0,
             supply_mode: SupplyMode::Capped,
@@ -2997,6 +3004,7 @@ mod tests {
     #[test]
     fn simulate_create_asset_with_mint_rejects_initial_mint_above_cap() {
         let op = CreateAssetWithMintOp {
+            token_version: CURRENT_TOKEN_VERSION,
             decimals: 0,
             supply_mode: SupplyMode::Capped,
             max_supply: 100,
@@ -3015,6 +3023,8 @@ mod tests {
     #[test]
     fn simulate_create_liquidity_rejects_zero_seed_reserve() {
         let op = CreateLiquidityAssetOp {
+            token_version: CURRENT_TOKEN_VERSION,
+            curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
             decimals: 0,
             max_supply: LIQUIDITY_TOKEN_SUPPLY_RAW,
             name: b"Pool".to_vec(),

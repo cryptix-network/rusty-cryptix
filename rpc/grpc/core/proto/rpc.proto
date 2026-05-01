@@ -1027,6 +1027,7 @@ message RpcTokenAssetMessage {
   optional uint64 createdDaaScore = 12;
   optional uint64 createdAt = 13;
   string platformTag = 14;
+  uint32 tokenVersion = 15;
 }
 
 message GetTokenAssetRequestMessage {
@@ -1206,6 +1207,7 @@ message RpcLiquidityPoolStateMessage {
   string currentSpotPriceSompi = 23;
   string circulatingMcapCpaySompi = 24;
   string fdvMcapCpaySompi = 25;
+  uint32 curveVersion = 26;
 }
 
 message GetLiquidityPoolStateRequestMessage {

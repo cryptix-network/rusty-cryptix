@@ -12,6 +12,8 @@ use workflow_core::time::Duration;
 
 const CAT_MAGIC: [u8; 3] = *b"CAT";
 const CAT_VERSION: u8 = 1;
+const CAT_CURRENT_TOKEN_VERSION: u8 = 1;
+const CAT_CURRENT_LIQUIDITY_CURVE_VERSION: u8 = 1;
 const CAT_FLAGS: u8 = 0;
 
 const CAT_OP_CREATE_ASSET: u8 = 0;
@@ -1444,6 +1446,7 @@ impl Token {
         metadata: &[u8],
     ) -> Result<()> {
         let mint_authority_owner_id = Self::parse_hex_32(mint_authority_owner_id, "mintAuthorityOwnerId")?;
+        payload.push(CAT_CURRENT_TOKEN_VERSION);
         payload.push(decimals);
         payload.push(supply_mode);
         payload.extend_from_slice(&max_supply.to_le_bytes());
@@ -1576,6 +1579,8 @@ impl Token {
         }
 
         let mut payload = Self::build_header(CAT_OP_CREATE_LIQUIDITY_ASSET, nonce, auth_input_index)?;
+        payload.push(CAT_CURRENT_TOKEN_VERSION);
+        payload.push(CAT_CURRENT_LIQUIDITY_CURVE_VERSION);
         payload.push(decimals);
         payload.extend_from_slice(&max_supply.to_le_bytes());
         payload.push(name.len() as u8);

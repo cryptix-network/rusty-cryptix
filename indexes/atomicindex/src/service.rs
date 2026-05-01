@@ -43,7 +43,7 @@ use std::{
 use tokio::sync::Mutex;
 
 const SERVICE_IDENT: &str = "cryptix-atomic-service";
-const TOKEN_PROTOCOL_VERSION: u16 = 5;
+const TOKEN_PROTOCOL_VERSION: u16 = 6;
 
 const TOKEN_FINALITY_DEPTH_MAINNET: u64 = 86_400;
 const TOKEN_FINALITY_DEPTH_TESTNET: u64 = 86_400;

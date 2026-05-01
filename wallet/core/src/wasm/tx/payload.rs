@@ -13,6 +13,10 @@ const CRYPTOBOX_TAG_BYTES: usize = 16;
 const CRYPTOBOX_OVERHEAD_BYTES: usize = CRYPTOBOX_NONCE_BYTES + CRYPTOBOX_TAG_BYTES;
 const CAT_MAGIC: [u8; 3] = *b"CAT";
 const CAT_VERSION: u8 = 1;
+const CAT_CURRENT_TOKEN_VERSION: u8 = 1;
+const CAT_CURRENT_LIQUIDITY_CURVE_VERSION: u8 = 1;
+const CAT_MAX_TOKEN_VERSION: u8 = 99;
+const CAT_MAX_LIQUIDITY_CURVE_VERSION: u8 = 99;
 const CAT_FLAGS: u8 = 0;
 const CAT_MAX_NAME_LEN: usize = 32;
 const CAT_MAX_SYMBOL_LEN: usize = 10;
@@ -259,6 +263,7 @@ fn push_create_asset_common(
 
     let mint_authority_owner_id = parse_hex_32("mintAuthorityOwnerId", mint_authority_owner_id)?;
 
+    payload.push(CAT_CURRENT_TOKEN_VERSION);
     payload.push(decimals);
     payload.push(supply_mode);
     payload.extend_from_slice(&max_supply.to_le_bytes());
@@ -408,6 +413,10 @@ const TS_ATOMIC_TOKEN_PAYLOAD_TYPES: &'static str = r#"
  * @category Wallet SDK
  */
 export interface IAtomicTokenPayloadConstants {
+    currentTokenVersion: number;
+    currentLiquidityCurveVersion: number;
+    maxTokenVersion: number;
+    maxLiquidityCurveVersion: number;
     maxNameBytes: number;
     maxSymbolBytes: number;
     maxMetadataBytes: number;
@@ -428,6 +437,10 @@ export interface IAtomicTokenPayloadConstants {
 #[wasm_bindgen(js_name = atomicTokenPayloadConstants)]
 pub fn atomic_token_payload_constants_js() -> Result<Object> {
     let object = Object::new();
+    object.set("currentTokenVersion", &JsValue::from_f64(CAT_CURRENT_TOKEN_VERSION as f64))?;
+    object.set("currentLiquidityCurveVersion", &JsValue::from_f64(CAT_CURRENT_LIQUIDITY_CURVE_VERSION as f64))?;
+    object.set("maxTokenVersion", &JsValue::from_f64(CAT_MAX_TOKEN_VERSION as f64))?;
+    object.set("maxLiquidityCurveVersion", &JsValue::from_f64(CAT_MAX_LIQUIDITY_CURVE_VERSION as f64))?;
     object.set("maxNameBytes", &JsValue::from_f64(CAT_MAX_NAME_LEN as f64))?;
     object.set("maxSymbolBytes", &JsValue::from_f64(CAT_MAX_SYMBOL_LEN as f64))?;
     object.set("maxMetadataBytes", &JsValue::from_f64(CAT_MAX_METADATA_LEN as f64))?;
@@ -666,6 +679,8 @@ pub fn serialize_atomic_token_create_liquidity_asset_payload_js(
     }
 
     let mut payload = build_cat_header(CAT_OP_CREATE_LIQUIDITY_ASSET, auth_input_index, nonce)?;
+    payload.push(CAT_CURRENT_TOKEN_VERSION);
+    payload.push(CAT_CURRENT_LIQUIDITY_CURVE_VERSION);
     payload.push(decimals);
     payload.extend_from_slice(&max_supply.to_le_bytes());
     payload.push(name.len() as u8);
