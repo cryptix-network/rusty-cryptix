@@ -301,7 +301,7 @@ pub fn cpmm_sell(
     let y_after = y_before.checked_add(token_in).ok_or(LiquidityMathError::Overflow)?;
     let x_before = virtual_cpay_reserves_sompi;
     let k = Uint256::from_u64(x_before) * Uint256::from_u128(y_before);
-    let x_after_u256 = k / Uint256::from_u128(y_after);
+    let x_after_u256 = ceil_div_u256(k, Uint256::from_u128(y_after));
     let x_after_u128 = u128::try_from(x_after_u256).map_err(|_| LiquidityMathError::Overflow)?;
     let x_after = u64::try_from(x_after_u128).map_err(|_| LiquidityMathError::Overflow)?;
     if x_after > x_before {
@@ -379,20 +379,20 @@ mod tests {
     }
 
     #[test]
-    fn cpmm_sell_floor_uses_gross_out() {
-        let err = cpmm_sell(100, 1_000, 1, 1_000).expect_err("gross-out floor breach must be rejected");
+    fn cpmm_sell_uses_gross_out_for_reserve_floor() {
+        let err = cpmm_sell(100, 1_000, 1, 1_000).expect_err("gross-out reserve breach must be rejected");
         assert_eq!(err, LiquidityMathError::InvalidInput);
     }
 
     #[test]
-    fn cpmm_sell_rejects_gross_floor_breach_even_when_net_payout_would_fit() {
+    fn cpmm_sell_rejects_gross_reserve_breach_even_when_net_payout_would_fit() {
         let hypothetical_gross_out = 1_000u64;
         let fee = calculate_trade_fee(hypothetical_gross_out, 1_000).expect("fee should calculate");
         let cpay_out = hypothetical_gross_out - fee;
         assert!(hypothetical_gross_out > 1_000 - MIN_CPAY_RESERVE_SOMPI);
         assert!(cpay_out <= 1_000 - MIN_CPAY_RESERVE_SOMPI);
 
-        let err = cpmm_sell(1_000, 2_000, 1, 1).expect_err("gross-out floor breach must be rejected");
+        let err = cpmm_sell(1_000, 2_000, 1, 1).expect_err("gross-out reserve breach must be rejected");
         assert_eq!(err, LiquidityMathError::InvalidInput);
     }
 
@@ -609,11 +609,11 @@ mod tests {
                 1_009_002,
                 250,
                 100,
-                24_795_343_483,
+                24_795_343_482,
                 247_953_434,
-                24_547_390_049,
-                74_304_656_517,
-                100_074_204_656_517,
+                24_547_390_048,
+                74_304_656_518,
+                100_074_204_656_518,
                 1_009_252,
             ),
             (
@@ -637,11 +637,11 @@ mod tests {
                 7_272_902,
                 7_777,
                 40,
-                353_809_349_880,
+                353_809_349_879,
                 1_415_237_399,
-                352_394_112_481,
-                875_852_650_120,
-                330_875_752_650_120,
+                352_394_112_480,
+                875_852_650_121,
+                330_875_752_650_121,
                 7_280_679,
             ),
         ];
@@ -837,6 +837,27 @@ mod tests {
     }
 
     #[test]
+    fn split_sell_round_trip_does_not_extract_rounding_profit() {
+        let net_in = 7u64;
+        let (token_out, _, mut virtual_cpay, mut virtual_tokens) = cpmm_buy(4, 2, 4, net_in).expect("regression buy should quote");
+        assert_eq!(token_out, 3);
+
+        let mut real_cpay = virtual_cpay;
+        let mut total_gross_out = 0u64;
+        for step in 0..token_out {
+            let (gross_out, next_real_cpay, next_virtual_cpay, next_virtual_tokens) =
+                cpmm_sell(real_cpay, virtual_cpay, virtual_tokens, 1)
+                    .unwrap_or_else(|err| panic!("split sell step {step} failed: {err:?}"));
+            total_gross_out = total_gross_out.checked_add(gross_out).expect("gross_out overflow");
+            real_cpay = next_real_cpay;
+            virtual_cpay = next_virtual_cpay;
+            virtual_tokens = next_virtual_tokens;
+        }
+
+        assert!(total_gross_out <= net_in, "split sell returned {total_gross_out}, exceeding original net input {net_in}");
+    }
+
+    #[test]
     fn no_fee_curve_shape_matches_target_percentages() {
         let cases = [
             (10, 100_000u128, 22_727_272_727_273u128),
@@ -973,11 +994,11 @@ mod tests {
                 1_199_525,
                 100,
                 100,
-                20_848_098_365,
+                20_848_098_364,
                 208_480_983,
-                20_639_617_382,
-                78_251_901_635,
-                250_078_151_901_635,
+                20_639_617_381,
+                78_251_901_636,
+                250_078_151_901_636,
                 1_199_625,
             ),
             (
@@ -987,11 +1008,11 @@ mod tests {
                 876_543,
                 12_345,
                 250,
-                13_716_680_384,
+                13_716_680_383,
                 342_917_009,
-                13_373_763_375,
-                6_283_319_616,
-                973_937_640_616,
+                13_373_763_374,
+                6_283_319_617,
+                973_937_640_617,
                 888_888,
             ),
             (
@@ -1001,11 +1022,11 @@ mod tests {
                 987_654,
                 500_000,
                 1_000,
-                414_937_845_132,
+                414_937_845_131,
                 41_493_784_513,
-                373_444_060_619,
-                49_585_062_154_868,
-                819_630_044_991,
+                373_444_060_618,
+                49_585_062_154_869,
+                819_630_044_992,
                 1_487_654,
             ),
         ];

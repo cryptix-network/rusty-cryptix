@@ -3121,7 +3121,7 @@ mod tests {
     }
 
     #[test]
-    fn simulate_sell_liquidity_rejects_gross_floor_breach_even_when_net_payout_would_fit() {
+    fn simulate_sell_liquidity_rejects_gross_reserve_breach_even_when_net_payout_would_fit() {
         let mut pool = sample_liquidity_pool(900, 1_000, 9000);
         pool.virtual_cpay_reserves_sompi = 2_000;
         pool.virtual_token_reserves = 1;

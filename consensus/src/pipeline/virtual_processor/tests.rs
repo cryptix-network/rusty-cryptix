@@ -551,7 +551,8 @@ fn initial_liquidity_virtual_token_reserves(max_supply: u128) -> u128 {
 fn quote_sell(virtual_cpay_reserves_sompi: u64, virtual_token_reserves: u128, token_in: u128, fee_bps: u16) -> (u64, u64) {
     let y_after = virtual_token_reserves + token_in;
     let x_before = u128::from(virtual_cpay_reserves_sompi);
-    let x_after = (x_before * virtual_token_reserves) / y_after;
+    let numerator = x_before * virtual_token_reserves;
+    let x_after = numerator / y_after + u128::from(numerator % y_after != 0);
     let gross = u64::try_from(x_before - x_after).unwrap();
     let trade_fee = fee(gross, fee_bps);
     (trade_fee, gross - trade_fee)

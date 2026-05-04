@@ -383,7 +383,7 @@ fn cpmm_sell(
 
     let x_before = virtual_cpay_reserves_sompi;
     let k = Uint256::from_u64(x_before) * Uint256::from_u128(virtual_token_reserves);
-    let x_after_u256 = k / Uint256::from_u128(y_after);
+    let x_after_u256 = ceil_div_u256(k, Uint256::from_u128(y_after));
     let x_after_u128 = u128::try_from(x_after_u256)
         .map_err(|_| TxRuleError::InvalidAtomicPayload("CPMM sell x_after conversion overflow".to_string()))?;
     let x_after = u64::try_from(x_after_u128)
