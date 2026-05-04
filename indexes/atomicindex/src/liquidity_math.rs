@@ -741,6 +741,102 @@ mod tests {
     }
 
     #[test]
+    fn canonical_buy_input_is_minimal_across_deterministic_cases() {
+        let fee_schedule = [0u16, 10, 100, 250, 1_000];
+        let mut seed = 0xD15EA5E_CAFEBABEu64;
+
+        for step in 0..5_000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let real_token_reserves = 2 + u128::from(seed % 1_000_000);
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let virtual_token_reserves = real_token_reserves + 1 + u128::from(seed % 2_000_000);
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let virtual_cpay_reserves_sompi = 1 + (seed % 800_000_000_000_000);
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let gross_in = 1 + (seed % (10_000 * SOMPI_PER_CRYPTIX));
+            let fee_bps = fee_schedule[step % fee_schedule.len()];
+
+            let fee = calculate_trade_fee(gross_in, fee_bps).expect("fee should calculate");
+            let net = gross_in - fee;
+            if net == 0 {
+                continue;
+            }
+            let Ok((token_out, _, _, _)) = cpmm_buy(real_token_reserves, virtual_cpay_reserves_sompi, virtual_token_reserves, net)
+            else {
+                continue;
+            };
+
+            let canonical = min_gross_input_for_token_out(
+                real_token_reserves,
+                virtual_cpay_reserves_sompi,
+                virtual_token_reserves,
+                token_out,
+                fee_bps,
+            )
+            .unwrap_or_else(|err| panic!("case {step}: canonical input failed for token_out {token_out}: {err:?}"));
+            assert!(canonical <= gross_in, "case {step}: canonical gross input {canonical} exceeds accepted gross input {gross_in}");
+
+            let canonical_fee = calculate_trade_fee(canonical, fee_bps).expect("canonical fee should calculate");
+            let canonical_net = canonical - canonical_fee;
+            let canonical_token_out =
+                cpmm_buy(real_token_reserves, virtual_cpay_reserves_sompi, virtual_token_reserves, canonical_net)
+                    .map(|(token_out, _, _, _)| token_out)
+                    .unwrap_or(0);
+            assert_eq!(canonical_token_out, token_out, "case {step}: canonical input changed token_out");
+
+            if canonical > 1 {
+                let previous = canonical - 1;
+                let previous_fee = calculate_trade_fee(previous, fee_bps).expect("previous fee should calculate");
+                let previous_net = previous - previous_fee;
+                let previous_token_out =
+                    cpmm_buy(real_token_reserves, virtual_cpay_reserves_sompi, virtual_token_reserves, previous_net)
+                        .map(|(token_out, _, _, _)| token_out)
+                        .unwrap_or(0);
+                assert!(
+                    previous_token_out < token_out,
+                    "case {step}: previous gross input {previous} still bought {previous_token_out}/{token_out} tokens"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn buy_then_sell_same_tokens_never_returns_more_cpay_than_spent() {
+        let fee_schedule = [0u16, 10, 100, 250, 1_000];
+        let mut seed = 0xA11CE5AFE1234567u64;
+
+        for step in 0..5_000 {
+            seed = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+            let real_token_reserves = 2 + u128::from(seed % 1_000_000);
+            seed = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+            let virtual_token_reserves = real_token_reserves + 1 + u128::from(seed % 2_000_000);
+            seed = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+            let virtual_cpay_reserves_sompi = 1 + (seed % 800_000_000_000_000);
+            seed = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+            let gross_in = 1 + (seed % (10_000 * SOMPI_PER_CRYPTIX));
+            let fee_bps = fee_schedule[step % fee_schedule.len()];
+
+            let buy_fee = calculate_trade_fee(gross_in, fee_bps).expect("buy fee should calculate");
+            let net_in = gross_in - buy_fee;
+            if net_in == 0 {
+                continue;
+            }
+            let Ok((token_out, _, virtual_cpay_after_buy, virtual_tokens_after_buy)) =
+                cpmm_buy(real_token_reserves, virtual_cpay_reserves_sompi, virtual_token_reserves, net_in)
+            else {
+                continue;
+            };
+            let (gross_out, _, _, _) = cpmm_sell(virtual_cpay_after_buy, virtual_cpay_after_buy, virtual_tokens_after_buy, token_out)
+                .unwrap_or_else(|err| panic!("case {step}: round-trip sell failed: {err:?}"));
+            let sell_fee = calculate_trade_fee(gross_out, fee_bps).expect("sell fee should calculate");
+            let cpay_out = gross_out - sell_fee;
+
+            assert!(gross_out <= net_in, "case {step}: sell gross_out {gross_out} exceeded buy net_in {net_in}");
+            assert!(cpay_out <= gross_in, "case {step}: buy gross_in {gross_in}, sell cpay_out {cpay_out}, token_out {token_out}");
+        }
+    }
+
+    #[test]
     fn no_fee_curve_shape_matches_target_percentages() {
         let cases = [
             (10, 100_000u128, 22_727_272_727_273u128),

@@ -1282,6 +1282,7 @@ dependencies = [
  "blake2b_simd",
  "criterion",
  "crossbeam-channel",
+ "cryptix-atomicindex",
  "cryptix-consensus-core",
  "cryptix-consensus-notify",
  "cryptix-consensusmanager",

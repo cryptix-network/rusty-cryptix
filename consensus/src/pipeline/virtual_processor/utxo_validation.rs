@@ -88,9 +88,14 @@ struct VaultTransition {
 #[cfg(test)]
 mod tests {
     use super::{
-        atomic_op_allows_liquidity_vault_output, validate_liquidity_claim_authorization, validate_liquidity_creation_parameters,
-        AtomicPayloadOp, INITIAL_REAL_CPAY_RESERVES_SOMPI, LIQUIDITY_TOKEN_SUPPLY_RAW, MAX_LIQUIDITY_SUPPLY_RAW,
-        MIN_LIQUIDITY_SUPPLY_RAW,
+        atomic_op_allows_liquidity_vault_output, calculate_trade_fee, cpmm_buy, cpmm_sell,
+        initial_virtual_cpay_reserves_sompi_for_curve, initial_virtual_token_reserves_for_curve, min_gross_input_for_token_out,
+        validate_liquidity_claim_authorization, validate_liquidity_creation_parameters, AtomicPayloadOp, DEFAULT_LIQUIDITY_CURVE_MODE,
+        INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI, INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS,
+        INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI, INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS, INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI,
+        INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS, INITIAL_REAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+        INITIAL_VIRTUAL_TOKEN_RESERVES, LIQUIDITY_CURVE_MODE_AGGRESSIVE, LIQUIDITY_CURVE_MODE_BASIC, LIQUIDITY_CURVE_MODE_INDIVIDUAL,
+        LIQUIDITY_TOKEN_SUPPLY_RAW, MAX_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SUPPLY_RAW,
     };
 
     #[test]
@@ -123,6 +128,96 @@ mod tests {
             cpay_in_sompi: 1,
             min_token_out: 1,
         }));
+    }
+
+    #[test]
+    fn consensus_liquidity_math_matches_atomicindex_reference() {
+        use cryptix_atomicindex::liquidity_math as index_math;
+
+        let fee_schedule = [0u16, 10, 100, 250, 1_000];
+        let curve_cases = [
+            (LIQUIDITY_CURVE_MODE_BASIC, 0, 0),
+            (LIQUIDITY_CURVE_MODE_AGGRESSIVE, 0, 0),
+            (LIQUIDITY_CURVE_MODE_INDIVIDUAL, INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI, INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS),
+            (LIQUIDITY_CURVE_MODE_INDIVIDUAL, INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI, INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS),
+            (
+                LIQUIDITY_CURVE_MODE_INDIVIDUAL,
+                INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI + (4 * INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI),
+                INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS + (7 * INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS),
+            ),
+        ];
+
+        for max_supply in [MIN_LIQUIDITY_SUPPLY_RAW, LIQUIDITY_TOKEN_SUPPLY_RAW, MAX_LIQUIDITY_SUPPLY_RAW] {
+            for (mode, fixed_cpay, multiplier_bps) in curve_cases {
+                let consensus_cpay = initial_virtual_cpay_reserves_sompi_for_curve(mode, fixed_cpay).ok();
+                let index_cpay = index_math::initial_virtual_cpay_reserves_sompi_for_curve(mode, fixed_cpay).ok();
+                assert_eq!(consensus_cpay, index_cpay, "virtual CPAY drift for mode {mode}");
+
+                let consensus_tokens = initial_virtual_token_reserves_for_curve(max_supply, mode, multiplier_bps).ok();
+                let index_tokens = index_math::initial_virtual_token_reserves_for_curve(max_supply, mode, multiplier_bps).ok();
+                assert_eq!(consensus_tokens, index_tokens, "virtual token drift for mode {mode} max_supply {max_supply}");
+            }
+        }
+
+        let mut seed = 0xD1FF_E2E_C0DEC0DEu64;
+        for step in 0..5_000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let real_token_reserves = 2 + u128::from(seed % 1_000_000);
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let virtual_token_reserves = real_token_reserves + 1 + u128::from(seed % 2_000_000);
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let virtual_cpay_reserves_sompi = 1 + (seed % 800_000_000_000_000);
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let gross_in = 1 + (seed % (10_000 * cryptix_consensus_core::constants::SOMPI_PER_CRYPTIX));
+            let fee_bps = fee_schedule[step % fee_schedule.len()];
+
+            let consensus_fee = calculate_trade_fee(gross_in, fee_bps).ok();
+            let index_fee = index_math::calculate_trade_fee(gross_in, fee_bps).ok();
+            assert_eq!(consensus_fee, index_fee, "fee drift in case {step}");
+            let Some(fee) = consensus_fee else {
+                continue;
+            };
+            let net_in = gross_in - fee;
+
+            let consensus_buy = cpmm_buy(real_token_reserves, virtual_cpay_reserves_sompi, virtual_token_reserves, net_in).ok();
+            let index_buy =
+                index_math::cpmm_buy(real_token_reserves, virtual_cpay_reserves_sompi, virtual_token_reserves, net_in).ok();
+            assert_eq!(consensus_buy, index_buy, "buy drift in case {step}");
+
+            let spendable_token_reserves = real_token_reserves - 1;
+            let target_token_out = 1 + (u128::from(seed % 1_000_000) % spendable_token_reserves);
+            let consensus_canonical = min_gross_input_for_token_out(
+                real_token_reserves,
+                virtual_cpay_reserves_sompi,
+                virtual_token_reserves,
+                target_token_out,
+                fee_bps,
+            )
+            .ok();
+            let index_canonical = index_math::min_gross_input_for_token_out(
+                real_token_reserves,
+                virtual_cpay_reserves_sompi,
+                virtual_token_reserves,
+                target_token_out,
+                fee_bps,
+            )
+            .ok();
+            assert_eq!(consensus_canonical, index_canonical, "canonical buy drift in case {step}");
+
+            let real_cpay_reserves_sompi = virtual_cpay_reserves_sompi;
+            let token_in = 1 + u128::from(seed.rotate_left(17) % 1_000_000);
+            let consensus_sell =
+                cpmm_sell(real_cpay_reserves_sompi, virtual_cpay_reserves_sompi, virtual_token_reserves, token_in).ok();
+            let index_sell =
+                index_math::cpmm_sell(real_cpay_reserves_sompi, virtual_cpay_reserves_sompi, virtual_token_reserves, token_in).ok();
+            assert_eq!(consensus_sell, index_sell, "sell drift in case {step}");
+        }
+
+        let consensus_default_tokens =
+            initial_virtual_token_reserves_for_curve(LIQUIDITY_TOKEN_SUPPLY_RAW, DEFAULT_LIQUIDITY_CURVE_MODE, 0).unwrap();
+        assert_eq!(consensus_default_tokens, INITIAL_VIRTUAL_TOKEN_RESERVES);
+        let consensus_default_cpay = initial_virtual_cpay_reserves_sompi_for_curve(DEFAULT_LIQUIDITY_CURVE_MODE, 0).unwrap();
+        assert_eq!(consensus_default_cpay, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI);
     }
 }
 

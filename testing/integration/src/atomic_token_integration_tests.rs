@@ -21,6 +21,7 @@ use secp256k1::Keypair;
 use std::{fs, path::PathBuf, time::Duration};
 
 const CAT_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
+const CURRENT_TOKEN_VERSION: u8 = 1;
 const OWNER_AUTH_SCHEME_PUBKEY: u8 = 0;
 const OWNER_AUTH_SCHEME_PUBKEY_ECDSA: u8 = 1;
 
@@ -68,6 +69,7 @@ fn payload_create_asset(
     metadata: &[u8],
 ) -> Vec<u8> {
     let mut payload = base_header(0, auth_input_index, nonce);
+    payload.push(CURRENT_TOKEN_VERSION);
     payload.push(decimals);
     payload.push(0);
     payload.extend_from_slice(&0u128.to_le_bytes());
