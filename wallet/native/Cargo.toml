@@ -33,3 +33,6 @@ workflow-terminal.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true
+
+[dev-dependencies]
+cryptix-atomicindex.workspace = true

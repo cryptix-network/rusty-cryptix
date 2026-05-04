@@ -2165,6 +2165,7 @@ dependencies = [
  "async-std",
  "async-trait",
  "cryptix-addresses",
+ "cryptix-atomicindex",
  "cryptix-cli",
  "cryptix-consensus-client",
  "cryptix-consensus-core",

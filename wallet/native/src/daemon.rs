@@ -37,6 +37,8 @@ const DEFAULT_DAEMON_LISTEN: &str = "localhost:8082";
 const DEFAULT_RPC_SERVER: &str = "localhost";
 const CAT_MAGIC: [u8; 3] = *b"CAT";
 const CAT_VERSION: u8 = 1;
+const CAT_CURRENT_TOKEN_VERSION: u8 = 1;
+const CAT_CURRENT_LIQUIDITY_CURVE_VERSION: u8 = 1;
 const CAT_FLAGS: u8 = 0;
 const CAT_OP_CREATE_ASSET: u8 = 0;
 const CAT_OP_TRANSFER: u8 = 1;
@@ -836,6 +838,7 @@ impl WalletDaemonService {
         metadata: &[u8],
     ) -> Result<(), Status> {
         let mint_authority_owner_id = Self::parse_hex_32(mint_authority_owner_id, "mint_authority_owner_id")?;
+        payload.push(CAT_CURRENT_TOKEN_VERSION);
         payload.push(decimals);
         payload.push(supply_mode);
         payload.extend_from_slice(&max_supply.to_le_bytes());
@@ -982,6 +985,8 @@ impl WalletDaemonService {
         }
 
         let mut payload = Self::build_header(CAT_OP_CREATE_LIQUIDITY_ASSET, nonce, auth_input_index)?;
+        payload.push(CAT_CURRENT_TOKEN_VERSION);
+        payload.push(CAT_CURRENT_LIQUIDITY_CURVE_VERSION);
         payload.push(decimals);
         payload.extend_from_slice(&max_supply.to_le_bytes());
         payload.push(name.len() as u8);
@@ -2471,4 +2476,119 @@ fn print_start_daemon_help() {
 fn print_get_daemon_version_help() {
     println!("cryptix-wallet get-daemon-version");
     println!("  --daemonaddress,-d <addr>       wallet daemon address (default: {DEFAULT_DAEMON_LISTEN})");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cryptix_atomicindex::liquidity_math::DEFAULT_LIQUIDITY_CURVE_MODE;
+    use cryptix_atomicindex::payload::{parse_atomic_token_payload, SupplyMode, TokenOp};
+
+    const TEST_AUTH_INPUT_INDEX: u16 = 2;
+    const TEST_NONCE: u64 = 7;
+
+    fn owner_id(byte: u8) -> String {
+        hex::encode([byte; 32])
+    }
+
+    #[test]
+    fn native_create_asset_payload_matches_atomic_parser() {
+        let payload = WalletDaemonService::build_create_asset_payload(
+            "Gold",
+            "GLD",
+            8,
+            SupplyMode::Capped as u8,
+            100,
+            &owner_id(7),
+            b"hello",
+            "Bridge",
+            TEST_NONCE,
+            TEST_AUTH_INPUT_INDEX,
+        )
+        .unwrap();
+
+        let parsed = parse_atomic_token_payload(&payload).unwrap().unwrap();
+        assert_eq!(parsed.header.nonce, TEST_NONCE);
+        assert_eq!(parsed.header.auth_input_index, TEST_AUTH_INPUT_INDEX);
+        match parsed.op {
+            TokenOp::CreateAsset(op) => {
+                assert_eq!(op.token_version, CAT_CURRENT_TOKEN_VERSION);
+                assert_eq!(op.decimals, 8);
+                assert_eq!(op.supply_mode, SupplyMode::Capped);
+                assert_eq!(op.max_supply, 100);
+                assert_eq!(op.mint_authority_owner_id, [7u8; 32]);
+                assert_eq!(op.name, b"Gold");
+                assert_eq!(op.symbol, b"GLD");
+                assert_eq!(op.metadata, b"hello");
+                assert_eq!(op.platform_tag, b"Bridge");
+            }
+            _ => panic!("expected create asset"),
+        }
+    }
+
+    #[test]
+    fn native_create_asset_with_mint_payload_matches_atomic_parser() {
+        let payload = WalletDaemonService::build_create_asset_with_mint_payload(
+            "Gold",
+            "GLD",
+            8,
+            SupplyMode::Capped as u8,
+            100,
+            &owner_id(7),
+            b"hello",
+            42,
+            &owner_id(9),
+            "",
+            TEST_NONCE,
+            TEST_AUTH_INPUT_INDEX,
+        )
+        .unwrap();
+
+        let parsed = parse_atomic_token_payload(&payload).unwrap().unwrap();
+        match parsed.op {
+            TokenOp::CreateAssetWithMint(op) => {
+                assert_eq!(op.token_version, CAT_CURRENT_TOKEN_VERSION);
+                assert_eq!(op.initial_mint_amount, 42);
+                assert_eq!(op.initial_mint_to_owner_id, [9u8; 32]);
+                assert!(op.platform_tag.is_empty());
+            }
+            _ => panic!("expected create asset with mint"),
+        }
+    }
+
+    #[test]
+    fn native_create_liquidity_payload_matches_atomic_parser() {
+        let payload = WalletDaemonService::build_create_liquidity_asset_payload(
+            "Pool",
+            "POOL",
+            LIQUIDITY_TOKEN_DECIMALS,
+            MIN_LIQUIDITY_TOKEN_SUPPLY_RAW,
+            b"",
+            MIN_LIQUIDITY_SEED_RESERVE_SOMPI,
+            0,
+            &[],
+            0,
+            0,
+            "Bridge",
+            SOMPI_PER_CRYPTIX,
+            TEST_NONCE,
+            TEST_AUTH_INPUT_INDEX,
+        )
+        .unwrap();
+
+        let parsed = parse_atomic_token_payload(&payload).unwrap().unwrap();
+        match parsed.op {
+            TokenOp::CreateLiquidityAsset(op) => {
+                assert_eq!(op.token_version, CAT_CURRENT_TOKEN_VERSION);
+                assert_eq!(op.curve_version, CAT_CURRENT_LIQUIDITY_CURVE_VERSION);
+                assert_eq!(op.curve_mode, DEFAULT_LIQUIDITY_CURVE_MODE);
+                assert_eq!(op.decimals, LIQUIDITY_TOKEN_DECIMALS);
+                assert_eq!(op.max_supply, MIN_LIQUIDITY_TOKEN_SUPPLY_RAW);
+                assert_eq!(op.seed_reserve_sompi, MIN_LIQUIDITY_SEED_RESERVE_SOMPI);
+                assert_eq!(op.platform_tag, b"Bridge");
+                assert_eq!(op.liquidity_unlock_target_sompi, SOMPI_PER_CRYPTIX);
+            }
+            _ => panic!("expected liquidity create asset"),
+        }
+    }
 }
