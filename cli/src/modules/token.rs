@@ -553,7 +553,6 @@ impl Token {
             if let Some(sender) = argv.first() { Address::try_from(sender.as_str())? } else { account.receive_address()? };
 
         let pool = Self::fetch_liquidity_pool(&rpc, asset_id.as_str()).await?;
-        Self::ensure_liquidity_outflow_unlocked(&pool, "liquidity sell")?;
         let quote = rpc
             .get_liquidity_quote_call(
                 None,
@@ -642,6 +641,7 @@ impl Token {
             if let Some(sender) = argv.first() { Address::try_from(sender.as_str())? } else { account.receive_address()? };
 
         let pool = Self::fetch_liquidity_pool(&rpc, asset_id.as_str()).await?;
+        Self::ensure_liquidity_outflow_unlocked(&pool, "liquidity sell")?;
         let quote = rpc
             .get_liquidity_quote_call(
                 None,

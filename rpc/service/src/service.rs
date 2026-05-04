@@ -569,7 +569,7 @@ impl RpcCoreService {
     ) -> RpcLiquidityPoolState {
         let circulating_token_supply = asset.max_supply.saturating_sub(pool.real_token_reserves);
         let liquidity_lock_enabled = pool.unlock_target_sompi > 0;
-        let sell_locked = liquidity_lock_enabled && !pool.unlocked;
+        let sell_locked = Self::liquidity_sell_locked(pool);
         let max_buy_in =
             max_buy_in_sompi(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, pool.fee_bps)
                 .unwrap_or(0);
@@ -623,6 +623,20 @@ impl RpcCoreService {
             owner_id: entry.0.as_slice().to_hex(),
             balance: entry.1.to_string(),
         }
+    }
+
+    fn liquidity_sell_locked(pool: &LiquidityPoolState) -> bool {
+        pool.unlock_target_sompi > 0 && !pool.unlocked
+    }
+
+    fn liquidity_claim_preview_status(pool: &LiquidityPoolState, claimable_sompi: u64) -> (bool, Option<String>) {
+        if Self::liquidity_sell_locked(pool) {
+            return (false, Some("liquidity_sell_locked".to_string()));
+        }
+        if claimable_sompi < LIQUIDITY_MIN_PAYOUT_SOMPI {
+            return (false, Some("below_min_payout".to_string()));
+        }
+        (true, None)
     }
 
     fn map_liquidity_math_error(err: LiquidityMathError) -> RpcError {
@@ -791,7 +805,7 @@ impl RpcCoreService {
         if pool.pool_nonce != op.expected_pool_nonce {
             return Some(NoopReason::NonceStale);
         }
-        if pool.unlock_target_sompi > 0 && !pool.unlocked {
+        if Self::liquidity_sell_locked(pool) {
             return Some(NoopReason::LiquiditySellLocked);
         }
         if sender_balance < op.token_in {
@@ -1056,7 +1070,7 @@ impl RpcCoreService {
                 if pool.pool_nonce != op.expected_pool_nonce {
                     return Some(NoopReason::NonceStale);
                 }
-                if pool.unlock_target_sompi > 0 && !pool.unlocked {
+                if Self::liquidity_sell_locked(pool) {
                     return Some(NoopReason::LiquiditySellLocked);
                 }
                 let recipient_index = usize::from(op.recipient_index);
@@ -2670,8 +2684,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                 match maybe_recipient {
                     Some(recipient) => {
                         let claimable = recipient.unclaimed_sompi;
-                        let claimable_now = claimable >= LIQUIDITY_MIN_PAYOUT_SOMPI;
-                        let reason = if claimable_now { None } else { Some("below_min_payout".to_string()) };
+                        let (claimable_now, reason) = Self::liquidity_claim_preview_status(pool, claimable);
                         (Some(owner_id.as_slice().to_hex()), claimable, claimable_now, reason)
                     }
                     None => (Some(owner_id.as_slice().to_hex()), 0u64, false, Some("recipient_not_configured".to_string())),
@@ -3155,5 +3168,28 @@ mod tests {
             RpcCoreService::simulate_sell_liquidity_noop_reason(&asset, &pool, 100, &op),
             Some(NoopReason::LiquiditySellLocked)
         );
+    }
+
+    #[test]
+    fn liquidity_claim_preview_reports_active_lock_before_payout_amount() {
+        let mut pool = sample_liquidity_pool(900, 1_000, 0);
+        pool.unlock_target_sompi = 2_000;
+        pool.unlocked = false;
+
+        assert_eq!(
+            RpcCoreService::liquidity_claim_preview_status(&pool, LIQUIDITY_MIN_PAYOUT_SOMPI),
+            (false, Some("liquidity_sell_locked".to_string()))
+        );
+    }
+
+    #[test]
+    fn liquidity_claim_preview_reports_below_min_only_when_unlocked() {
+        let pool = sample_liquidity_pool(900, 1_000, 0);
+
+        assert_eq!(
+            RpcCoreService::liquidity_claim_preview_status(&pool, LIQUIDITY_MIN_PAYOUT_SOMPI - 1),
+            (false, Some("below_min_payout".to_string()))
+        );
+        assert_eq!(RpcCoreService::liquidity_claim_preview_status(&pool, LIQUIDITY_MIN_PAYOUT_SOMPI), (true, None));
     }
 }
