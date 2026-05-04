@@ -50,5 +50,5 @@ Denied in `RESTRICTED_AF`:
 - Corrupt snapshot files are ignored/quarantined; node continues
 - If no valid snapshot is available:
   - `hash_window = [0,0,0]`
-  - start in `RESTRICTED_AF`
-  - keep retrying source(s)
+  - with peer snapshot fallback enabled, start AntiFraud runtime in `RESTRICTED_AF` and keep requesting peer snapshots
+  - with peer snapshot fallback disabled, remain fail-open and keep retrying configured source(s)

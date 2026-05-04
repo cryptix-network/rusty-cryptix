@@ -799,9 +799,7 @@ impl FlowContext {
             .claim_messages_for_block(block_hash)
             .into_iter()
             .filter(|message| {
-                Self::claim_message_node_id(message)
-                    .map(|node_id| node_id == self.unified_node_identity.node_id && !self.is_claim_node_id_banned(&node_id))
-                    .unwrap_or(false)
+                Self::claim_message_node_id(message).map(|node_id| !self.is_claim_node_id_banned(&node_id)).unwrap_or(false)
             })
             .collect()
     }
@@ -1240,7 +1238,7 @@ impl FlowContext {
             self.report_misbehaving_peer(router, "block producer claim peer has no verified unified node ID").await;
             return;
         }
-        let outcome = self.strong_node_claims_engine.ingest_claim(&message, self.is_payload_hf_active(), peer_unified_node_id);
+        let outcome = self.strong_node_claims_engine.ingest_claim(&message, self.is_payload_hf_active());
         match outcome {
             ClaimIngestOutcome::Accepted { pending: _ } => {
                 self.strong_node_claims_engine.maybe_flush();
@@ -1300,12 +1298,24 @@ impl FlowContext {
         if !self.is_strong_node_claims_p2p_enabled() {
             return;
         }
+        if let Some(message) = self.local_block_producer_claim_for_hash(block_hash) {
+            self.broadcast_block_producer_claim(message, None).await;
+        }
+    }
+
+    fn local_block_producer_claim_for_hash(&self, block_hash: Hash) -> Option<BlockProducerClaimV1Message> {
+        if self.is_claim_node_id_banned(&self.unified_node_identity.node_id) {
+            return None;
+        }
         match self.strong_node_claims_engine.build_local_claim(block_hash, self.unified_node_identity.as_ref()) {
             Ok(message) => {
-                let _ = self.strong_node_claims_engine.ingest_claim(&message, self.is_payload_hf_active(), None);
-                self.broadcast_block_producer_claim(message, None).await;
+                let _ = self.strong_node_claims_engine.ingest_claim(&message, self.is_payload_hf_active());
+                Some(message)
             }
-            Err(err) => warn!("failed building local block producer claim for {}: {}", block_hash, err),
+            Err(err) => {
+                warn!("failed building local block producer claim for {}: {}", block_hash, err);
+                None
+            }
         }
     }
 

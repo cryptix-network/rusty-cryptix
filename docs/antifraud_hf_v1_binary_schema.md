@@ -13,10 +13,14 @@ This document is normative for Rust/Go implementations.
 4. `snapshot_seq` (`u64`, big-endian)
 5. `generated_at_ms` (`u64`, big-endian; telemetry only)
 6. `signing_key_id` (`u8`)
-7. `banned_ips_count` (`u32`, big-endian)
-8. `banned_ip_entry[]` (concatenated)
-9. `banned_node_ids_count` (`u32`, big-endian)
-10. `banned_node_id_entry[]` (concatenated)
+7. `antifraud_enabled` (`u8`; `0x00 = false`, `0x01 = true`)
+8. `banned_ips_count` (`u32`, big-endian)
+9. `banned_ip_entry[]` (concatenated)
+10. `banned_node_ids_count` (`u32`, big-endian)
+11. `banned_node_id_entry[]` (concatenated)
+
+`antifraud_enabled` is part of the signed payload. Implementations MUST reject
+any unsigned or non-boolean runtime gate representation.
 
 ## Entry Encoding
 - `banned_ip_entry`:

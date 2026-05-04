@@ -159,12 +159,7 @@ impl StrongNodeClaimsEngine {
         })
     }
 
-    pub fn ingest_claim(
-        &self,
-        message: &BlockProducerClaimV1Message,
-        hardfork_active: bool,
-        expected_node_id: Option<[u8; 32]>,
-    ) -> ClaimIngestOutcome {
+    pub fn ingest_claim(&self, message: &BlockProducerClaimV1Message, hardfork_active: bool) -> ClaimIngestOutcome {
         if !self.enabled || !hardfork_active {
             return ClaimIngestOutcome::Ignored;
         }
@@ -175,12 +170,6 @@ impl StrongNodeClaimsEngine {
                 return ClaimIngestOutcome::Strike { reason, node_id: None };
             }
         };
-        if expected_node_id.is_some_and(|expected| expected != record.node_id) {
-            return ClaimIngestOutcome::Strike {
-                reason: "claim node ID does not match peer handshake identity".to_string(),
-                node_id: Some(record.node_id),
-            };
-        }
 
         let mut state = self.state.lock();
         cleanup_pending_unknown_claims(&mut state, now_ms);
@@ -787,7 +776,7 @@ mod tests {
             "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
             1_588_910,
         );
-        let outcome = engine.ingest_claim(&claim, true, None);
+        let outcome = engine.ingest_claim(&claim, true);
         match outcome {
             ClaimIngestOutcome::Accepted { pending } => assert!(pending, "claim should be pending before block is known"),
             other => panic!("unexpected ingest outcome: {other:?}"),
@@ -833,7 +822,7 @@ mod tests {
             "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
             1_588_910,
         );
-        assert!(matches!(engine.ingest_claim(&claim, false, None), ClaimIngestOutcome::Ignored));
+        assert!(matches!(engine.ingest_claim(&claim, false), ClaimIngestOutcome::Ignored));
 
         let block_hash = Hash::from_bytes(decode_hex_32("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").unwrap());
         let mut path = ChainPath::default();
@@ -860,7 +849,7 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             1_588_910,
         );
-        let outcome = engine.ingest_claim(&claim, true, None);
+        let outcome = engine.ingest_claim(&claim, true);
         match outcome {
             ClaimIngestOutcome::Accepted { pending } => assert!(pending, "claim should be pending before block is known"),
             other => panic!("unexpected ingest outcome: {other:?}"),
@@ -898,12 +887,12 @@ mod tests {
             1_588_910,
         );
         claim.node_pow_nonce = Some(0);
-        assert!(matches!(engine.ingest_claim(&claim, true, None), ClaimIngestOutcome::Strike { .. }));
+        assert!(matches!(engine.ingest_claim(&claim, true), ClaimIngestOutcome::Strike { .. }));
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
-    fn claim_must_match_expected_peer_node_id() {
+    fn valid_claim_is_bound_to_signer_not_transport_peer() {
         let temp_dir = std::env::temp_dir().join(format!("strong-node-claims-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).expect("failed creating temp dir");
         let engine = StrongNodeClaimsEngine::new(true, "devnet", &temp_dir);
@@ -913,7 +902,10 @@ mod tests {
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             1_588_910,
         );
-        assert!(matches!(engine.ingest_claim(&claim, true, Some([0xff; 32])), ClaimIngestOutcome::Strike { .. }));
+        match engine.ingest_claim(&claim, true) {
+            ClaimIngestOutcome::Accepted { pending } => assert!(pending, "forwarded valid claim should be accepted"),
+            other => panic!("unexpected ingest outcome: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 

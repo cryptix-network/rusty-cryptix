@@ -165,24 +165,32 @@ impl Flow for AntiFraudSnapshotSyncFlow {
                         continue;
                     }
 
-                    if !connection_manager.is_antifraud_runtime_enabled() {
-                        mode_mismatch_streak = 0;
-                        continue;
-                    }
-
+                    let runtime_enabled = connection_manager.is_antifraud_runtime_enabled();
                     let current_mode = anti_fraud_hash_window_from_vec(&properties.anti_fraud_hashes)
-                        .map(|peer_hash_window| connection_manager.anti_fraud_mode_for_peer_hashes(&peer_hash_window))
-                        .unwrap_or(AntiFraudMode::Restricted);
+                        .map(|peer_hash_window| {
+                            if runtime_enabled {
+                                connection_manager.anti_fraud_mode_for_peer_hashes(&peer_hash_window)
+                            } else {
+                                AntiFraudMode::Full
+                            }
+                        })
+                        .unwrap_or(if runtime_enabled {
+                            AntiFraudMode::Restricted
+                        } else {
+                            AntiFraudMode::Full
+                        });
                     let mode_mismatch = (properties.anti_fraud_restricted && current_mode == AntiFraudMode::Full)
                         || (!properties.anti_fraud_restricted && current_mode == AntiFraudMode::Restricted);
                     if !should_disconnect_on_consecutive_mismatch(&mut mode_mismatch_streak, mode_mismatch) {
                         continue;
                     }
                     if properties.anti_fraud_restricted && current_mode == AntiFraudMode::Full {
-                        debug!(
-                            "Peer {} anti-fraud overlap became valid; reconnecting to upgrade from RESTRICTED_AF to FULL",
-                            self.router
-                        );
+                        let reason = if runtime_enabled {
+                            "anti-fraud overlap became valid"
+                        } else {
+                            "anti-fraud runtime is disabled"
+                        };
+                        debug!("Peer {} {}; reconnecting to upgrade from RESTRICTED_AF to FULL", self.router, reason);
                         self.ctx.hub().terminate(self.router.key()).await;
                         return Ok(());
                     }

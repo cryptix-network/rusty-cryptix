@@ -836,10 +836,14 @@ impl ConnectionManager {
         let winner = candidates.into_iter().find(|candidate| candidate.root_hash == winner_hash).expect("winner hash exists");
         if !winner.antifraud_enabled {
             drop(state);
-            if let Err(err) = self.try_apply_snapshot(winner.clone(), "peer-majority-gate-disabled") {
-                warn!("Failed to cache disabled peer-gate snapshot: {}", err);
+            match self.try_apply_snapshot(winner.clone(), "peer-majority-gate-disabled") {
+                Ok(_) => {
+                    self.disable_antifraud_runtime("peer snapshot majority gate is false");
+                }
+                Err(err) => {
+                    warn!("Rejected disabled peer-gate snapshot without changing runtime: {}", err);
+                }
             }
-            self.disable_antifraud_runtime("peer snapshot majority gate is false");
             return Ok(IngestPeerSnapshotResult { applied: false, root_hash: peer_root_hash });
         }
         drop(state);
@@ -998,10 +1002,15 @@ impl ConnectionManager {
         let fetched = match self.fetch_banserver_payload().await {
             BanserverFetchOutcome::Enabled(payload) => payload,
             BanserverFetchOutcome::DisabledByGate(payload) => {
-                if let Err(err) = self.try_apply_snapshot(payload.snapshot, "seed-server-gate-disabled") {
-                    warn!("Failed to cache disabled anti-fraud gate snapshot: {}", err);
+                match self.try_apply_snapshot(payload.snapshot, "seed-server-gate-disabled") {
+                    Ok(_) => {
+                        self.disable_antifraud_runtime("snapshot endpoint antifraud_enabled flag is false");
+                    }
+                    Err(err) => {
+                        warn!("Rejected disabled anti-fraud gate snapshot without changing runtime: {}", err);
+                        self.handle_seed_server_refresh_failure(&format!("disabled gate snapshot rejected: {err}"));
+                    }
                 }
-                self.disable_antifraud_runtime("snapshot endpoint antifraud_enabled flag is false");
                 return;
             }
             BanserverFetchOutcome::Unavailable => {
@@ -1220,7 +1229,7 @@ impl ConnectionManager {
                                 "Banserver {} HTTPS fetch failed for {} ({}), HTTP fallback {} succeeded",
                                 endpoint_name, endpoint_url, primary_err, fallback_url
                             );
-                            return Self::parse_endpoint_payload(endpoint_name, &fallback_url, payload);
+                            return self.parse_endpoint_payload(endpoint_name, &fallback_url, payload);
                         }
                         Err(fallback_err) => {
                             return Err(format!(
@@ -1234,15 +1243,16 @@ impl ConnectionManager {
             }
         };
 
-        Self::parse_endpoint_payload(endpoint_name, endpoint_url, primary_payload)
+        self.parse_endpoint_payload(endpoint_name, endpoint_url, primary_payload)
     }
 
     fn parse_endpoint_payload(
+        &self,
         endpoint_name: &'static str,
         endpoint_url: &str,
         payload: JsonValue,
     ) -> Result<EndpointBanserverPayload, String> {
-        let parsed = Self::parse_banserver_payload(payload)
+        let parsed = Self::parse_banserver_payload_for_network(payload, self.anti_fraud_network)
             .map_err(|err| format!("{} endpoint payload parse failed for {}: {}", endpoint_name, endpoint_url, err))?;
 
         if !parsed.enabled {
@@ -1309,7 +1319,10 @@ impl ConnectionManager {
         Some(parsed.to_string())
     }
 
-    fn parse_banserver_payload(payload: JsonValue) -> Result<BanserverPayload, String> {
+    fn parse_banserver_payload_for_network(
+        payload: JsonValue,
+        expected_network: AntiFraudNetwork,
+    ) -> Result<BanserverPayload, String> {
         let root = payload.get("data").unwrap_or(&payload);
         let antifraud_enabled = Self::read_antifraud_enabled(&payload)?;
         let schema_version = Self::read_u64(root, &["schema_version", "schemaVersion"]).ok_or("missing schema_version")? as u8;
@@ -1373,8 +1386,16 @@ impl ConnectionManager {
             antifraud_enabled,
         };
 
-        let snapshot = Self::normalize_snapshot_static(envelope, AntiFraudNetwork::from_u8(network).ok_or("invalid network enum")?)?;
+        let snapshot = Self::normalize_snapshot_static(envelope, expected_network)?;
         Ok(BanserverPayload { enabled: antifraud_enabled, snapshot })
+    }
+
+    #[cfg(test)]
+    fn parse_banserver_payload(payload: JsonValue) -> Result<BanserverPayload, String> {
+        let root = payload.get("data").unwrap_or(&payload);
+        let network = Self::read_network(root).ok_or("missing network")?;
+        let expected_network = AntiFraudNetwork::from_u8(network).ok_or("invalid network enum")?;
+        Self::parse_banserver_payload_for_network(payload, expected_network)
     }
 
     fn read_antifraud_enabled(payload: &JsonValue) -> Result<bool, String> {
@@ -1781,7 +1802,16 @@ impl ConnectionManager {
             loaded = self.load_snapshot_from_disk(previous_path);
         }
         if let Some(snapshot) = loaded {
-            let _ = self.try_apply_snapshot(snapshot, "persisted");
+            let should_enable_runtime = snapshot.antifraud_enabled;
+            match self.try_apply_snapshot(snapshot, "persisted") {
+                Ok(_) if should_enable_runtime => {
+                    self.set_antifraud_runtime_enabled_with_reason(true, "persisted signed snapshot loaded");
+                }
+                Ok(_) => {
+                    self.disable_antifraud_runtime("persisted snapshot antifraud_enabled flag is false");
+                }
+                Err(err) => warn!("failed applying persisted anti-fraud snapshot: {}", err),
+            }
         }
     }
 
@@ -1982,6 +2012,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_banserver_payload_rejects_wrong_expected_network() {
+        let payload = build_seed_payload();
+        let err = ConnectionManager::parse_banserver_payload_for_network(payload, AntiFraudNetwork::Testnet)
+            .expect_err("mainnet snapshot must not be accepted on testnet");
+        assert!(err.contains("network mismatch"));
+    }
+
+    #[test]
     fn parse_banserver_payload_accepts_signed_runtime_disable() {
         let mut payload = build_seed_payload();
         payload["antifraud_enabled"] = json!(false);
@@ -1991,6 +2029,42 @@ mod tests {
         let parsed = ConnectionManager::parse_banserver_payload(payload).expect("payload should parse");
         assert!(!parsed.enabled);
         assert_eq!(parsed.snapshot.snapshot_seq, 2);
+    }
+
+    #[test]
+    fn docs_antifraud_vectors_match_parser() {
+        let vectors_doc = include_str!("../../../docs/antifraud_hf_v1_test_vectors.json");
+        let vectors: JsonValue = serde_json::from_str(vectors_doc).expect("vectors json should parse");
+        let Some(entries) = vectors.get("vectors").and_then(JsonValue::as_array) else {
+            panic!("vectors array missing");
+        };
+
+        for entry in entries {
+            let network = entry["network"].as_u64().expect("network should be u64") as u8;
+            let expected_network = AntiFraudNetwork::from_u8(network).expect("known network enum");
+            let banned_ips = entry["canonical_banned_ips"].as_array().expect("canonical_banned_ips should be array").clone();
+            let banned_node_ids =
+                entry["canonical_banned_node_ids"].as_array().expect("canonical_banned_node_ids should be array").clone();
+            let banned_ips_count = banned_ips.len();
+            let banned_node_ids_count = banned_node_ids.len();
+            let payload = json!({
+                "antifraud_enabled": entry["antifraud_enabled"].as_bool().expect("antifraud_enabled should be bool"),
+                "schema_version": entry["schema_version"].as_u64().expect("schema_version should be u64"),
+                "network": network,
+                "snapshot_seq": entry["snapshot_seq"].as_u64().expect("snapshot_seq should be u64"),
+                "generated_at_ms": entry["generated_at_ms"].as_u64().expect("generated_at_ms should be u64"),
+                "signing_key_id": entry["signing_key_id"].as_u64().expect("signing_key_id should be u64"),
+                "banned_ips": banned_ips,
+                "banned_ips_count": banned_ips_count,
+                "banned_node_ids": banned_node_ids,
+                "banned_node_ids_count": banned_node_ids_count,
+                "signature": entry["signature_hex"].as_str().expect("signature_hex should be string"),
+            });
+
+            let parsed = ConnectionManager::parse_banserver_payload_for_network(payload, expected_network)
+                .unwrap_or_else(|err| panic!("{} should parse: {err}", entry["id"]));
+            assert_eq!(ConnectionManager::encode_hex(&parsed.snapshot.root_hash), entry["root_hash_hex"].as_str().unwrap());
+        }
     }
 
     #[test]
