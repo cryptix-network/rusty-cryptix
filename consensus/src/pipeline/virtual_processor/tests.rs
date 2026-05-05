@@ -18,11 +18,14 @@ use cryptix_consensus_core::{
     config::{params::MAINNET_PARAMS, ConfigBuilder},
     constants::{SOMPI_PER_CRYPTIX, TX_VERSION},
     subnets::{SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PAYLOAD},
-    tx::{MutableTransaction, ScriptPublicKey, ScriptVec, Transaction, TransactionInput, TransactionOutpoint, TransactionOutput},
+    tx::{
+        MutableTransaction, ScriptPublicKey, ScriptVec, Transaction, TransactionInput, TransactionOutpoint, TransactionOutput,
+        UtxoEntry,
+    },
     BlockHashSet,
 };
 use cryptix_hashes::Hash;
-use std::{collections::VecDeque, thread::JoinHandle};
+use std::{collections::VecDeque, sync::Arc, thread::JoinHandle};
 
 struct OnetimeTxSelector {
     txs: Option<Vec<Transaction>>,
@@ -478,6 +481,44 @@ fn find_virtual_utxo_by_script(
         from_outpoint = chunk.last().map(|(outpoint, _)| *outpoint);
         skip_first = true;
     }
+}
+
+#[test]
+fn pre_hf_atomic_state_reconstruction_counts_owner_utxos() {
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let second_owner_script = cryptix_txscript::pay_to_script_hash_script(&second_p2sh_redeem_script());
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    let second_owner_id = atomic_owner_id_from_script(&second_owner_script).expect("second owner id should derive from P2SH");
+    let non_owner_script = ScriptPublicKey::new(0, ScriptVec::from_slice(&[0x51]));
+
+    let utxos: Vec<Result<(TransactionOutpoint, Arc<UtxoEntry>), String>> = vec![
+        Ok((
+            TransactionOutpoint::new(Hash::from_u64_word(1), 0),
+            Arc::new(UtxoEntry::new(10, owner_script.clone(), 1, false)),
+        )),
+        Ok((
+            TransactionOutpoint::new(Hash::from_u64_word(2), 0),
+            Arc::new(UtxoEntry::new(20, owner_script, 2, false)),
+        )),
+        Ok((
+            TransactionOutpoint::new(Hash::from_u64_word(3), 0),
+            Arc::new(UtxoEntry::new(30, second_owner_script, 3, false)),
+        )),
+        Ok((
+            TransactionOutpoint::new(Hash::from_u64_word(4), 0),
+            Arc::new(UtxoEntry::new(40, non_owner_script, 4, false)),
+        )),
+    ];
+
+    let state = super::processor::VirtualStateProcessor::atomic_anchor_state_from_utxo_iterator(utxos, "test UTXO set")
+        .expect("UTXO-derived atomic state should be valid");
+
+    assert_eq!(state.anchor_counts.get(&owner_id).copied(), Some(2));
+    assert_eq!(state.anchor_counts.get(&second_owner_id).copied(), Some(1));
+    assert_eq!(state.anchor_counts.len(), 2);
+    assert!(state.next_nonces.is_empty());
+    assert!(state.assets.is_empty());
+    assert!(state.balances.is_empty());
 }
 
 fn fee(amount: u64, fee_bps: u16) -> u64 {

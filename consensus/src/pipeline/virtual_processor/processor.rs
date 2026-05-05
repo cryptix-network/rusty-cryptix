@@ -62,9 +62,9 @@ use cryptix_consensus_core::{
     header::Header,
     merkle::calc_hash_merkle_root,
     pruning::{PruningPointAtomicState, PruningPointsList},
-    tx::{MutableTransaction, Transaction, VerifiableTransaction},
+    tx::{MutableTransaction, Transaction, TransactionOutpoint, UtxoEntry, VerifiableTransaction},
     utxo::{
-        utxo_diff::UtxoDiff,
+        utxo_diff::{ImmutableUtxoDiff, UtxoDiff},
         utxo_view::{UtxoView, UtxoViewComposition},
     },
     BlockHashSet, ChainPath,
@@ -366,7 +366,7 @@ impl VirtualStateProcessor {
         }
     }
 
-    fn load_block_atomic_state_or_default_before_hf(&self, block_hash: Hash) -> Option<AtomicConsensusState> {
+    fn load_block_atomic_state(&self, block_hash: Hash) -> Option<AtomicConsensusState> {
         match self.atomic_state_store.get(block_hash) {
             Ok(state) => {
                 let mut state = state.as_ref().clone();
@@ -381,7 +381,8 @@ impl VirtualStateProcessor {
                     );
                     return None;
                 }
-                Some(AtomicConsensusState::default())
+                warn!("missing persisted pre-HF atomic consensus state for block `{block_hash}`; reconstructing when a UTXO view is available");
+                None
             }
             Err(err) => {
                 warn!(
@@ -426,7 +427,10 @@ impl VirtualStateProcessor {
 
         let split_point = split_point.expect("chain iterator was expected to reach the reorg split point");
         debug!("VIRTUAL PROCESSOR, found split point: {split_point}");
-        let Some(split_point_state) = self.load_block_atomic_state_or_default_before_hf(split_point) else {
+        let Some(split_point_state) = self
+            .load_block_atomic_state(split_point)
+            .or_else(|| self.pre_hf_atomic_state_from_virtual_diff(stores, diff, split_point))
+        else {
             warn!(
                 "cannot resolve virtual state because split point `{split_point}` has no usable atomic consensus state; keeping previous virtual sink"
             );
@@ -452,7 +456,7 @@ impl VirtualStateProcessor {
             let mut needs_recompute = true;
             match self.utxo_diffs_store.get(current) {
                 Ok(mergeset_diff) => {
-                    if let Some(current_atomic_state) = self.load_block_atomic_state_or_default_before_hf(current) {
+                    if let Some(current_atomic_state) = self.load_block_atomic_state(current) {
                         diff.with_diff_in_place(mergeset_diff.deref()).unwrap();
                         *atomic_state = current_atomic_state;
                         diff_point = current;
@@ -1249,6 +1253,7 @@ impl VirtualStateProcessor {
             drop(pruning_point_write);
             drop(pruning_utxoset_write);
         }
+        self.recover_pre_hf_virtual_atomic_state();
     }
 
     /// Initializes UTXO state of genesis and points virtual at genesis.
@@ -1288,19 +1293,51 @@ impl VirtualStateProcessor {
         info!("Importing the UTXO set of the pruning point {}", new_pruning_point);
         let new_pruning_point_header = self.headers_store.get_header(new_pruning_point).unwrap();
         let payload_hf_active = self.transaction_validator.is_payload_hf_active(new_pruning_point_header.daa_score);
-        let pruning_point_atomic_state = match self.atomic_state_store.get(new_pruning_point) {
-            Ok(state) => state.as_ref().clone(),
-            Err(StoreError::KeyNotFound(_)) => {
-                if payload_hf_active {
+        let (
+            pruning_point_atomic_state,
+            should_persist_pruning_point_atomic_state,
+            should_replace_pruning_point_atomic_state,
+        ) = if payload_hf_active {
+            let state = match self.atomic_state_store.get(new_pruning_point) {
+                Ok(state) => state.as_ref().clone(),
+                Err(StoreError::KeyNotFound(_)) => {
                     return Err(PruningImportError::NewPruningPointMissingAtomicState(new_pruning_point));
                 }
-                AtomicConsensusState::default()
-            }
-            Err(err) => {
-                return Err(PruningImportError::AtomicStateStoreError(format!(
-                    "failed reading pruning-point atomic state for `{new_pruning_point}`: {err}"
-                )));
-            }
+                Err(err) => {
+                    return Err(PruningImportError::AtomicStateStoreError(format!(
+                        "failed reading pruning-point atomic state for `{new_pruning_point}`: {err}"
+                    )));
+                }
+            };
+            (state, false, false)
+        } else {
+            let reconstructed = self.reconstruct_pre_hf_pruning_point_atomic_state(new_pruning_point)?;
+            let (should_persist, should_replace) = match self.atomic_state_store.get(new_pruning_point) {
+                Ok(existing_state) => {
+                    let existing_hash = existing_state.canonical_hash();
+                    let reconstructed_hash = reconstructed.canonical_hash();
+                    if existing_hash != reconstructed_hash {
+                        warn!(
+                            "replacing pre-HF pruning-point atomic consensus state for `{new_pruning_point}` with UTXO-derived state"
+                        );
+                        (true, true)
+                    } else {
+                        (false, false)
+                    }
+                }
+                Err(StoreError::KeyNotFound(_)) => {
+                    info!(
+                        "reconstructed missing pre-HF pruning-point atomic consensus state for `{new_pruning_point}` from imported UTXO set"
+                    );
+                    (true, false)
+                }
+                Err(err) => {
+                    return Err(PruningImportError::AtomicStateStoreError(format!(
+                        "failed reading pruning-point atomic state for `{new_pruning_point}`: {err}"
+                    )));
+                }
+            };
+            (reconstructed, should_persist, should_replace)
         };
         let imported_utxo_multiset_hash = imported_utxo_multiset.finalize();
         let imported_state_commitment =
@@ -1347,6 +1384,21 @@ impl VirtualStateProcessor {
             return Err(PruningImportError::NewPruningPointTxErrors);
         }
 
+        if should_persist_pruning_point_atomic_state {
+            if should_replace_pruning_point_atomic_state {
+                self.atomic_state_store.delete(new_pruning_point).map_err(|err| {
+                    PruningImportError::AtomicStateStoreError(format!(
+                        "failed deleting stale pruning-point atomic state for `{new_pruning_point}`: {err}"
+                    ))
+                })?;
+            }
+            self.atomic_state_store.insert(new_pruning_point, Arc::new(pruning_point_atomic_state.clone())).map_err(|err| {
+                PruningImportError::AtomicStateStoreError(format!(
+                    "failed writing reconstructed pruning-point atomic state for `{new_pruning_point}`: {err}"
+                ))
+            })?;
+        }
+
         {
             // Submit partial UTXO state for the pruning point.
             // Note we only have and need the multiset; acceptance data and utxo-diff are irrelevant.
@@ -1373,6 +1425,124 @@ impl VirtualStateProcessor {
         )?;
 
         Ok(())
+    }
+
+    fn recover_pre_hf_virtual_atomic_state(&self) {
+        let virtual_read = self.virtual_stores.upgradable_read();
+        let Ok(virtual_state) = virtual_read.state.get() else {
+            return;
+        };
+        if self.transaction_validator.is_payload_hf_active(virtual_state.daa_score) {
+            return;
+        }
+
+        let reconstructed =
+            match Self::atomic_anchor_state_from_utxo_iterator(virtual_read.utxo_set.iterator(), "virtual UTXO set") {
+                Ok(state) => state,
+                Err(err) => {
+                    warn!("failed reconstructing pre-HF virtual atomic consensus state: {err}");
+                    return;
+                }
+            };
+        if reconstructed.canonical_hash() == virtual_state.atomic_state.canonical_hash() {
+            return;
+        }
+
+        warn!("reconstructing pre-HF virtual atomic consensus state from the current UTXO set");
+        let mut updated_virtual_state = virtual_state.as_ref().clone();
+        updated_virtual_state.atomic_state = reconstructed;
+
+        let mut batch = WriteBatch::default();
+        let mut virtual_write = RwLockUpgradableReadGuard::upgrade(virtual_read);
+        virtual_write.state.set_batch(&mut batch, Arc::new(updated_virtual_state)).unwrap();
+        self.db.write(batch).unwrap();
+    }
+
+    fn reconstruct_pre_hf_pruning_point_atomic_state(&self, new_pruning_point: Hash) -> PruningImportResult<AtomicConsensusState> {
+        let pruning_utxoset_read = self.pruning_utxoset_stores.read();
+        Self::atomic_anchor_state_from_utxo_iterator(pruning_utxoset_read.utxo_set.iterator(), "pruning-point UTXO set")
+            .map_err(|err| {
+                PruningImportError::AtomicStateStoreError(format!(
+                    "failed reconstructing pre-HF pruning-point atomic state for `{new_pruning_point}`: {err}"
+                ))
+            })
+    }
+
+    pub(super) fn atomic_anchor_state_from_utxo_iterator<E>(
+        utxos: impl IntoIterator<Item = Result<(TransactionOutpoint, Arc<UtxoEntry>), E>>,
+        context: &str,
+    ) -> Result<AtomicConsensusState, String>
+    where
+        E: std::fmt::Display,
+    {
+        let mut state = AtomicConsensusState::default();
+        for item in utxos {
+            let (_outpoint, entry) = item.map_err(|err| format!("failed iterating {context}: {err}"))?;
+            Self::add_atomic_anchor_count(&mut state, &entry)?;
+        }
+        state.validate_normalized()?;
+        Ok(state)
+    }
+
+    fn add_atomic_anchor_count(state: &mut AtomicConsensusState, entry: &UtxoEntry) -> Result<(), String> {
+        let Some(owner_id) = atomic_owner_id_from_script(&entry.script_public_key) else {
+            return Ok(());
+        };
+        let count = state.anchor_counts.entry(owner_id).or_insert(0);
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| format!("atomic anchor count overflow for owner `{}`", faster_hex::hex_string(&owner_id)))?;
+        Ok(())
+    }
+
+    fn remove_atomic_anchor_count(state: &mut AtomicConsensusState, entry: &UtxoEntry) -> Result<(), String> {
+        let Some(owner_id) = atomic_owner_id_from_script(&entry.script_public_key) else {
+            return Ok(());
+        };
+        let count = state
+            .anchor_counts
+            .get_mut(&owner_id)
+            .ok_or_else(|| format!("atomic anchor count underflow for owner `{}`", faster_hex::hex_string(&owner_id)))?;
+        *count = count
+            .checked_sub(1)
+            .ok_or_else(|| format!("atomic anchor count underflow for owner `{}`", faster_hex::hex_string(&owner_id)))?;
+        if *count == 0 {
+            state.anchor_counts.remove(&owner_id);
+        }
+        Ok(())
+    }
+
+    fn pre_hf_atomic_state_from_virtual_diff(
+        &self,
+        stores: &VirtualStores,
+        diff_from_virtual: &impl ImmutableUtxoDiff,
+        block_hash: Hash,
+    ) -> Option<AtomicConsensusState> {
+        let mut state = match Self::atomic_anchor_state_from_utxo_iterator(stores.utxo_set.iterator(), "virtual UTXO set") {
+            Ok(state) => state,
+            Err(err) => {
+                warn!("failed reconstructing pre-HF atomic state for `{block_hash}` from virtual UTXO set: {err}");
+                return None;
+            }
+        };
+
+        for entry in diff_from_virtual.removed().values() {
+            if let Err(err) = Self::remove_atomic_anchor_count(&mut state, entry) {
+                warn!("failed applying removed UTXO anchor while reconstructing pre-HF atomic state for `{block_hash}`: {err}");
+                return None;
+            }
+        }
+        for entry in diff_from_virtual.added().values() {
+            if let Err(err) = Self::add_atomic_anchor_count(&mut state, entry) {
+                warn!("failed applying added UTXO anchor while reconstructing pre-HF atomic state for `{block_hash}`: {err}");
+                return None;
+            }
+        }
+        if let Err(err) = state.validate_normalized() {
+            warn!("reconstructed pre-HF atomic state for `{block_hash}` is not normalized: {err}");
+            return None;
+        }
+        Some(state)
     }
 
     pub fn import_pruning_point_atomic_state(
