@@ -687,6 +687,44 @@ mod mockery {
 
     test!(GetBlocksResponse);
 
+    impl Mock for RpcTransactionLookupRequest {
+        fn mock() -> Self {
+            RpcTransactionLookupRequest { transaction_id: mock(), block_daa_score: Some(mock()) }
+        }
+    }
+
+    test!(RpcTransactionLookupRequest);
+
+    impl Mock for GetTransactionsByIdsRequest {
+        fn mock() -> Self {
+            GetTransactionsByIdsRequest { entries: mock(), include_orphan_pool: true, filter_transaction_pool: false }
+        }
+    }
+
+    test!(GetTransactionsByIdsRequest);
+
+    impl Mock for RpcTransactionLookupResult {
+        fn mock() -> Self {
+            RpcTransactionLookupResult {
+                transaction_id: mock(),
+                transaction: Some(mock()),
+                block_hash: Some(mock()),
+                block_daa_score: Some(mock()),
+                source: "chain".to_string(),
+            }
+        }
+    }
+
+    test!(RpcTransactionLookupResult);
+
+    impl Mock for GetTransactionsByIdsResponse {
+        fn mock() -> Self {
+            GetTransactionsByIdsResponse { entries: mock() }
+        }
+    }
+
+    test!(GetTransactionsByIdsResponse);
+
     impl Mock for GetBlockCountRequest {
         fn mock() -> Self {
             GetBlockCountRequest {}

@@ -35,7 +35,7 @@ use cryptix_consensus_core::{
     config::Config,
     constants::MAX_SOMPI,
     network::NetworkType,
-    tx::{ScriptPublicKey, Transaction, COINBASE_TRANSACTION_INDEX},
+    tx::{ScriptPublicKey, Transaction, TransactionId, COINBASE_TRANSACTION_INDEX},
 };
 use cryptix_consensus_notify::{
     notifier::ConsensusNotifier,
@@ -95,7 +95,7 @@ use cryptix_utils_tower::counters::TowerConnectionCounters;
 use cryptix_utxoindex::api::UtxoIndexProxy;
 use std::time::Duration;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     iter::once,
     sync::{atomic::Ordering, Arc},
     vec,
@@ -158,6 +158,13 @@ const TOKEN_ASSETS_LIMIT_MAX: usize = 2048;
 const TOKEN_OWNER_BALANCES_LIMIT_MAX: usize = 4096;
 const TOKEN_HOLDERS_LIMIT_MAX: usize = 4096;
 const TOKEN_LIQUIDITY_HOLDERS_LIMIT_MAX: usize = 4096;
+const TX_LOOKUP_MAX_IDS: usize = 512;
+const TX_LOOKUP_LOOKBACK_MARGIN_DAA: u64 = 64;
+const TX_LOOKUP_LOOKBACK_MIN_HEADERS: usize = 256;
+const TX_LOOKUP_ARCHIVAL_LOOKBACK_MAX_HEADERS: u64 = 1_000_000;
+const TX_LOOKUP_DAA_WINDOW: u64 = 16;
+const TX_LOOKUP_MAX_CANDIDATE_BLOCKS: usize = 512;
+const TX_LOOKUP_MAX_SCANNED_BLOCKS: usize = 4096;
 const CAT_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
 const OWNER_AUTH_SCHEME_PUBKEY: u8 = 0;
 const OWNER_AUTH_SCHEME_PUBKEY_ECDSA: u8 = 1;
@@ -1430,6 +1437,178 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             Vec::new()
         };
         Ok(GetBlocksResponse { block_hashes, blocks })
+    }
+
+    async fn get_transactions_by_ids_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTransactionsByIdsRequest,
+    ) -> RpcResult<GetTransactionsByIdsResponse> {
+        if request.entries.len() > TX_LOOKUP_MAX_IDS {
+            return Err(RpcError::General(format!(
+                "getTransactionsByIds accepts at most {TX_LOOKUP_MAX_IDS} transaction ids per request"
+            )));
+        }
+
+        if request.entries.is_empty() {
+            return Ok(GetTransactionsByIdsResponse { entries: vec![] });
+        }
+
+        let session = self.consensus_manager.consensus().session().await;
+        let mut found = HashMap::<TransactionId, RpcTransactionLookupResult>::new();
+
+        for entry in request.entries.iter() {
+            if found.contains_key(&entry.transaction_id) {
+                continue;
+            }
+            let query = self.extract_tx_query(request.filter_transaction_pool, request.include_orphan_pool)?;
+            if let Some(transaction) = self.mining_manager.clone().get_transaction(entry.transaction_id, query).await {
+                let rpc_transaction = self.consensus_converter.get_mempool_entry(&session, &transaction).transaction;
+                found.insert(
+                    entry.transaction_id,
+                    RpcTransactionLookupResult {
+                        transaction_id: entry.transaction_id,
+                        transaction: Some(rpc_transaction),
+                        block_hash: None,
+                        block_daa_score: None,
+                        source: "mempool".to_string(),
+                    },
+                );
+            }
+        }
+
+        let pending_by_id = request
+            .entries
+            .iter()
+            .filter(|entry| !found.contains_key(&entry.transaction_id))
+            .filter_map(|entry| entry.block_daa_score.map(|daa_score| (entry.transaction_id, daa_score)))
+            .collect::<HashMap<_, _>>();
+
+        if !pending_by_id.is_empty() {
+            let target_ids = pending_by_id.keys().copied().collect::<HashSet<_>>();
+            let target_scores = pending_by_id.values().copied().collect::<HashSet<_>>();
+            let target_scores_vec = target_scores.iter().copied().collect::<Vec<_>>();
+            let min_target_score = target_scores_vec.iter().copied().min().unwrap_or_default();
+
+            let stats = session.async_get_stats().await;
+            let max_header_window =
+                if self.config.is_archival { TX_LOOKUP_ARCHIVAL_LOOKBACK_MAX_HEADERS } else { self.config.pruning_depth }
+                    .max(TX_LOOKUP_LOOKBACK_MIN_HEADERS as u64);
+            let header_limit = stats
+                .virtual_stats
+                .daa_score
+                .saturating_sub(min_target_score)
+                .saturating_add(TX_LOOKUP_LOOKBACK_MARGIN_DAA)
+                .clamp(TX_LOOKUP_LOOKBACK_MIN_HEADERS as u64, max_header_window) as usize;
+
+            let mut exact_candidates = Vec::new();
+            let mut near_candidates = Vec::new();
+            let mut current = session.async_get_sink().await;
+            for _ in 0..header_limit {
+                let Ok(header) = session.async_get_header(current).await else {
+                    break;
+                };
+                let daa_score = header.daa_score;
+                if target_scores.contains(&daa_score) {
+                    exact_candidates.push(current);
+                } else if target_scores_vec.iter().any(|target| daa_score.abs_diff(*target) <= TX_LOOKUP_DAA_WINDOW) {
+                    near_candidates.push(current);
+                }
+
+                if daa_score < min_target_score.saturating_sub(TX_LOOKUP_DAA_WINDOW) {
+                    break;
+                }
+
+                let Ok(ghostdag) = session.async_get_ghostdag_data(current).await else {
+                    break;
+                };
+                if ghostdag.selected_parent.is_origin() {
+                    break;
+                }
+                current = ghostdag.selected_parent;
+            }
+
+            let mut pending_blocks = exact_candidates
+                .into_iter()
+                .chain(near_candidates.into_iter())
+                .take(TX_LOOKUP_MAX_CANDIDATE_BLOCKS)
+                .collect::<Vec<_>>();
+            pending_blocks.reverse();
+            let mut visited_blocks = HashSet::new();
+            let mut missing_ids = target_ids;
+            let mut scanned_blocks = 0usize;
+
+            while let Some(block_hash) = pending_blocks.pop() {
+                if scanned_blocks >= TX_LOOKUP_MAX_SCANNED_BLOCKS || missing_ids.is_empty() {
+                    break;
+                }
+                if !visited_blocks.insert(block_hash) {
+                    continue;
+                }
+
+                let Ok(block) = session.async_get_block_even_if_header_only(block_hash).await else {
+                    continue;
+                };
+                scanned_blocks = scanned_blocks.saturating_add(1);
+                let block_daa_score = block.header.daa_score;
+
+                for transaction in block.transactions.iter() {
+                    let transaction_id = transaction.id();
+                    if !missing_ids.contains(&transaction_id) {
+                        continue;
+                    }
+
+                    let rpc_transaction =
+                        self.consensus_converter.get_transaction(&session, transaction, Some(block.header.as_ref()), true);
+                    found.insert(
+                        transaction_id,
+                        RpcTransactionLookupResult {
+                            transaction_id,
+                            transaction: Some(rpc_transaction),
+                            block_hash: Some(block_hash),
+                            block_daa_score: Some(block_daa_score),
+                            source: "chain".to_string(),
+                        },
+                    );
+                    missing_ids.remove(&transaction_id);
+                    if missing_ids.is_empty() {
+                        break;
+                    }
+                }
+
+                if scanned_blocks >= TX_LOOKUP_MAX_SCANNED_BLOCKS || missing_ids.is_empty() {
+                    break;
+                }
+
+                if let Ok(ghostdag) = session.async_get_ghostdag_data(block_hash).await {
+                    for merged_hash in ghostdag.mergeset_blues.into_iter().chain(ghostdag.mergeset_reds.into_iter()) {
+                        if visited_blocks.contains(&merged_hash) {
+                            continue;
+                        }
+                        if pending_blocks.len().saturating_add(scanned_blocks) >= TX_LOOKUP_MAX_SCANNED_BLOCKS {
+                            break;
+                        }
+                        pending_blocks.push(merged_hash);
+                    }
+                }
+            }
+        }
+
+        let entries = request
+            .entries
+            .into_iter()
+            .map(|entry| {
+                found.get(&entry.transaction_id).cloned().unwrap_or(RpcTransactionLookupResult {
+                    transaction_id: entry.transaction_id,
+                    transaction: None,
+                    block_hash: None,
+                    block_daa_score: entry.block_daa_score,
+                    source: "missing".to_string(),
+                })
+            })
+            .collect();
+
+        Ok(GetTransactionsByIdsResponse { entries })
     }
 
     async fn get_info_call(&self, _connection: Option<&DynRpcConnection>, _request: GetInfoRequest) -> RpcResult<GetInfoResponse> {

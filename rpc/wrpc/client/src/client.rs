@@ -618,6 +618,7 @@ impl RpcApi for CryptixRpcClient {
             GetBlockCount,
             GetBlockDagInfo,
             GetBlocks,
+            GetTransactionsByIds,
             GetBlockTemplate,
             GetCurrentBlockColor,
             GetCoinSupply,

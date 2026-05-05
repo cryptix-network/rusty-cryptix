@@ -631,6 +631,21 @@ pub trait RpcApi: Sync + Send + AnySync {
     }
     async fn get_blocks_call(&self, connection: Option<&DynRpcConnection>, request: GetBlocksRequest) -> RpcResult<GetBlocksResponse>;
 
+    /// Resolves transactions by id in a single batched request.
+    ///
+    /// The optional block DAA score hints let nodes avoid broad historical scans
+    /// when wallets need payload data for already indexed transaction records.
+    async fn get_transactions_by_ids(&self, entries: Vec<RpcTransactionLookupRequest>) -> RpcResult<GetTransactionsByIdsResponse> {
+        self.get_transactions_by_ids_call(None, GetTransactionsByIdsRequest::new(entries, true, false)).await
+    }
+    async fn get_transactions_by_ids_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetTransactionsByIdsRequest,
+    ) -> RpcResult<GetTransactionsByIdsResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
     /// Requests the current number of blocks in this node.
     ///
     /// Note that this number may decrease as pruning occurs.

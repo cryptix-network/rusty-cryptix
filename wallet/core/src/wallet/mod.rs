@@ -22,6 +22,7 @@ use cryptix_notify::{
     listener::ListenerId,
     scope::{Scope, VirtualDaaScoreChangedScope},
 };
+use cryptix_rpc_core::RpcTransactionLookupRequest;
 use cryptix_wallet_keys::xpub::NetworkTaggedXpub;
 use cryptix_wrpc_client::{CryptixRpcClient, Resolver, WrpcEncoding};
 use workflow_core::task::spawn;
@@ -126,6 +127,7 @@ const TX_ENRICH_LOOKBACK_MAX_HEADERS: u64 = 8192;
 const TX_ENRICH_DAA_WINDOW: u64 = 16;
 const TX_ENRICH_MAX_CANDIDATE_BLOCKS: usize = 64;
 const TX_ENRICH_MAX_MERGESET_BLOCKS_PER_CANDIDATE: usize = 256;
+const TX_ENRICH_LEGACY_RESIDUAL_LIMIT: usize = 8;
 
 impl Default for Wallet {
     fn default() -> Self {
@@ -1194,6 +1196,42 @@ impl Wallet {
         } else {
             None
         }
+    }
+
+    async fn resolve_records_transactions_by_ids(
+        &self,
+        records: &[TransactionRecord],
+        indices: &[usize],
+    ) -> std::result::Result<HashMap<TransactionId, cryptix_consensus_core::tx::Transaction>, String> {
+        if indices.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let entries = indices
+            .iter()
+            .filter_map(|index| records.get(*index))
+            .map(|record| RpcTransactionLookupRequest {
+                transaction_id: *record.id(),
+                block_daa_score: Some(record.block_daa_score()),
+            })
+            .collect::<Vec<_>>();
+
+        let response = self.rpc_api().get_transactions_by_ids(entries).await.map_err(|err| err.to_string())?;
+        let mut resolved = HashMap::new();
+        for entry in response.entries.into_iter() {
+            let Some(rpc_transaction) = entry.transaction else {
+                continue;
+            };
+            match cryptix_consensus_core::tx::Transaction::try_from(rpc_transaction) {
+                Ok(transaction) => {
+                    resolved.insert(entry.transaction_id, transaction);
+                }
+                Err(err) => {
+                    log_warn!("unable to decode batched transaction lookup result {}: {err}", entry.transaction_id);
+                }
+            }
+        }
+        Ok(resolved)
     }
 
     async fn enrich_record_transaction(&self, record: &TransactionRecord, allow_chain_lookup: bool) -> Result<TransactionRecord> {

@@ -553,25 +553,64 @@ impl WalletApi for super::Wallet {
         let TransactionRangeResult { transactions, total } =
             store.load_range(&binding, &network_id, filter, start as usize..end as usize).await?;
         let current_daa_score = self.current_daa_score();
-        let mut resolved = Vec::with_capacity(transactions.len());
+        let mut records = transactions
+            .into_iter()
+            .map(|record| {
+                let mut record = (*record).clone();
+                record.refresh_payload_availability(current_daa_score);
+                record
+            })
+            .collect::<Vec<_>>();
         let mut records_to_persist = Vec::<TransactionRecord>::new();
-        for record in transactions.into_iter() {
-            let mut record = (*record).clone();
-            record.refresh_payload_availability(current_daa_score);
 
-            // Refresh records with missing embedded tx data at query time so payload
-            // availability can recover from "missing" once the tx is resolvable.
-            if !record.has_embedded_transaction() {
-                if let Ok(enriched) = self.enrich_record_transaction(&record, true).await {
+        // Refresh records with missing embedded tx data at query time so payload
+        // availability can recover from "missing" once the tx is resolvable.
+        // New nodes support one batched lookup, avoiding hundreds of per-record
+        // header scans when a wallet has a long payload/messenger history.
+        let enrichment_indices = records
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                (!record.has_embedded_transaction() && Self::needs_transaction_enrichment(record)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+
+        let mut batch_lookup_available = false;
+        if !enrichment_indices.is_empty() {
+            if let Ok(resolved_transactions) = self.resolve_records_transactions_by_ids(&records, &enrichment_indices).await {
+                batch_lookup_available = true;
+                for index in enrichment_indices.iter().copied() {
+                    let Some(transaction) = resolved_transactions.get(records[index].id()).cloned() else {
+                        continue;
+                    };
+                    if records[index].try_attach_transaction(transaction) {
+                        records[index].refresh_payload_availability(current_daa_score);
+                        records_to_persist.push(records[index].clone());
+                    }
+                }
+            }
+        }
+
+        let unresolved_indices = records
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                (!record.has_embedded_transaction() && Self::needs_transaction_enrichment(record)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let allow_legacy_lookup = !batch_lookup_available || unresolved_indices.len() <= super::TX_ENRICH_LEGACY_RESIDUAL_LIMIT;
+        if allow_legacy_lookup {
+            for index in unresolved_indices {
+                if let Ok(enriched) = self.enrich_record_transaction(&records[index], true).await {
                     if enriched.has_embedded_transaction() {
                         records_to_persist.push(enriched.clone());
                     }
-                    record = enriched;
+                    records[index] = enriched;
                 }
             }
-
-            resolved.push(Arc::new(record));
         }
+
+        let resolved = records.into_iter().map(Arc::new).collect::<Vec<_>>();
 
         if !records_to_persist.is_empty() {
             let record_refs: Vec<&TransactionRecord> = records_to_persist.iter().collect();

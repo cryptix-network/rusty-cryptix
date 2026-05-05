@@ -1968,6 +1968,55 @@ try_from! ( args: GetBlocksResponse, IGetBlocksResponse, {
 // ---
 
 declare! {
+    IGetTransactionsByIdsRequest,
+    r#"
+    /**
+     * Resolves transactions by id, optionally using block DAA score hints.
+     * 
+     * @category Node RPC
+     */
+    export interface IGetTransactionsByIdsRequest {
+        entries : {
+            transactionId : HexString;
+            blockDaaScore? : bigint;
+        }[];
+        includeOrphanPool? : boolean;
+        filterTransactionPool? : boolean;
+    }
+    "#,
+}
+
+try_from! ( args: IGetTransactionsByIdsRequest, GetTransactionsByIdsRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetTransactionsByIdsResponse,
+    r#"
+    /**
+     * Batched transaction lookup results.
+     * 
+     * @category Node RPC
+     */
+    export interface IGetTransactionsByIdsResponse {
+        entries : {
+            transactionId : HexString;
+            transaction? : ITransaction;
+            blockHash? : HexString;
+            blockDaaScore? : bigint;
+            source : string;
+        }[];
+    }
+    "#,
+}
+
+try_from! ( args: GetTransactionsByIdsResponse, IGetTransactionsByIdsResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+// ---
+
+declare! {
     IGetBlockTemplateRequest,
     r#"
     /**

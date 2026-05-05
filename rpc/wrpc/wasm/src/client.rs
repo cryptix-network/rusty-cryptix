@@ -1004,6 +1004,9 @@ build_wrpc_wasm_bindgen_interface!(
         /// Retrieves multiple blocks from the Cryptix BlockDAG.
         /// Returned information: List of block information.
         GetBlocks,
+        /// Resolves transactions by id in one batched request.
+        /// Returned information: Transactions found in mempool or recent chain data.
+        GetTransactionsByIds,
         /// Generates a new block template for mining.
         /// Returned information: Block template information.
         GetBlockTemplate,

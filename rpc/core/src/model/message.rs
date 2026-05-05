@@ -998,6 +998,123 @@ impl Deserializer for GetBlocksResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RpcTransactionLookupRequest {
+    pub transaction_id: RpcTransactionId,
+    pub block_daa_score: Option<u64>,
+}
+
+impl Serializer for RpcTransactionLookupRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcTransactionId, &self.transaction_id, writer)?;
+        store!(Option<u64>, &self.block_daa_score, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcTransactionLookupRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let transaction_id = load!(RpcTransactionId, reader)?;
+        let block_daa_score = load!(Option<u64>, reader)?;
+        Ok(Self { transaction_id, block_daa_score })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTransactionsByIdsRequest {
+    pub entries: Vec<RpcTransactionLookupRequest>,
+    #[serde(default)]
+    pub include_orphan_pool: bool,
+    #[serde(default)]
+    pub filter_transaction_pool: bool,
+}
+
+impl GetTransactionsByIdsRequest {
+    pub fn new(entries: Vec<RpcTransactionLookupRequest>, include_orphan_pool: bool, filter_transaction_pool: bool) -> Self {
+        Self { entries, include_orphan_pool, filter_transaction_pool }
+    }
+}
+
+impl Serializer for GetTransactionsByIdsRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        serialize!(Vec<RpcTransactionLookupRequest>, &self.entries, writer)?;
+        store!(bool, &self.include_orphan_pool, writer)?;
+        store!(bool, &self.filter_transaction_pool, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTransactionsByIdsRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let entries = deserialize!(Vec<RpcTransactionLookupRequest>, reader)?;
+        let include_orphan_pool = load!(bool, reader)?;
+        let filter_transaction_pool = load!(bool, reader)?;
+        Ok(Self { entries, include_orphan_pool, filter_transaction_pool })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTransactionLookupResult {
+    pub transaction_id: RpcTransactionId,
+    pub transaction: Option<RpcTransaction>,
+    pub block_hash: Option<RpcHash>,
+    pub block_daa_score: Option<u64>,
+    pub source: String,
+}
+
+impl Serializer for RpcTransactionLookupResult {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcTransactionId, &self.transaction_id, writer)?;
+        serialize!(Option<RpcTransaction>, &self.transaction, writer)?;
+        store!(Option<RpcHash>, &self.block_hash, writer)?;
+        store!(Option<u64>, &self.block_daa_score, writer)?;
+        store!(String, &self.source, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcTransactionLookupResult {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let transaction_id = load!(RpcTransactionId, reader)?;
+        let transaction = deserialize!(Option<RpcTransaction>, reader)?;
+        let block_hash = load!(Option<RpcHash>, reader)?;
+        let block_daa_score = load!(Option<u64>, reader)?;
+        let source = load!(String, reader)?;
+        Ok(Self { transaction_id, transaction, block_hash, block_daa_score, source })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTransactionsByIdsResponse {
+    pub entries: Vec<RpcTransactionLookupResult>,
+}
+
+impl Serializer for GetTransactionsByIdsResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        serialize!(Vec<RpcTransactionLookupResult>, &self.entries, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTransactionsByIdsResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let entries = deserialize!(Vec<RpcTransactionLookupResult>, reader)?;
+        Ok(Self { entries })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GetBlockCountRequest {}
 
 impl Serializer for GetBlockCountRequest {

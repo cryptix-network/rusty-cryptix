@@ -8,7 +8,7 @@ use workflow_core::enums::Describe;
 pub const RPC_API_VERSION: u16 = 1;
 /// API revision. Change in this value denotes
 /// backwards-compatible changes.
-pub const RPC_API_REVISION: u16 = 1;
+pub const RPC_API_REVISION: u16 = 2;
 
 #[derive(Describe, Clone, Copy, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -194,6 +194,8 @@ pub enum RpcApiOps {
     GetLiquidityHolders = 178,
     /// Get the consensus Atomic state hash for an exact block hash.
     GetConsensusAtomicStateHash = 179,
+    /// Resolve transactions by id, optionally using block DAA hints for batched payload/history enrichment.
+    GetTransactionsByIds = 180,
 }
 
 impl RpcApiOps {

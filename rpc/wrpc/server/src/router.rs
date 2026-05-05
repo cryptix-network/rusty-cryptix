@@ -43,6 +43,7 @@ impl Router {
                 GetBlockCount,
                 GetBlockDagInfo,
                 GetBlocks,
+                GetTransactionsByIds,
                 GetBlockTemplate,
                 GetCurrentBlockColor,
                 GetCoinSupply,
