@@ -392,7 +392,7 @@ pub fn cli() -> Command {
             Arg::new("atomic-bootstrap-allow-peer-fallback")
                 .long("atomic-bootstrap-allow-peer-fallback")
                 .action(ArgAction::SetTrue)
-                .help("Enable peer-only fallback when no seed source is reachable (mainnet safety override; disabled by default)."),
+                .help("Enable peer-only Atomic bootstrap fallback when no seed source is reachable or DNS seeds are disabled (mainnet safety override; disabled by default)."),
         )
         .arg(
             Arg::new("max-tracked-addresses")

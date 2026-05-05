@@ -307,9 +307,11 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     );
     info!("Cryptix Atomic bootstrap attestation policy: seed/peer quorum; manifests are not signer-attested");
     let bootstrap_source_policy = if config.net.is_mainnet() {
-        if args.disable_dns_seeding {
-            "mainnet DNS seed bootstrap disabled by --nodnsseed; Atomic bootstrap will use peer-majority from manual/configured peers only"
+        if args.disable_dns_seeding && args.atomic_bootstrap_allow_peer_fallback {
+            "mainnet DNS seed bootstrap disabled by --nodnsseed; peer-only Atomic bootstrap fallback enabled by explicit operator flag"
                 .to_string()
+        } else if args.disable_dns_seeding {
+            "mainnet DNS seed bootstrap disabled by --nodnsseed; peer-only Atomic bootstrap fallback disabled".to_string()
         } else if args.atomic_bootstrap_allow_peer_fallback {
             "mainnet strict seed policy; peer-only fallback enabled by explicit operator flag".to_string()
         } else {

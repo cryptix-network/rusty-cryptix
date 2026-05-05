@@ -158,10 +158,12 @@ impl AtomicBootstrapService {
     ) -> Result<Self, String> {
         let retry_interval_sec = retry_interval_sec.max(5);
         if flow_context.config.net.is_mainnet() {
-            if disable_dns_seed_sources {
+            if disable_dns_seed_sources && allow_peer_majority_fallback_override {
                 warn!(
-                    "[atomic-bootstrap] mainnet DNS seed bootstrap disabled by operator (--nodnsseed); using peer-majority bootstrap from configured/manual peers only"
+                    "[atomic-bootstrap] mainnet DNS seed bootstrap disabled by operator (--nodnsseed); peer-only fallback ENABLED by explicit override"
                 );
+            } else if disable_dns_seed_sources {
+                warn!("[atomic-bootstrap] mainnet DNS seed bootstrap disabled by operator (--nodnsseed); peer-only fallback DISABLED");
             } else if allow_peer_majority_fallback_override {
                 warn!("[atomic-bootstrap] mainnet peer-only fallback override ENABLED; used only when no seed source is reachable");
             } else {
@@ -193,8 +195,11 @@ impl AtomicBootstrapService {
 
     fn no_sources_reason(&self) -> String {
         if self.disable_dns_seed_sources {
-            "no compatible bootstrap sources found (DNS seed bootstrap disabled by --nodnsseed; add manual peers and/or at least 3 independent --atomic-bootstrap-peer sources for peer-only quorum)"
-                .to_string()
+            if self.flow_context.config.net.is_mainnet() && !self.allow_peer_majority_fallback_override {
+                "no compatible bootstrap sources found (DNS seed bootstrap disabled by --nodnsseed; mainnet peer-only fallback is disabled unless --atomic-bootstrap-allow-peer-fallback is explicitly set)".to_string()
+            } else {
+                "no compatible bootstrap sources found (DNS seed bootstrap disabled by --nodnsseed; add manual peers and/or at least 3 independent --atomic-bootstrap-peer sources for peer-only quorum)".to_string()
+            }
         } else {
             "no compatible bootstrap sources found".to_string()
         }
@@ -1321,17 +1326,13 @@ fn source_preferred_over(candidate: &SourceClient, current: &SourceClient) -> bo
 
 fn snapshot_quorum_policy_for_network(
     is_mainnet: bool,
-    disable_dns_seed_sources: bool,
+    _disable_dns_seed_sources: bool,
     allow_peer_majority_fallback_override: bool,
 ) -> SnapshotQuorumPolicy {
     if is_mainnet {
-        if disable_dns_seed_sources {
-            SnapshotQuorumPolicy { allow_peer_majority_fallback: true, require_seed_confirmed_if_any_seed: false }
-        } else {
-            SnapshotQuorumPolicy {
-                allow_peer_majority_fallback: allow_peer_majority_fallback_override,
-                require_seed_confirmed_if_any_seed: true,
-            }
+        SnapshotQuorumPolicy {
+            allow_peer_majority_fallback: allow_peer_majority_fallback_override,
+            require_seed_confirmed_if_any_seed: true,
         }
     } else {
         SnapshotQuorumPolicy { allow_peer_majority_fallback: true, require_seed_confirmed_if_any_seed: false }
@@ -1826,11 +1827,19 @@ mod tests {
     }
 
     #[test]
-    fn network_policy_mainnet_nodnsseed_switches_to_peer_majority_mode() {
+    fn network_policy_mainnet_nodnsseed_keeps_peer_majority_disabled_by_default() {
         let policy = snapshot_quorum_policy_for_network(true, true, false);
 
+        assert!(!policy.allow_peer_majority_fallback);
+        assert!(policy.require_seed_confirmed_if_any_seed);
+    }
+
+    #[test]
+    fn network_policy_mainnet_peer_fallback_requires_explicit_override() {
+        let policy = snapshot_quorum_policy_for_network(true, true, true);
+
         assert!(policy.allow_peer_majority_fallback);
-        assert!(!policy.require_seed_confirmed_if_any_seed);
+        assert!(policy.require_seed_confirmed_if_any_seed);
     }
 
     #[test]
