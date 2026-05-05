@@ -15,7 +15,9 @@ use cryptix_grpc_client::GrpcClient;
 use cryptix_p2p_flows::flow_context::{AtomicStateQuorumVerifier, FlowContext};
 use cryptix_rpc_core::{
     api::rpc::RpcApi,
-    model::message::{GetConsensusAtomicStateHashRequest, GetScSnapshotChunkRequest, RpcScBootstrapSource},
+    model::message::{
+        GetConsensusAtomicStateHashRequest, GetScReplayWindowChunkRequest, GetScSnapshotChunkRequest, RpcScBootstrapSource,
+    },
 };
 use cryptix_utils::triggers::SingleTrigger;
 use hex::{decode as hex_decode, encode as hex_encode};
@@ -545,8 +547,10 @@ impl AtomicBootstrapService {
 
             let snapshot_path = download_dir.join(&manifest.snapshot_file_name);
             let manifest_path = PathBuf::from(format!("{}.manifest", snapshot_path.display()));
+            let replay_path = snapshot_path.with_extension("replay.bin");
 
             self.download_and_verify_snapshot_to_file(&sources, &snapshot_id, &manifest, &snapshot_path).await?;
+            self.download_and_verify_replay_window_to_file(&sources, &snapshot_id, &manifest, &replay_path).await?;
             std::fs::write(&manifest_path, &manifest_bytes)
                 .map_err(|err| format!("failed writing snapshot manifest `{}`: {err}", manifest_path.display()))?;
 
@@ -967,6 +971,80 @@ impl AtomicBootstrapService {
         Ok(())
     }
 
+    async fn download_and_verify_replay_window_to_file(
+        &self,
+        sources: &[SourceClient],
+        snapshot_id: &str,
+        manifest: &SnapshotManifestV1,
+        output_path: &Path,
+    ) -> Result<(), String> {
+        let expected_total = manifest.replay_window_chunk_hashes.len() as u32;
+        if expected_total == 0 {
+            if manifest.replay_window_size != 0 {
+                return Err("replay manifest has non-zero size but zero replay chunks".to_string());
+            }
+            std::fs::write(output_path, [])
+                .map_err(|err| format!("failed writing empty replay window `{}`: {err}", output_path.display()))?;
+            return Ok(());
+        }
+
+        let temp_path = output_path.with_extension("part");
+        let mut file = std::fs::File::create(&temp_path)
+            .map_err(|err| format!("failed creating replay download file `{}`: {err}", temp_path.display()))?;
+        let mut replay_hasher = Blake2bParams::new().hash_length(32).to_state();
+        replay_hasher.update(SNAPSHOT_MANIFEST_DOMAIN);
+        let mut written = 0u64;
+        for chunk_index in 0..expected_total {
+            let response = self
+                .fetch_replay_window_chunk_from_sources(
+                    sources,
+                    snapshot_id,
+                    chunk_index,
+                    manifest.replay_window_chunk_size,
+                    expected_total,
+                    manifest.replay_window_size,
+                )
+                .await?;
+
+            let chunk = decode_chunk_payload(
+                &response.chunk_hex,
+                manifest.replay_window_chunk_size,
+                chunk_index,
+                expected_total,
+                manifest.replay_window_size,
+                usize::try_from(written).map_err(|_| "replay assembled length does not fit usize".to_string())?,
+                "replay",
+            )?;
+            verify_expected_chunk_hash(&chunk, &manifest.replay_window_chunk_hashes, chunk_index)?;
+            file.write_all(&chunk)
+                .map_err(|err| format!("failed writing replay chunk {} to `{}`: {err}", chunk_index, temp_path.display()))?;
+            replay_hasher.update(&chunk);
+            written = written.checked_add(chunk.len() as u64).ok_or_else(|| "replay assembled size overflow".to_string())?;
+        }
+
+        file.sync_all().map_err(|err| format!("failed syncing replay download file `{}`: {err}", temp_path.display()))?;
+
+        if written != manifest.replay_window_size {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(format!("replay assembled size mismatch: expected {}, got {}", manifest.replay_window_size, written));
+        }
+
+        let digest = replay_hasher.finalize();
+        if digest.as_bytes() != manifest.replay_window_hash {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err("replay assembled hash mismatch".to_string());
+        }
+
+        if output_path.exists() {
+            std::fs::remove_file(output_path)
+                .map_err(|err| format!("failed replacing existing replay file `{}`: {err}", output_path.display()))?;
+        }
+        std::fs::rename(&temp_path, output_path)
+            .map_err(|err| format!("failed finalizing replay download `{}`: {err}", output_path.display()))?;
+
+        Ok(())
+    }
+
     async fn fetch_snapshot_chunk_from_sources(
         &self,
         sources: &[SourceClient],
@@ -1031,6 +1109,72 @@ impl AtomicBootstrapService {
         }
 
         Err(format!("failed fetching snapshot chunk {}: {}", chunk_index, last_error))
+    }
+
+    async fn fetch_replay_window_chunk_from_sources(
+        &self,
+        sources: &[SourceClient],
+        snapshot_id: &str,
+        chunk_index: u32,
+        chunk_size: u32,
+        expected_total_chunks: u32,
+        expected_file_size: u64,
+    ) -> Result<cryptix_rpc_core::model::message::GetScReplayWindowChunkResponse, String> {
+        let mut last_error = "replay chunk unavailable".to_string();
+
+        for offset in 0..sources.len() {
+            let source = &sources[(chunk_index as usize + offset) % sources.len()];
+            if self.is_source_blocked(&source.endpoint).await {
+                continue;
+            }
+
+            let request =
+                GetScReplayWindowChunkRequest { snapshot_id: snapshot_id.to_string(), chunk_index, chunk_size: Some(chunk_size) };
+
+            let response = match timeout(RPC_CALL_TIMEOUT, source.client.get_sc_replay_window_chunk(request)).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(err)) => {
+                    self.record_source_failure(&source.endpoint).await;
+                    last_error = format!("{}: {err}", source.endpoint);
+                    continue;
+                }
+                Err(_) => {
+                    self.record_source_failure(&source.endpoint).await;
+                    last_error = format!("{}: timeout", source.endpoint);
+                    continue;
+                }
+            };
+
+            if response.chunk_index != chunk_index {
+                self.record_source_failure(&source.endpoint).await;
+                last_error = format!(
+                    "{}: replay chunk index mismatch (expected {}, got {})",
+                    source.endpoint, chunk_index, response.chunk_index
+                );
+                continue;
+            }
+            if response.total_chunks != expected_total_chunks {
+                self.record_source_failure(&source.endpoint).await;
+                last_error = format!(
+                    "{}: replay total chunk mismatch (expected {}, got {})",
+                    source.endpoint, expected_total_chunks, response.total_chunks
+                );
+                continue;
+            }
+            if response.file_size != expected_file_size {
+                self.record_source_failure(&source.endpoint).await;
+                last_error = format!(
+                    "{}: replay file size mismatch (expected {}, got {})",
+                    source.endpoint, expected_file_size, response.file_size
+                );
+                continue;
+            }
+
+            self.record_source_success(&source.endpoint).await;
+            return Ok(response);
+        }
+
+        Err(format!("failed fetching replay chunk {}: {}", chunk_index, last_error))
     }
 
     async fn is_source_blocked(&self, endpoint: &str) -> bool {

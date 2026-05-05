@@ -1,6 +1,9 @@
 use crate::{
     error::{AtomicTokenError, AtomicTokenResult},
-    state::{AtomicTokenHealth, AtomicTokenReadView, AtomicTokenSnapshot, AtomicTokenState, ProcessedOp, TokenAsset, TokenEvent},
+    state::{
+        AtomicTokenHealth, AtomicTokenReadContext, AtomicTokenReadView, AtomicTokenSnapshot, AtomicTokenState,
+        LiquidityHolderAddressState, ProcessedOp, TokenAsset, TokenEvent, TokenHolderEntry, TokenOwnerBalanceEntry,
+    },
     IDENT,
 };
 use async_channel::Receiver;
@@ -274,6 +277,146 @@ impl AtomicTokenProcessor {
         view
     }
 
+    async fn read_context(
+        &self,
+        requested_at_block_hash: Option<BlockHash>,
+        fallback_block_hash: BlockHash,
+    ) -> Option<AtomicTokenReadContext> {
+        let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
+        let state = self.state.lock().await;
+        let runtime_state = state.runtime_state(bootstrap_in_progress);
+        match requested_at_block_hash {
+            Some(at_block_hash) => {
+                let mut view = state.materialize_view_at_block(at_block_hash)?;
+                view.runtime_state = runtime_state;
+                Some(view.context())
+            }
+            None => Some(state.materialize_latest_context(fallback_block_hash, runtime_state)),
+        }
+    }
+
+    async fn indexed_balances_by_owner(
+        &self,
+        owner_id: [u8; 32],
+        include_assets: bool,
+        requested_at_block_hash: Option<BlockHash>,
+        fallback_block_hash: BlockHash,
+    ) -> Option<(AtomicTokenReadContext, Vec<TokenOwnerBalanceEntry>)> {
+        let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
+        let state = self.state.lock().await;
+        let runtime_state = state.runtime_state(bootstrap_in_progress);
+        match requested_at_block_hash {
+            Some(at_block_hash) => {
+                let mut view = state.materialize_view_at_block(at_block_hash)?;
+                view.runtime_state = runtime_state;
+                let balances = view
+                    .balances
+                    .iter()
+                    .filter_map(|(key, balance)| {
+                        if key.owner_id != owner_id || *balance == 0 {
+                            return None;
+                        }
+                        let asset = if include_assets { view.assets.get(&key.asset_id).cloned() } else { None };
+                        Some((key.asset_id, *balance, asset))
+                    })
+                    .collect();
+                Some((view.context(), balances))
+            }
+            None => {
+                let context = state.materialize_latest_context(fallback_block_hash, runtime_state);
+                let balances = state.indexed_balances_by_owner(owner_id, include_assets);
+                Some((context, balances))
+            }
+        }
+    }
+
+    async fn indexed_holders_by_asset(
+        &self,
+        asset_id: [u8; 32],
+        requested_at_block_hash: Option<BlockHash>,
+        fallback_block_hash: BlockHash,
+    ) -> Option<(AtomicTokenReadContext, Vec<TokenHolderEntry>)> {
+        let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
+        let state = self.state.lock().await;
+        let runtime_state = state.runtime_state(bootstrap_in_progress);
+        match requested_at_block_hash {
+            Some(at_block_hash) => {
+                let mut view = state.materialize_view_at_block(at_block_hash)?;
+                view.runtime_state = runtime_state;
+                let holders = view
+                    .balances
+                    .iter()
+                    .filter_map(
+                        |(key, balance)| {
+                            if key.asset_id == asset_id && *balance > 0 {
+                                Some((key.owner_id, *balance))
+                            } else {
+                                None
+                            }
+                        },
+                    )
+                    .collect();
+                Some((view.context(), holders))
+            }
+            None => {
+                let context = state.materialize_latest_context(fallback_block_hash, runtime_state);
+                let holders = state.indexed_holders_by_asset(asset_id);
+                Some((context, holders))
+            }
+        }
+    }
+
+    async fn indexed_liquidity_holders(
+        &self,
+        asset_id: [u8; 32],
+        requested_at_block_hash: Option<BlockHash>,
+        fallback_block_hash: BlockHash,
+    ) -> Option<(AtomicTokenReadContext, Option<TokenAsset>, Vec<TokenHolderEntry>, HashMap<[u8; 32], LiquidityHolderAddressState>)>
+    {
+        let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
+        let state = self.state.lock().await;
+        let runtime_state = state.runtime_state(bootstrap_in_progress);
+        match requested_at_block_hash {
+            Some(at_block_hash) => {
+                let mut view = state.materialize_view_at_block(at_block_hash)?;
+                view.runtime_state = runtime_state;
+                let asset = view.assets.get(&asset_id).cloned();
+                let holders = view
+                    .balances
+                    .iter()
+                    .filter_map(
+                        |(key, balance)| {
+                            if key.asset_id == asset_id && *balance > 0 {
+                                Some((key.owner_id, *balance))
+                            } else {
+                                None
+                            }
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                let pool_holder_addresses =
+                    asset.as_ref().and_then(|asset| asset.liquidity.as_ref()).map(|pool| &pool.holder_addresses);
+                let owner_to_address_state = holders
+                    .iter()
+                    .filter_map(|(owner_id, _)| {
+                        pool_holder_addresses
+                            .and_then(|addresses| addresses.get(owner_id))
+                            .or_else(|| view.known_owner_addresses.get(owner_id))
+                            .map(|holder| (*owner_id, holder.clone()))
+                    })
+                    .collect();
+                Some((view.context(), asset, holders, owner_to_address_state))
+            }
+            None => {
+                let context = state.materialize_latest_context(fallback_block_hash, runtime_state);
+                let asset = state.get_asset(asset_id);
+                let holders = state.indexed_holders_by_asset(asset_id);
+                let owner_to_address_state = state.indexed_liquidity_holder_addresses(asset_id, &holders);
+                Some((context, asset, holders, owner_to_address_state))
+            }
+        }
+    }
+
     async fn persist_state(&self) -> AtomicTokenResult<()> {
         let state = self.state.lock().await;
         persist_state_to_path(&self.state_path, &state)
@@ -429,6 +572,36 @@ impl AtomicTokenService {
 
     pub async fn get_read_view(&self, requested_at_block_hash: Option<BlockHash>) -> Option<AtomicTokenReadView> {
         self.processor.read_view(requested_at_block_hash, self.genesis_hash).await
+    }
+
+    pub async fn get_read_context(&self, requested_at_block_hash: Option<BlockHash>) -> Option<AtomicTokenReadContext> {
+        self.processor.read_context(requested_at_block_hash, self.genesis_hash).await
+    }
+
+    pub async fn get_indexed_balances_by_owner(
+        &self,
+        owner_id: [u8; 32],
+        include_assets: bool,
+        requested_at_block_hash: Option<BlockHash>,
+    ) -> Option<(AtomicTokenReadContext, Vec<TokenOwnerBalanceEntry>)> {
+        self.processor.indexed_balances_by_owner(owner_id, include_assets, requested_at_block_hash, self.genesis_hash).await
+    }
+
+    pub async fn get_indexed_holders_by_asset(
+        &self,
+        asset_id: [u8; 32],
+        requested_at_block_hash: Option<BlockHash>,
+    ) -> Option<(AtomicTokenReadContext, Vec<TokenHolderEntry>)> {
+        self.processor.indexed_holders_by_asset(asset_id, requested_at_block_hash, self.genesis_hash).await
+    }
+
+    pub async fn get_indexed_liquidity_holders(
+        &self,
+        asset_id: [u8; 32],
+        requested_at_block_hash: Option<BlockHash>,
+    ) -> Option<(AtomicTokenReadContext, Option<TokenAsset>, Vec<TokenHolderEntry>, HashMap<[u8; 32], LiquidityHolderAddressState>)>
+    {
+        self.processor.indexed_liquidity_holders(asset_id, requested_at_block_hash, self.genesis_hash).await
     }
 
     async fn revalidate_loaded_state(&self) -> AtomicTokenResult<bool> {
@@ -1191,8 +1364,16 @@ fn load_state_from_path(path: &Path, protocol_version: u16, network_id: &str) ->
         return Ok(None);
     }
     let bytes = std::fs::read(path).map_err(|e| AtomicTokenError::Processing(format!("failed reading Atomic state file: {e}")))?;
-    let mut state: AtomicTokenState =
-        bincode::deserialize(&bytes).map_err(|e| AtomicTokenError::Processing(format!("failed decoding Atomic state file: {e}")))?;
+    let mut state: AtomicTokenState = match bincode::deserialize(&bytes) {
+        Ok(state) => state,
+        Err(err) => {
+            warn!(
+                "[{IDENT}] ignoring unreadable persisted Atomic state at `{}`; verified bootstrap/replay repair is required ({err})",
+                path.display()
+            );
+            return Ok(None);
+        }
+    };
     if state.protocol_version != protocol_version {
         warn!(
             "[{IDENT}] ignoring persisted Atomic state at `{}` due to protocol mismatch (expected {}, got {})",
@@ -1635,6 +1816,18 @@ mod tests {
         let loaded =
             load_state_from_path(&path, TOKEN_PROTOCOL_VERSION, "cryptix-simnet").expect("load state").expect("state present");
         assert!(!loaded.live_correct);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_state_from_path_ignores_corrupt_state_file() {
+        let dir = unique_temp_dir("load-corrupt-state");
+        let path = dir.join("state.bin");
+        fs::write(&path, b"not a bincode atomic state").expect("write corrupt state");
+
+        let loaded = load_state_from_path(&path, TOKEN_PROTOCOL_VERSION, "cryptix-simnet").expect("load corrupt state");
+        assert!(loaded.is_none());
 
         let _ = fs::remove_dir_all(dir);
     }

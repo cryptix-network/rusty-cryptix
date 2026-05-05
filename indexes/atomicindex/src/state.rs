@@ -124,6 +124,30 @@ pub struct AtomicTokenReadView {
     pub known_owner_addresses: HashMap<[u8; 32], LiquidityHolderAddressState>,
 }
 
+#[derive(Clone, Debug)]
+pub struct AtomicTokenReadContext {
+    pub at_block_hash: BlockHash,
+    pub state_hash: [u8; 32],
+    pub is_degraded: bool,
+    pub runtime_state: AtomicTokenRuntimeState,
+    pub event_sequence_cutoff: u64,
+}
+
+pub type TokenOwnerBalanceEntry = ([u8; 32], u128, Option<TokenAsset>);
+pub type TokenHolderEntry = ([u8; 32], u128);
+
+impl AtomicTokenReadView {
+    pub fn context(&self) -> AtomicTokenReadContext {
+        AtomicTokenReadContext {
+            at_block_hash: self.at_block_hash,
+            state_hash: self.state_hash,
+            is_degraded: self.is_degraded,
+            runtime_state: self.runtime_state,
+            event_sequence_cutoff: self.event_sequence_cutoff,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AtomicTokenSnapshot {
     pub schema_version: u16,
@@ -445,6 +469,10 @@ pub struct AtomicTokenState {
     liquidity_vault_outpoints: HashMap<TransactionOutpoint, [u8; 32]>,
     #[serde(skip, default)]
     known_owner_addresses: HashMap<[u8; 32], LiquidityHolderAddressState>,
+    #[serde(skip, default)]
+    balances_by_owner: HashMap<[u8; 32], HashSet<[u8; 32]>>,
+    #[serde(skip, default)]
+    holders_by_asset: HashMap<[u8; 32], HashSet<[u8; 32]>>,
 }
 
 impl AtomicTokenState {
@@ -469,6 +497,8 @@ impl AtomicTokenState {
             payload_hf_activation_daa_score: 0,
             liquidity_vault_outpoints: Default::default(),
             known_owner_addresses: Default::default(),
+            balances_by_owner: Default::default(),
+            holders_by_asset: Default::default(),
         }
     }
 
@@ -479,6 +509,7 @@ impl AtomicTokenState {
     pub fn rebuild_runtime_caches(&mut self) {
         self.rebuild_liquidity_vault_outpoint_index();
         self.rebuild_known_owner_address_cache();
+        self.rebuild_balance_indices();
     }
 
     fn rebuild_liquidity_vault_outpoint_index(&mut self) {
@@ -495,34 +526,77 @@ impl AtomicTokenState {
     }
 
     fn rebuild_known_owner_address_cache(&mut self) {
-        self.known_owner_addresses.clear();
-        let mut remembered = Vec::new();
-        for asset in self.assets.values() {
+        self.known_owner_addresses = Self::known_owner_addresses_from_assets(&self.assets);
+    }
+
+    fn known_owner_addresses_from_assets(assets: &HashMap<[u8; 32], TokenAsset>) -> HashMap<[u8; 32], LiquidityHolderAddressState> {
+        let mut known_owner_addresses = HashMap::new();
+        for asset in assets.values() {
             let Some(pool) = asset.liquidity.as_ref() else {
                 continue;
             };
             for recipient in pool.fee_recipients.iter() {
-                remembered.push((
-                    recipient.owner_id,
-                    LiquidityHolderAddressState {
-                        address_version: recipient.address_version,
-                        address_payload: recipient.address_payload.clone(),
-                    },
-                ));
+                known_owner_addresses.entry(recipient.owner_id).or_insert_with(|| LiquidityHolderAddressState {
+                    address_version: recipient.address_version,
+                    address_payload: recipient.address_payload.clone(),
+                });
             }
             for (owner_id, holder) in pool.holder_addresses.iter() {
-                remembered.push((*owner_id, holder.clone()));
+                known_owner_addresses.entry(*owner_id).or_insert_with(|| holder.clone());
             }
         }
-        for (owner_id, holder) in remembered {
-            self.known_owner_addresses.entry(owner_id).or_insert(holder);
-        }
+        known_owner_addresses
     }
 
     fn remember_owner_address(&mut self, owner_id: [u8; 32], address_version: u8, address_payload: &[u8]) {
         self.known_owner_addresses
             .entry(owner_id)
             .or_insert_with(|| LiquidityHolderAddressState { address_version, address_payload: address_payload.to_vec() });
+    }
+
+    fn rebuild_balance_indices(&mut self) {
+        self.balances_by_owner.clear();
+        self.holders_by_asset.clear();
+        let keys = self.balances.keys().copied().collect::<Vec<_>>();
+        for key in keys {
+            if self.balances.get(&key).copied().unwrap_or(0) > 0 {
+                self.index_balance_key(key);
+            }
+        }
+    }
+
+    fn index_balance_key(&mut self, key: BalanceKey) {
+        self.balances_by_owner.entry(key.owner_id).or_default().insert(key.asset_id);
+        self.holders_by_asset.entry(key.asset_id).or_default().insert(key.owner_id);
+    }
+
+    fn unindex_balance_key(&mut self, key: BalanceKey) {
+        if let Some(asset_ids) = self.balances_by_owner.get_mut(&key.owner_id) {
+            asset_ids.remove(&key.asset_id);
+            if asset_ids.is_empty() {
+                self.balances_by_owner.remove(&key.owner_id);
+            }
+        }
+        if let Some(owner_ids) = self.holders_by_asset.get_mut(&key.asset_id) {
+            owner_ids.remove(&key.owner_id);
+            if owner_ids.is_empty() {
+                self.holders_by_asset.remove(&key.asset_id);
+            }
+        }
+    }
+
+    fn set_balance_amount(&mut self, key: BalanceKey, amount: u128) {
+        if amount == 0 {
+            self.remove_balance(key);
+        } else {
+            self.balances.insert(key, amount);
+            self.index_balance_key(key);
+        }
+    }
+
+    fn remove_balance(&mut self, key: BalanceKey) {
+        self.balances.remove(&key);
+        self.unindex_balance_key(key);
     }
 
     fn set_asset_state(&mut self, asset_id: [u8; 32], asset: TokenAsset) {
@@ -700,14 +774,15 @@ impl AtomicTokenState {
             }
         }
         self.rebuild_liquidity_vault_outpoint_index();
+        self.rebuild_known_owner_address_cache();
 
         for change in journal.changed_balances.iter().rev() {
             match change.old_value {
                 Some(value) => {
-                    self.balances.insert(change.key, value);
+                    self.set_balance_amount(change.key, value);
                 }
                 None => {
-                    self.balances.remove(&change.key);
+                    self.remove_balance(change.key);
                 }
             }
         }
@@ -1205,13 +1280,8 @@ impl AtomicTokenState {
         self.record_balance_before(from_key, journal);
         self.record_balance_before(to_key, journal);
 
-        if sender_after == 0 {
-            self.balances.remove(&from_key);
-        } else {
-            self.balances.insert(from_key, sender_after);
-        }
-
-        self.balances.insert(to_key, receiver_after);
+        self.set_balance_amount(from_key, sender_after);
+        self.set_balance_amount(to_key, receiver_after);
         if is_liquidity_asset {
             let mut asset_changed = false;
             if let Some(pool) = asset.liquidity.as_mut() {
@@ -1254,7 +1324,7 @@ impl AtomicTokenState {
 
         asset.total_supply = new_total_supply;
         self.set_asset_state(op.asset_id, asset);
-        self.balances.insert(receiver_key, receiver_after);
+        self.set_balance_amount(receiver_key, receiver_after);
         Ok(())
     }
 
@@ -1284,11 +1354,7 @@ impl AtomicTokenState {
 
         asset.total_supply = supply_after;
         self.set_asset_state(asset_id, asset);
-        if sender_after == 0 {
-            self.balances.remove(&sender_key);
-        } else {
-            self.balances.insert(sender_key, sender_after);
-        }
+        self.set_balance_amount(sender_key, sender_after);
         Ok(())
     }
 
@@ -1381,7 +1447,7 @@ impl AtomicTokenState {
             self.record_balance_before(receiver_key, journal);
             let receiver_balance = self.balances.get(&receiver_key).copied().unwrap_or(0);
             let receiver_after = receiver_balance.checked_add(token_out).ok_or(NoopReason::BalanceOverflow)?;
-            self.balances.insert(receiver_key, receiver_after);
+            self.set_balance_amount(receiver_key, receiver_after);
             holder_addresses.insert(
                 creator_owner_id,
                 LiquidityHolderAddressState {
@@ -1504,7 +1570,7 @@ impl AtomicTokenState {
 
         let receiver_balance = self.balances.get(&receiver_key).copied().unwrap_or(0);
         let receiver_after = receiver_balance.checked_add(token_out).ok_or(NoopReason::BalanceOverflow)?;
-        self.balances.insert(receiver_key, receiver_after);
+        self.set_balance_amount(receiver_key, receiver_after);
 
         asset.total_supply = asset.total_supply.checked_add(token_out).ok_or(NoopReason::SupplyOverflow)?;
         asset.liquidity = Some(pool);
@@ -1574,10 +1640,10 @@ impl AtomicTokenState {
         pool.pool_nonce = pool.pool_nonce.checked_add(1).ok_or(NoopReason::SupplyOverflow)?;
 
         if sender_after == 0 {
-            self.balances.remove(&sender_key);
+            self.remove_balance(sender_key);
             pool.holder_addresses.remove(&seller_owner_id);
         } else {
-            self.balances.insert(sender_key, sender_after);
+            self.set_balance_amount(sender_key, sender_after);
         }
 
         asset.total_supply = supply_after;
@@ -2241,6 +2307,71 @@ impl AtomicTokenState {
         }
     }
 
+    pub fn materialize_latest_context(
+        &self,
+        fallback_block_hash: BlockHash,
+        runtime_state: AtomicTokenRuntimeState,
+    ) -> AtomicTokenReadContext {
+        AtomicTokenReadContext {
+            at_block_hash: self.applied_chain_order.last().copied().unwrap_or(fallback_block_hash),
+            state_hash: self.compute_state_hash(),
+            is_degraded: self.degraded,
+            runtime_state,
+            event_sequence_cutoff: self.next_event_sequence,
+        }
+    }
+
+    pub fn indexed_balances_by_owner(&self, owner_id: [u8; 32], include_assets: bool) -> Vec<TokenOwnerBalanceEntry> {
+        self.balances_by_owner
+            .get(&owner_id)
+            .into_iter()
+            .flat_map(|asset_ids| asset_ids.iter().copied())
+            .filter_map(|asset_id| {
+                let balance = self.balances.get(&BalanceKey { asset_id, owner_id }).copied().unwrap_or(0);
+                if balance == 0 {
+                    return None;
+                }
+                let asset = if include_assets { self.assets.get(&asset_id).cloned() } else { None };
+                Some((asset_id, balance, asset))
+            })
+            .collect()
+    }
+
+    pub fn indexed_holders_by_asset(&self, asset_id: [u8; 32]) -> Vec<TokenHolderEntry> {
+        self.holders_by_asset
+            .get(&asset_id)
+            .into_iter()
+            .flat_map(|owner_ids| owner_ids.iter().copied())
+            .filter_map(|owner_id| {
+                let balance = self.balances.get(&BalanceKey { asset_id, owner_id }).copied().unwrap_or(0);
+                if balance > 0 {
+                    Some((owner_id, balance))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn indexed_liquidity_holder_addresses(
+        &self,
+        asset_id: [u8; 32],
+        holders: &[TokenHolderEntry],
+    ) -> HashMap<[u8; 32], LiquidityHolderAddressState> {
+        let pool_holder_addresses =
+            self.assets.get(&asset_id).and_then(|asset| asset.liquidity.as_ref()).map(|pool| &pool.holder_addresses);
+
+        holders
+            .iter()
+            .filter_map(|(owner_id, _)| {
+                pool_holder_addresses
+                    .and_then(|addresses| addresses.get(owner_id))
+                    .or_else(|| self.known_owner_addresses.get(owner_id))
+                    .map(|holder| (*owner_id, holder.clone()))
+            })
+            .collect()
+    }
+
     pub fn materialize_view_at_block(&self, at_block_hash: BlockHash) -> Option<AtomicTokenReadView> {
         let target_index = self.applied_chain_order.iter().position(|hash| *hash == at_block_hash)?;
         let mut assets = self.assets.clone();
@@ -2303,6 +2434,7 @@ impl AtomicTokenState {
 
         let state_hash = self.state_hash_by_block.get(&at_block_hash).copied()?;
         let event_sequence_cutoff = self.event_sequence_by_block.get(&at_block_hash).copied().unwrap_or(self.next_event_sequence);
+        let known_owner_addresses = Self::known_owner_addresses_from_assets(&assets);
         Some(AtomicTokenReadView {
             at_block_hash,
             state_hash,
@@ -2314,7 +2446,7 @@ impl AtomicTokenState {
             nonces,
             anchor_counts,
             processed_ops,
-            known_owner_addresses: self.known_owner_addresses.clone(),
+            known_owner_addresses,
         })
     }
 
@@ -2960,6 +3092,64 @@ mod tests {
         state.state_hash_by_block.insert(accepting_block_hash, state.compute_state_hash());
         state.event_sequence_by_block.insert(accepting_block_hash, state.next_event_sequence);
         state.applied_chain_order.push(accepting_block_hash);
+    }
+
+    #[test]
+    fn balance_indices_track_balance_lifecycle_and_rebuild() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let asset_a = [0x11; 32];
+        let asset_b = [0x22; 32];
+        let owner_a = [0x33; 32];
+        let owner_b = [0x44; 32];
+
+        state.set_balance_amount(BalanceKey { asset_id: asset_a, owner_id: owner_a }, 100);
+        state.set_balance_amount(BalanceKey { asset_id: asset_b, owner_id: owner_a }, 200);
+        state.set_balance_amount(BalanceKey { asset_id: asset_a, owner_id: owner_b }, 300);
+
+        let mut owner_balances = state.indexed_balances_by_owner(owner_a, false);
+        owner_balances.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(owner_balances, vec![(asset_a, 100, None), (asset_b, 200, None)]);
+
+        let mut asset_holders = state.indexed_holders_by_asset(asset_a);
+        asset_holders.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(asset_holders, vec![(owner_a, 100), (owner_b, 300)]);
+
+        state.set_balance_amount(BalanceKey { asset_id: asset_a, owner_id: owner_a }, 0);
+        assert_eq!(state.indexed_balances_by_owner(owner_a, false), vec![(asset_b, 200, None)]);
+        assert_eq!(state.indexed_holders_by_asset(asset_a), vec![(owner_b, 300)]);
+
+        state.balances.insert(BalanceKey { asset_id: asset_a, owner_id: owner_a }, 400);
+        state.rebuild_runtime_caches();
+        let mut rebuilt_holders = state.indexed_holders_by_asset(asset_a);
+        rebuilt_holders.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(rebuilt_holders, vec![(owner_a, 400), (owner_b, 300)]);
+    }
+
+    #[test]
+    fn rollback_restores_balance_indices() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let asset_id = [0x55; 32];
+        let owner_id = [0x66; 32];
+        let key = BalanceKey { asset_id, owner_id };
+        state.set_balance_amount(key, 100);
+
+        let block_hash = BlockHash::from_u64_word(123);
+        let mut journal = JournalBuilder::default();
+        state.record_balance_before(key, &mut journal);
+        state.set_balance_amount(key, 0);
+        state.block_journals.insert(block_hash, journal.into_block_journal());
+        state.state_hash_by_block.insert(block_hash, state.compute_state_hash());
+        state.event_sequence_by_block.insert(block_hash, state.next_event_sequence);
+        state.applied_chain_order.push(block_hash);
+
+        assert!(state.indexed_balances_by_owner(owner_id, false).is_empty());
+        assert!(state.indexed_holders_by_asset(asset_id).is_empty());
+
+        state.rollback_block(block_hash).expect("rollback should restore recorded balance");
+
+        assert_eq!(state.get_balance(asset_id, owner_id), 100);
+        assert_eq!(state.indexed_balances_by_owner(owner_id, false), vec![(asset_id, 100, None)]);
+        assert_eq!(state.indexed_holders_by_asset(asset_id), vec![(owner_id, 100)]);
     }
 
     #[test]

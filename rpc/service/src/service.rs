@@ -22,8 +22,8 @@ use cryptix_atomicindex::{
     },
     service::{AtomicTokenService, ScBootstrapSource, ScSnapshotChunk, ScSnapshotManifestSignature},
     state::{
-        AtomicTokenHealth, AtomicTokenReadView, AtomicTokenRuntimeState, LiquidityFeeRecipientState, LiquidityPoolState, ProcessedOp,
-        TokenAsset, TokenAssetClass, TokenEvent,
+        AtomicTokenHealth, AtomicTokenReadContext, AtomicTokenReadView, AtomicTokenRuntimeState, LiquidityFeeRecipientState,
+        LiquidityPoolState, ProcessedOp, TokenAsset, TokenAssetClass, TokenEvent,
     },
 };
 use cryptix_consensus_core::api::counters::ProcessingCounters;
@@ -449,6 +449,13 @@ impl RpcCoreService {
         }
     }
 
+    fn ensure_token_context_read_ready(context: &AtomicTokenReadContext) -> RpcResult<()> {
+        match context.runtime_state {
+            AtomicTokenRuntimeState::Healthy => Ok(()),
+            other => Err(Self::token_state_unavailable_error(other)),
+        }
+    }
+
     fn ensure_token_simulation_ready(view: &AtomicTokenReadView) -> RpcResult<()> {
         Self::ensure_token_read_ready(view)
     }
@@ -479,6 +486,23 @@ impl RpcCoreService {
             at_daa_score,
             state_hash: view.state_hash.as_slice().to_hex(),
             is_degraded: view.is_degraded,
+        })
+    }
+
+    async fn atomic_context_from_read_context(&self, context: &AtomicTokenReadContext) -> RpcResult<RpcTokenContext> {
+        let consensus = self.consensus_manager.consensus();
+        let session = consensus.session().await;
+        let at_block_hash = context.at_block_hash;
+        let at_daa_score = session
+            .async_get_header(at_block_hash)
+            .await
+            .map_err(|err| RpcError::General(format!("failed reading token context header: {err}")))?
+            .daa_score;
+        Ok(RpcTokenContext {
+            at_block_hash,
+            at_daa_score,
+            state_hash: context.state_hash.as_slice().to_hex(),
+            is_degraded: context.is_degraded,
         })
     }
 
@@ -2447,25 +2471,14 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
         let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_OWNER_BALANCES_LIMIT_MAX);
         let offset = usize::try_from(offset).map_err(|e| RpcError::General(e.to_string()))?;
-        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
-        Self::ensure_token_read_ready(&view)?;
-
-        let mut balances: Vec<([u8; 32], u128, Option<TokenAsset>)> = view
-            .balances
-            .iter()
-            .filter_map(|(key, balance)| {
-                if key.owner_id != owner_id || *balance == 0 {
-                    return None;
-                }
-                let asset = if include_assets { view.assets.get(&key.asset_id).cloned() } else { None };
-                Some((key.asset_id, *balance, asset))
-            })
-            .collect();
+        let (read_context, mut balances) =
+            atomic.get_indexed_balances_by_owner(owner_id, include_assets, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
 
         balances.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let total = balances.len() as u64;
         let balances = balances.into_iter().skip(offset).take(limit).map(Self::map_token_owner_balance).collect();
-        let context = self.atomic_context(&view).await?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetTokenBalancesByOwnerResponse { balances, total, context })
     }
 
@@ -2479,19 +2492,14 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
         let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_HOLDERS_LIMIT_MAX);
         let offset = usize::try_from(offset).map_err(|e| RpcError::General(e.to_string()))?;
-        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
-        Self::ensure_token_read_ready(&view)?;
-
-        let mut holders: Vec<([u8; 32], u128)> = view
-            .balances
-            .iter()
-            .filter_map(|(key, balance)| if key.asset_id == asset_id && *balance > 0 { Some((key.owner_id, *balance)) } else { None })
-            .collect();
+        let (read_context, mut holders) =
+            atomic.get_indexed_holders_by_asset(asset_id, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
         holders.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         let total = holders.len() as u64;
         let holders = holders.into_iter().skip(offset).take(limit).map(Self::map_token_holder).collect();
-        let context = self.atomic_context(&view).await?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetTokenHoldersResponse { holders, total, context })
     }
 
@@ -2715,46 +2723,32 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let asset_id_bytes = Self::parse_hex_32(&asset_id, "assetId")?;
         let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_LIQUIDITY_HOLDERS_LIMIT_MAX);
         let offset = usize::try_from(offset).map_err(|e| RpcError::General(e.to_string()))?;
-        let view =
-            atomic.get_read_view(at_block_hash).await.ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
-        Self::ensure_token_read_ready(&view)?;
+        let (read_context, asset, mut holders, owner_to_address_state) = atomic
+            .get_indexed_liquidity_holders(asset_id_bytes, at_block_hash)
+            .await
+            .ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
+        Self::ensure_token_context_read_ready(&read_context)?;
 
-        let asset = view.assets.get(&asset_id_bytes).ok_or_else(|| RpcError::General("liquidity asset not found".to_string()))?;
+        let asset = asset.ok_or_else(|| RpcError::General("liquidity asset not found".to_string()))?;
         if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
             return Err(RpcError::General("asset is not a liquidity asset".to_string()));
         }
-        let pool = asset.liquidity.as_ref().ok_or_else(|| RpcError::General("liquidity state missing for asset".to_string()))?;
-
-        let mut holders: Vec<([u8; 32], u128)> = view
-            .balances
-            .iter()
-            .filter_map(
-                |(key, balance)| {
-                    if key.asset_id == asset_id_bytes && *balance > 0 {
-                        Some((key.owner_id, *balance))
-                    } else {
-                        None
-                    }
-                },
-            )
-            .collect();
+        asset.liquidity.as_ref().ok_or_else(|| RpcError::General("liquidity state missing for asset".to_string()))?;
         holders.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         let prefix = self.config.prefix();
-        let owner_to_address: HashMap<[u8; 32], String> = holders
+        let owner_to_address: HashMap<[u8; 32], String> = owner_to_address_state
             .iter()
-            .filter_map(|(owner_id, _)| {
-                pool.holder_addresses.get(owner_id).or_else(|| view.known_owner_addresses.get(owner_id)).and_then(|holder| {
-                    Self::liquidity_address_string_from_components(prefix, holder.address_version, holder.address_payload.as_slice())
-                        .map(|address| (*owner_id, address))
-                })
+            .filter_map(|(owner_id, holder)| {
+                Self::liquidity_address_string_from_components(prefix, holder.address_version, holder.address_payload.as_slice())
+                    .map(|address| (*owner_id, address))
             })
             .collect();
 
         let total = holders.len() as u64;
         let holders =
             holders.into_iter().skip(offset).take(limit).map(|entry| Self::map_liquidity_holder(entry, &owner_to_address)).collect();
-        let context = self.atomic_context(&view).await?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetLiquidityHoldersResponse { holders, total, context })
     }
 
