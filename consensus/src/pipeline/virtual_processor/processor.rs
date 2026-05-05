@@ -1518,6 +1518,12 @@ impl VirtualStateProcessor {
         diff_from_virtual: &impl ImmutableUtxoDiff,
         block_hash: Hash,
     ) -> Option<AtomicConsensusState> {
+        let block_daa_score = self.headers_store.get_header(block_hash).unwrap().daa_score;
+        if self.transaction_validator.is_payload_hf_active(block_daa_score) {
+            warn!("refusing to reconstruct post-HF atomic state for `{block_hash}` from the virtual UTXO set");
+            return None;
+        }
+
         let mut state = match Self::atomic_anchor_state_from_utxo_iterator(stores.utxo_set.iterator(), "virtual UTXO set") {
             Ok(state) => state,
             Err(err) => {

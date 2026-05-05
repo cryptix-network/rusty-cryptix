@@ -49,10 +49,14 @@ impl PruningPointAndItsAnticoneRequestsFlow {
             let mut session = consensus.session().await;
 
             let pp_headers = session.async_pruning_point_headers().await;
+            let Some(proof_pruning_point_header) = pp_headers.last() else {
+                return Err(ProtocolError::Other("cannot serve pruning point data without pruning point headers"));
+            };
+            let payload_hf_active = proof_pruning_point_header.daa_score >= self.ctx.config.params.payload_hf_activation_daa_score;
             self.router
                 .enqueue(make_response!(
                     Payload::PruningPoints,
-                    PruningPointsMessage { headers: pp_headers.into_iter().map(|header| <pb::BlockHeader>::from(&*header)).collect() },
+                    PruningPointsMessage { headers: pp_headers.iter().map(|header| <pb::BlockHeader>::from(&**header)).collect() },
                     request_id
                 ))
                 .await?;
@@ -61,7 +65,14 @@ impl PruningPointAndItsAnticoneRequestsFlow {
             let pp_anticone = &trusted_data.anticone;
             let daa_window = &trusted_data.daa_window_blocks;
             let ghostdag_data = &trusted_data.ghostdag_blocks;
-            let atomic_state = trusted_data.atomic_state.as_ref();
+            let atomic_state = if payload_hf_active {
+                trusted_data.atomic_state.as_ref()
+            } else {
+                if trusted_data.atomic_state.is_some() {
+                    debug!("Skipping pre-HF pruning-point atomic state transfer; peer reconstructs it from the UTXO set");
+                }
+                None
+            };
             let (atomic_consensus_state_hash, atomic_consensus_state_byte_length, atomic_consensus_state_chunk_count) =
                 match atomic_state {
                     Some(state) => {
