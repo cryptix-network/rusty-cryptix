@@ -16,7 +16,7 @@ use crate::common::ProtocolError;
 pub const TRUSTED_ATOMIC_STATE_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 // The pruning-point atomic consensus state is assembled in memory during IBD.
 // Keep this bounded separately from AtomicIndex snapshot bootstrap data.
-pub const MAX_TRUSTED_ATOMIC_STATE_CHUNKS: u64 = 256;
+pub const MAX_TRUSTED_ATOMIC_STATE_CHUNKS: u64 = 2_048;
 pub const MAX_TRUSTED_ATOMIC_STATE_BYTES: u64 = TRUSTED_ATOMIC_STATE_CHUNK_SIZE as u64 * MAX_TRUSTED_ATOMIC_STATE_CHUNKS;
 
 pub fn trusted_atomic_state_chunk_count(byte_length: u64) -> u64 {
@@ -133,6 +133,18 @@ pub struct TrustedAtomicStateChunk {
 impl TrustedAtomicStateChunk {
     pub fn new(state_hash: [u8; 32], chunk_index: u64, total_chunks: u64, total_bytes: u64, chunk: Vec<u8>) -> Self {
         Self { state_hash, chunk_index, total_chunks, total_bytes, chunk }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusted_atomic_state_transfer_limit_is_chunk_aligned() {
+        assert_eq!(MAX_TRUSTED_ATOMIC_STATE_BYTES, 8 * 1024 * 1024 * 1024);
+        assert_eq!(trusted_atomic_state_chunk_count(MAX_TRUSTED_ATOMIC_STATE_BYTES), MAX_TRUSTED_ATOMIC_STATE_CHUNKS);
+        assert_eq!(trusted_atomic_state_chunk_count(MAX_TRUSTED_ATOMIC_STATE_BYTES + 1), MAX_TRUSTED_ATOMIC_STATE_CHUNKS + 1);
     }
 }
 
