@@ -446,6 +446,85 @@ pub struct AccountsGetResponse {
     pub account_descriptor: AccountDescriptor,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountUtxoEntry {
+    pub address: Option<Address>,
+    pub index: TransactionIndexType,
+    pub amount: u64,
+    pub script_public_key: ScriptPublicKey,
+    pub block_daa_score: u64,
+    pub is_coinbase: bool,
+    pub status: String,
+}
+
+impl AccountUtxoEntry {
+    pub fn from_reference(utxo: &UtxoEntryReference, status: &str) -> Self {
+        let entry = utxo.as_ref();
+        Self {
+            address: entry.address.clone(),
+            index: entry.outpoint.get_index(),
+            amount: entry.amount,
+            script_public_key: entry.script_public_key.clone(),
+            block_daa_score: entry.block_daa_score,
+            is_coinbase: entry.is_coinbase,
+            status: status.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountUtxoTransaction {
+    pub transaction_id: TransactionId,
+    pub entries: Vec<AccountUtxoEntry>,
+    pub value: u64,
+    pub block_daa_score: u64,
+    pub status: String,
+    pub is_coinbase: bool,
+}
+
+impl AccountUtxoTransaction {
+    pub fn new(transaction_id: TransactionId, status: &str) -> Self {
+        Self {
+            transaction_id,
+            entries: Vec::new(),
+            value: 0,
+            block_daa_score: 0,
+            status: status.to_string(),
+            is_coinbase: false,
+        }
+    }
+
+    pub fn push(&mut self, entry: AccountUtxoEntry) {
+        self.value = self.value.saturating_add(entry.amount);
+        self.block_daa_score = self.block_daa_score.max(entry.block_daa_score);
+        self.is_coinbase |= entry.is_coinbase;
+        if self.status == "mature" && entry.status != "mature" {
+            self.status = entry.status.clone();
+        }
+        self.entries.push(entry);
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsUtxosRequest {
+    pub account_id: AccountId,
+    pub start: u64,
+    pub end: u64,
+    pub include_pending: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsUtxosResponse {
+    pub account_id: AccountId,
+    pub transactions: Vec<AccountUtxoTransaction>,
+    pub start: u64,
+    pub total: u64,
+}
+
 /// Specifies the type of an account address to create.
 /// The address can bea receive address or a change address.
 ///

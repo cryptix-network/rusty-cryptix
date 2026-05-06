@@ -1304,6 +1304,94 @@ try_from! ( args: AccountsGetResponse, IAccountsGetResponse, {
 // ---
 
 declare! {
+    IAccountsUtxosRequest,
+    r#"
+    /**
+     * 
+     *  
+     * @category Wallet API
+     */
+    export interface IAccountsUtxosRequest {
+        accountId: HexString;
+        start: bigint;
+        end: bigint;
+        includePending?: boolean;
+    }
+    "#,
+}
+
+try_from! ( args: IAccountsUtxosRequest, AccountsUtxosRequest, {
+    let account_id = args.get_account_id("accountId")?;
+    let start = args.get_u64("start")?;
+    let end = args.get_u64("end")?;
+    let include_pending = args.try_get_bool("includePending")?.unwrap_or(true);
+
+    Ok(AccountsUtxosRequest { account_id, start, end, include_pending })
+});
+
+declare! {
+    IAccountUtxoEntry,
+    r#"
+    /**
+     * 
+     *  
+     * @category Wallet API
+     */
+    export interface IAccountUtxoEntry {
+        address?: Address;
+        index: number;
+        amount: bigint;
+        scriptPublicKey: ScriptPublicKey;
+        blockDaaScore: bigint;
+        isCoinbase: boolean;
+        status: string;
+    }
+    "#,
+}
+
+declare! {
+    IAccountUtxoTransaction,
+    r#"
+    /**
+     * 
+     *  
+     * @category Wallet API
+     */
+    export interface IAccountUtxoTransaction {
+        transactionId: HexString;
+        entries: IAccountUtxoEntry[];
+        value: bigint;
+        blockDaaScore: bigint;
+        status: string;
+        isCoinbase: boolean;
+    }
+    "#,
+}
+
+declare! {
+    IAccountsUtxosResponse,
+    r#"
+    /**
+     * 
+     *  
+     * @category Wallet API
+     */
+    export interface IAccountsUtxosResponse {
+        accountId: HexString;
+        transactions: IAccountUtxoTransaction[];
+        start: bigint;
+        total: bigint;
+    }
+    "#,
+}
+
+try_from! ( args: AccountsUtxosResponse, IAccountsUtxosResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+// ---
+
+declare! {
     IAccountsCreateNewAddressRequest,
     r#"
     /**

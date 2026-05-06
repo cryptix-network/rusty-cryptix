@@ -44,6 +44,7 @@ declare_wasm_handlers!([
     AccountsDeactivate,
     // AccountsRemove,
     AccountsGet,
+    AccountsUtxos,
     AccountsCreateNewAddress,
     AccountsSend,
     AccountsTransfer,

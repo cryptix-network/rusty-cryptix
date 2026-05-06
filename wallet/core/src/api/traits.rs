@@ -361,6 +361,9 @@ pub trait WalletApi: Send + Sync + AnySync {
     /// Get an [`AccountDescriptor`] for a specific account id.
     async fn accounts_get_call(self: Arc<Self>, request: AccountsGetRequest) -> Result<AccountsGetResponse>;
 
+    /// Get a paged, transaction-grouped view of the current UTXO set for an active account.
+    async fn accounts_utxos_call(self: Arc<Self>, request: AccountsUtxosRequest) -> Result<AccountsUtxosResponse>;
+
     /// Wrapper around [`accounts_create_new_address`](Self::accounts_create_new_address)
     async fn accounts_create_new_address(
         self: Arc<Self>,

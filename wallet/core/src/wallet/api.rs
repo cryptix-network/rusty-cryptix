@@ -409,6 +409,62 @@ impl WalletApi for super::Wallet {
         Ok(AccountsGetResponse { account_descriptor })
     }
 
+    async fn accounts_utxos_call(self: Arc<Self>, request: AccountsUtxosRequest) -> Result<AccountsUtxosResponse> {
+        let AccountsUtxosRequest { account_id, start, end, include_pending } = request;
+
+        if start > end {
+            return Err(Error::InvalidRange(start, end));
+        }
+
+        let guard = self.guard();
+        let _guard = guard.lock().await;
+
+        let account = self
+            .active_accounts()
+            .get(&account_id)
+            .ok_or_else(|| Error::custom(format!("account {account_id} is not active")))?;
+
+        let mut groups = HashMap::<TransactionId, AccountUtxoTransaction>::new();
+        {
+            let context = account.utxo_context().context();
+
+            for utxo in context.mature.iter() {
+                let transaction_id = utxo.transaction_id();
+                let entry = AccountUtxoEntry::from_reference(utxo, "mature");
+                groups.entry(transaction_id).or_insert_with(|| AccountUtxoTransaction::new(transaction_id, "mature")).push(entry);
+            }
+
+            if include_pending {
+                for utxo in context.pending.values() {
+                    let transaction_id = utxo.transaction_id();
+                    let entry = AccountUtxoEntry::from_reference(utxo, "pending");
+                    groups.entry(transaction_id).or_insert_with(|| AccountUtxoTransaction::new(transaction_id, "pending")).push(entry);
+                }
+
+                for utxo in context.stasis.values() {
+                    let transaction_id = utxo.transaction_id();
+                    let entry = AccountUtxoEntry::from_reference(utxo, "stasis");
+                    groups.entry(transaction_id).or_insert_with(|| AccountUtxoTransaction::new(transaction_id, "stasis")).push(entry);
+                }
+            }
+        }
+
+        let mut transactions = groups.into_values().collect::<Vec<_>>();
+        transactions.sort_by(|left, right| {
+            right
+                .block_daa_score
+                .cmp(&left.block_daa_score)
+                .then_with(|| right.transaction_id.to_string().cmp(&left.transaction_id.to_string()))
+        });
+
+        let total = transactions.len() as u64;
+        let range_start = start.min(total) as usize;
+        let range_end = end.min(total) as usize;
+        let transactions = transactions[range_start..range_end].to_vec();
+
+        Ok(AccountsUtxosResponse { account_id, transactions, start, total })
+    }
+
     async fn accounts_create_new_address_call(
         self: Arc<Self>,
         request: AccountsCreateNewAddressRequest,
