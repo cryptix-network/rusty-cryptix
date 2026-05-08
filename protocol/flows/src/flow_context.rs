@@ -21,7 +21,7 @@ use cryptix_addressmanager::AddressManager;
 use cryptix_connectionmanager::{AntiFraudMode, ConnectionManager};
 use cryptix_consensus_core::api::{BlockValidationFuture, BlockValidationFutures};
 use cryptix_consensus_core::block::Block;
-use cryptix_consensus_core::config::Config;
+use cryptix_consensus_core::config::{params::Params, Config};
 use cryptix_consensus_core::errors::block::RuleError;
 use cryptix_consensus_core::tx::{Transaction, TransactionId};
 use cryptix_consensus_core::ChainPath;
@@ -87,6 +87,11 @@ const QUANTUM_HANDSHAKE_STATE_LEGACY: u8 = 1;
 const QUANTUM_HANDSHAKE_STATE_ENFORCED: u8 = 2;
 const BLOCK_PRODUCER_CLAIM_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const BLOCK_PRODUCER_CLAIM_WAIT_INTERVAL: Duration = Duration::from_millis(50);
+
+fn is_transport_payload_hf_active(params: &Params, virtual_daa_score: u64) -> bool {
+    let canonical_network_params = Params::from(params.net);
+    virtual_daa_score >= canonical_network_params.payload_hf_activation_daa_score
+}
 
 #[async_trait]
 pub trait AtomicStateQuorumVerifier: Send + Sync {
@@ -720,7 +725,7 @@ impl FlowContext {
 
     pub fn is_payload_hf_active(&self) -> bool {
         let virtual_daa_score = self.consensus().unguarded_session().get_virtual_daa_score();
-        virtual_daa_score >= self.config.params.payload_hf_activation_daa_score
+        is_transport_payload_hf_active(&self.config.params, virtual_daa_score)
     }
 
     fn log_quantum_handshake_mode_transition(&self, enforce_quantum_handshake: bool) {
@@ -1787,7 +1792,8 @@ impl ConnectionInitializer for FlowContext {
 
 #[cfg(test)]
 mod tests {
-    use super::is_compatible_peer_network;
+    use super::{is_compatible_peer_network, is_transport_payload_hf_active};
+    use cryptix_consensus_core::config::params::MAINNET_PARAMS;
 
     #[test]
     fn test_network_compatibility() {
@@ -1796,5 +1802,23 @@ mod tests {
         assert!(!is_compatible_peer_network("cryptix-testnet", "cryptix-testnet-isolated"));
         assert!(!is_compatible_peer_network("cryptix-testnet-isolated", "cryptix-testnet"));
         assert!(!is_compatible_peer_network("cryptix-mainnet", "cryptix-testnet"));
+    }
+
+    #[test]
+    fn transport_hf_ignores_local_activation_override_before_network_hf() {
+        let mut params = MAINNET_PARAMS;
+        params.payload_hf_activation_daa_score = 1_111;
+
+        assert!(!is_transport_payload_hf_active(&params, 133_018));
+    }
+
+    #[test]
+    fn transport_hf_uses_canonical_network_activation_score() {
+        let canonical_activation = MAINNET_PARAMS.payload_hf_activation_daa_score;
+        let mut params = MAINNET_PARAMS;
+        params.payload_hf_activation_daa_score = u64::MAX;
+
+        assert!(!is_transport_payload_hf_active(&params, canonical_activation - 1));
+        assert!(is_transport_payload_hf_active(&params, canonical_activation));
     }
 }
