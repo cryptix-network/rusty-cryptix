@@ -317,6 +317,14 @@ pub trait WalletApi: Send + Sync + AnySync {
     /// considered as viable.
     async fn accounts_discovery_call(self: Arc<Self>, request: AccountsDiscoveryRequest) -> Result<AccountsDiscoveryResponse>;
 
+    /// Scans a derivation-capable account address space up to an explicit depth.
+    ///
+    /// This is useful for recovering accounts where older wallets left gaps in
+    /// the receive/change address sequence. Legacy accounts require
+    /// `wallet_secret` so the legacy private derivation context can be
+    /// initialized for the duration of the scan.
+    async fn accounts_scan_call(self: Arc<Self>, request: AccountsScanRequest) -> Result<AccountsScanResponse>;
+
     /// Wrapper around [`accounts_create_call()`](Self::accounts_create_call)
     async fn accounts_create(
         self: Arc<Self>,
@@ -370,7 +378,7 @@ pub trait WalletApi: Send + Sync + AnySync {
         account_id: AccountId,
         kind: NewAddressKind,
     ) -> Result<AccountsCreateNewAddressResponse> {
-        self.accounts_create_new_address_call(AccountsCreateNewAddressRequest { account_id, kind }).await
+        self.accounts_create_new_address_call(AccountsCreateNewAddressRequest { account_id, wallet_secret: None, kind }).await
     }
 
     /// Creates a new address for a specified account id. This call is applicable

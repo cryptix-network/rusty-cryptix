@@ -1,5 +1,5 @@
 //!
-//! Legacy (KDX, cryptix-network.io Web Wallet) account implementation
+//! Legacy account implementation for the old web wallet derivation path.
 //!
 
 use crate::account::{AsLegacyAccount, Inner};
@@ -20,7 +20,7 @@ impl Factory for Ctor {
     }
 
     fn description(&self) -> String {
-        "Cryptix Legacy Account (KDX, cryptix-network.io Web Wallet)".to_string()
+        "Cryptix Legacy Account (old web wallet derivation path)".to_string()
     }
 
     async fn try_load(

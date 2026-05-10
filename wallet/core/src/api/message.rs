@@ -368,6 +368,21 @@ pub struct AccountsDiscoveryResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AccountsScanRequest {
+    pub account_id: AccountId,
+    pub wallet_secret: Option<Secret>,
+    pub depth: Option<u32>,
+    pub window_size: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsScanResponse {
+    pub account_descriptor: AccountDescriptor,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountsCreateRequest {
     pub wallet_secret: Secret,
     pub account_create_args: AccountCreateArgs,
@@ -552,6 +567,7 @@ impl FromStr for NewAddressKind {
 #[serde(rename_all = "camelCase")]
 pub struct AccountsCreateNewAddressRequest {
     pub account_id: AccountId,
+    pub wallet_secret: Option<Secret>,
     #[serde(rename = "type")]
     pub kind: NewAddressKind,
 }

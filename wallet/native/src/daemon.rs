@@ -1306,7 +1306,11 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
         let account_id = *account.id();
         let response = self
             .wallet()
-            .accounts_create_new_address_call(AccountsCreateNewAddressRequest { account_id, kind: NewAddressKind::Receive })
+            .accounts_create_new_address_call(AccountsCreateNewAddressRequest {
+                account_id,
+                wallet_secret: None,
+                kind: NewAddressKind::Receive,
+            })
             .await
             .map_err(Self::status_internal)?;
 

@@ -37,6 +37,7 @@ declare_wasm_handlers!([
     AccountsEnumerate,
     AccountsRename,
     AccountsDiscovery,
+    AccountsScan,
     AccountsCreate,
     AccountsEnsureDefault,
     AccountsImport,

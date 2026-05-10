@@ -543,7 +543,7 @@ pub trait Account: AnySync + Send + Sync + 'static {
 
 downcast_sync!(dyn Account);
 
-/// Account trait used by legacy account types (BIP32 account types with the `'972` derivation path).
+/// Account trait used by legacy account types (old web wallet derivation path).
 #[async_trait]
 pub trait AsLegacyAccount: Account {
     async fn create_private_context(

@@ -268,7 +268,7 @@ impl PubkeyDerivationManagerTrait for PubkeyDerivationManagerV0 {
 
 #[derive(Clone)]
 pub struct WalletDerivationManagerV0 {
-    /// extended public key derived upto `m/<Purpose>'/972/<Account Index>'`
+    /// extended public key derived up to the old web wallet legacy path.
     extended_public_key: Option<ExtendedPublicKey<secp256k1::PublicKey>>,
 
     account_index: u64,

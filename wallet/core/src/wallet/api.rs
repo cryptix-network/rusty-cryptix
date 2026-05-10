@@ -365,6 +365,43 @@ impl WalletApi for super::Wallet {
         Ok(AccountsDiscoveryResponse { last_account_index_found })
     }
 
+    async fn accounts_scan_call(self: Arc<Self>, request: AccountsScanRequest) -> Result<AccountsScanResponse> {
+        let AccountsScanRequest { account_id, wallet_secret, depth, window_size } = request;
+
+        let guard = self.guard();
+        let guard = guard.lock().await;
+
+        let account = self.get_account_by_id(&account_id, &guard).await?.ok_or(Error::AccountNotFound(account_id))?;
+        let legacy_account = account.clone().as_legacy_account().ok();
+
+        if let Some(legacy_account) = legacy_account.as_ref() {
+            let wallet_secret = wallet_secret
+                .as_ref()
+                .ok_or_else(|| Error::Custom("walletSecret is required to scan legacy accounts".to_string()))?;
+            legacy_account.create_private_context(wallet_secret, None, None).await?;
+        }
+
+        let scan_result = account.clone().scan(window_size.map(|value| value as usize), depth).await;
+        if let Some(legacy_account) = legacy_account.as_ref() {
+            let clear_result = legacy_account.clear_private_context().await;
+            if scan_result.is_ok() {
+                clear_result?;
+            } else if let Err(err) = clear_result {
+                log_warn!("failed to clear legacy private context after scan error: {err}");
+            }
+        }
+        scan_result?;
+
+        if let Some(metadata) = account.metadata()? {
+            self.store().as_account_store()?.update_metadata(vec![metadata]).await?;
+        }
+
+        let account_descriptor = account.descriptor()?;
+        self.notify(Events::AccountUpdate { account_descriptor: account_descriptor.clone() }).await?;
+
+        Ok(AccountsScanResponse { account_descriptor })
+    }
+
     async fn accounts_create_call(self: Arc<Self>, request: AccountsCreateRequest) -> Result<AccountsCreateResponse> {
         let AccountsCreateRequest { wallet_secret, account_create_args } = request;
 
@@ -469,17 +506,34 @@ impl WalletApi for super::Wallet {
         self: Arc<Self>,
         request: AccountsCreateNewAddressRequest,
     ) -> Result<AccountsCreateNewAddressResponse> {
-        let AccountsCreateNewAddressRequest { account_id, kind } = request;
+        let AccountsCreateNewAddressRequest { account_id, wallet_secret, kind } = request;
 
         let guard = self.guard();
         let guard = guard.lock().await;
 
         let account = self.get_account_by_id(&account_id, &guard).await?.ok_or(Error::AccountNotFound(account_id))?;
+        let legacy_account = account.clone().as_legacy_account().ok();
 
-        let address = match kind {
-            NewAddressKind::Receive => account.as_derivation_capable()?.new_receive_address().await?,
-            NewAddressKind::Change => account.as_derivation_capable()?.new_change_address().await?,
+        if let Some(legacy_account) = legacy_account.as_ref() {
+            let wallet_secret = wallet_secret
+                .as_ref()
+                .ok_or_else(|| Error::Custom("walletSecret is required to create legacy addresses".to_string()))?;
+            legacy_account.create_private_context(wallet_secret, None, None).await?;
+        }
+
+        let address_result = match kind {
+            NewAddressKind::Receive => account.clone().as_derivation_capable()?.new_receive_address().await,
+            NewAddressKind::Change => account.clone().as_derivation_capable()?.new_change_address().await,
         };
+        if let Some(legacy_account) = legacy_account.as_ref() {
+            let clear_result = legacy_account.clear_private_context().await;
+            if address_result.is_ok() {
+                clear_result?;
+            } else if let Err(err) = clear_result {
+                log_warn!("failed to clear legacy private context after address creation error: {err}");
+            }
+        }
+        let address = address_result?;
 
         Ok(AccountsCreateNewAddressResponse { address })
     }

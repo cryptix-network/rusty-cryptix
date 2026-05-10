@@ -1966,7 +1966,7 @@ impl Wallet {
         mnemonic_phrase: Option<&Secret>,
         guard: &WalletGuard<'_>,
     ) -> Result<AccountDescriptor> {
-        if kind != BIP32_ACCOUNT_KIND {
+        if kind != BIP32_ACCOUNT_KIND && kind != LEGACY_ACCOUNT_KIND {
             return Err(Error::custom("Account kind is not supported"));
         }
 
@@ -1988,7 +1988,11 @@ impl Wallet {
             self.store().batch().await?;
             let prv_key_data_id = self.clone().create_prv_key_data(wallet_secret, prv_key_data_args).await?;
 
-            let account_create_args = AccountCreateArgs::new_bip32(prv_key_data_id, payment_secret.cloned(), None, None);
+            let account_create_args = if kind == LEGACY_ACCOUNT_KIND {
+                AccountCreateArgs::new_legacy(prv_key_data_id, None)
+            } else {
+                AccountCreateArgs::new_bip32(prv_key_data_id, payment_secret.cloned(), None, None)
+            };
 
             let account = self.clone().create_account(wallet_secret, account_create_args, false, guard).await?;
 

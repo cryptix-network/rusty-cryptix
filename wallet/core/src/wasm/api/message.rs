@@ -111,8 +111,6 @@ declare! {
     IFlushRequest,
     r#"
     /**
-     * 
-     *  
      * @category Wallet API
      */
     export interface IFlushRequest {
@@ -130,8 +128,6 @@ declare! {
     IFlushResponse,
     r#"
     /**
-     * 
-     *  
      * @category Wallet API
      */
     export interface IFlushResponse { }
@@ -445,7 +441,6 @@ try_from! ( args: WalletCreateResponse, IWalletCreateResponse, {
 // ---
 
 // ---
-// NOTE: `legacy_accounts` are disabled in JS API
 declare! {
     IWalletOpenRequest,
     r#"
@@ -457,6 +452,7 @@ declare! {
         walletSecret: string;
         filename?: string;
         accountDescriptors: boolean;
+        legacyAccounts?: boolean;
     }
     "#,
 }
@@ -465,8 +461,9 @@ try_from! ( args: IWalletOpenRequest, WalletOpenRequest, {
     let wallet_secret = args.get_secret("walletSecret")?;
     let filename = args.try_get_string("filename")?;
     let account_descriptors = args.get_value("accountDescriptors")?.as_bool().unwrap_or(false);
+    let legacy_accounts = args.try_get_value("legacyAccounts")?.and_then(|value| value.as_bool()).unwrap_or(false);
 
-    Ok(WalletOpenRequest { wallet_secret, filename, account_descriptors, legacy_accounts: None })
+    Ok(WalletOpenRequest { wallet_secret, filename, account_descriptors, legacy_accounts: legacy_accounts.then_some(true) })
 });
 
 declare! {
@@ -1019,6 +1016,60 @@ try_from! ( args: AccountsDiscoveryResponse, IAccountsDiscoveryResponse, {
 // ---
 
 declare! {
+    IAccountsScanRequest,
+    r#"
+    /**
+     * @category Wallet API
+     */
+    export interface IAccountsScanRequest {
+        accountId: HexString;
+        walletSecret?: string;
+        depth?: number;
+        windowSize?: number;
+    }
+    "#,
+}
+
+try_from! (args: IAccountsScanRequest, AccountsScanRequest, {
+    let account_id = args.get_account_id("accountId")?;
+    let wallet_secret = args.try_get_secret("walletSecret")?;
+    let depth = args
+        .try_get_value("depth")?
+        .map(|value| {
+            let value = value.try_as_u64()?;
+            u32::try_from(value).map_err(|_| Error::InvalidArgument("depth".to_string()))
+        })
+        .transpose()?;
+    let window_size = args
+        .try_get_value("windowSize")?
+        .map(|value| {
+            let value = value.try_as_u64()?;
+            u32::try_from(value).map_err(|_| Error::InvalidArgument("windowSize".to_string()))
+        })
+        .transpose()?;
+
+    Ok(AccountsScanRequest { account_id, wallet_secret, depth, window_size })
+});
+
+declare! {
+    IAccountsScanResponse,
+    r#"
+    /**
+     * @category Wallet API
+     */
+    export interface IAccountsScanResponse {
+        accountDescriptor: IAccountDescriptor;
+    }
+    "#,
+}
+
+try_from! ( args: AccountsScanResponse, IAccountsScanResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+// ---
+
+declare! {
     IAccountsCreateRequest,
     r#"
     /**
@@ -1028,7 +1079,7 @@ declare! {
      */
     export type IAccountsCreateRequest = {
         walletSecret: string;
-        type: "bip32";
+        type: "bip32" | "legacy";
         accountName:string;
         accountIndex?:number;
         prvKeyDataId:string;
@@ -1060,21 +1111,24 @@ try_from! (args: IAccountsCreateRequest, AccountsCreateRequest, {
 
     let kind = AccountKind::try_from(args.try_get_value("type")?.ok_or(Error::custom("type is required"))?)?;
 
-    if kind != crate::account::BIP32_ACCOUNT_KIND {
-        return Err(Error::custom("only BIP32 accounts are currently supported"));
-    }
+    let prv_key_data_id = args.try_get_prv_key_data_id("prvKeyDataId")?.ok_or(Error::custom("prvKeyDataId is required"))?;
+    let account_create_args = if kind == crate::account::BIP32_ACCOUNT_KIND {
+        let prv_key_data_args = PrvKeyDataArgs {
+            prv_key_data_id,
+            payment_secret: args.try_get_secret("paymentSecret")?,
+        };
 
-    let prv_key_data_args = PrvKeyDataArgs {
-        prv_key_data_id: args.try_get_prv_key_data_id("prvKeyDataId")?.ok_or(Error::custom("prvKeyDataId is required"))?,
-        payment_secret: args.try_get_secret("paymentSecret")?,
+        let account_args = AccountCreateArgsBip32 {
+            account_name: args.try_get_string("accountName")?,
+            account_index: args.get_u64("accountIndex").ok(),
+        };
+
+        AccountCreateArgs::Bip32 { prv_key_data_args, account_args }
+    } else if kind == crate::account::LEGACY_ACCOUNT_KIND {
+        AccountCreateArgs::new_legacy(prv_key_data_id, args.try_get_string("accountName")?)
+    } else {
+        return Err(Error::custom("only BIP32 and legacy accounts are currently supported"));
     };
-
-    let account_args = AccountCreateArgsBip32 {
-        account_name: args.try_get_string("accountName")?,
-        account_index: args.get_u64("accountIndex").ok(),
-    };
-
-    let account_create_args = AccountCreateArgs::Bip32 { prv_key_data_args, account_args };
 
     Ok(AccountsCreateRequest { wallet_secret, account_create_args })
 });
@@ -1401,6 +1455,7 @@ declare! {
      */
     export interface IAccountsCreateNewAddressRequest {
         accountId: string;
+        walletSecret?: string;
         addressKind?: NewAddressKind | string,
     }
     "#,
@@ -1408,6 +1463,7 @@ declare! {
 
 try_from!(args: IAccountsCreateNewAddressRequest, AccountsCreateNewAddressRequest, {
     let account_id = args.get_account_id("accountId")?;
+    let wallet_secret = args.try_get_secret("walletSecret")?;
     let value = args.get_value("addressKind")?;
     let kind: NewAddressKind = if let Some(string) = value.as_string() {
         string.parse()?
@@ -1416,7 +1472,7 @@ try_from!(args: IAccountsCreateNewAddressRequest, AccountsCreateNewAddressReques
     } else {
         NewAddressKind::Receive
     };
-    Ok(AccountsCreateNewAddressRequest { account_id, kind })
+    Ok(AccountsCreateNewAddressRequest { account_id, wallet_secret, kind })
 });
 
 declare! {
