@@ -120,14 +120,20 @@ impl Legacy {
         let xprv = ExtendedPrivateKey::<SecretKey>::new(seed).unwrap();
         let xprv = xprv.to_string(Prefix::XPRV).to_string();
 
+        let receive_manager = self.derivation.receive_address_manager();
+        let change_manager = self.derivation.change_address_manager();
+        let receive_index = index.unwrap_or_else(|| receive_manager.index());
+        let change_index = index.unwrap_or_else(|| change_manager.index());
+
         for derivator in &self.derivation.derivators {
             derivator.initialize(xprv.clone(), index)?;
         }
 
-        let m = self.derivation.receive_address_manager();
-        m.get_range(0..(m.index() + CACHE_ADDRESS_OFFSET))?;
-        let m = self.derivation.change_address_manager();
-        m.get_range(0..(m.index() + CACHE_ADDRESS_OFFSET))?;
+        receive_manager.set_index(receive_index)?;
+        change_manager.set_index(change_index)?;
+
+        receive_manager.get_range(0..(receive_manager.index() + CACHE_ADDRESS_OFFSET))?;
+        change_manager.get_range(0..(change_manager.index() + CACHE_ADDRESS_OFFSET))?;
 
         Ok(())
     }
