@@ -91,7 +91,7 @@ impl Scan {
             let resp = utxo_context.processor().rpc_api().get_utxos_by_addresses(addresses).await?;
             let elapsed_sec = ts.elapsed().as_secs_f32();
             if elapsed_sec > 1.0 {
-                log_warn!("get_utxos_by_address() fetched {} entries in: {} msec", resp.len(), elapsed_sec);
+                log_info!("get_utxos_by_address() fetched {} entries in: {:.4} sec", resp.len(), elapsed_sec);
             }
             yield_executor().await;
 

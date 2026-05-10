@@ -553,6 +553,10 @@ impl WalletApi for super::Wallet {
         let guard = self.guard();
         let guard = guard.lock().await;
         let account = self.get_account_by_id(&account_id, &guard).await?.ok_or(Error::AccountNotFound(account_id))?;
+        let legacy_account = account.clone().as_legacy_account().ok();
+        if let Some(legacy_account) = legacy_account.as_ref() {
+            legacy_account.create_private_context(&wallet_secret, payment_secret.as_ref(), None).await?;
+        }
 
         let abortable = Abortable::new();
         let fast_submit = fast_path.and_then(|fast_path| {
@@ -567,7 +571,7 @@ impl WalletApi for super::Wallet {
                 None
             }
         });
-        let (generator_summary, transaction_ids, fast_summary) = account
+        let send_result = account
             .send(
                 destination,
                 priority_fee_sompi,
@@ -579,7 +583,16 @@ impl WalletApi for super::Wallet {
                 &abortable,
                 None,
             )
-            .await?;
+            .await;
+        if let Some(legacy_account) = legacy_account.as_ref() {
+            let clear_result = legacy_account.clear_private_context().await;
+            if send_result.is_ok() {
+                clear_result?;
+            } else if let Err(err) = clear_result {
+                log_warn!("failed to clear legacy private context after send error: {err}");
+            }
+        }
+        let (generator_summary, transaction_ids, fast_summary) = send_result?;
 
         Ok(AccountsSendResponse {
             generator_summary,
