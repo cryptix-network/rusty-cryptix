@@ -334,7 +334,7 @@ impl MiningManager {
         let args = TransactionValidationArgs::new(feerate_threshold);
         // no lock on mempool
         let mut validation_result = validate_mempool_transaction(consensus, &mut transaction, &args);
-        if Self::is_atomic_nonce_baseline_violation(&validation_result) {
+        if Self::is_atomic_pending_context_recoverable_violation(&validation_result) {
             (transaction, validation_result) =
                 self.validate_transaction_with_pending_atomic_context(consensus, transaction, feerate_threshold);
         }
@@ -358,11 +358,13 @@ impl MiningManager {
         }
     }
 
-    fn is_atomic_nonce_baseline_violation(validation_result: &Result<(), RuleError>) -> bool {
+    fn is_atomic_pending_context_recoverable_violation(validation_result: &Result<(), RuleError>) -> bool {
         matches!(
             validation_result,
             Err(RuleError::RejectTxRule(TxRuleError::InvalidAtomicPayload(message)))
                 if message.contains("nonce baseline violation")
+                    || message.contains("unknown LiquidityVault input outpoint")
+                    || message.contains("stale liquidity nonce")
         )
     }
 
