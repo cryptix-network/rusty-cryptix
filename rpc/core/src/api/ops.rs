@@ -146,7 +146,7 @@ pub enum RpcApiOps {
     SimulateTokenOp = 154,
     /// Get Cryptix Atomic token balance for owner and asset.
     GetTokenBalance = 155,
-    /// Get Cryptix Atomic next nonce for owner.
+    /// Get Cryptix Atomic next nonce for owner-scope or owner/asset-scope.
     GetTokenNonce = 156,
     /// Get Cryptix Atomic asset metadata.
     GetTokenAsset = 157,
@@ -196,6 +196,8 @@ pub enum RpcApiOps {
     GetConsensusAtomicStateHash = 179,
     /// Resolve transactions by id, optionally using block DAA hints for batched payload/history enrichment.
     GetTransactionsByIds = 180,
+    /// Get Cryptix Atomic next nonce for owner-scope create operations.
+    GetOwnerNonce = 181,
 }
 
 impl RpcApiOps {

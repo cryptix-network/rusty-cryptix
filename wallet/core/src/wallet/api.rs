@@ -375,9 +375,8 @@ impl WalletApi for super::Wallet {
         let legacy_account = account.clone().as_legacy_account().ok();
 
         if let Some(legacy_account) = legacy_account.as_ref() {
-            let wallet_secret = wallet_secret
-                .as_ref()
-                .ok_or_else(|| Error::Custom("walletSecret is required to scan legacy accounts".to_string()))?;
+            let wallet_secret =
+                wallet_secret.as_ref().ok_or_else(|| Error::Custom("walletSecret is required to scan legacy accounts".to_string()))?;
             legacy_account.create_private_context(wallet_secret, None, None).await?;
         }
 
@@ -456,10 +455,8 @@ impl WalletApi for super::Wallet {
         let guard = self.guard();
         let _guard = guard.lock().await;
 
-        let account = self
-            .active_accounts()
-            .get(&account_id)
-            .ok_or_else(|| Error::custom(format!("account {account_id} is not active")))?;
+        let account =
+            self.active_accounts().get(&account_id).ok_or_else(|| Error::custom(format!("account {account_id} is not active")))?;
 
         let mut groups = HashMap::<TransactionId, AccountUtxoTransaction>::new();
         {

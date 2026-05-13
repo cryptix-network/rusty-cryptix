@@ -239,8 +239,12 @@ impl AtomicTokenProcessor {
         self.state.lock().await.get_balance(asset_id, owner_id)
     }
 
-    async fn nonce(&self, owner_id: [u8; 32]) -> u64 {
-        self.state.lock().await.get_nonce(owner_id)
+    async fn owner_nonce(&self, owner_id: [u8; 32]) -> u64 {
+        self.state.lock().await.get_owner_nonce(owner_id)
+    }
+
+    async fn token_nonce(&self, owner_id: [u8; 32], asset_id: [u8; 32]) -> u64 {
+        self.state.lock().await.get_token_nonce(owner_id, asset_id)
     }
 
     async fn asset(&self, asset_id: [u8; 32]) -> Option<TokenAsset> {
@@ -551,7 +555,15 @@ impl AtomicTokenService {
     }
 
     pub async fn get_nonce(&self, owner_id: [u8; 32]) -> u64 {
-        self.processor.nonce(owner_id).await
+        self.processor.owner_nonce(owner_id).await
+    }
+
+    pub async fn get_owner_nonce(&self, owner_id: [u8; 32]) -> u64 {
+        self.processor.owner_nonce(owner_id).await
+    }
+
+    pub async fn get_token_nonce(&self, owner_id: [u8; 32], asset_id: [u8; 32]) -> u64 {
+        self.processor.token_nonce(owner_id, asset_id).await
     }
 
     pub async fn get_asset(&self, asset_id: [u8; 32]) -> Option<TokenAsset> {

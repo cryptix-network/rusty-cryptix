@@ -753,7 +753,11 @@ from!(item: RpcResult<&cryptix_rpc_core::GetTokenBalanceResponse>, protowire::Ge
     Self { balance: item.balance.clone(), context: Some((&item.context).into()), error: None }
 });
 from!(item: &cryptix_rpc_core::GetTokenNonceRequest, protowire::GetTokenNonceRequestMessage, {
-    Self { owner_id: item.owner_id.clone(), at_block_hash: item.at_block_hash.map(|hash| hash.to_string()) }
+    Self {
+        owner_id: item.owner_id.clone(),
+        at_block_hash: item.at_block_hash.map(|hash| hash.to_string()),
+        asset_id: item.asset_id.clone(),
+    }
 });
 from!(item: RpcResult<&cryptix_rpc_core::GetTokenNonceResponse>, protowire::GetTokenNonceResponseMessage, {
     Self { expected_next_nonce: item.expected_next_nonce, context: Some((&item.context).into()), error: None }
@@ -1769,7 +1773,11 @@ try_from!(item: &protowire::GetTokenBalanceResponseMessage, RpcResult<cryptix_rp
     }
 });
 try_from!(item: &protowire::GetTokenNonceRequestMessage, cryptix_rpc_core::GetTokenNonceRequest, {
-    Self { owner_id: item.owner_id.clone(), at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()? }
+    Self {
+        owner_id: item.owner_id.clone(),
+        asset_id: item.asset_id.clone(),
+        at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+    }
 });
 try_from!(item: &protowire::GetTokenNonceResponseMessage, RpcResult<cryptix_rpc_core::GetTokenNonceResponse>, {
     Self {

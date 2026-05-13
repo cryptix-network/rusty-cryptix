@@ -501,14 +501,7 @@ pub struct AccountUtxoTransaction {
 
 impl AccountUtxoTransaction {
     pub fn new(transaction_id: TransactionId, status: &str) -> Self {
-        Self {
-            transaction_id,
-            entries: Vec::new(),
-            value: 0,
-            block_daa_score: 0,
-            status: status.to_string(),
-            is_coinbase: false,
-        }
+        Self { transaction_id, entries: Vec::new(), value: 0, block_daa_score: 0, status: status.to_string(), is_coinbase: false }
     }
 
     pub fn push(&mut self, entry: AccountUtxoEntry) {

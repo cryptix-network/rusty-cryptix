@@ -159,7 +159,10 @@ fn script_payment_output_from_js(value: impl AsRef<JsValue>) -> Result<ScriptPay
             Ok(ScriptPaymentOutput { amount, script_public_key })
         } else {
             let payment_output = PaymentOutput::try_owned_from(value)?;
-            Ok(ScriptPaymentOutput { amount: payment_output.amount, script_public_key: pay_to_address_script(&payment_output.address) })
+            Ok(ScriptPaymentOutput {
+                amount: payment_output.amount,
+                script_public_key: pay_to_address_script(&payment_output.address),
+            })
         }
     } else {
         Err(Error::Custom("Invalid script payment output".to_string()))
@@ -201,21 +204,11 @@ impl From<ScriptPaymentOutput> for PaymentDestination {
 
 fn script_payment_outputs_from_js(value: impl AsRef<JsValue>) -> Result<ScriptPaymentOutputs> {
     let outputs = if let Some(output_array) = value.as_ref().dyn_ref::<js_sys::Array>() {
-        output_array
-            .to_vec()
-            .into_iter()
-            .map(script_payment_output_from_js)
-            .collect::<Result<Vec<_>>>()?
+        output_array.to_vec().into_iter().map(script_payment_output_from_js).collect::<Result<Vec<_>>>()?
     } else if let Some(object) = value.as_ref().dyn_ref::<js_sys::Object>() {
-        Object::entries(object)
-            .iter()
-            .map(script_payment_output_from_js)
-            .collect::<Result<Vec<_>>>()?
+        Object::entries(object).iter().map(script_payment_output_from_js).collect::<Result<Vec<_>>>()?
     } else if let Some(map) = value.as_ref().dyn_ref::<js_sys::Map>() {
-        map.entries()
-            .into_iter()
-            .flat_map(|v| v.map(script_payment_output_from_js))
-            .collect::<Result<Vec<_>>>()?
+        map.entries().into_iter().flat_map(|v| v.map(script_payment_output_from_js)).collect::<Result<Vec<_>>>()?
     } else {
         return Err(Error::Custom("script payment outputs must be an array or an object".to_string()));
     };
@@ -229,9 +222,10 @@ pub fn payment_destination_from_js_outputs(outputs: JsValue) -> Result<PaymentDe
     }
 
     let contains_script_output = if let Some(output_array) = outputs.dyn_ref::<js_sys::Array>() {
-        output_array.to_vec().iter().any(|value| {
-            Object::try_from(value).and_then(|object| object.try_get_value("scriptPublicKey").ok().flatten()).is_some()
-        })
+        output_array
+            .to_vec()
+            .iter()
+            .any(|value| Object::try_from(value).and_then(|object| object.try_get_value("scriptPublicKey").ok().flatten()).is_some())
     } else if let Some(object) = outputs.dyn_ref::<js_sys::Object>() {
         object.try_get_value("scriptPublicKey").ok().flatten().is_some()
     } else {

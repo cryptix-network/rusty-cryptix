@@ -146,6 +146,17 @@ pub trait RpcApi: Sync + Send + AnySync {
         Err(crate::RpcError::NotImplemented)
     }
 
+    async fn get_owner_nonce(&self, request: GetOwnerNonceRequest) -> RpcResult<GetOwnerNonceResponse> {
+        self.get_owner_nonce_call(None, request).await
+    }
+    async fn get_owner_nonce_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetOwnerNonceRequest,
+    ) -> RpcResult<GetOwnerNonceResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
     async fn get_token_asset(&self, request: GetTokenAssetRequest) -> RpcResult<GetTokenAssetResponse> {
         self.get_token_asset_call(None, request).await
     }

@@ -344,6 +344,7 @@ declare! {
      */
     export interface IGetTokenNonceRequest {
         ownerId : string;
+        assetId? : string;
         atBlockHash? : HexString;
     }
     "#,
@@ -367,6 +368,40 @@ declare! {
 }
 
 try_from! ( args: GetTokenNonceResponse, IGetTokenNonceResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetOwnerNonceRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetOwnerNonceRequest {
+        ownerId : string;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetOwnerNonceRequest, GetOwnerNonceRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetOwnerNonceResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetOwnerNonceResponse {
+        expectedNextNonce : bigint;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetOwnerNonceResponse, IGetOwnerNonceResponse, {
     Ok(to_value(&args)?.into())
 });
 

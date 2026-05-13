@@ -140,7 +140,7 @@ impl Token {
 
         let sender_owner_id = Self::resolve_owner_id(&rpc, &sender_address, "senderAddress").await?;
         let recipient_owner_id = Self::resolve_owner_id(&rpc, &recipient_address, "toAddress").await?;
-        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str()).await?;
+        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str(), Some(asset_id.as_str())).await?;
 
         let payload =
             Self::build_transfer_payload(asset_id.as_str(), recipient_owner_id.as_str(), amount, nonce, DEFAULT_AUTH_INPUT_INDEX)?;
@@ -184,7 +184,7 @@ impl Token {
 
         let sender_owner_id = Self::resolve_owner_id(&rpc, &sender_address, "senderAddress").await?;
         let recipient_owner_id = Self::resolve_owner_id(&rpc, &recipient_address, "toAddress").await?;
-        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str()).await?;
+        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str(), Some(asset_id.as_str())).await?;
         let payload =
             Self::build_mint_payload(asset_id.as_str(), recipient_owner_id.as_str(), amount, nonce, DEFAULT_AUTH_INPUT_INDEX)?;
 
@@ -225,7 +225,7 @@ impl Token {
             if let Some(sender) = argv.first() { Address::try_from(sender.as_str())? } else { account.receive_address()? };
 
         let sender_owner_id = Self::resolve_owner_id(&rpc, &sender_address, "senderAddress").await?;
-        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str()).await?;
+        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str(), Some(asset_id.as_str())).await?;
         let payload = Self::build_burn_payload(asset_id.as_str(), amount, nonce, DEFAULT_AUTH_INPUT_INDEX)?;
 
         let (summary, ids) = Self::submit_payload_tx(&ctx, &account, payload, sender_address.clone()).await?;
@@ -264,7 +264,7 @@ impl Token {
 
         let sender_owner_id = Self::resolve_owner_id(&rpc, &sender_address, "--sender").await?;
         let mint_authority_owner_id = Self::resolve_owner_id(&rpc, &mint_authority_address, "--mint-authority").await?;
-        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str()).await?;
+        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str(), None).await?;
 
         let payload = Self::build_create_asset_payload(
             name.as_str(),
@@ -336,7 +336,7 @@ impl Token {
         let sender_owner_id = Self::resolve_owner_id(&rpc, &sender_address, "--sender").await?;
         let mint_authority_owner_id = Self::resolve_owner_id(&rpc, &mint_authority_address, "--mint-authority").await?;
         let initial_mint_to_owner_id = Self::resolve_owner_id(&rpc, &initial_mint_to_address, "initialMintToAddress").await?;
-        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str()).await?;
+        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str(), None).await?;
 
         let payload = Self::build_create_asset_with_mint_payload(
             name.as_str(),
@@ -467,7 +467,7 @@ impl Token {
 
         let sender_address = options.sender.unwrap_or(account.receive_address()?);
         let sender_owner_id = Self::resolve_owner_id(&rpc, &sender_address, "--sender").await?;
-        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str()).await?;
+        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str(), None).await?;
         let payload = Self::build_create_liquidity_asset_payload(
             name.as_str(),
             symbol.as_str(),
@@ -580,7 +580,7 @@ impl Token {
         }
 
         let sender_owner_id = Self::resolve_owner_id(&rpc, &sender_address, "senderAddress").await?;
-        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str()).await?;
+        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str(), Some(asset_id.as_str())).await?;
         let payload = Self::build_buy_liquidity_payload(
             asset_id.as_str(),
             pool.pool_nonce,
@@ -662,7 +662,7 @@ impl Token {
         }
 
         let sender_owner_id = Self::resolve_owner_id(&rpc, &sender_address, "senderAddress").await?;
-        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str()).await?;
+        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str(), Some(asset_id.as_str())).await?;
         let payload = Self::build_sell_liquidity_payload(
             asset_id.as_str(),
             pool.pool_nonce,
@@ -718,7 +718,7 @@ impl Token {
         let pool = Self::fetch_liquidity_pool(&rpc, asset_id.as_str()).await?;
         Self::ensure_liquidity_outflow_unlocked(&pool, "liquidity fee claim")?;
         let sender_owner_id = Self::resolve_owner_id(&rpc, &sender_address, "senderAddress").await?;
-        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str()).await?;
+        let nonce = Self::resolve_sender_nonce(&rpc, sender_owner_id.as_str(), Some(asset_id.as_str())).await?;
         let payload = Self::build_claim_liquidity_payload(
             asset_id.as_str(),
             pool.pool_nonce,
@@ -970,9 +970,16 @@ impl Token {
         }
     }
 
-    async fn resolve_sender_nonce(rpc: &Arc<DynRpcApi>, sender_owner_id: &str) -> Result<u64> {
+    async fn resolve_sender_nonce(rpc: &Arc<DynRpcApi>, sender_owner_id: &str, asset_id: Option<&str>) -> Result<u64> {
         let nonce_response = rpc
-            .get_token_nonce_call(None, GetTokenNonceRequest { owner_id: sender_owner_id.to_string(), at_block_hash: None })
+            .get_token_nonce_call(
+                None,
+                GetTokenNonceRequest {
+                    owner_id: sender_owner_id.to_string(),
+                    asset_id: asset_id.map(ToString::to_string),
+                    at_block_hash: None,
+                },
+            )
             .await?;
         let nonce = nonce_response.expected_next_nonce;
         if nonce == 0 {

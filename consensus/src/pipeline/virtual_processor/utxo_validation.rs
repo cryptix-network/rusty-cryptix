@@ -8,7 +8,7 @@ use crate::{
     model::stores::{
         atomic_state::{
             AtomicAssetClass, AtomicAssetState, AtomicBalanceKey, AtomicConsensusState, AtomicLiquidityFeeRecipientState,
-            AtomicLiquidityPoolState, AtomicSupplyMode,
+            AtomicLiquidityPoolState, AtomicNonceKey, AtomicSupplyMode,
         },
         block_transactions::BlockTransactionsStoreReader,
         daa::DaaStoreReader,
@@ -591,6 +591,20 @@ fn validate_liquidity_creation_parameters(decimals: u8, max_supply: u128, seed_r
     Ok(())
 }
 
+pub(crate) fn atomic_nonce_key_for_op(owner_id: [u8; 32], op: &AtomicPayloadOp) -> AtomicNonceKey {
+    match op {
+        AtomicPayloadOp::CreateAsset { .. }
+        | AtomicPayloadOp::CreateAssetWithMint { .. }
+        | AtomicPayloadOp::CreateLiquidityAsset { .. } => AtomicNonceKey::owner(owner_id),
+        AtomicPayloadOp::Transfer { asset_id, .. }
+        | AtomicPayloadOp::Mint { asset_id, .. }
+        | AtomicPayloadOp::Burn { asset_id, .. }
+        | AtomicPayloadOp::BuyLiquidityExactIn { asset_id, .. }
+        | AtomicPayloadOp::SellLiquidityExactIn { asset_id, .. }
+        | AtomicPayloadOp::ClaimLiquidityFees { asset_id, .. } => AtomicNonceKey::asset(owner_id, *asset_id),
+    }
+}
+
 /// A context for processing the UTXO state of a block with respect to its selected parent.
 /// Note this can also be the virtual block.
 pub(super) struct UtxoProcessingContext<'a> {
@@ -862,11 +876,14 @@ impl VirtualStateProcessor {
         };
         let owner_id = self.resolve_atomic_owner_from_populated_tx(tx, parsed_payload.auth_input_index)?;
 
-        let expected_nonce = atomic_state.next_nonces.get(&owner_id).copied().unwrap_or(1);
+        let nonce_key = atomic_nonce_key_for_op(owner_id, &parsed_payload.op);
+        let expected_nonce = atomic_state.next_nonces.get(&nonce_key).copied().unwrap_or(1);
         if parsed_payload.nonce != expected_nonce {
             return Err(TxRuleError::InvalidAtomicPayload(format!(
-                "nonce baseline violation for owner `{}`: expected `{}`, got `{}`",
-                faster_hex::hex_string(&owner_id),
+                "nonce baseline violation for owner `{}` scope `{}` `{}`: expected `{}`, got `{}`",
+                faster_hex::hex_string(&nonce_key.owner_id),
+                nonce_key.scope_kind,
+                faster_hex::hex_string(&nonce_key.scope_id),
                 expected_nonce,
                 parsed_payload.nonce
             )));
@@ -898,11 +915,13 @@ impl VirtualStateProcessor {
 
         let Some(next_nonce) = expected_nonce.checked_add(1) else {
             return Err(TxRuleError::InvalidAtomicPayload(format!(
-                "nonce progression overflow for owner `{}`",
-                faster_hex::hex_string(&owner_id)
+                "nonce progression overflow for owner `{}` scope `{}` `{}`",
+                faster_hex::hex_string(&nonce_key.owner_id),
+                nonce_key.scope_kind,
+                faster_hex::hex_string(&nonce_key.scope_id)
             )));
         };
-        atomic_state.next_nonces.insert(owner_id, next_nonce);
+        atomic_state.next_nonces.insert(nonce_key, next_nonce);
         self.apply_anchor_deltas_to_atomic_state(tx, atomic_state);
         Ok(())
     }

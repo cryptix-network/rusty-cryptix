@@ -549,10 +549,17 @@ impl WalletDaemonService {
         })
     }
 
-    async fn resolve_sender_nonce(&self, sender_owner_id: &str) -> Result<u64, Status> {
+    async fn resolve_sender_nonce(&self, sender_owner_id: &str, asset_id: Option<&str>) -> Result<u64, Status> {
         let nonce_response = self
             .rpc()
-            .get_token_nonce_call(None, GetTokenNonceRequest { owner_id: sender_owner_id.to_string(), at_block_hash: None })
+            .get_token_nonce_call(
+                None,
+                GetTokenNonceRequest {
+                    owner_id: sender_owner_id.to_string(),
+                    asset_id: asset_id.map(ToString::to_string),
+                    at_block_hash: None,
+                },
+            )
             .await
             .map_err(Self::status_internal)?;
         let nonce = nonce_response.expected_next_nonce;
@@ -1464,7 +1471,7 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
 
         let sender_owner_id = self.resolve_owner_id(&sender_address, "sender_address").await?;
         let recipient_owner_id = self.resolve_owner_id(&recipient_address, "to_address").await?;
-        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str()).await?;
+        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str(), Some(request.asset_id.as_str())).await?;
         let payload =
             Self::build_transfer_payload(request.asset_id.as_str(), recipient_owner_id.as_str(), amount, nonce, auth_input_index)?;
 
@@ -1494,7 +1501,7 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
 
         let sender_owner_id = self.resolve_owner_id(&sender_address, "sender_address").await?;
         let recipient_owner_id = self.resolve_owner_id(&recipient_address, "to_address").await?;
-        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str()).await?;
+        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str(), Some(request.asset_id.as_str())).await?;
         let payload =
             Self::build_mint_payload(request.asset_id.as_str(), recipient_owner_id.as_str(), amount, nonce, auth_input_index)?;
 
@@ -1521,7 +1528,7 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
         };
 
         let sender_owner_id = self.resolve_owner_id(&sender_address, "sender_address").await?;
-        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str()).await?;
+        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str(), Some(request.asset_id.as_str())).await?;
         let payload = Self::build_burn_payload(request.asset_id.as_str(), amount, nonce, auth_input_index)?;
 
         let tx_ids = self.submit_payload_tx(account, wallet_secret, payload, sender_address, TOKEN_CARRIER_OUTPUT_SOMPI).await?;
@@ -1559,7 +1566,7 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
 
         let sender_owner_id = self.resolve_owner_id(&sender_address, "sender_address").await?;
         let mint_authority_owner_id = self.resolve_owner_id(&mint_authority_address, "mint_authority_address").await?;
-        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str()).await?;
+        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str(), None).await?;
         let payload = Self::build_create_asset_payload(
             request.name.as_str(),
             request.symbol.as_str(),
@@ -1620,7 +1627,7 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
         let sender_owner_id = self.resolve_owner_id(&sender_address, "sender_address").await?;
         let mint_authority_owner_id = self.resolve_owner_id(&mint_authority_address, "mint_authority_address").await?;
         let initial_mint_to_owner_id = self.resolve_owner_id(&initial_mint_to_address, "initial_mint_to_address").await?;
-        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str()).await?;
+        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str(), None).await?;
         let payload = Self::build_create_asset_with_mint_payload(
             request.name.as_str(),
             request.symbol.as_str(),
@@ -1723,7 +1730,7 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
         };
 
         let sender_owner_id = self.resolve_owner_id(&sender_address, "sender_address").await?;
-        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str()).await?;
+        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str(), None).await?;
         let payload = Self::build_create_liquidity_asset_payload(
             request.name.as_str(),
             request.symbol.as_str(),
@@ -1813,7 +1820,7 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
         }
 
         let sender_owner_id = self.resolve_owner_id(&sender_address, "sender_address").await?;
-        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str()).await?;
+        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str(), Some(request.asset_id.as_str())).await?;
         let payload = Self::build_buy_liquidity_payload(
             asset_id.as_str(),
             pool.pool_nonce,
@@ -1890,7 +1897,7 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
         }
 
         let sender_owner_id = self.resolve_owner_id(&sender_address, "sender_address").await?;
-        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str()).await?;
+        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str(), Some(request.asset_id.as_str())).await?;
         let payload = Self::build_sell_liquidity_payload(
             asset_id.as_str(),
             pool.pool_nonce,
@@ -1949,7 +1956,7 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
         let pool = self.fetch_liquidity_pool(asset_id.as_str()).await?;
         Self::ensure_liquidity_outflow_unlocked(&pool, "liquidity fee claim")?;
         let sender_owner_id = self.resolve_owner_id(&sender_address, "sender_address").await?;
-        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str()).await?;
+        let nonce = self.resolve_sender_nonce(sender_owner_id.as_str(), Some(request.asset_id.as_str())).await?;
         let payload = Self::build_claim_liquidity_payload(
             asset_id.as_str(),
             pool.pool_nonce,

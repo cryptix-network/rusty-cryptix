@@ -643,6 +643,7 @@ impl RpcApi for CryptixRpcClient {
             SimulateTokenOp,
             GetTokenBalance,
             GetTokenNonce,
+            GetOwnerNonce,
             GetTokenAsset,
             GetTokenOpStatus,
             GetTokenStateHash,

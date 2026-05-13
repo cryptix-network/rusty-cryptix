@@ -2883,14 +2883,16 @@ impl Deserializer for GetTokenBalanceResponse {
 #[serde(rename_all = "camelCase")]
 pub struct GetTokenNonceRequest {
     pub owner_id: String,
+    pub asset_id: Option<String>,
     pub at_block_hash: Option<RpcHash>,
 }
 
 impl Serializer for GetTokenNonceRequest {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &2, writer)?;
+        store!(u16, &3, writer)?;
         store!(String, &self.owner_id, writer)?;
         store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        store!(Option<String>, &self.asset_id, writer)?;
         Ok(())
     }
 }
@@ -2900,6 +2902,32 @@ impl Deserializer for GetTokenNonceRequest {
         let version = load!(u16, reader)?;
         let owner_id = load!(String, reader)?;
         let at_block_hash = if version >= 2 { load!(Option<RpcHash>, reader)? } else { None };
+        let asset_id = if version >= 3 { load!(Option<String>, reader)? } else { None };
+        Ok(Self { owner_id, asset_id, at_block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetOwnerNonceRequest {
+    pub owner_id: String,
+    pub at_block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetOwnerNonceRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(String, &self.owner_id, writer)?;
+        store!(Option<RpcHash>, &self.at_block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetOwnerNonceRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let owner_id = load!(String, reader)?;
+        let at_block_hash = load!(Option<RpcHash>, reader)?;
         Ok(Self { owner_id, at_block_hash })
     }
 }
@@ -2928,6 +2956,8 @@ impl Deserializer for GetTokenNonceResponse {
         Ok(Self { expected_next_nonce, context })
     }
 }
+
+pub type GetOwnerNonceResponse = GetTokenNonceResponse;
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "camelCase")]

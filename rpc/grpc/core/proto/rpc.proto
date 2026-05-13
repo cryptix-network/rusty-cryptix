@@ -1004,6 +1004,7 @@ message GetTokenBalanceResponseMessage {
 message GetTokenNonceRequestMessage {
   string ownerId = 1;
   optional string atBlockHash = 2;
+  optional string assetId = 3;
 }
 
 message GetTokenNonceResponseMessage {

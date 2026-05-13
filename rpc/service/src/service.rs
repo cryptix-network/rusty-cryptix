@@ -22,8 +22,8 @@ use cryptix_atomicindex::{
     },
     service::{AtomicTokenService, ScBootstrapSource, ScSnapshotChunk, ScSnapshotManifestSignature},
     state::{
-        AtomicTokenHealth, AtomicTokenReadContext, AtomicTokenReadView, AtomicTokenRuntimeState, LiquidityFeeRecipientState,
-        LiquidityPoolState, ProcessedOp, TokenAsset, TokenAssetClass, TokenEvent,
+        nonce_key_for_op, AtomicTokenHealth, AtomicTokenReadContext, AtomicTokenReadView, AtomicTokenRuntimeState,
+        LiquidityFeeRecipientState, LiquidityPoolState, NonceKey, ProcessedOp, TokenAsset, TokenAssetClass, TokenEvent,
     },
 };
 use cryptix_consensus_core::api::counters::ProcessingCounters;
@@ -978,13 +978,26 @@ impl RpcCoreService {
         }
     }
 
+    fn expected_nonce_for_op(view: &AtomicTokenReadView, owner_id: [u8; 32], op: &TokenOp) -> u64 {
+        let key = nonce_key_for_op(owner_id, op);
+        view.nonces.get(&key).copied().unwrap_or(1)
+    }
+
+    fn expected_owner_nonce(view: &AtomicTokenReadView, owner_id: [u8; 32]) -> u64 {
+        view.nonces.get(&NonceKey::owner(owner_id)).copied().unwrap_or(1)
+    }
+
+    fn expected_asset_nonce(view: &AtomicTokenReadView, owner_id: [u8; 32], asset_id: [u8; 32]) -> u64 {
+        view.nonces.get(&NonceKey::asset(owner_id, asset_id)).copied().unwrap_or(1)
+    }
+
     fn simulate_token_noop_reason(
         &self,
         view: &AtomicTokenReadView,
         owner_id: [u8; 32],
         parsed: &cryptix_atomicindex::payload::ParsedTokenPayload,
     ) -> Option<NoopReason> {
-        let expected_next_nonce = view.nonces.get(&owner_id).copied().unwrap_or(1);
+        let expected_next_nonce = Self::expected_nonce_for_op(view, owner_id, &parsed.op);
         if parsed.header.nonce != expected_next_nonce {
             return Some(NoopReason::BadNonce);
         }
@@ -2451,17 +2464,16 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         Self::ensure_token_simulation_ready(&view)?;
         let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
         let payload = Vec::<u8>::from_hex(&payload_hex).map_err(|err| RpcError::General(format!("invalid `payloadHex`: {err}")))?;
-        let expected_next_nonce = view.nonces.get(&owner_id).copied().unwrap_or(1);
-
-        let (result, noop_reason) = match parse_atomic_token_payload(&payload) {
-            None => ("ignored".to_string(), None),
-            Some(Err(noop_reason)) => ("noop".to_string(), Some(noop_reason as u32)),
+        let (result, noop_reason, expected_next_nonce) = match parse_atomic_token_payload(&payload) {
+            None => ("ignored".to_string(), None, Self::expected_owner_nonce(&view, owner_id)),
+            Some(Err(noop_reason)) => ("noop".to_string(), Some(noop_reason as u32), Self::expected_owner_nonce(&view, owner_id)),
             Some(Ok(parsed)) => {
+                let expected_next_nonce = Self::expected_nonce_for_op(&view, owner_id, &parsed.op);
                 let noop_reason = self.simulate_token_noop_reason(&view, owner_id, &parsed).map(|reason| reason as u32);
                 if noop_reason.is_some() {
-                    ("noop".to_string(), noop_reason)
+                    ("noop".to_string(), noop_reason, expected_next_nonce)
                 } else {
-                    ("state_only".to_string(), None)
+                    ("state_only".to_string(), None, expected_next_nonce)
                 }
             }
         };
@@ -2492,12 +2504,31 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         _connection: Option<&DynRpcConnection>,
         request: GetTokenNonceRequest,
     ) -> RpcResult<GetTokenNonceResponse> {
-        let GetTokenNonceRequest { owner_id, at_block_hash } = request;
+        let GetTokenNonceRequest { owner_id, asset_id, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
+        let asset_id = asset_id.as_deref().map(|asset_id| Self::parse_hex_32(asset_id, "assetId")).transpose()?;
+        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_read_ready(&view)?;
+        let expected_next_nonce = match asset_id {
+            Some(asset_id) => Self::expected_asset_nonce(&view, owner_id, asset_id),
+            None => Self::expected_owner_nonce(&view, owner_id),
+        };
+        let context = self.atomic_context(&view).await?;
+        Ok(GetTokenNonceResponse { expected_next_nonce, context })
+    }
+
+    async fn get_owner_nonce_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetOwnerNonceRequest,
+    ) -> RpcResult<GetOwnerNonceResponse> {
+        let GetOwnerNonceRequest { owner_id, at_block_hash } = request;
         let atomic = self.atomic_service()?;
         let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
         let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
         Self::ensure_token_read_ready(&view)?;
-        let expected_next_nonce = view.nonces.get(&owner_id).copied().unwrap_or(1);
+        let expected_next_nonce = Self::expected_owner_nonce(&view, owner_id);
         let context = self.atomic_context(&view).await?;
         Ok(GetTokenNonceResponse { expected_next_nonce, context })
     }
@@ -2565,7 +2596,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         }
         let balance = view.balances.get(&cryptix_atomicindex::state::BalanceKey { asset_id, owner_id }).copied().unwrap_or(0);
         let anchor_count = view.anchor_counts.get(&owner_id).copied().unwrap_or(0);
-        let expected_next_nonce = view.nonces.get(&owner_id).copied().unwrap_or(1);
+        let expected_next_nonce = Self::expected_asset_nonce(&view, owner_id, asset_id);
         let context = self.atomic_context(&view).await?;
 
         let (can_spend, reason) = if context.is_degraded {

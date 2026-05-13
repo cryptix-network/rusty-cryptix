@@ -39,7 +39,26 @@ const SECTION_NONCES: u8 = 0xC1;
 const SECTION_ANCHOR_COUNTS: u8 = 0xD1;
 const CAT_EVENT_DOMAIN: &[u8] = b"CAT_EVT_V1";
 const CAT_EVENT_INSTANCE_DOMAIN: &[u8] = b"CAT_EVT_INSTANCE_V1";
-pub const SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+pub const SNAPSHOT_SCHEMA_VERSION: u16 = 2;
+pub const NONCE_SCOPE_OWNER: u8 = 0;
+pub const NONCE_SCOPE_ASSET: u8 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NonceKey {
+    pub owner_id: [u8; 32],
+    pub scope_kind: u8,
+    pub scope_id: [u8; 32],
+}
+
+impl NonceKey {
+    pub fn owner(owner_id: [u8; 32]) -> Self {
+        Self { owner_id, scope_kind: NONCE_SCOPE_OWNER, scope_id: [0u8; 32] }
+    }
+
+    pub fn asset(owner_id: [u8; 32], asset_id: [u8; 32]) -> Self {
+        Self { owner_id, scope_kind: NONCE_SCOPE_ASSET, scope_id: asset_id }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct VaultTransition {
@@ -118,7 +137,7 @@ pub struct AtomicTokenReadView {
     pub event_sequence_cutoff: u64,
     pub assets: HashMap<[u8; 32], TokenAsset>,
     pub balances: HashMap<BalanceKey, u128>,
-    pub nonces: HashMap<[u8; 32], u64>,
+    pub nonces: HashMap<NonceKey, u64>,
     pub anchor_counts: HashMap<[u8; 32], u64>,
     pub processed_ops: HashMap<BlockHash, ProcessedOp>,
     pub known_owner_addresses: HashMap<[u8; 32], LiquidityHolderAddressState>,
@@ -168,7 +187,7 @@ pub struct AtomicTokenSnapshot {
 pub struct AtomicTokenSnapshotState {
     pub assets: HashMap<[u8; 32], TokenAsset>,
     pub balances: HashMap<BalanceKey, u128>,
-    pub nonces: HashMap<[u8; 32], u64>,
+    pub nonces: HashMap<NonceKey, u64>,
     pub anchor_counts: HashMap<[u8; 32], u64>,
     pub processed_ops: HashMap<BlockHash, ProcessedOp>,
     pub state_hash_by_block: HashMap<BlockHash, [u8; 32]>,
@@ -311,7 +330,7 @@ pub struct ChangedBalance {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedNonce {
-    pub owner_id: [u8; 32],
+    pub key: NonceKey,
     pub old_value: Option<u64>,
 }
 
@@ -341,7 +360,7 @@ struct JournalBuilder {
     tx_results: Vec<TokenApplyResult>,
     seen_assets: HashSet<[u8; 32]>,
     seen_balances: HashSet<BalanceKey>,
-    seen_nonces: HashSet<[u8; 32]>,
+    seen_nonces: HashSet<NonceKey>,
     seen_anchor_counts: HashSet<[u8; 32]>,
 }
 
@@ -373,6 +392,18 @@ fn token_op_allows_liquidity_vault_output(op: &TokenOp) -> bool {
             | TokenOp::SellLiquidityExactIn(_)
             | TokenOp::ClaimLiquidityFees(_)
     )
+}
+
+pub fn nonce_key_for_op(owner_id: [u8; 32], op: &TokenOp) -> NonceKey {
+    match op {
+        TokenOp::CreateAsset(_) | TokenOp::CreateAssetWithMint(_) | TokenOp::CreateLiquidityAsset(_) => NonceKey::owner(owner_id),
+        TokenOp::Transfer(op) => NonceKey::asset(owner_id, op.asset_id),
+        TokenOp::Mint(op) => NonceKey::asset(owner_id, op.asset_id),
+        TokenOp::Burn(op) => NonceKey::asset(owner_id, op.asset_id),
+        TokenOp::BuyLiquidityExactIn(op) => NonceKey::asset(owner_id, op.asset_id),
+        TokenOp::SellLiquidityExactIn(op) => NonceKey::asset(owner_id, op.asset_id),
+        TokenOp::ClaimLiquidityFees(op) => NonceKey::asset(owner_id, op.asset_id),
+    }
 }
 
 fn validate_liquidity_claim_authorization(claimant_owner_id: [u8; 32], recipient_owner_id: [u8; 32]) -> Result<(), NoopReason> {
@@ -452,7 +483,7 @@ pub struct AtomicTokenState {
     pub live_correct: bool,
     pub assets: HashMap<[u8; 32], TokenAsset>,
     pub balances: HashMap<BalanceKey, u128>,
-    pub nonces: HashMap<[u8; 32], u64>,
+    pub nonces: HashMap<NonceKey, u64>,
     pub anchor_counts: HashMap<[u8; 32], u64>,
     pub processed_ops: HashMap<BlockHash, ProcessedOp>,
     pub block_journals: HashMap<BlockHash, BlockJournal>,
@@ -790,10 +821,10 @@ impl AtomicTokenState {
         for change in journal.changed_nonces.iter().rev() {
             match change.old_value {
                 Some(value) => {
-                    self.nonces.insert(change.owner_id, value);
+                    self.nonces.insert(change.key, value);
                 }
                 None => {
-                    self.nonces.remove(&change.owner_id);
+                    self.nonces.remove(&change.key);
                 }
             }
         }
@@ -1010,7 +1041,8 @@ impl AtomicTokenState {
         let auth_context = self.resolve_auth_context(tx, parsed.header.auth_input_index, auth_inputs)?;
         let owner_id = auth_context.owner_id;
         self.remember_owner_address(owner_id, auth_context.address_version, auth_context.address_payload.as_slice());
-        let expected_nonce = self.nonces.get(&owner_id).copied().unwrap_or(1);
+        let nonce_key = nonce_key_for_op(owner_id, &parsed.op);
+        let expected_nonce = self.nonces.get(&nonce_key).copied().unwrap_or(1);
         if parsed.header.nonce != expected_nonce {
             return Err(NoopReason::BadNonce);
         }
@@ -1072,8 +1104,8 @@ impl AtomicTokenState {
             TokenOp::ClaimLiquidityFees(op) => self.execute_claim_liquidity_fees(tx, owner_id, op, auth_inputs, journal)?,
         }
 
-        self.record_nonce_before(owner_id, journal);
-        self.nonces.insert(owner_id, expected_nonce + 1);
+        self.record_nonce_before(nonce_key, journal);
+        self.nonces.insert(nonce_key, expected_nonce + 1);
         Ok(details)
     }
 
@@ -2167,9 +2199,9 @@ impl AtomicTokenState {
         }
     }
 
-    fn record_nonce_before(&mut self, owner_id: [u8; 32], journal: &mut JournalBuilder) {
-        if journal.seen_nonces.insert(owner_id) {
-            journal.changed_nonces.push(ChangedNonce { owner_id, old_value: self.nonces.get(&owner_id).copied() });
+    fn record_nonce_before(&mut self, key: NonceKey, journal: &mut JournalBuilder) {
+        if journal.seen_nonces.insert(key) {
+            journal.changed_nonces.push(ChangedNonce { key, old_value: self.nonces.get(&key).copied() });
         }
     }
 
@@ -2247,8 +2279,16 @@ impl AtomicTokenState {
         self.balances.get(&BalanceKey { asset_id, owner_id }).copied().unwrap_or(0)
     }
 
+    pub fn get_owner_nonce(&self, owner_id: [u8; 32]) -> u64 {
+        self.nonces.get(&NonceKey::owner(owner_id)).copied().unwrap_or(1)
+    }
+
+    pub fn get_token_nonce(&self, owner_id: [u8; 32], asset_id: [u8; 32]) -> u64 {
+        self.nonces.get(&NonceKey::asset(owner_id, asset_id)).copied().unwrap_or(1)
+    }
+
     pub fn get_nonce(&self, owner_id: [u8; 32]) -> u64 {
-        self.nonces.get(&owner_id).copied().unwrap_or(1)
+        self.get_owner_nonce(owner_id)
     }
 
     pub fn get_asset(&self, asset_id: [u8; 32]) -> Option<TokenAsset> {
@@ -2408,10 +2448,10 @@ impl AtomicTokenState {
             for change in journal.changed_nonces.iter().rev() {
                 match change.old_value {
                     Some(value) => {
-                        nonces.insert(change.owner_id, value);
+                        nonces.insert(change.key, value);
                     }
                     None => {
-                        nonces.remove(&change.owner_id);
+                        nonces.remove(&change.key);
                     }
                 }
             }
@@ -2880,13 +2920,15 @@ impl AtomicTokenState {
 
     fn hash_nonces_section(&self, hasher: &mut blake2b_simd::State) {
         hasher.update(&[SECTION_NONCES]);
-        let mut owners: Vec<[u8; 32]> = self.nonces.keys().copied().collect();
-        owners.sort_unstable();
-        hasher.update(&(owners.len() as u32).to_le_bytes());
+        let mut keys: Vec<NonceKey> = self.nonces.keys().copied().collect();
+        keys.sort_unstable();
+        hasher.update(&(keys.len() as u32).to_le_bytes());
 
-        for owner in owners {
-            if let Some(nonce) = self.nonces.get(&owner) {
-                hasher.update(&owner);
+        for key in keys {
+            if let Some(nonce) = self.nonces.get(&key) {
+                hasher.update(&key.owner_id);
+                hasher.update(&[key.scope_kind]);
+                hasher.update(&key.scope_id);
                 hasher.update(&nonce.to_le_bytes());
             }
         }
@@ -3204,11 +3246,11 @@ mod tests {
             },
         );
         state.balances.insert(BalanceKey { asset_id, owner_id: owner }, 900);
-        state.nonces.insert(owner, 7);
+        state.nonces.insert(NonceKey::owner(owner), 7);
 
         let hash = state.compute_state_hash();
         let hash_hex = to_hex(&hash);
-        assert_eq!(hash_hex, "c02fc311047bb392ece09c21611f85d206275fef189d0f466740db52c3d8eb3a");
+        assert_eq!(hash_hex, "9f3162381eade07b51c1d8df159e87ce4933d51c651d79cb7074dc7c67010a6a");
     }
 
     #[test]
@@ -3359,7 +3401,7 @@ mod tests {
         )
         .expect("canonical buy should calculate");
         let buy_auth_outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(2), 0);
-        let buy_payload = payload_buy_liquidity(1, 2, asset_id, pool.pool_nonce, buy_in_sompi, 1);
+        let buy_payload = payload_buy_liquidity(1, 1, asset_id, pool.pool_nonce, buy_in_sompi, 1);
         let buy_tx = tx_with_inputs_outputs(
             vec![(pool.vault_outpoint, 0), (buy_auth_outpoint, 1)],
             vec![
@@ -4104,9 +4146,9 @@ mod tests {
         let create_tx = token_tx(outpoint1, owner_script.clone(), payload_create_asset(0, 1, 8, owner, b"Token", b"TKN", b"\x01\x02"));
         let asset_id = hash_bytes(create_tx.id());
 
-        let mint_tx = token_tx(outpoint2, owner_script.clone(), payload_mint(0, 2, asset_id, owner, 1000));
-        let transfer_tx = token_tx(outpoint3, owner_script.clone(), payload_transfer(0, 3, asset_id, receiver, 300));
-        let burn_tx = token_tx(outpoint4, owner_script.clone(), payload_burn(0, 4, asset_id, 200));
+        let mint_tx = token_tx(outpoint2, owner_script.clone(), payload_mint(0, 1, asset_id, owner, 1000));
+        let transfer_tx = token_tx(outpoint3, owner_script.clone(), payload_transfer(0, 2, asset_id, receiver, 300));
+        let burn_tx = token_tx(outpoint4, owner_script.clone(), payload_burn(0, 3, asset_id, 200));
 
         let block1 = BlockHash::from_u64_word(100);
         let block2 = BlockHash::from_u64_word(101);
@@ -4126,7 +4168,8 @@ mod tests {
         assert_eq!(asset.total_supply, 800);
         assert_eq!(state.get_balance(asset_id, owner), 500);
         assert_eq!(state.get_balance(asset_id, receiver), 300);
-        assert_eq!(state.get_nonce(owner), 5);
+        assert_eq!(state.get_owner_nonce(owner), 2);
+        assert_eq!(state.get_token_nonce(owner, asset_id), 4);
         assert_eq!(state.processed_ops.len(), 4);
         assert_eq!(state.events.len(), 4);
         assert!(state.events.iter().all(|e| matches!(e.event_type, EventType::Applied)));

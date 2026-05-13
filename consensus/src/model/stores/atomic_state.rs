@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::Arc;
 
-const ATOMIC_CONSENSUS_STATE_MAGIC: &[u8; 8] = b"CATCS004";
-const ATOMIC_CONSENSUS_STATE_HASH_DOMAIN: &[u8] = b"cryptix-atomic-consensus-state-v4";
+const ATOMIC_CONSENSUS_STATE_MAGIC: &[u8; 8] = b"CATCS005";
+const ATOMIC_CONSENSUS_STATE_HASH_DOMAIN: &[u8] = b"cryptix-atomic-consensus-state-v5";
 const ATOMIC_STATE_COMMITMENT_DOMAIN: &[u8] = b"cryptix-utxo-atomic-state-commitment-v1";
 pub const ATOMIC_CURRENT_TOKEN_VERSION: u8 = 1;
 pub const ATOMIC_CURRENT_LIQUIDITY_CURVE_VERSION: u8 = 1;
@@ -39,11 +39,58 @@ const MAX_ATOMIC_LIQUIDITY_FEE_RECIPIENTS: usize = 2;
 const MIN_ATOMIC_LIQUIDITY_FEE_BPS: u16 = 10;
 const MAX_ATOMIC_LIQUIDITY_FEE_BPS: u16 = 1000;
 const MAX_ATOMIC_PLATFORM_TAG_LEN: usize = 50;
+pub const ATOMIC_NONCE_SCOPE_OWNER: u8 = 0;
+pub const ATOMIC_NONCE_SCOPE_ASSET: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AtomicBalanceKey {
     pub asset_id: [u8; 32],
     pub owner_id: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AtomicNonceKey {
+    pub owner_id: [u8; 32],
+    pub scope_kind: u8,
+    pub scope_id: [u8; 32],
+}
+
+impl AtomicNonceKey {
+    pub fn owner(owner_id: [u8; 32]) -> Self {
+        Self { owner_id, scope_kind: ATOMIC_NONCE_SCOPE_OWNER, scope_id: [0u8; 32] }
+    }
+
+    pub fn asset(owner_id: [u8; 32], asset_id: [u8; 32]) -> Self {
+        Self { owner_id, scope_kind: ATOMIC_NONCE_SCOPE_ASSET, scope_id: asset_id }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self.scope_kind {
+            ATOMIC_NONCE_SCOPE_OWNER => {
+                if self.scope_id == [0u8; 32] {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "owner nonce scope for owner `{}` has non-zero scope id `{}`",
+                        faster_hex::hex_string(&self.owner_id),
+                        faster_hex::hex_string(&self.scope_id)
+                    ))
+                }
+            }
+            ATOMIC_NONCE_SCOPE_ASSET => {
+                if self.scope_id != [0u8; 32] {
+                    Ok(())
+                } else {
+                    Err(format!("asset nonce scope for owner `{}` has zero asset id", faster_hex::hex_string(&self.owner_id)))
+                }
+            }
+            _ => Err(format!(
+                "atomic nonce for owner `{}` has invalid scope kind `{}`",
+                faster_hex::hex_string(&self.owner_id),
+                self.scope_kind
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,7 +159,7 @@ pub struct AtomicAssetState {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AtomicConsensusState {
     #[serde(default)]
-    pub next_nonces: HashMap<[u8; 32], u64>,
+    pub next_nonces: HashMap<AtomicNonceKey, u64>,
     #[serde(default)]
     pub assets: HashMap<[u8; 32], AtomicAssetState>,
     #[serde(default)]
@@ -160,8 +207,10 @@ impl AtomicConsensusState {
         let mut nonces: Vec<_> = self.next_nonces.iter().collect();
         nonces.sort_unstable_by(|a, b| a.0.cmp(b.0));
         write_len(&mut out, nonces.len());
-        for (owner_id, nonce) in nonces {
-            out.extend_from_slice(owner_id);
+        for (key, nonce) in nonces {
+            out.extend_from_slice(&key.owner_id);
+            out.push(key.scope_kind);
+            out.extend_from_slice(&key.scope_id);
             write_u64(&mut out, *nonce);
         }
 
@@ -238,9 +287,13 @@ impl AtomicConsensusState {
         let nonce_len = reader.read_len()?;
         for _ in 0..nonce_len {
             let owner_id = reader.read_32()?;
+            let scope_kind = reader.read_u8()?;
+            let scope_id = reader.read_32()?;
+            let key = AtomicNonceKey { owner_id, scope_kind, scope_id };
+            key.validate()?;
             let nonce = reader.read_u64()?;
-            if next_nonces.insert(owner_id, nonce).is_some() {
-                return Err("duplicate atomic nonce owner id".to_string());
+            if next_nonces.insert(key, nonce).is_some() {
+                return Err("duplicate atomic nonce key".to_string());
             }
         }
 
@@ -282,9 +335,15 @@ impl AtomicConsensusState {
     }
 
     pub fn validate_normalized(&self) -> Result<(), String> {
-        for (owner_id, nonce) in self.next_nonces.iter() {
+        for (key, nonce) in self.next_nonces.iter() {
+            key.validate()?;
             if *nonce < 2 {
-                return Err(format!("atomic nonce for owner `{}` is not normalized", faster_hex::hex_string(owner_id)));
+                return Err(format!(
+                    "atomic nonce for owner `{}` scope `{}` `{}` is not normalized",
+                    faster_hex::hex_string(&key.owner_id),
+                    key.scope_kind,
+                    faster_hex::hex_string(&key.scope_id)
+                ));
             }
         }
 
@@ -854,7 +913,7 @@ impl MemSizeEstimator for AtomicConsensusStateEntry {
             })
             .sum();
         size_of::<Self>()
-            + state.next_nonces.len() * (size_of::<[u8; 32]>() + size_of::<u64>())
+            + state.next_nonces.len() * (size_of::<AtomicNonceKey>() + size_of::<u64>())
             + state.assets.len() * (size_of::<[u8; 32]>() + size_of::<AtomicAssetState>())
             + state.balances.len() * (size_of::<AtomicBalanceKey>() + size_of::<u128>())
             + state.anchor_counts.len() * (size_of::<[u8; 32]>() + size_of::<u64>())
@@ -999,8 +1058,8 @@ mod tests {
         };
 
         let mut state = AtomicConsensusState::default();
-        state.next_nonces.insert(owner(0x61), 3);
-        state.next_nonces.insert(owner(0x60), 99);
+        state.next_nonces.insert(AtomicNonceKey::owner(owner(0x61)), 3);
+        state.next_nonces.insert(AtomicNonceKey::asset(owner(0x60), standard_asset_id), 99);
         state.assets.insert(liquidity_asset_id, liquidity_asset);
         state.assets.insert(standard_asset_id, standard_asset);
         state.balances.insert(AtomicBalanceKey { asset_id: standard_asset_id, owner_id: owner(0xB1) }, standard_balance_b);
@@ -1102,8 +1161,8 @@ mod tests {
             }),
         };
 
-        left.next_nonces.insert(owner(5), 2);
-        left.next_nonces.insert(owner(4), 9);
+        left.next_nonces.insert(AtomicNonceKey::owner(owner(5)), 2);
+        left.next_nonces.insert(AtomicNonceKey::asset(owner(4), asset_a), 9);
         left.assets.insert(asset_b, liquidity_asset.clone());
         left.assets.insert(asset_a, standard_asset.clone());
         left.balances.insert(AtomicBalanceKey { asset_id: asset_b, owner_id: owner(8) }, 500);
@@ -1116,8 +1175,8 @@ mod tests {
         right.balances.insert(AtomicBalanceKey { asset_id: asset_b, owner_id: owner(8) }, 500);
         right.assets.insert(asset_a, standard_asset);
         right.assets.insert(asset_b, liquidity_asset);
-        right.next_nonces.insert(owner(4), 9);
-        right.next_nonces.insert(owner(5), 2);
+        right.next_nonces.insert(AtomicNonceKey::asset(owner(4), asset_a), 9);
+        right.next_nonces.insert(AtomicNonceKey::owner(owner(5)), 2);
         right.rebuild_liquidity_vault_outpoint_index();
 
         left.validate_normalized().expect("left state should be normalized");

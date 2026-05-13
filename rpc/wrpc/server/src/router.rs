@@ -69,6 +69,7 @@ impl Router {
                 SimulateTokenOp,
                 GetTokenBalance,
                 GetTokenNonce,
+                GetOwnerNonce,
                 GetTokenAsset,
                 GetTokenOpStatus,
                 GetTokenStateHash,

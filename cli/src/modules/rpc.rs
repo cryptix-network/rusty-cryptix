@@ -458,11 +458,21 @@ impl Rpc {
             }
             RpcApiOps::GetTokenNonce => {
                 if argv.is_empty() {
-                    return Err(Error::custom("Usage: rpc get-token-nonce <ownerId> [atBlockHash]"));
+                    return Err(Error::custom("Usage: rpc get-token-nonce <ownerId> [assetId] [atBlockHash]"));
+                }
+                let owner_id = argv.remove(0);
+                let asset_id = if !argv.is_empty() { Some(argv.remove(0)) } else { None };
+                let at_block_hash = Self::parse_optional_hash(argv.first())?;
+                let result = rpc.get_token_nonce_call(None, GetTokenNonceRequest { owner_id, asset_id, at_block_hash }).await?;
+                self.println(&ctx, result);
+            }
+            RpcApiOps::GetOwnerNonce => {
+                if argv.is_empty() {
+                    return Err(Error::custom("Usage: rpc get-owner-nonce <ownerId> [atBlockHash]"));
                 }
                 let owner_id = argv.remove(0);
                 let at_block_hash = Self::parse_optional_hash(argv.first())?;
-                let result = rpc.get_token_nonce_call(None, GetTokenNonceRequest { owner_id, at_block_hash }).await?;
+                let result = rpc.get_owner_nonce_call(None, GetOwnerNonceRequest { owner_id, at_block_hash }).await?;
                 self.println(&ctx, result);
             }
             RpcApiOps::GetTokenAsset => {

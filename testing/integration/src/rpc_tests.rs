@@ -774,7 +774,10 @@ async fn sanity_test() {
                 let rpc_client = client.clone();
                 tst!(op, {
                     let result = rpc_client
-                        .get_token_nonce_call(None, GetTokenNonceRequest { owner_id: String::new(), at_block_hash: None })
+                        .get_token_nonce_call(
+                            None,
+                            GetTokenNonceRequest { owner_id: String::new(), asset_id: None, at_block_hash: None },
+                        )
                         .await;
                     assert!(result.is_err());
                 })

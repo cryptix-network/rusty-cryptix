@@ -1043,8 +1043,10 @@ build_wrpc_wasm_bindgen_interface!(
         SimulateTokenOp,
         /// Returns Cryptix Atomic token balance for owner and asset.
         GetTokenBalance,
-        /// Returns Cryptix Atomic next nonce for owner.
+        /// Returns Cryptix Atomic next nonce for owner-scope or owner/asset-scope.
         GetTokenNonce,
+        /// Returns Cryptix Atomic next owner-scope nonce for create operations.
+        GetOwnerNonce,
         /// Returns Cryptix Atomic asset metadata.
         GetTokenAsset,
         /// Returns Cryptix Atomic operation status by txid.

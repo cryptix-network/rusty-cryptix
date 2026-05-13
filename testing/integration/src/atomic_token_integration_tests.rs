@@ -214,8 +214,10 @@ async fn atomic_token_atomic_enabled_not_ready_state_fails_closed() {
         "expected fail-closed not-ready error, got: {balance_err}"
     );
 
-    let nonce_err =
-        client.get_token_nonce_call(None, GetTokenNonceRequest { owner_id: zero_hex.clone(), at_block_hash: None }).await.unwrap_err();
+    let nonce_err = client
+        .get_token_nonce_call(None, GetTokenNonceRequest { owner_id: zero_hex.clone(), asset_id: None, at_block_hash: None })
+        .await
+        .unwrap_err();
     assert!(
         nonce_err.to_string().contains("Cryptix Atomic state unavailable"),
         "expected fail-closed not-ready error, got: {nonce_err}"
@@ -273,7 +275,7 @@ async fn atomic_token_atomic_enabled_e2e_transfer_mint_burn_snapshot() {
         Keypair::from_secret_key(secp256k1::SECP256K1, &owner_sk),
         &utxos[1],
         &owner_address,
-        payload_mint(0, 2, asset_id_bytes, owner_id, 1000),
+        payload_mint(0, 1, asset_id_bytes, owner_id, 1000),
     );
     submit_and_wait_indexed(&client, &mint_tx, &owner_address).await;
 
@@ -281,7 +283,7 @@ async fn atomic_token_atomic_enabled_e2e_transfer_mint_burn_snapshot() {
         Keypair::from_secret_key(secp256k1::SECP256K1, &owner_sk),
         &utxos[2],
         &owner_address,
-        payload_transfer(0, 3, asset_id_bytes, receiver_id, 300),
+        payload_transfer(0, 2, asset_id_bytes, receiver_id, 300),
     );
     submit_and_wait_indexed(&client, &transfer_tx, &owner_address).await;
 
@@ -289,7 +291,7 @@ async fn atomic_token_atomic_enabled_e2e_transfer_mint_burn_snapshot() {
         Keypair::from_secret_key(secp256k1::SECP256K1, &owner_sk),
         &utxos[3],
         &owner_address,
-        payload_burn(0, 4, asset_id_bytes, 200),
+        payload_burn(0, 3, asset_id_bytes, 200),
     );
     submit_and_wait_indexed(&client, &burn_tx, &owner_address).await;
 
@@ -331,9 +333,19 @@ async fn atomic_token_atomic_enabled_e2e_transfer_mint_burn_snapshot() {
         .expect("asset must exist");
     assert_eq!(asset.total_supply, "800");
 
-    let nonce =
-        client.get_token_nonce_call(None, GetTokenNonceRequest { owner_id: hex32(owner_id), at_block_hash: None }).await.unwrap();
-    assert_eq!(nonce.expected_next_nonce, 5);
+    let nonce = client
+        .get_token_nonce_call(None, GetTokenNonceRequest { owner_id: hex32(owner_id), asset_id: None, at_block_hash: None })
+        .await
+        .unwrap();
+    assert_eq!(nonce.expected_next_nonce, 2);
+    let token_nonce = client
+        .get_token_nonce_call(
+            None,
+            GetTokenNonceRequest { owner_id: hex32(owner_id), asset_id: Some(asset_id.clone()), at_block_hash: None },
+        )
+        .await
+        .unwrap();
+    assert_eq!(token_nonce.expected_next_nonce, 4);
 
     let events = client
         .get_token_events_call(None, GetTokenEventsRequest { after_sequence: 0, limit: 100, at_block_hash: None })
@@ -510,7 +522,7 @@ async fn atomic_token_atomic_enabled_rpc_smoke_simulate_and_snapshot() {
         Keypair::from_secret_key(secp256k1::SECP256K1, &owner_sk),
         &utxos[1],
         &owner_address,
-        payload_mint(0, 2, asset_id_bytes, owner_id, 1000),
+        payload_mint(0, 1, asset_id_bytes, owner_id, 1000),
     );
     submit_and_wait_indexed(&client, &mint_tx, &owner_address).await;
 
@@ -518,7 +530,7 @@ async fn atomic_token_atomic_enabled_rpc_smoke_simulate_and_snapshot() {
         Keypair::from_secret_key(secp256k1::SECP256K1, &owner_sk),
         &utxos[2],
         &owner_address,
-        payload_transfer(0, 3, asset_id_bytes, receiver_id, 300),
+        payload_transfer(0, 2, asset_id_bytes, receiver_id, 300),
     );
     submit_and_wait_indexed(&client, &transfer_tx, &owner_address).await;
 
@@ -526,7 +538,7 @@ async fn atomic_token_atomic_enabled_rpc_smoke_simulate_and_snapshot() {
         Keypair::from_secret_key(secp256k1::SECP256K1, &owner_sk),
         &utxos[3],
         &owner_address,
-        payload_burn(0, 4, asset_id_bytes, 200),
+        payload_burn(0, 3, asset_id_bytes, 200),
     );
     submit_and_wait_indexed(&client, &burn_tx, &owner_address).await;
 
@@ -553,10 +565,12 @@ async fn atomic_token_atomic_enabled_rpc_smoke_simulate_and_snapshot() {
         )
         .await
         .unwrap();
-    let owner_nonce_before =
-        client.get_token_nonce_call(None, GetTokenNonceRequest { owner_id: owner_id_hex.clone(), at_block_hash: None }).await.unwrap();
+    let owner_nonce_before = client
+        .get_token_nonce_call(None, GetTokenNonceRequest { owner_id: owner_id_hex.clone(), asset_id: None, at_block_hash: None })
+        .await
+        .unwrap();
     let receiver_nonce_before = client
-        .get_token_nonce_call(None, GetTokenNonceRequest { owner_id: receiver_id_hex.clone(), at_block_hash: None })
+        .get_token_nonce_call(None, GetTokenNonceRequest { owner_id: receiver_id_hex.clone(), asset_id: None, at_block_hash: None })
         .await
         .unwrap();
     let events_before = client
@@ -658,10 +672,12 @@ async fn atomic_token_atomic_enabled_rpc_smoke_simulate_and_snapshot() {
     assert_eq!(owner_balance_after.balance, owner_balance_before.balance);
     assert_eq!(receiver_balance_after.balance, receiver_balance_before.balance);
 
-    let owner_nonce_after =
-        client.get_token_nonce_call(None, GetTokenNonceRequest { owner_id: owner_id_hex.clone(), at_block_hash: None }).await.unwrap();
+    let owner_nonce_after = client
+        .get_token_nonce_call(None, GetTokenNonceRequest { owner_id: owner_id_hex.clone(), asset_id: None, at_block_hash: None })
+        .await
+        .unwrap();
     let receiver_nonce_after = client
-        .get_token_nonce_call(None, GetTokenNonceRequest { owner_id: receiver_id_hex.clone(), at_block_hash: None })
+        .get_token_nonce_call(None, GetTokenNonceRequest { owner_id: receiver_id_hex.clone(), asset_id: None, at_block_hash: None })
         .await
         .unwrap();
     assert_eq!(owner_nonce_after.expected_next_nonce, owner_nonce_before.expected_next_nonce);

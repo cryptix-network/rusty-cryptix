@@ -6,9 +6,7 @@ use crate::{
     mempool::{
         config::{Config, DEFAULT_PAYLOAD_MAX_STANDARD_LEN},
         model::tx::{MempoolTransaction, TransactionPostValidation, TransactionPreValidation, TxRemovalReason},
-        populate_entries_and_try_validate::{
-            populate_mempool_transactions_in_parallel, validate_mempool_transaction, validate_mempool_transactions_in_parallel,
-        },
+        populate_entries_and_try_validate::{validate_mempool_transaction, validate_mempool_transactions_in_parallel},
         tx::{Orphan, Priority, RbfPolicy},
         Mempool,
     },
@@ -335,7 +333,11 @@ impl MiningManager {
             self.mempool.read().pre_validate_and_populate_transaction(consensus, transaction, rbf_policy)?;
         let args = TransactionValidationArgs::new(feerate_threshold);
         // no lock on mempool
-        let validation_result = validate_mempool_transaction(consensus, &mut transaction, &args);
+        let mut validation_result = validate_mempool_transaction(consensus, &mut transaction, &args);
+        if Self::is_atomic_nonce_baseline_violation(&validation_result) {
+            (transaction, validation_result) =
+                self.validate_transaction_with_pending_atomic_context(consensus, transaction, feerate_threshold);
+        }
         // write lock on mempool
         let mut mempool = self.mempool.write();
         match mempool.post_validate_and_insert_transaction(consensus, validation_result, transaction, priority, orphan, rbf_policy)? {
@@ -354,6 +356,44 @@ impl MiningManager {
             }
             TransactionPostValidation { removed, accepted: None } => Ok(TransactionInsertion::new(removed, vec![])),
         }
+    }
+
+    fn is_atomic_nonce_baseline_violation(validation_result: &Result<(), RuleError>) -> bool {
+        matches!(
+            validation_result,
+            Err(RuleError::RejectTxRule(TxRuleError::InvalidAtomicPayload(message)))
+                if message.contains("nonce baseline violation")
+        )
+    }
+
+    fn validate_transaction_with_pending_atomic_context(
+        &self,
+        consensus: &dyn ConsensusApi,
+        transaction: MutableTransaction,
+        feerate_threshold: Option<f64>,
+    ) -> (MutableTransaction, Result<(), RuleError>) {
+        let mut transactions = self.mempool.read().get_all_transactions(TransactionQuery::TransactionsOnly).0;
+        let incoming_index = transactions.len();
+        if incoming_index == 0 {
+            let mut transaction = transaction;
+            let args = TransactionValidationArgs::new(feerate_threshold);
+            let validation_result = validate_mempool_transaction(consensus, &mut transaction, &args);
+            return (transaction, validation_result);
+        }
+
+        let incoming_id = transaction.id();
+        transactions.push(transaction);
+
+        let mut args = TransactionValidationBatchArgs::new();
+        if let Some(threshold) = feerate_threshold {
+            args.set_feerate_threshold(incoming_id, threshold);
+        }
+
+        let mut validation_results = validate_mempool_transactions_in_parallel(consensus, &mut transactions, &args);
+        let transaction = transactions.swap_remove(incoming_index);
+        let validation_result = validation_results.swap_remove(incoming_index);
+
+        (transaction, validation_result)
     }
 
     fn validate_and_insert_unorphaned_transactions(
@@ -709,14 +749,7 @@ impl MiningManager {
                 } else if mempool.has_transaction(&transaction_id, TransactionQuery::TransactionsOnly) {
                     x.clear_entries();
                     mempool.populate_mempool_entries(&mut x);
-                    match x.is_fully_populated() {
-                        false => Some(x),
-                        true => {
-                            // If all entries are populated with mempool UTXOs, we already know the transaction is valid
-                            valid += 1;
-                            None
-                        }
-                    }
+                    Some(x)
                 } else {
                     other += 1;
                     None
@@ -733,8 +766,11 @@ impl MiningManager {
         while let Some(upper_bound) = self.next_transaction_chunk_upper_bound(&transactions, lower_bound) {
             assert!(lower_bound < upper_bound, "the chunk is never empty");
             let _swo = Stopwatch::<60>::with_threshold("revalidate validate_mempool_transactions_in_parallel op");
-            validation_results
-                .extend(populate_mempool_transactions_in_parallel(consensus, &mut transactions[lower_bound..upper_bound]));
+            validation_results.extend(validate_mempool_transactions_in_parallel(
+                consensus,
+                &mut transactions[lower_bound..upper_bound],
+                &TransactionValidationBatchArgs::new(),
+            ));
             drop(_swo);
             lower_bound = upper_bound;
         }

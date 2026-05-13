@@ -190,6 +190,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_atomic_nonce_submit_can_use_pending_mempool_context() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+
+        let first_transaction = create_transaction_with_utxo_entry(0, 0);
+        let second_transaction = create_transaction_with_utxo_entry(1, 0);
+
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                first_transaction.clone(),
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("first transaction should enter the mempool");
+
+        consensus.set_single_validation_status(
+            second_transaction.id(),
+            Err(TxRuleError::InvalidAtomicPayload(
+                "nonce baseline violation for owner `00` scope `asset` `11`: expected `1`, got `2`".to_string(),
+            )),
+        );
+
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                second_transaction.clone(),
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("future CAT nonce should validate against pending mempool context");
+
+        let (transactions_from_pool, _) = mining_manager.get_all_transactions(TransactionQuery::TransactionsOnly);
+        assert!(transactions_from_pool.iter().any(|tx| tx.id() == first_transaction.id()));
+        assert!(transactions_from_pool.iter().any(|tx| tx.id() == second_transaction.id()));
+    }
+
     /// test_insert_double_transactions_to_mempool verifies that an attempt to insert a transaction
     /// more than once into the mempool will result in raising an appropriate error.
     #[test]
