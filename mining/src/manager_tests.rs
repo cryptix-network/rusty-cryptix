@@ -361,6 +361,43 @@ mod tests {
     }
 
     #[test]
+    fn test_atomic_mempool_removes_accepted_liquidity_pool_conflict() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let asset_id = [0x44; 32];
+        let local_transaction = create_cat_payload_transaction_with_utxo_entry(
+            0,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_buy_liquidity_payload(1, asset_id, 9),
+        );
+        let accepted_transaction_from_peer = create_cat_payload_transaction_with_utxo_entry(
+            1,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_buy_liquidity_payload(2, asset_id, 9),
+        );
+
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                local_transaction.clone(),
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("local liquidity CAT transaction should enter the mempool");
+
+        let block_transactions = build_block_transactions(std::iter::once(accepted_transaction_from_peer.tx.as_ref()));
+        let result = mining_manager.handle_new_block_transactions(consensus.as_ref(), 2, &block_transactions);
+        assert!(result.is_ok(), "handling a block with an accepted liquidity pool conflict should succeed but returned {result:?}");
+
+        assert!(
+            mining_manager.get_transaction(&local_transaction.id(), TransactionQuery::All).is_none(),
+            "local liquidity CAT transaction should be removed after another node accepted the same pool slot"
+        );
+    }
+
+    #[test]
     fn test_atomic_rbf_rejects_incoming_cat_replacement() {
         let consensus = Arc::new(ConsensusMock::new());
         let counters = Arc::new(MiningCounters::default());

@@ -1,4 +1,5 @@
 use crate::mempool::{
+    atomic_slots::atomic_mempool_liquidity_pool_slot,
     errors::RuleResult,
     model::{
         pool::Pool,
@@ -34,6 +35,7 @@ impl Mempool {
                 self.remove_transaction(&transaction_id, false, TxRemovalReason::Accepted, "")?;
             }
             self.remove_double_spends(transaction)?;
+            self.remove_accepted_atomic_conflicts(transaction)?;
             self.orphan_pool.remove_orphan(&transaction_id, false, TxRemovalReason::Accepted, "")?;
             if self.accepted_transactions.add(transaction_id, block_daa_score) {
                 tx_accepted_counts += 1;
@@ -76,5 +78,21 @@ impl Mempool {
         transactions_to_remove.iter().try_for_each(|x| {
             self.remove_transaction(x, true, TxRemovalReason::DoubleSpend, format!(" favouring {}", transaction.id()).as_str())
         })
+    }
+
+    fn remove_accepted_atomic_conflicts(&mut self, transaction: &Transaction) -> RuleResult<()> {
+        let Some(slot) = atomic_mempool_liquidity_pool_slot(transaction)? else {
+            return Ok(());
+        };
+        let Some(conflicting_transaction_id) = self.transaction_pool.atomic_slot_owner(&slot).copied() else {
+            return Ok(());
+        };
+
+        self.remove_transaction(
+            &conflicting_transaction_id,
+            true,
+            TxRemovalReason::DoubleSpend,
+            format!(" atomic slot favouring {}", transaction.id()).as_str(),
+        )
     }
 }

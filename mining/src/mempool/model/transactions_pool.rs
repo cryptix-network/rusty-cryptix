@@ -223,6 +223,10 @@ impl TransactionsPool {
         }
     }
 
+    pub(crate) fn atomic_slot_owner(&self, slot: &AtomicMempoolSlot) -> Option<&TransactionId> {
+        self.atomic_slot_owners.get(slot)
+    }
+
     pub(crate) fn ready_transaction_count(&self) -> usize {
         self.ready_transactions.len()
     }

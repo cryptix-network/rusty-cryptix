@@ -88,6 +88,18 @@ pub(crate) fn atomic_mempool_slots(transaction: &MutableTransaction) -> RuleResu
     Ok(slots)
 }
 
+pub(crate) fn atomic_mempool_liquidity_pool_slot(transaction: &Transaction) -> RuleResult<Option<AtomicMempoolSlot>> {
+    if !is_cat_transaction(transaction) {
+        return Ok(None);
+    }
+
+    let Some(parsed) = parse_atomic_mempool_payload(transaction.payload.as_slice())? else {
+        return Ok(None);
+    };
+
+    Ok(parsed.pool_slot.map(|(asset_id, pool_nonce)| AtomicMempoolSlot::LiquidityPool { asset_id, pool_nonce }))
+}
+
 fn parse_atomic_mempool_payload(payload: &[u8]) -> RuleResult<Option<ParsedAtomicMempoolPayload>> {
     if !payload.starts_with(CAT_MAGIC) {
         return Ok(None);
