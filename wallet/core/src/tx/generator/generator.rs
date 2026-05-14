@@ -821,8 +821,6 @@ impl Generator {
             // checks output dust threshold in network params
             // if is_dust(&self.inner.network_params, change_output_value) {
             if absorb_change_to_fees || change_output_value == 0 {
-                transaction_fees += change_output_value;
-
                 // as we might absorb an input as a part of the receiver
                 // pays fee reduction, we should update the mass to make
                 // sure internal metrics and unit tests check out.

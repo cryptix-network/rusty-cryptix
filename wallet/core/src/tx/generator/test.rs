@@ -655,6 +655,30 @@ fn test_generator_inputs_100_outputs_1_fees_include_success() -> Result<()> {
 }
 
 #[test]
+fn test_generator_receiver_pays_exact_balance_single_utxo() -> Result<()> {
+    let generator =
+        generator(test_network_id(), &[10.0], &[], Fees::receiver(Cryptix(0.1)), [(output_address, Cryptix(10.0))].as_slice())?;
+
+    let pending = generator.generate_transaction()?.expect("receiver-pays transaction");
+    let tx = pending.transaction();
+    let aggregate_input_value = pending.utxo_entries().values().map(|o| o.amount()).sum::<u64>();
+    let aggregate_output_value = tx.outputs.iter().map(|o| o.value).sum::<u64>();
+
+    assert!(pending.is_final());
+    assert_eq!(tx.outputs.len(), 1, "exact receiver-pays spend should not need change");
+    assert!(aggregate_output_value < aggregate_input_value, "receiver output should absorb all fees");
+    assert_eq!(
+        aggregate_input_value,
+        aggregate_output_value + pending.fees(),
+        "receiver-pays exact-balance send must spend the full input without reporting insufficient funds"
+    );
+    assert!(pending.fees() > cryptix_to_sompi(0.1), "priority fee should be included in total fees");
+    assert!(generator.generate_transaction()?.is_none());
+
+    Ok(())
+}
+
+#[test]
 fn test_generator_inputs_100_outputs_1_fees_exclude_insufficient_funds() -> Result<()> {
     generator(test_network_id(), &[10.0; 100], &[], Fees::sender(Cryptix(5.0)), [(output_address, Cryptix(1000.0))].as_slice())
         .unwrap()
