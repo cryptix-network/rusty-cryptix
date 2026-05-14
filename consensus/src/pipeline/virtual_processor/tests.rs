@@ -1522,6 +1522,74 @@ async fn liquidity_parallel_vault_conflict_applies_only_one_branch() {
 }
 
 #[tokio::test]
+async fn liquidity_same_pool_nonce_parallel_blocks_apply_once_when_seen_out_of_order() {
+    let (mut ctx, fixture) = setup_dual_owner_liquidity_pool().await;
+    let (owner_buy_tx, owner_token_out, owner_vault_value) = build_liquidity_buy_tx(
+        fixture.asset_id,
+        &fixture.pool,
+        fixture.owner_anchor,
+        fixture.owner_anchor_value,
+        &fixture.owner_script,
+        p2sh_signature_script(),
+        1,
+        10 * SOMPI_PER_CRYPTIX,
+        fixture.tx_fee,
+    );
+    let (second_buy_tx, second_token_out, second_vault_value) = build_liquidity_buy_tx(
+        fixture.asset_id,
+        &fixture.pool,
+        fixture.second_owner_anchor,
+        fixture.second_owner_anchor_value,
+        &fixture.second_owner_script,
+        p2sh_signature_script_for(&second_p2sh_redeem_script()),
+        1,
+        20 * SOMPI_PER_CRYPTIX,
+        fixture.tx_fee,
+    );
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let owner_buy_block = ctx.build_utxo_valid_block_with_parents_and_transactions(
+        vec![fixture.create_block_hash],
+        vec![owner_buy_tx],
+        250,
+        ctx.simulated_time,
+    );
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let second_buy_block = ctx.build_utxo_valid_block_with_parents_and_transactions(
+        vec![fixture.create_block_hash],
+        vec![second_buy_tx],
+        251,
+        ctx.simulated_time,
+    );
+
+    ctx.validate_and_insert_block(second_buy_block.to_immutable()).await;
+    ctx.validate_and_insert_block(owner_buy_block.to_immutable()).await;
+
+    let atomic = ctx.consensus.virtual_atomic_state();
+    let asset = atomic.assets.get(&fixture.asset_id).expect("liquidity asset should exist");
+    let pool = asset.liquidity.as_ref().expect("pool should exist");
+    assert_eq!(pool.pool_nonce, fixture.pool.pool_nonce + 1);
+
+    let owner_balance = balance_of(&atomic, fixture.asset_id, fixture.owner_id);
+    let second_owner_balance = balance_of(&atomic, fixture.asset_id, fixture.second_owner_id);
+    let applied_buys = usize::from(owner_balance == fixture.launch_token_out + owner_token_out)
+        + usize::from(second_owner_balance == second_token_out);
+    assert_eq!(applied_buys, 1, "exactly one same-pool same-nonce buy may affect atomic state");
+
+    match pool.vault_value_sompi {
+        value if value == owner_vault_value => {
+            assert_eq!(owner_balance, fixture.launch_token_out + owner_token_out);
+            assert_eq!(second_owner_balance, 0);
+        }
+        value if value == second_vault_value => {
+            assert_eq!(owner_balance, fixture.launch_token_out);
+            assert_eq!(second_owner_balance, second_token_out);
+        }
+        value => panic!("unexpected vault value after out-of-order parallel conflict: {value}"),
+    }
+}
+
+#[tokio::test]
 async fn liquidity_reorg_switches_to_winning_conflicting_vault_branch() {
     let (mut ctx, fixture) = setup_dual_owner_liquidity_pool().await;
     let (owner_buy_tx, owner_token_out, _) = build_liquidity_buy_tx(
