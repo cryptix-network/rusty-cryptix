@@ -1719,6 +1719,7 @@ dependencies = [
 name = "cryptix-mining"
 version = "0.16.0"
 dependencies = [
+ "blake2b_simd",
  "criterion",
  "cryptix-addresses",
  "cryptix-consensus-core",

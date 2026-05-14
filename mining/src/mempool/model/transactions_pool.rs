@@ -1,6 +1,7 @@
 use crate::{
     feerate::{FeerateEstimator, FeerateEstimatorArgs},
     mempool::{
+        atomic_slots::{atomic_mempool_slots, AtomicMempoolSlot},
         config::Config,
         errors::{RuleError, RuleResult},
         model::{
@@ -20,7 +21,7 @@ use cryptix_consensus_core::{
 };
 use cryptix_core::{debug, time::unix_now, trace};
 use std::{
-    collections::{hash_map::Keys, hash_set::Iter},
+    collections::{hash_map::Keys, hash_set::Iter, HashMap},
     iter::once,
     sync::Arc,
 };
@@ -64,6 +65,12 @@ pub(crate) struct TransactionsPool {
     /// Transactions dependencies formed by outputs present in pool - successor relations.
     chained_transactions: TransactionsEdges,
 
+    /// First-seen CAT slots currently occupied in the mempool.
+    atomic_slot_owners: HashMap<AtomicMempoolSlot, TransactionId>,
+
+    /// Reverse mapping for removing CAT slots with their owning transaction.
+    atomic_slots_by_tx: HashMap<TransactionId, Vec<AtomicMempoolSlot>>,
+
     /// Transactions with no parents in the mempool -- ready to be inserted into a block template
     ready_transactions: Frontier,
 
@@ -86,6 +93,8 @@ impl TransactionsPool {
             all_transactions: MempoolTransactionCollection::default(),
             parent_transactions: TransactionsEdges::default(),
             chained_transactions: TransactionsEdges::default(),
+            atomic_slot_owners: HashMap::new(),
+            atomic_slots_by_tx: HashMap::new(),
             ready_transactions: Default::default(),
             last_expire_scan_daa_score: 0,
             last_expire_scan_time: unix_now(),
@@ -115,6 +124,13 @@ impl TransactionsPool {
         assert!(!self.all_transactions.contains_key(&id), "transaction {id} to be added already exists in the transactions pool");
         assert!(transaction.mtx.is_fully_populated(), "transaction {id} to be added in the transactions pool is not fully populated");
 
+        let atomic_slots = atomic_mempool_slots(&transaction.mtx)?;
+        for slot in atomic_slots.iter() {
+            if let Some(existing_id) = self.atomic_slot_owners.get(slot) {
+                return Err(RuleError::RejectAtomicSlotConflict(id, *existing_id, slot.to_string()));
+            }
+        }
+
         // Create the bijective parent/chained relations.
         // This concerns only the parents of the added transaction.
         // The transactions chained to the added transaction cannot be stored
@@ -131,6 +147,12 @@ impl TransactionsPool {
 
         self.utxo_set.add_transaction(&transaction.mtx);
         self.estimated_size += transaction_size;
+        for slot in atomic_slots.iter() {
+            self.atomic_slot_owners.insert(slot.clone(), id);
+        }
+        if !atomic_slots.is_empty() {
+            self.atomic_slots_by_tx.insert(id, atomic_slots);
+        }
         self.all_transactions.insert(id, transaction);
         trace!("Added transaction {}", id);
         Ok(())
@@ -162,6 +184,13 @@ impl TransactionsPool {
 
         // Remove the transaction itself
         let removed_tx = self.all_transactions.remove(transaction_id).ok_or(RuleError::RejectMissingTransaction(*transaction_id))?;
+        if let Some(slots) = self.atomic_slots_by_tx.remove(transaction_id) {
+            for slot in slots {
+                if self.atomic_slot_owners.get(&slot).is_some_and(|owner| owner == transaction_id) {
+                    self.atomic_slot_owners.remove(&slot);
+                }
+            }
+        }
 
         self.ready_transactions.remove(&(&removed_tx).into());
 

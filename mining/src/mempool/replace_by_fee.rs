@@ -1,4 +1,5 @@
 use crate::mempool::{
+    atomic_slots::is_cat_transaction,
     errors::{RuleError, RuleResult},
     model::tx::{DoubleSpend, MempoolTransaction, TxRemovalReason},
     tx::RbfPolicy,
@@ -28,6 +29,7 @@ impl Mempool {
             RbfPolicy::Allowed => {
                 // When RBF is allowed, never fails since both insertion and replacement are possible
                 let double_spends = self.transaction_pool.get_double_spend_transaction_ids(transaction);
+                self.rejects_atomic_replace_by_fee(transaction, &double_spends)?;
                 if double_spends.is_empty() {
                     Ok(None)
                 } else {
@@ -43,6 +45,7 @@ impl Mempool {
             RbfPolicy::Mandatory => {
                 // When RBF is mandatory, fails early if we do not have exactly one double spending transaction
                 let double_spends = self.transaction_pool.get_double_spend_transaction_ids(transaction);
+                self.rejects_atomic_replace_by_fee(transaction, &double_spends)?;
                 match double_spends.len() {
                     0 => Err(RuleError::RejectRbfNoDoubleSpend),
                     1 => {
@@ -75,6 +78,7 @@ impl Mempool {
 
             RbfPolicy::Allowed => {
                 let double_spends = self.transaction_pool.get_double_spend_transaction_ids(transaction);
+                self.rejects_atomic_replace_by_fee(transaction, &double_spends)?;
                 match double_spends.is_empty() {
                     true => Ok(None),
                     false => {
@@ -99,6 +103,7 @@ impl Mempool {
 
             RbfPolicy::Mandatory => {
                 let double_spends = self.transaction_pool.get_double_spend_transaction_ids(transaction);
+                self.rejects_atomic_replace_by_fee(transaction, &double_spends)?;
                 match double_spends.len() {
                     0 => Err(RuleError::RejectRbfNoDoubleSpend),
                     1 => {
@@ -125,6 +130,22 @@ impl Mempool {
             // and mass at this stage but nonetheless we fail gracefully
             None => Err(double_spend.into()),
         }
+    }
+
+    fn rejects_atomic_replace_by_fee(&self, transaction: &MutableTransaction, double_spends: &[DoubleSpend]) -> RuleResult<()> {
+        if double_spends.is_empty() {
+            return Ok(());
+        }
+        if is_cat_transaction(transaction.tx.as_ref()) {
+            return Err(RuleError::RejectAtomicReplaceByFee(transaction.id()));
+        }
+        for double_spend in double_spends {
+            let owner = self.transaction_pool.get_double_spend_owner(double_spend)?;
+            if is_cat_transaction(owner.mtx.tx.as_ref()) {
+                return Err(RuleError::RejectAtomicReplaceByFee(transaction.id()));
+            }
+        }
+        Ok(())
     }
 
     fn validate_double_spending_transaction<'a>(

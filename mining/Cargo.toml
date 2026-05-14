@@ -20,6 +20,7 @@ cryptix-muhash.workspace = true
 cryptix-txscript.workspace = true
 cryptix-utils.workspace = true
 
+blake2b_simd.workspace = true
 futures-util.workspace = true
 itertools.workspace = true
 log.workspace = true

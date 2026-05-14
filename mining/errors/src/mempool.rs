@@ -33,6 +33,12 @@ pub enum RuleError {
     #[error("replace by fee found more than one double spending transaction in the mempool")]
     RejectRbfTooManyDoubleSpendingTransactions,
 
+    #[error("transaction {0} is a CAT transaction or conflicts with a pending CAT transaction, so replace-by-fee is disabled")]
+    RejectAtomicReplaceByFee(TransactionId),
+
+    #[error("transaction {0} conflicts with pending CAT transaction {1} on atomic slot {2}")]
+    RejectAtomicSlotConflict(TransactionId, TransactionId, String),
+
     /// a transaction is rejected if the mempool is full
     #[error("transaction could not be added to the mempool because it's full with transactions with higher priority")]
     RejectMempoolIsFull,

@@ -19,6 +19,7 @@ use cryptix_consensus_core::{
 use cryptix_core::time::Stopwatch;
 use std::sync::Arc;
 
+pub(crate) mod atomic_slots;
 pub(crate) mod check_transaction_standard;
 pub mod config;
 pub mod errors;
