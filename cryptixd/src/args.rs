@@ -90,10 +90,6 @@ pub struct Args {
     pub hfa_microblock_interval_ms_normal: u64,
     pub autoban: bool,
     pub banserver: bool,
-    pub antifraud_guard: bool,
-    pub antifraud_allow_peer_fallback: bool,
-    // Deprecated and ignored: banserver endpoint is fixed in code.
-    pub banserver_url: Option<String>,
     pub coinbase_maturity_override: Option<u64>,
     pub payload_hf_activation_daa_score: Option<u64>,
 
@@ -159,9 +155,6 @@ impl Default for Args {
             hfa_microblock_interval_ms_normal: 50,
             autoban: false,
             banserver: true,
-            antifraud_guard: false,
-            antifraud_allow_peer_fallback: false,
-            banserver_url: None,
             coinbase_maturity_override: None,
             payload_hf_activation_daa_score: None,
 
@@ -500,26 +493,15 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
                 .long("banserver")
                 .action(ArgAction::SetTrue)
                 .conflicts_with("no-banserver")
-                .help("Enable remote ban list synchronization from the antifraud banserver (default: enabled)."),
+                .help("Enable signed AntiFraud list synchronization from the primary seed endpoint (default: enabled)."),
         )
         .arg(
             Arg::new("no-banserver")
                 .long("no-banserver")
+                .visible_alias("antifraud-no-seed")
                 .action(ArgAction::SetTrue)
                 .conflicts_with("banserver")
-                .help("Disable remote ban list synchronization from the antifraud banserver (overrides config)."),
-        )
-        .arg(
-            Arg::new("antifraud-guard")
-                .long("antifraud-guard")
-                .action(ArgAction::SetTrue)
-                .help("Also query the optional AntiFraud guard mirror as a secondary consistency endpoint."),
-        )
-        .arg(
-            Arg::new("antifraud-allow-peer-fallback")
-                .long("antifraud-allow-peer-fallback")
-                .action(ArgAction::SetTrue)
-                .help("Allow peer snapshot fallback for AntiFraud when seed endpoints are unavailable."),
+                .help("Disable the AntiFraud seed endpoint and use peer-majority snapshots only (overrides config)."),
         )
         .arg(arg!(--"disable-upnp" "Disable upnp"))
         .arg(arg!(--"nodnsseed" "Disable DNS seeding for peers"))
@@ -660,13 +642,6 @@ impl Args {
             ),
             autoban: autoban_enabled,
             banserver: banserver_enabled,
-            antifraud_guard: arg_match_unwrap_or::<bool>(&m, "antifraud-guard", defaults.antifraud_guard),
-            antifraud_allow_peer_fallback: arg_match_unwrap_or::<bool>(
-                &m,
-                "antifraud-allow-peer-fallback",
-                defaults.antifraud_allow_peer_fallback,
-            ),
-            banserver_url: defaults.banserver_url,
             coinbase_maturity_override: m
                 .get_one::<u64>("coinbase-maturity-override")
                 .copied()
@@ -714,14 +689,20 @@ mod tests {
     use super::Args;
 
     #[test]
-    fn antifraud_guard_is_disabled_by_default() {
+    fn banserver_is_enabled_by_default() {
         let args = Args::parse(["cryptixd"]).expect("default args should parse");
-        assert!(!args.antifraud_guard);
+        assert!(args.banserver);
     }
 
     #[test]
-    fn antifraud_guard_flag_enables_secondary_endpoint() {
-        let args = Args::parse(["cryptixd", "--antifraud-guard"]).expect("flag args should parse");
-        assert!(args.antifraud_guard);
+    fn no_banserver_flag_disables_seed_fetch() {
+        let args = Args::parse(["cryptixd", "--no-banserver"]).expect("flag args should parse");
+        assert!(!args.banserver);
+    }
+
+    #[test]
+    fn antifraud_no_seed_alias_disables_seed_fetch() {
+        let args = Args::parse(["cryptixd", "--antifraud-no-seed"]).expect("alias args should parse");
+        assert!(!args.banserver);
     }
 }

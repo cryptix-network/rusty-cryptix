@@ -18,7 +18,7 @@ use crate::strong_node_claims::{
 use crate::{v5, v6};
 use async_trait::async_trait;
 use cryptix_addressmanager::AddressManager;
-use cryptix_connectionmanager::{AntiFraudMode, ConnectionManager};
+use cryptix_connectionmanager::ConnectionManager;
 use cryptix_consensus_core::api::{BlockValidationFuture, BlockValidationFutures};
 use cryptix_consensus_core::block::Block;
 use cryptix_consensus_core::config::{params::Params, Config};
@@ -134,13 +134,6 @@ const INBOUND_CONNECTION_RATE_LIMIT_STRIKE_COOLDOWN: Duration = Duration::from_s
 
 /// Soft memory cap for tracked peer IPs in the inbound connection limiter map.
 const INBOUND_CONNECTION_RATE_LIMIT_MAX_TRACKED_IPS: usize = 4096;
-
-fn anti_fraud_hash_window_from_vec(entries: &[[u8; 32]]) -> Option<[[u8; 32]; 3]> {
-    if entries.len() != 3 {
-        return None;
-    }
-    Some([entries[0], entries[1], entries[2]])
-}
 
 fn short_hex_for_log(data: &[u8]) -> String {
     if data.is_empty() {
@@ -774,10 +767,7 @@ impl FlowContext {
         if !self.is_strong_node_claims_p2p_enabled() {
             return true;
         }
-        self.strong_node_claims_engine
-            .claim_node_ids_for_block(block_hash)
-            .into_iter()
-            .any(|node_id| !self.is_claim_node_id_banned(&node_id))
+        self.strong_node_claims_engine.claim_node_ids_for_block(block_hash).into_iter().next().is_some()
     }
 
     pub async fn wait_for_valid_block_producer_claim(&self, block_hash: Hash) -> bool {
@@ -800,28 +790,13 @@ impl FlowContext {
         if !self.is_strong_node_claims_p2p_enabled() {
             return Vec::new();
         }
-        self.strong_node_claims_engine
-            .claim_messages_for_block(block_hash)
-            .into_iter()
-            .filter(|message| {
-                Self::claim_message_node_id(message).map(|node_id| !self.is_claim_node_id_banned(&node_id)).unwrap_or(false)
-            })
-            .collect()
+        self.strong_node_claims_engine.claim_messages_for_block(block_hash)
     }
 
     pub async fn broadcast_block_producer_claims_for_hash(&self, block_hash: Hash) {
         for message in self.block_producer_claims_for_hash(block_hash) {
             self.broadcast_block_producer_claim(message, None).await;
         }
-    }
-
-    fn claim_message_node_id(message: &BlockProducerClaimV1Message) -> Option<[u8; 32]> {
-        let pubkey: [u8; 32] = message.node_pubkey_xonly.as_slice().try_into().ok()?;
-        Some(compute_node_id(&pubkey))
-    }
-
-    fn is_claim_node_id_banned(&self, node_id: &[u8; 32]) -> bool {
-        self.connection_manager().map(|cm| cm.is_unified_node_id_banned(node_id)).unwrap_or(false)
     }
 
     pub fn consensus(&self) -> ConsensusInstance {
@@ -833,7 +808,7 @@ impl FlowContext {
     }
 
     fn unrestricted_peer_keys(&self) -> Vec<PeerKey> {
-        self.hub.active_peers().into_iter().filter(|peer| !peer.properties().anti_fraud_restricted).map(|peer| peer.key()).collect()
+        self.hub.active_peers().into_iter().map(|peer| peer.key()).collect()
     }
 
     pub async fn broadcast_to_unrestricted_peers(&self, msg: CryptixdMessage) {
@@ -1163,8 +1138,8 @@ impl FlowContext {
         self.transactions_spread.write().await.mempool_scanning_is_done()
     }
 
-    /// Add the given transactions IDs to a set of IDs to broadcast. The IDs will be broadcasted to all
-    /// non-restricted peers within transaction Inv messages.
+    /// Add the given transactions IDs to a set of IDs to broadcast. The IDs will be broadcasted to peers
+    /// within transaction Inv messages.
     ///
     /// The broadcast itself may happen only during a subsequent call to this function since it is done at most
     /// after a predefined interval or when the queue length is larger than the Inv message capacity.
@@ -1191,9 +1166,6 @@ impl FlowContext {
             if (peer.properties().services & HFA_P2P_SERVICE_BIT) == 0 {
                 continue;
             }
-            if peer.properties().anti_fraud_restricted {
-                continue;
-            }
             let _ = self.hub.send(peer.key(), msg.clone()).await;
         }
     }
@@ -1212,9 +1184,6 @@ impl FlowContext {
         );
         for peer in self.hub.active_peers() {
             if (peer.properties().services & HFA_P2P_SERVICE_BIT) == 0 {
-                continue;
-            }
-            if peer.properties().anti_fraud_restricted {
                 continue;
             }
             let _ = self.hub.send(peer.key(), msg.clone()).await;
@@ -1248,15 +1217,7 @@ impl FlowContext {
             ClaimIngestOutcome::Accepted { pending: _ } => {
                 self.strong_node_claims_engine.maybe_flush();
             }
-            ClaimIngestOutcome::Strike { reason, node_id } => {
-                if let Some(node_id) = node_id {
-                    if let Some(connection_manager) = self.connection_manager() {
-                        if connection_manager.is_unified_node_id_banned(&node_id) {
-                            connection_manager.ban(router.net_address().ip()).await;
-                            return;
-                        }
-                    }
-                }
+            ClaimIngestOutcome::Strike { reason, node_id: _ } => {
                 self.report_misbehaving_peer(router, &reason).await;
             }
             ClaimIngestOutcome::Ignored | ClaimIngestOutcome::Dropped => {}
@@ -1274,9 +1235,6 @@ impl FlowContext {
             .into_iter()
             .filter_map(|peer| {
                 if (peer.properties().services & STRONG_NODE_CLAIMS_P2P_SERVICE_BIT) == 0 {
-                    return None;
-                }
-                if peer.properties().anti_fraud_restricted {
                     return None;
                 }
                 if exclude_peer.is_some_and(|excluded| excluded == peer.key()) {
@@ -1309,9 +1267,6 @@ impl FlowContext {
     }
 
     fn local_block_producer_claim_for_hash(&self, block_hash: Hash) -> Option<BlockProducerClaimV1Message> {
-        if self.is_claim_node_id_banned(&self.unified_node_identity.node_id) {
-            return None;
-        }
         match self.strong_node_claims_engine.build_local_claim(block_hash, self.unified_node_identity.as_ref()) {
             Ok(message) => {
                 let _ = self.strong_node_claims_engine.ingest_claim(&message, self.is_payload_hf_active());
@@ -1434,9 +1389,7 @@ impl ConnectionInitializer for FlowContext {
         }
 
         let payload_hf_active = self.is_payload_hf_active();
-        let anti_fraud_runtime_enabled = self.connection_manager().map(|cm| cm.is_antifraud_runtime_enabled()).unwrap_or(false);
         let enforce_hardfork_core = payload_hf_active;
-        let enforce_anti_fraud = enforce_hardfork_core && anti_fraud_runtime_enabled;
         let peer_supports_quantum_fallback = (peer_version.services & P2P_SERVICE_BIT_QUANTUM_HANDSHAKE_FALLBACK) != 0;
         let require_quantum_ready = enforce_hardfork_core && !peer_supports_quantum_fallback;
         self.log_quantum_handshake_mode_transition(enforce_hardfork_core);
@@ -1527,26 +1480,11 @@ impl ConnectionInitializer for FlowContext {
             );
         }
 
-        let anti_fraud_mode = if enforce_anti_fraud {
-            self.connection_manager()
-                .map(|cm| match anti_fraud_hash_window_from_vec(&peer_version.anti_fraud_hashes) {
-                    Some(peer_hash_window) => cm.anti_fraud_mode_for_peer_hashes(&peer_hash_window),
-                    None => AntiFraudMode::Restricted,
-                })
-                .unwrap_or(AntiFraudMode::Restricted)
-        } else {
-            AntiFraudMode::Full
-        };
-
         let minimum_protocol_version = if enforce_hardfork_core { PROTOCOL_VERSION } else { MIN_PRE_HARD_FORK_PROTOCOL_VERSION };
         let (flows, applied_protocol_version) = match peer_version.protocol_version {
             // New protocol line.
             v if v >= PROTOCOL_VERSION => {
-                if enforce_anti_fraud && anti_fraud_mode == AntiFraudMode::Restricted {
-                    (v6::register_restricted(self.clone(), router.clone()), PROTOCOL_VERSION)
-                } else {
-                    (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), PROTOCOL_VERSION)
-                }
+                (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), PROTOCOL_VERSION)
             }
             // Pre-HF compatibility lines.
             PRE_HARD_FORK_PROTOCOL_VERSION if !enforce_hardfork_core => {
@@ -1575,7 +1513,6 @@ impl ConnectionInitializer for FlowContext {
             subnetwork_id: peer_version.subnetwork_id.to_owned(),
             time_offset,
             anti_fraud_hashes: peer_version.anti_fraud_hashes.clone(),
-            anti_fraud_restricted: enforce_anti_fraud && anti_fraud_mode == AntiFraudMode::Restricted,
             unified_node_id: peer_unified_node_id,
             hfa_enabled: peer_hfa_enabled,
             atomic_enabled: peer_atomic_enabled,

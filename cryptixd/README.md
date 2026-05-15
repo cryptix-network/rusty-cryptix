@@ -12,6 +12,7 @@ For more information please refer to the GitHub repository `README.md` located a
 
 ## Banserver Sync
 
-- CLI: `--banserver` (enable), `--no-banserver` (disable)
+- CLI: `--banserver` (primary AntiFraud seed enabled), `--no-banserver` / `--antifraud-no-seed` (peer-majority only)
 - Config file: `banserver = true|false`
-
+- Runtime policy: signed ban list is connection-only enforcement (admission/termination), while block relay/acceptance remains independent of ban entries.
+- Fallback policy: peer snapshot fallback is automatic (on seed fetch failures and in `--no-banserver` / `--antifraud-no-seed` mode).

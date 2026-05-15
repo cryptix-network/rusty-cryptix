@@ -54,10 +54,8 @@ Feedback and contributions are always welcome.
 | `--no-hfa` | switch | `false` | Force-disable HFA (overrides config). |
 | `--autoban` | switch | `false` | Enable automatic banning of repeatedly misbehaving peers. |
 | `--no-autoban` | switch | `false` | Force-disable automatic banning of repeatedly misbehaving peers (overrides config). |
-| `--banserver` | switch | `true` | Enable remote ban list synchronization from the antifraud banserver. |
-| `--no-banserver` | switch | `false` | Disable remote ban list synchronization from the antifraud banserver (overrides config). |
-| `--antifraud-guard` | switch | `false` | Also query the optional AntiFraud guard mirror as a secondary consistency endpoint. |
-| `--antifraud-allow-peer-fallback` | switch | `false` | Allow peer snapshot fallback for AntiFraud when seed endpoints are unavailable. |
+| `--banserver` | switch | `true` | Enable signed AntiFraud list synchronization from the primary seed endpoint. |
+| `--no-banserver`, `--antifraud-no-seed` | switch | `false` | Disable the AntiFraud seed endpoint and use peer-majority snapshots only (overrides config). |
 | `--disable-upnp` | switch | `false` | Disable UPnP. |
 | `--nodnsseed` | switch | `false` | Disable DNS peer seeding. This also disables Atomic bootstrap DNS seed sources and allows Atomic peer-majority mode from manual/configured peers only. |
 | `--nogrpc` | switch | `false` | Disable gRPC server. |
@@ -329,20 +327,6 @@ Pass the `--help` flag to view all possible arguments
 cargo run --release --bin cryptixd -- --help
   ```
 
-  Auto-ban defaults:
-  - disabled by default (`autoban = false`)
-  - enable explicitly with `--autoban` or `autoban = true`
-  - ban threshold: 5 strikes
-  - ban duration: 3 hours
-  - inbound connection rate-limiter
-  - rate-limit penalties are strike-cooldown limited to 1 per 60s per IP
-
-  Banserver sync defaults:
-  - enabled by default (`banserver = true`)
-  - uses the primary AntiFraud endpoint only by default; `--antifraud-guard` enables the optional guard mirror consistency check
-  - startup fetch + periodic refresh every 10 minutes
-  - `--no-banserver` disables endpoint fetches; peer snapshot fallback requires `--antifraud-allow-peer-fallback`
-  - fail-open: server/network/payload errors keep the current AntiFraud state and do not crash node operation
 </details>
 
 <details>

@@ -23,7 +23,6 @@ pub struct PeerProperties {
     pub subnetwork_id: Option<SubnetworkId>,
     pub time_offset: i64,
     pub anti_fraud_hashes: Vec<[u8; 32]>,
-    pub anti_fraud_restricted: bool,
     pub unified_node_id: Option<[u8; 32]>,
     pub hfa_enabled: bool,
     pub atomic_enabled: bool,

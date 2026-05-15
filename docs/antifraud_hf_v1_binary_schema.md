@@ -48,6 +48,6 @@ any unsigned or non-boolean runtime gate representation.
 - `2 = devnet`
 - `3 = simnet`
 
-## Zero-Hash
-- Zero-Hash is exactly 32 bytes of `0x00`
-- Zero-Hash is padding-only in hash windows and never counts as overlap
+## Hash Windows
+Hash windows are optional transport metadata for advertising recently accepted
+snapshot roots. They are not an admission, relay, or block-acceptance gate.

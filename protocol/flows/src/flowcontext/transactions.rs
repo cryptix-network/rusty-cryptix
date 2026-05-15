@@ -71,8 +71,8 @@ impl TransactionsSpread {
         self.scanning_task_running = false;
     }
 
-    /// Add the given transactions IDs to a set of IDs to broadcast. The IDs will be broadcasted to all
-    /// non-restricted peers within transaction Inv messages.
+    /// Add the given transactions IDs to a set of IDs to broadcast. The IDs will be broadcasted to peers
+    /// within transaction Inv messages.
     ///
     /// The broadcast itself may happen only during a subsequent call to this function since it is done at most
     /// every `broadcast_interval` milliseconds or when the queue length is larger than the Inv message
@@ -98,13 +98,7 @@ impl TransactionsSpread {
     }
 
     async fn broadcast(&self, msg: CryptixdMessage, should_throttle: bool) {
-        let mut peers = self
-            .hub
-            .active_peers()
-            .into_iter()
-            .filter(|peer| !peer.properties().anti_fraud_restricted)
-            .map(|peer| peer.key())
-            .collect_vec();
+        let mut peers = self.hub.active_peers().into_iter().map(|peer| peer.key()).collect_vec();
         if should_throttle && peers.len() > 8 {
             // TODO: Figure out a better number
             peers.shuffle(&mut rand::thread_rng());

@@ -327,12 +327,7 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     info!("Strong-Node claimant overlay: ENABLED");
     info!("Auto-ban: {}; default strike threshold: 5, ban duration: 3h", if args.autoban { "ENABLED" } else { "DISABLED" });
     info!("Banserver sync: {}", if args.banserver { "ENABLED" } else { "DISABLED" });
-    info!("AntiFraud guard mirror: {}", if args.antifraud_guard { "ENABLED" } else { "DISABLED" });
-    let antifraud_peer_fallback_allowed = args.antifraud_allow_peer_fallback;
-    info!(
-        "AntiFraud peer fallback: {}",
-        if antifraud_peer_fallback_allowed { "ENABLED by operator policy" } else { "DISABLED; seed failures keep current state" }
-    );
+    info!("AntiFraud peer fallback: ENABLED (automatic in --no-banserver/--antifraud-no-seed mode and on seed refresh failures)");
 
     assert!(!db_dir.to_str().unwrap().is_empty());
     info!("Application directory: {}", app_dir.display());
@@ -604,8 +599,6 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         dns_seeders,
         config.default_p2p_port(),
         args.banserver,
-        args.antifraud_guard,
-        antifraud_peer_fallback_allowed,
         Some(db_dir.clone()),
         p2p_tower_counters.clone(),
     ));
