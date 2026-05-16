@@ -40,7 +40,7 @@ const SNAPSHOT_ID_DOMAIN: &[u8] = b"CAT_SNAPSHOT_ID_V1";
 const MAX_REMOTE_SOURCES: usize = 64;
 const RPC_CALL_TIMEOUT: Duration = Duration::from_secs(15);
 const SOURCE_FAILURE_THRESHOLD: u32 = 3;
-const SOURCE_BLOCK_DURATION: Duration = Duration::from_secs(300);
+const SOURCE_RETRY_COOLDOWN: Duration = Duration::from_secs(300);
 pub(crate) const ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES: usize = 1;
 pub(crate) const ATOMIC_BOOTSTRAP_REQUIRED_NON_SEED_SOURCES: usize = 2;
 pub(crate) const ATOMIC_BOOTSTRAP_REQUIRED_TOTAL_SOURCES: usize =
@@ -211,6 +211,12 @@ impl AtomicBootstrapService {
     }
 
     fn no_sources_reason(&self) -> String {
+        if !self.configured_rpc_peers.is_empty() {
+            return format!(
+                "no compatible bootstrap sources found ({} configured --atomic-bootstrap-peer source(s) did not serve a compatible live-correct Atomic snapshot; check RPC port, peer Atomic health, and snapshot freshness)",
+                self.configured_rpc_peers.len()
+            );
+        }
         if self.disable_dns_seed_sources {
             if self.flow_context.config.net.is_mainnet() && !self.allow_peer_majority_fallback_override {
                 "no compatible bootstrap sources found (DNS seed bootstrap disabled by --nodnsseed; mainnet peer-only fallback is disabled unless --atomic-bootstrap-allow-peer-fallback is explicitly set)".to_string()
@@ -222,6 +228,14 @@ impl AtomicBootstrapService {
             }
         } else {
             "no compatible bootstrap sources found".to_string()
+        }
+    }
+
+    fn log_candidate_unavailable(candidate: &CandidateEndpoint, reason: &str) {
+        if matches!(candidate.kind, SourceKind::Configured) {
+            info!("[atomic-bootstrap] configured --atomic-bootstrap-peer {} unavailable: {}", candidate.endpoint, reason);
+        } else {
+            trace!("[atomic-bootstrap] source {} unavailable: {}", candidate.endpoint, reason);
         }
     }
 
@@ -243,7 +257,7 @@ impl AtomicBootstrapService {
 
         for candidate in candidates.into_iter().take(MAX_REMOTE_SOURCES) {
             if self.is_source_blocked(&candidate.endpoint).await {
-                trace!("[atomic-bootstrap] skipping temporarily blocked source {}", candidate.endpoint);
+                Self::log_candidate_unavailable(&candidate, "on temporary retry cooldown after repeated bootstrap failures");
                 continue;
             }
 
@@ -251,77 +265,127 @@ impl AtomicBootstrapService {
                 Ok(Ok(client)) => client,
                 Ok(Err(err)) => {
                     self.record_source_failure(&candidate.endpoint).await;
-                    trace!("[atomic-bootstrap] failed connecting to {}: {err}", candidate.endpoint);
+                    Self::log_candidate_unavailable(
+                        &candidate,
+                        &format!("RPC connect failed: {err}; use the peer RPC/GRPC port, not the P2P listen port"),
+                    );
                     continue;
                 }
                 Err(_) => {
                     self.record_source_failure(&candidate.endpoint).await;
-                    trace!("[atomic-bootstrap] connect timeout for {}", candidate.endpoint);
+                    Self::log_candidate_unavailable(
+                        &candidate,
+                        &format!("RPC connect timed out after {}s", RPC_CALL_TIMEOUT.as_secs()),
+                    );
                     continue;
                 }
             };
 
-            let head = match timeout(RPC_CALL_TIMEOUT, client.get_sc_snapshot_head()).await {
-                Ok(Ok(response)) => match response.head {
-                    Some(head) => head,
-                    None => {
-                        let _ = client.disconnect().await;
-                        continue;
-                    }
-                },
+            let candidate_sources = match timeout(RPC_CALL_TIMEOUT, client.get_sc_bootstrap_sources()).await {
+                Ok(Ok(response)) => response.sources,
                 Ok(Err(err)) => {
-                    self.record_source_failure(&candidate.endpoint).await;
-                    trace!("[atomic-bootstrap] getScSnapshotHead failed on {}: {err}", candidate.endpoint);
-                    let _ = client.disconnect().await;
-                    continue;
+                    trace!(
+                        "[atomic-bootstrap] getScBootstrapSources failed on {}; falling back to getScSnapshotHead: {err}",
+                        candidate.endpoint
+                    );
+                    match timeout(RPC_CALL_TIMEOUT, client.get_sc_snapshot_head()).await {
+                        Ok(Ok(response)) => response.head.into_iter().collect(),
+                        Ok(Err(err)) => {
+                            self.record_source_failure(&candidate.endpoint).await;
+                            Self::log_candidate_unavailable(&candidate, &format!("getScSnapshotHead RPC failed: {err}"));
+                            let _ = client.disconnect().await;
+                            continue;
+                        }
+                        Err(_) => {
+                            self.record_source_failure(&candidate.endpoint).await;
+                            Self::log_candidate_unavailable(
+                                &candidate,
+                                &format!("getScSnapshotHead timed out after {}s", RPC_CALL_TIMEOUT.as_secs()),
+                            );
+                            let _ = client.disconnect().await;
+                            continue;
+                        }
+                    }
                 }
                 Err(_) => {
                     self.record_source_failure(&candidate.endpoint).await;
-                    trace!("[atomic-bootstrap] getScSnapshotHead timeout on {}", candidate.endpoint);
+                    Self::log_candidate_unavailable(
+                        &candidate,
+                        &format!("getScBootstrapSources timed out after {}s", RPC_CALL_TIMEOUT.as_secs()),
+                    );
                     let _ = client.disconnect().await;
                     continue;
                 }
             };
 
-            if head.protocol_version != protocol_version || head.network_id != network_id {
+            if candidate_sources.is_empty() {
+                Self::log_candidate_unavailable(
+                    &candidate,
+                    "returned no Atomic bootstrap snapshots; remote Atomic may still be revalidating, degraded, or below the finality-safe snapshot depth",
+                );
                 let _ = client.disconnect().await;
                 continue;
             }
 
-            let source_identity_bytes = match decode_hash32_hex(&head.node_identity) {
-                Ok(identity) => identity,
-                Err(err) => {
-                    self.record_source_failure(&candidate.endpoint).await;
+            let mut accepted = 0usize;
+            for head in candidate_sources {
+                if head.protocol_version != protocol_version || head.network_id != network_id {
                     trace!(
-                        "[atomic-bootstrap] getScSnapshotHead from {} has invalid/missing canonical node identity: {err}",
-                        candidate.endpoint
-                    );
-                    let _ = client.disconnect().await;
-                    continue;
-                }
-            };
-            if let Some(expected_node_identity) = candidate.expected_node_identity {
-                if expected_node_identity != source_identity_bytes {
-                    self.record_source_failure(&candidate.endpoint).await;
-                    trace!(
-                        "[atomic-bootstrap] canonical node identity mismatch on {} (expected {}, got {})",
+                        "[atomic-bootstrap] skipping incompatible Atomic snapshot from {} (expected protocol {}, network {}; got protocol {}, network {})",
                         candidate.endpoint,
-                        hex_encode(expected_node_identity),
-                        hex_encode(source_identity_bytes)
+                        protocol_version,
+                        network_id,
+                        head.protocol_version,
+                        head.network_id
                     );
-                    let _ = client.disconnect().await;
                     continue;
                 }
+
+                let source_identity_bytes = match decode_hash32_hex(&head.node_identity) {
+                    Ok(identity) => identity,
+                    Err(err) => {
+                        self.record_source_failure(&candidate.endpoint).await;
+                        trace!(
+                            "[atomic-bootstrap] skipping Atomic snapshot from {} with invalid/missing canonical node identity: {}",
+                            candidate.endpoint,
+                            err
+                        );
+                        continue;
+                    }
+                };
+                if let Some(expected_node_identity) = candidate.expected_node_identity {
+                    if expected_node_identity != source_identity_bytes {
+                        self.record_source_failure(&candidate.endpoint).await;
+                        trace!(
+                            "[atomic-bootstrap] skipping Atomic snapshot from {} due to canonical node identity mismatch (expected {}, got {})",
+                            candidate.endpoint,
+                            hex_encode(expected_node_identity),
+                            hex_encode(source_identity_bytes)
+                        );
+                        continue;
+                    }
+                }
+
+                accepted = accepted.saturating_add(1);
+                sources.push(SourceClient {
+                    endpoint: candidate.endpoint.clone(),
+                    source_identity: hex_encode(source_identity_bytes),
+                    kind: candidate.kind,
+                    client: client.clone(),
+                    head,
+                });
+            }
+
+            if accepted == 0 {
+                Self::log_candidate_unavailable(
+                    &candidate,
+                    "served Atomic bootstrap snapshots, but none were compatible with the expected network/protocol/source identity",
+                );
+                let _ = client.disconnect().await;
+                continue;
             }
 
             self.record_source_success(&candidate.endpoint).await;
-            sources.push(SourceClient {
-                endpoint: candidate.endpoint,
-                source_identity: hex_encode(source_identity_bytes),
-                kind: candidate.kind,
-                client,
-                head,
-            });
         }
 
         sources
@@ -615,12 +679,54 @@ impl AtomicBootstrapService {
 
         let protocol_version = self.atomic_token_service.protocol_version() as u32;
         let network_id = self.atomic_token_service.network_id().to_string();
-        let sources = self.collect_compatible_sources(protocol_version, &network_id).await;
+        let mut sources = self.collect_compatible_sources(protocol_version, &network_id).await;
+
+        let mut retained_revalidation_error = None;
+        if health.runtime_state == AtomicTokenRuntimeState::Degraded && sources.is_empty() {
+            match self.atomic_token_service.revalidate_retained_state_once().await {
+                Ok(true) => {
+                    info!(
+                        "[atomic-bootstrap] degraded Atomic state repaired by local retained-chain revalidation; remote snapshot bootstrap not needed"
+                    );
+                    return Ok(true);
+                }
+                Ok(false) => {
+                    info!(
+                        "[atomic-bootstrap] degraded Atomic state has no retained verified chain state for local revalidation; remote snapshot bootstrap is required"
+                    );
+                    retained_revalidation_error = Some("no retained Atomic state is available for local revalidation".to_string());
+                }
+                Err(err) => {
+                    warn!(
+                        "[atomic-bootstrap] local retained-chain revalidation failed while Atomic is degraded: {err}; remote snapshot bootstrap is required"
+                    );
+                    retained_revalidation_error = Some(err.to_string());
+                }
+            }
+            if health.runtime_state == AtomicTokenRuntimeState::Degraded {
+                sources = self.collect_compatible_sources(protocol_version, &network_id).await;
+            }
+        } else if health.runtime_state == AtomicTokenRuntimeState::Degraded {
+            info!("[atomic-bootstrap] degraded Atomic state has compatible remote source(s); using snapshot bootstrap before local retained-chain repair");
+        }
 
         if sources.is_empty() {
-            let reason = self.no_sources_reason();
+            let mut reason = self.no_sources_reason();
+            if let Some(local_err) = retained_revalidation_error {
+                reason.push_str("; local retained-chain revalidation also failed: ");
+                reason.push_str(&local_err);
+            }
             if should_audit_healthy_state {
                 trace!("[atomic-bootstrap] healthy-state audit skipped: {reason}");
+                return Ok(false);
+            }
+            if health.runtime_state == AtomicTokenRuntimeState::NotReady
+                && !health.is_degraded
+                && (self.flow_context.is_ibd_running() || health.last_applied_block.is_none())
+            {
+                info!(
+                    "[atomic-bootstrap] Atomic state is not ready yet; waiting for local block replay/IBD or a compatible snapshot source ({reason})"
+                );
                 return Ok(false);
             }
             return self.defer_and_retry(&reason).await;
@@ -1239,7 +1345,7 @@ impl AtomicBootstrapService {
         let entry = penalties.entry(endpoint.to_string()).or_default();
         entry.failures = entry.failures.saturating_add(1);
         if entry.failures >= SOURCE_FAILURE_THRESHOLD {
-            entry.blocked_until = Some(Instant::now() + SOURCE_BLOCK_DURATION);
+            entry.blocked_until = Some(Instant::now() + SOURCE_RETRY_COOLDOWN);
         }
     }
 }
@@ -1388,12 +1494,21 @@ fn select_snapshot_quorum(
         best_block_hash: String,
     }
 
-    let mut unique_sources = HashMap::<String, SnapshotSupportEvidence>::new();
+    let mut unique_identities = HashMap::<String, SourceKind>::new();
+    let mut unique_support = HashMap::<(String, String), SnapshotSupportEvidence>::new();
     for mut source in evidence {
-        if let Some(existing) = unique_sources.get_mut(&source.source_identity) {
+        let snapshot_id = source.snapshot_id.to_ascii_lowercase();
+        source.snapshot_id = snapshot_id.clone();
+        unique_identities
+            .entry(source.source_identity.clone())
+            .and_modify(|kind| *kind = merge_source_kind(*kind, source.kind))
+            .or_insert(source.kind);
+
+        let support_key = (source.source_identity.clone(), snapshot_id);
+        if let Some(existing) = unique_support.get_mut(&support_key) {
             let merged_kind = merge_source_kind(existing.kind, source.kind);
-            let replace_existing =
-                (source.at_daa_score, source.at_block_hash.clone()) > (existing.at_daa_score, existing.at_block_hash.clone());
+            let replace_existing = (source.at_daa_score, source.at_block_hash.clone())
+                > (existing.at_daa_score, existing.at_block_hash.clone());
             if replace_existing {
                 source.kind = merged_kind;
                 *existing = source;
@@ -1403,24 +1518,22 @@ fn select_snapshot_quorum(
             continue;
         }
 
-        unique_sources.insert(source.source_identity.clone(), source);
+        unique_support.insert(support_key, source);
     }
 
     let mut grouped: HashMap<String, Vec<SnapshotSupportEvidence>> = HashMap::new();
-    for source in unique_sources.into_values() {
-        grouped.entry(source.snapshot_id.to_ascii_lowercase()).or_default().push(source);
+    for source in unique_support.into_values() {
+        grouped.entry(source.snapshot_id.clone()).or_default().push(source);
     }
 
-    let mut total_seed_sources = 0usize;
-    let mut total_non_seed_sources = 0usize;
+    let total_seed_sources = unique_identities.values().filter(|kind| matches!(kind, SourceKind::Seed)).count();
+    let total_non_seed_sources = unique_identities.len().saturating_sub(total_seed_sources);
     let mut candidates = grouped
         .into_iter()
         .map(|(snapshot_id, group_sources)| {
             let support = group_sources.len();
             let seed_support = group_sources.iter().filter(|s| matches!(s.kind, SourceKind::Seed)).count();
             let non_seed_support = support.saturating_sub(seed_support);
-            total_seed_sources += seed_support;
-            total_non_seed_sources += non_seed_support;
             let best_daa = group_sources.iter().map(|s| s.at_daa_score).max().unwrap_or(0);
             let best_block_hash = group_sources.iter().map(|s| s.at_block_hash.clone()).max().unwrap_or_default();
 
@@ -1673,6 +1786,28 @@ mod tests {
         assert!(decision.policy_description.contains(&format!(
             ">={ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES} seed + >={ATOMIC_BOOTSTRAP_REQUIRED_NON_SEED_SOURCES} independent non-seeds"
         )));
+    }
+
+    #[test]
+    fn quorum_policy_accepts_common_older_snapshot_when_heads_are_skewed() {
+        let decision = select_snapshot_quorum(
+            vec![
+                evidence("seed-1", "snapshot-seed-head", SourceKind::Seed, 130, "seed-head"),
+                evidence("seed-1", "snapshot-common", SourceKind::Seed, 120, "common"),
+                evidence("peer-1", "snapshot-peer-1-head", SourceKind::Peer, 132, "peer-1-head"),
+                evidence("peer-1", "snapshot-common", SourceKind::Peer, 120, "common"),
+                evidence("peer-2", "snapshot-peer-2-head", SourceKind::Peer, 131, "peer-2-head"),
+                evidence("peer-2", "snapshot-common", SourceKind::Peer, 120, "common"),
+            ],
+            true,
+            true,
+            ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES,
+        )
+        .expect("seed and peers should quorum on a common retained snapshot even when their latest heads differ");
+
+        assert_eq!(decision.snapshot_id, "snapshot-common");
+        assert_eq!(decision.required_votes, ATOMIC_BOOTSTRAP_REQUIRED_TOTAL_SOURCES);
+        assert!(decision.policy_description.contains("seed-confirmed quorum"));
     }
 
     #[test]

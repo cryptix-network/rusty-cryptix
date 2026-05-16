@@ -12,6 +12,7 @@ use crate::{
         CreateLiquidityAssetOp, EventType, LiquidityRecipientAddress, MintOp, NoopReason, ParsedTokenPayload, SellLiquidityExactInOp,
         SupplyMode, TokenOp, TokenOpCode, CURRENT_LIQUIDITY_CURVE_VERSION, CURRENT_TOKEN_VERSION,
     },
+    IDENT,
 };
 use blake2b_simd::Params as Blake2bParams;
 use cryptix_consensus_core::{
@@ -22,21 +23,27 @@ use cryptix_consensus_core::{
 };
 use cryptix_consensus_notify::notification::VirtualChainChangedNotification;
 use cryptix_consensusmanager::{ConsensusManager, ConsensusProxy};
+use cryptix_core::info;
 use cryptix_txscript::script_class::ScriptClass;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 const CAT_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
 const OWNER_AUTH_SCHEME_PUBKEY: u8 = 0;
 const OWNER_AUTH_SCHEME_PUBKEY_ECDSA: u8 = 1;
 const OWNER_AUTH_SCHEME_SCRIPT_HASH: u8 = 2;
 const CAT_STATE_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_STATE_V1";
+const LONG_ATOMIC_REPLAY_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 const SECTION_ASSETS: u8 = 0xA1;
 const SECTION_BALANCES: u8 = 0xB1;
 const SECTION_NONCES: u8 = 0xC1;
 const SECTION_ANCHOR_COUNTS: u8 = 0xD1;
+const SECTION_PROCESSED_OPS: u8 = 0xE1;
 const CAT_EVENT_DOMAIN: &[u8] = b"CAT_EVT_V1";
 const CAT_EVENT_INSTANCE_DOMAIN: &[u8] = b"CAT_EVT_INSTANCE_V1";
 pub const SNAPSHOT_SCHEMA_VERSION: u16 = 2;
@@ -659,6 +666,17 @@ impl AtomicTokenState {
         self.applied_chain_order.last().is_some()
     }
 
+    pub fn first_replayable_block_hash(&self) -> Option<BlockHash> {
+        let mut index = self.applied_chain_order.len().checked_sub(1)?;
+        if !self.block_journals.contains_key(&self.applied_chain_order[index]) {
+            return None;
+        }
+        while index > 0 && self.block_journals.contains_key(&self.applied_chain_order[index - 1]) {
+            index -= 1;
+        }
+        Some(self.applied_chain_order[index])
+    }
+
     pub fn runtime_state(&self, bootstrap_in_progress: bool) -> AtomicTokenRuntimeState {
         if self.degraded {
             AtomicTokenRuntimeState::Degraded
@@ -681,12 +699,31 @@ impl AtomicTokenState {
             return Ok(());
         }
 
-        for removed_block_hash in notification.removed_chain_block_hashes.iter().copied() {
+        let removed_total = notification.removed_chain_block_hashes.len();
+        let added_total = notification.added_chain_block_hashes.len();
+        let should_log_long_replay = removed_total.saturating_add(added_total) >= 1024;
+        let mut last_replay_log = Instant::now();
+        if should_log_long_replay {
+            info!(
+                "[{IDENT}] Cryptix Atomic applying virtual-chain update: +{} / -{} block(s)",
+                added_total, removed_total
+            );
+        }
+
+        for (idx, removed_block_hash) in notification.removed_chain_block_hashes.iter().copied().enumerate() {
             if self.rollback_block(removed_block_hash).is_err() {
                 self.mark_degraded();
                 return Err(AtomicTokenError::Processing(format!(
                     "Cryptix Atomic cannot rollback block `{removed_block_hash}` because journal is missing"
                 )));
+            }
+            if should_log_long_replay && last_replay_log.elapsed() >= LONG_ATOMIC_REPLAY_LOG_INTERVAL {
+                info!(
+                    "[{IDENT}] Cryptix Atomic virtual-chain rollback progress: {}/{} block(s)",
+                    idx.saturating_add(1),
+                    removed_total
+                );
+                last_replay_log = Instant::now();
             }
         }
 
@@ -753,18 +790,32 @@ impl AtomicTokenState {
             self.state_hash_by_block.insert(accepting_block_hash, state_hash);
             self.event_sequence_by_block.insert(accepting_block_hash, self.next_event_sequence);
             self.applied_chain_order.push(accepting_block_hash);
+            if should_log_long_replay && last_replay_log.elapsed() >= LONG_ATOMIC_REPLAY_LOG_INTERVAL {
+                info!(
+                    "[{IDENT}] Cryptix Atomic virtual-chain apply progress: {}/{} block(s)",
+                    idx.saturating_add(1),
+                    added_total
+                );
+                last_replay_log = Instant::now();
+            }
         }
 
         self.live_correct = !self.degraded;
+        if should_log_long_replay {
+            info!(
+                "[{IDENT}] Cryptix Atomic virtual-chain update applied: +{} / -{} block(s), live_correct={}",
+                added_total, removed_total, self.live_correct
+            );
+        }
         Ok(())
     }
 
-    pub fn prune_history(&mut self, max_retained_blocks: usize) {
+    pub fn prune_history(&mut self, max_retained_blocks: usize) -> bool {
         if max_retained_blocks == 0 {
-            return;
+            return false;
         }
         if self.applied_chain_order.len() <= max_retained_blocks {
-            return;
+            return false;
         }
 
         let prune_len = self.applied_chain_order.len().saturating_sub(max_retained_blocks);
@@ -779,12 +830,96 @@ impl AtomicTokenState {
             self.event_sequence_by_block.remove(&block_hash);
         }
 
+        let processed_ops_before = self.processed_ops.len();
         self.processed_ops.retain(|_, op| !pruned_hashes_set.contains(&op.accepting_block_hash));
+        let pruned_processed_ops = self.processed_ops.len() != processed_ops_before;
 
         if let Some(last_pruned_event_sequence) = last_pruned_event_sequence {
             self.events.retain(|event| event.sequence > last_pruned_event_sequence);
             self.rebuild_event_id_index();
         }
+
+        pruned_processed_ops
+    }
+
+    pub fn recompute_state_hashes_for_retained_segment(
+        &self,
+        retained_segment: &[BlockHash],
+    ) -> AtomicTokenResult<HashMap<BlockHash, [u8; 32]>> {
+        if retained_segment.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let segment_start = self.applied_chain_order.iter().position(|hash| *hash == retained_segment[0]).ok_or_else(|| {
+            AtomicTokenError::Processing(
+                "failed refreshing retained state hash cache: requested segment start is not in applied chain".to_string(),
+            )
+        })?;
+        let segment_end =
+            self.applied_chain_order.iter().position(|hash| *hash == *retained_segment.last().unwrap()).ok_or_else(|| {
+                AtomicTokenError::Processing(
+                    "failed refreshing retained state hash cache: requested segment end is not in applied chain".to_string(),
+                )
+            })?;
+        if segment_end < segment_start {
+            return Err(AtomicTokenError::Processing(
+                "failed refreshing retained state hash cache: requested segment end appears before start".to_string(),
+            ));
+        }
+        if &self.applied_chain_order[segment_start..=segment_end] != retained_segment {
+            return Err(AtomicTokenError::Processing(
+                "failed refreshing retained state hash cache: requested blocks are not a contiguous retained chain segment".to_string(),
+            ));
+        }
+
+        let mut cursor = self.clone();
+        for block_hash in self.applied_chain_order[segment_end + 1..].iter().rev().copied() {
+            cursor.rollback_block_internal(block_hash, false).map_err(|_| {
+                AtomicTokenError::Processing(format!(
+                    "failed refreshing retained state hash cache: missing journal while rolling back post-segment block `{block_hash}`"
+                ))
+            })?;
+        }
+
+        let mut refreshed = HashMap::with_capacity(retained_segment.len());
+        let should_log_progress = retained_segment.len() >= 1024;
+        let mut last_log = Instant::now();
+        for (idx, block_hash) in retained_segment.iter().rev().copied().enumerate() {
+            refreshed.insert(block_hash, cursor.compute_state_hash());
+            cursor.rollback_block_internal(block_hash, false).map_err(|_| {
+                AtomicTokenError::Processing(format!(
+                    "failed refreshing retained state hash cache: missing journal while rolling back block `{block_hash}`"
+                ))
+            })?;
+            if should_log_progress && last_log.elapsed() >= LONG_ATOMIC_REPLAY_LOG_INTERVAL {
+                info!(
+                    "[{IDENT}] refreshed retained Atomic state hash cache progress: {}/{} block(s)",
+                    idx.saturating_add(1),
+                    retained_segment.len()
+                );
+                last_log = Instant::now();
+            }
+        }
+        Ok(refreshed)
+    }
+
+    pub fn refresh_retained_state_hashes_from_current_state(&mut self) -> AtomicTokenResult<usize> {
+        let first_replayable = self.first_replayable_block_hash().ok_or_else(|| {
+            AtomicTokenError::Processing(
+                "failed refreshing retained state hash cache: no contiguous retained replay journal window is available".to_string(),
+            )
+        })?;
+        let suffix_start = self.applied_chain_order.iter().position(|hash| *hash == first_replayable).ok_or_else(|| {
+            AtomicTokenError::Processing(
+                "failed refreshing retained state hash cache: replay window root is not in applied chain".to_string(),
+            )
+        })?;
+        let retained_suffix = self.applied_chain_order[suffix_start..].to_vec();
+        let refreshed = self.recompute_state_hashes_for_retained_segment(&retained_suffix)?;
+        for (block_hash, state_hash) in refreshed {
+            self.state_hash_by_block.insert(block_hash, state_hash);
+        }
+        Ok(retained_suffix.len())
     }
 
     fn rollback_block(&mut self, block_hash: BlockHash) -> Result<(), ()> {
@@ -2473,12 +2608,11 @@ impl AtomicTokenState {
             }
         }
 
-        let state_hash = self.state_hash_by_block.get(&at_block_hash).copied()?;
         let event_sequence_cutoff = self.event_sequence_by_block.get(&at_block_hash).copied().unwrap_or(self.next_event_sequence);
         let known_owner_addresses = Self::known_owner_addresses_from_assets(&assets);
-        Some(AtomicTokenReadView {
+        let mut view = AtomicTokenReadView {
             at_block_hash,
-            state_hash,
+            state_hash: [0u8; 32],
             is_degraded: self.degraded,
             runtime_state: self.runtime_state(false),
             event_sequence_cutoff,
@@ -2488,7 +2622,9 @@ impl AtomicTokenState {
             anchor_counts,
             processed_ops,
             known_owner_addresses,
-        })
+        };
+        view.state_hash = self.compute_state_hash_for_view(view.clone(), true);
+        Some(view)
     }
 
     pub fn get_health(&self) -> AtomicTokenHealth {
@@ -2505,6 +2641,11 @@ impl AtomicTokenState {
 
     pub fn get_state_hash_at_block(&self, at_block_hash: BlockHash) -> Option<[u8; 32]> {
         self.state_hash_by_block.get(&at_block_hash).copied()
+    }
+
+    pub fn get_legacy_state_hash_at_block_without_processed_ops(&self, at_block_hash: BlockHash) -> Option<[u8; 32]> {
+        let view = self.materialize_view_at_block(at_block_hash)?;
+        Some(self.compute_state_hash_for_view(view, false))
     }
 
     pub fn export_snapshot(
@@ -2560,11 +2701,8 @@ impl AtomicTokenState {
         let view = self.materialize_view_at_block(at_block_hash).ok_or_else(|| {
             AtomicTokenError::Processing(format!("snapshot export failed: unable to materialize state at block `{at_block_hash}`"))
         })?;
-        let applied_chain_order = self.applied_chain_order[..=target_index].to_vec();
-        let state_hash_by_block: HashMap<BlockHash, [u8; 32]> = applied_chain_order
-            .iter()
-            .filter_map(|hash| self.state_hash_by_block.get(hash).copied().map(|state_hash| (*hash, state_hash)))
-            .collect();
+        let applied_chain_order = self.applied_chain_order[window_start_index..=target_index].to_vec();
+        let state_hash_by_block = self.recompute_state_hashes_for_retained_segment(&applied_chain_order)?;
         let event_sequence_by_block: HashMap<BlockHash, u64> = applied_chain_order
             .iter()
             .filter_map(|hash| self.event_sequence_by_block.get(hash).copied().map(|seq| (*hash, seq)))
@@ -2670,20 +2808,20 @@ impl AtomicTokenState {
             }
         }
 
-        let trusted_processed_ops = Self::rebuild_processed_ops_from_snapshot_window(&snapshot.journals_in_window)?;
         let AtomicTokenSnapshot { state, journals_in_window, .. } = snapshot;
         let AtomicTokenSnapshotState {
             assets,
             balances,
             nonces,
             anchor_counts,
-            processed_ops: _,
+            processed_ops,
             state_hash_by_block,
             event_sequence_by_block,
             applied_chain_order,
             next_event_sequence: _,
             events: _,
         } = state;
+        Self::validate_snapshot_processed_ops(&processed_ops, &journals_in_window)?;
 
         let mut trusted_state_hash_by_block = HashMap::with_capacity(applied_chain_order.len());
         let mut trusted_event_sequence_by_block = HashMap::with_capacity(applied_chain_order.len());
@@ -2706,8 +2844,7 @@ impl AtomicTokenState {
         self.balances = balances;
         self.nonces = nonces;
         self.anchor_counts = anchor_counts;
-        // Never trust snapshot-supplied processed/event history that is not committed by state_hash_at_fp.
-        self.processed_ops = trusted_processed_ops;
+        self.processed_ops = processed_ops;
         self.state_hash_by_block = trusted_state_hash_by_block;
         self.event_sequence_by_block = trusted_event_sequence_by_block;
         self.applied_chain_order = applied_chain_order;
@@ -2778,10 +2915,11 @@ impl AtomicTokenState {
         Ok(())
     }
 
-    fn rebuild_processed_ops_from_snapshot_window(
+    fn validate_snapshot_processed_ops(
+        processed_ops: &HashMap<BlockHash, ProcessedOp>,
         journals_in_window: &[(BlockHash, BlockJournal)],
-    ) -> AtomicTokenResult<HashMap<BlockHash, ProcessedOp>> {
-        let mut trusted = HashMap::new();
+    ) -> AtomicTokenResult<()> {
+        let mut seen_window_txids = HashSet::new();
         for (accepting_block_hash, journal) in journals_in_window.iter() {
             if journal.added_processed_ops.len() != journal.tx_results.len() {
                 return Err(AtomicTokenError::Processing(format!(
@@ -2790,30 +2928,76 @@ impl AtomicTokenState {
             }
 
             for (txid, tx_result) in journal.added_processed_ops.iter().copied().zip(journal.tx_results.iter()) {
+                if !seen_window_txids.insert(txid) {
+                    return Err(AtomicTokenError::Processing(format!(
+                        "snapshot import failed: duplicate processed txid `{txid}` in rollback window journals"
+                    )));
+                }
                 if tx_result.txid != txid {
                     return Err(AtomicTokenError::Processing(format!(
                         "snapshot import failed: journal txid mismatch for block `{accepting_block_hash}`"
                     )));
                 }
-                let previous = trusted.insert(
-                    txid,
-                    ProcessedOp {
-                        accepting_block_hash: *accepting_block_hash,
-                        apply_status: tx_result.apply_status,
-                        noop_reason: tx_result.noop_reason,
-                    },
-                );
-                if previous.is_some() {
-                    return Err(AtomicTokenError::Processing(format!(
-                        "snapshot import failed: duplicate processed txid `{txid}` in rollback window journals"
-                    )));
+                let expected = ProcessedOp {
+                    accepting_block_hash: *accepting_block_hash,
+                    apply_status: tx_result.apply_status,
+                    noop_reason: tx_result.noop_reason,
+                };
+                match processed_ops.get(&txid) {
+                    Some(actual) if *actual == expected => {}
+                    Some(_) => {
+                        return Err(AtomicTokenError::Processing(format!(
+                            "snapshot import failed: processed txid `{txid}` does not match rollback window journal"
+                        )));
+                    }
+                    None => {
+                        return Err(AtomicTokenError::Processing(format!(
+                            "snapshot import failed: processed txid `{txid}` is missing from snapshot processed_ops"
+                        )));
+                    }
                 }
             }
         }
-        Ok(trusted)
+        Ok(())
     }
 
     pub fn compute_state_hash(&self) -> [u8; 32] {
+        self.compute_state_hash_with_processed_ops(true)
+    }
+
+    #[cfg(test)]
+    fn compute_legacy_state_hash_without_processed_ops(&self) -> [u8; 32] {
+        self.compute_state_hash_with_processed_ops(false)
+    }
+
+    fn compute_state_hash_for_view(&self, view: AtomicTokenReadView, include_processed_ops: bool) -> [u8; 32] {
+        let state = Self {
+            protocol_version: self.protocol_version,
+            network_id: self.network_id.clone(),
+            degraded: false,
+            live_correct: false,
+            assets: view.assets,
+            balances: view.balances,
+            nonces: view.nonces,
+            anchor_counts: view.anchor_counts,
+            processed_ops: view.processed_ops,
+            block_journals: Default::default(),
+            state_hash_by_block: Default::default(),
+            event_sequence_by_block: Default::default(),
+            applied_chain_order: Default::default(),
+            next_event_sequence: 0,
+            events: Default::default(),
+            event_ids: Default::default(),
+            payload_hf_activation_daa_score: self.payload_hf_activation_daa_score,
+            liquidity_vault_outpoints: Default::default(),
+            known_owner_addresses: Default::default(),
+            balances_by_owner: Default::default(),
+            holders_by_asset: Default::default(),
+        };
+        state.compute_state_hash_with_processed_ops(include_processed_ops)
+    }
+
+    fn compute_state_hash_with_processed_ops(&self, include_processed_ops: bool) -> [u8; 32] {
         let network_id_bytes = self.network_id.as_bytes();
         let network_len = u16::try_from(network_id_bytes.len()).unwrap_or(0);
 
@@ -2827,6 +3011,9 @@ impl AtomicTokenState {
         self.hash_balances_section(&mut hasher);
         self.hash_nonces_section(&mut hasher);
         self.hash_anchor_counts_section(&mut hasher);
+        if include_processed_ops {
+            self.hash_processed_ops_section(&mut hasher);
+        }
 
         let digest = hasher.finalize();
         let mut out = [0u8; 32];
@@ -2945,6 +3132,22 @@ impl AtomicTokenState {
             if let Some(anchor_count) = self.anchor_counts.get(&owner) {
                 hasher.update(&owner);
                 hasher.update(&anchor_count.to_le_bytes());
+            }
+        }
+    }
+
+    fn hash_processed_ops_section(&self, hasher: &mut blake2b_simd::State) {
+        hasher.update(&[SECTION_PROCESSED_OPS]);
+        let mut txids: Vec<BlockHash> = self.processed_ops.keys().copied().collect();
+        txids.sort_unstable();
+        hasher.update(&(txids.len() as u32).to_le_bytes());
+
+        for txid in txids {
+            if let Some(op) = self.processed_ops.get(&txid) {
+                hasher.update(&txid.as_bytes());
+                hasher.update(&op.accepting_block_hash.as_bytes());
+                hasher.update(&[op.apply_status as u8]);
+                hasher.update(&(op.noop_reason as u16).to_le_bytes());
             }
         }
     }
@@ -3275,7 +3478,7 @@ mod tests {
 
         let hash = state.compute_state_hash();
         let hash_hex = to_hex(&hash);
-        assert_eq!(hash_hex, "9f3162381eade07b51c1d8df159e87ce4933d51c651d79cb7074dc7c67010a6a");
+        assert_eq!(hash_hex, "e50e93ad14aab0b237e9717764b1174aaf39395b0fcbdc51eaf71ecfde614f8f");
     }
 
     #[test]
@@ -3830,9 +4033,10 @@ mod tests {
     }
 
     #[test]
-    fn state_hash_ignores_processed_ops() {
+    fn state_hash_commits_processed_ops() {
         let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
         let before = state.compute_state_hash();
+        let legacy_before = state.compute_legacy_state_hash_without_processed_ops();
         state.processed_ops.insert(
             BlockHash::from_u64_word(99),
             ProcessedOp {
@@ -3842,7 +4046,9 @@ mod tests {
             },
         );
         let after = state.compute_state_hash();
-        assert_eq!(before, after);
+        let legacy_after = state.compute_legacy_state_hash_without_processed_ops();
+        assert_ne!(before, after);
+        assert_eq!(legacy_before, legacy_after);
     }
 
     #[test]
@@ -3904,6 +4110,107 @@ mod tests {
         assert_eq!(state.events.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![3, 4]);
         assert_eq!(state.event_ids.len(), 2);
         assert_eq!(state.next_event_sequence, 4);
+    }
+
+    #[test]
+    fn prune_history_refreshes_processed_op_committed_checkpoint_hashes() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        for index in 1..=4u64 {
+            let block_hash = BlockHash::from_u64_word(index);
+            let txid = BlockHash::from_u64_word(1000 + index);
+            state.processed_ops.insert(
+                txid,
+                ProcessedOp { accepting_block_hash: block_hash, apply_status: ApplyStatus::Applied, noop_reason: NoopReason::None },
+            );
+            state
+                .block_journals
+                .insert(block_hash, BlockJournal { added_processed_ops: vec![txid], ..Default::default() });
+            state.applied_chain_order.push(block_hash);
+            state.state_hash_by_block.insert(block_hash, state.compute_state_hash());
+            state.event_sequence_by_block.insert(block_hash, index);
+        }
+        let tip = BlockHash::from_u64_word(4);
+        let stale_tip_hash = state.get_state_hash_at_block(tip).expect("tip hash should exist");
+
+        assert!(state.prune_history(2));
+        assert_eq!(state.applied_chain_order, vec![BlockHash::from_u64_word(3), tip]);
+        assert_ne!(state.compute_state_hash(), stale_tip_hash);
+        assert_eq!(state.get_state_hash_at_block(tip), Some(stale_tip_hash));
+
+        let refreshed = state.refresh_retained_state_hashes_from_current_state().expect("refresh should succeed");
+        assert_eq!(refreshed, 2);
+        assert_eq!(state.get_state_hash_at_block(tip), Some(state.compute_state_hash()));
+    }
+
+    #[test]
+    fn first_replayable_block_hash_uses_contiguous_journal_suffix() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let blocks = (1..=5u64).map(BlockHash::from_u64_word).collect::<Vec<_>>();
+        state.applied_chain_order = blocks.clone();
+        state.block_journals.insert(blocks[2], BlockJournal::default());
+        state.block_journals.insert(blocks[3], BlockJournal::default());
+        state.block_journals.insert(blocks[4], BlockJournal::default());
+
+        assert_eq!(state.first_replayable_block_hash(), Some(blocks[2]));
+
+        state.block_journals.remove(&blocks[4]);
+        assert_eq!(state.first_replayable_block_hash(), None);
+    }
+
+    #[test]
+    fn export_snapshot_state_chain_is_replay_window_suffix() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let auth_inputs = HashMap::new();
+        let block1 = BlockHash::from_u64_word(7001);
+        let block2 = BlockHash::from_u64_word(7002);
+        let block3 = BlockHash::from_u64_word(7003);
+
+        apply_block(&mut state, block1, vec![], &auth_inputs);
+        let window_start_parent_hash = state.get_state_hash_at_block(block1);
+        apply_block(&mut state, block2, vec![], &auth_inputs);
+        apply_block(&mut state, block3, vec![], &auth_inputs);
+
+        let snapshot = state.export_snapshot(block3, 77, block1, &[block2, block3]).expect("snapshot export must succeed");
+
+        assert_eq!(snapshot.state.applied_chain_order, vec![block2, block3]);
+        assert_eq!(snapshot.state.state_hash_by_block.len(), 2);
+        assert!(snapshot.state.state_hash_by_block.contains_key(&block2));
+        assert!(snapshot.state.state_hash_by_block.contains_key(&block3));
+        assert_eq!(snapshot.state_hash_at_window_start_parent, window_start_parent_hash);
+    }
+
+    #[test]
+    fn snapshot_import_preserves_processed_ops_for_duplicate_replay_guard() {
+        let network = "cryptix-simnet".to_string();
+        let mut state = AtomicTokenState::new(1, network.clone());
+        let owner_script = test_script(93);
+        let owner = owner_id(&state, &owner_script);
+        let outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(8100), 0);
+        let mut auth_inputs = HashMap::new();
+        auth_inputs.insert(outpoint, UtxoEntry::new(1000, owner_script.clone(), 0, false));
+
+        let create_tx = token_tx(outpoint, owner_script, payload_create_asset(0, 1, 8, owner, b"Dup", b"DUP", b""));
+        let duplicate_txid = create_tx.id();
+        let block1 = BlockHash::from_u64_word(8101);
+        let block2 = BlockHash::from_u64_word(8102);
+        let refs_block1 = vec![tx_ref(create_tx.clone(), block1, 0, 0)];
+        let refs_block2 = vec![tx_ref(create_tx.clone(), block2, 0, 0)];
+
+        apply_block(&mut state, block1, refs_block1, &auth_inputs);
+        apply_block(&mut state, block2, refs_block2.clone(), &auth_inputs);
+        let expected_hash = state.compute_state_hash();
+        let snapshot = state.export_snapshot(block2, 99, block1, &[block2]).expect("snapshot export must succeed");
+
+        assert_eq!(snapshot.state.applied_chain_order, vec![block2]);
+        assert!(snapshot.state.processed_ops.contains_key(&duplicate_txid));
+        assert!(snapshot.journals_in_window[0].1.added_processed_ops.is_empty());
+
+        let mut recovered = AtomicTokenState::new(1, network);
+        recovered.import_snapshot(snapshot.clone()).expect("snapshot import should succeed");
+        recovered.rollback_snapshot_window_to_parent(snapshot.window_start_block_hash).expect("snapshot rollback should succeed");
+        apply_block(&mut recovered, block2, refs_block2, &auth_inputs);
+
+        assert_eq!(recovered.compute_state_hash(), expected_hash);
     }
 
     #[test]
@@ -4012,7 +4319,7 @@ mod tests {
     }
 
     #[test]
-    fn import_snapshot_drops_unbound_history_fields() {
+    fn import_snapshot_rejects_unbound_history_fields() {
         let network = "cryptix-simnet".to_string();
         let mut state = AtomicTokenState::new(1, network.clone());
         let owner_script = test_script(41);
@@ -4061,13 +4368,10 @@ mod tests {
         snapshot.state.next_event_sequence = u64::MAX;
 
         let mut recovered = AtomicTokenState::new(1, network);
-        recovered.import_snapshot(snapshot).expect("snapshot import should succeed");
-
-        assert_eq!(recovered.compute_state_hash(), expected_state_hash);
-        assert_eq!(recovered.events.len(), 0);
-        assert_eq!(recovered.next_event_sequence, 0);
-        assert!(!recovered.processed_ops.contains_key(&poisoned_txid));
-        assert_eq!(recovered.processed_ops.keys().copied().collect::<HashSet<_>>(), expected_window_txids);
+        let err = recovered.import_snapshot(snapshot).expect_err("snapshot import must reject poisoned processed_ops");
+        assert!(matches!(err, AtomicTokenError::Processing(message) if message.contains("state hash mismatch")));
+        assert!(!expected_window_txids.contains(&poisoned_txid));
+        assert_ne!(expected_state_hash, recovered.compute_state_hash());
     }
 
     #[test]

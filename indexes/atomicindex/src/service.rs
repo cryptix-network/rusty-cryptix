@@ -70,6 +70,7 @@ pub const MAX_BOOTSTRAP_SNAPSHOT_FILE_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub const MAX_BOOTSTRAP_REPLAY_WINDOW_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const BOOTSTRAP_STORE_MAX_SNAPSHOTS_PER_NETWORK: usize = 16;
 const ATOMIC_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const ATOMIC_LONG_OPERATION_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 struct SnapshotManifestV1 {
@@ -192,9 +193,30 @@ impl AtomicTokenProcessor {
         let consensus = self.consensus_manager.consensus();
         let session = consensus.session().await;
         let mut auth_inputs = HashMap::new();
-        for block_hash in added_chain_block_hashes.iter().copied() {
+        let total = added_chain_block_hashes.len();
+        let should_log_progress = total >= 1024;
+        let mut last_log = Instant::now();
+        if should_log_progress {
+            info!("[{IDENT}] collecting Atomic auth inputs for {} replay block(s)", total);
+        }
+        for (idx, block_hash) in added_chain_block_hashes.iter().copied().enumerate() {
             let utxo_diff = session.async_get_block_utxo_diff(block_hash).await?;
             auth_inputs.extend(utxo_diff.remove.iter().map(|(outpoint, entry)| (*outpoint, entry.clone())));
+            if should_log_progress && last_log.elapsed() >= ATOMIC_LONG_OPERATION_LOG_INTERVAL {
+                info!(
+                    "[{IDENT}] collecting Atomic auth inputs progress: {}/{} block(s)",
+                    idx.saturating_add(1),
+                    total
+                );
+                last_log = Instant::now();
+            }
+        }
+        if should_log_progress {
+            info!(
+                "[{IDENT}] collected Atomic auth inputs for {} replay block(s): {} spent output(s)",
+                total,
+                auth_inputs.len()
+            );
         }
         Ok(auth_inputs)
     }
@@ -225,7 +247,9 @@ impl AtomicTokenProcessor {
                     let _ = persist_state_to_path(&self.state_path, &state);
                     return Err(err);
                 }
-                state.prune_history(self.max_retained_blocks);
+                if state.prune_history(self.max_retained_blocks) {
+                    trace!("[{IDENT}] Cryptix Atomic pruning removed processed op guard entries");
+                }
                 if let Err(err) = persist_state_to_path(&self.state_path, &state) {
                     if !state.degraded {
                         warn!("[{IDENT}] marking Cryptix Atomic degraded after persistence error: {err}");
@@ -501,6 +525,7 @@ pub struct AtomicTokenService {
     recv_channel: Receiver<ConsensusNotification>,
     processor: Arc<AtomicTokenProcessor>,
     shutdown: SingleTrigger,
+    retained_revalidation_failed: AtomicBool,
     expected_finality_depth: u64,
     replay_overlap: usize,
     max_retained_blocks: usize,
@@ -538,6 +563,14 @@ impl AtomicTokenService {
         let mut state = load_state_from_path(&state_path, TOKEN_PROTOCOL_VERSION, &network_id)?
             .unwrap_or_else(|| AtomicTokenState::new(TOKEN_PROTOCOL_VERSION, network_id.clone()));
         state.set_payload_hf_activation_daa_score(config.params.payload_hf_activation_daa_score);
+        if state.degraded && !state.has_verified_state() {
+            warn!(
+                "[{IDENT}] persisted Atomic state is degraded but has no verified chain anchor; resetting Atomic index state so local block replay can rebuild it"
+            );
+            state = AtomicTokenState::new(TOKEN_PROTOCOL_VERSION, network_id.clone());
+            state.set_payload_hf_activation_daa_score(config.params.payload_hf_activation_daa_score);
+            persist_state_to_path(&state_path, &state)?;
+        }
         state.rebuild_runtime_caches();
 
         let consensus_notify_channel = Channel::<ConsensusNotification>::default();
@@ -561,6 +594,7 @@ impl AtomicTokenService {
             recv_channel: consensus_notify_channel.receiver(),
             processor: Arc::new(AtomicTokenProcessor::new(consensus_manager, max_retained_blocks, state, state_path)),
             shutdown: Default::default(),
+            retained_revalidation_failed: AtomicBool::new(false),
             expected_finality_depth,
             replay_overlap,
             max_retained_blocks,
@@ -596,7 +630,7 @@ impl AtomicTokenService {
     }
 
     pub async fn get_state_hash_at_block(&self, at_block_hash: BlockHash) -> Option<[u8; 32]> {
-        self.processor.state.lock().await.get_state_hash_at_block(at_block_hash)
+        self.processor.state.lock().await.materialize_view_at_block(at_block_hash).map(|view| view.state_hash)
     }
 
     pub async fn mark_degraded_and_persist(&self, reason: &str) -> AtomicTokenResult<()> {
@@ -649,6 +683,17 @@ impl AtomicTokenService {
         self.processor.read_context(requested_at_block_hash, self.genesis_hash).await
     }
 
+    pub async fn revalidate_retained_state_once(&self) -> AtomicTokenResult<bool> {
+        {
+            let state = self.processor.state.lock().await;
+            if !state.degraded && state.live_correct && state.has_verified_state() {
+                info!("[{IDENT}] Cryptix Atomic retained-chain revalidation skipped: local state is already healthy");
+                return Ok(false);
+            }
+        }
+        self.revalidate_loaded_state_once_per_process().await
+    }
+
     pub async fn get_indexed_balances_by_owner(
         &self,
         owner_id: [u8; 32],
@@ -677,44 +722,75 @@ impl AtomicTokenService {
 
     async fn revalidate_loaded_state(&self) -> AtomicTokenResult<bool> {
         let _operation_guard = self.processor.operation_lock.lock().await;
+        if self.retained_revalidation_failed.load(Ordering::SeqCst) {
+            return Err(AtomicTokenError::Processing(
+                "retained-chain revalidation already failed in this process; remote snapshot bootstrap is required".to_string(),
+            ));
+        }
 
         let loaded_state = {
             let state = self.processor.state.lock().await;
             if !state.has_verified_state() {
                 return Ok(false);
             }
+            info!(
+                "[{IDENT}] Cryptix Atomic startup state revalidation starting: retained_blocks={}, degraded={}, live_correct={}",
+                state.applied_chain_order.len(),
+                state.degraded,
+                state.live_correct
+            );
             state.clone()
         };
 
-        let first_retained_block_hash = *loaded_state.applied_chain_order.first().ok_or_else(|| {
-            AtomicTokenError::Processing("startup state revalidation failed: retained chain is unexpectedly empty".to_string())
+        let first_replayable_block_hash = loaded_state.first_replayable_block_hash().ok_or_else(|| {
+            AtomicTokenError::Processing(
+                "startup state revalidation failed: no contiguous retained replay journal window is available".to_string(),
+            )
         })?;
-        let expected_chain = loaded_state.applied_chain_order.clone();
+        let first_replayable_index =
+            loaded_state.applied_chain_order.iter().position(|hash| *hash == first_replayable_block_hash).ok_or_else(|| {
+                AtomicTokenError::Processing("startup state revalidation failed: replay root not retained".to_string())
+            })?;
+        let expected_chain = loaded_state.applied_chain_order[first_replayable_index..].to_vec();
         let expected_hashes = loaded_state.state_hash_by_block.clone();
+        info!(
+            "[{IDENT}] Cryptix Atomic startup state revalidation replay window: first_replayable={}, retained_replay_blocks={}",
+            first_replayable_block_hash,
+            expected_chain.len()
+        );
 
         let consensus = self.processor.consensus_manager.consensus();
         let session = consensus.session().await;
         let sink = session.async_get_sink().await;
-        let first_retained_parent = session.async_get_ghostdag_data(first_retained_block_hash).await?.selected_parent;
+        let first_replayable_parent = session.async_get_ghostdag_data(first_replayable_block_hash).await?.selected_parent;
 
-        if !session.async_is_chain_ancestor_of(first_retained_parent, sink).await? {
+        if !session.async_is_chain_ancestor_of(first_replayable_parent, sink).await? {
             return Err(AtomicTokenError::Processing(format!(
-                "startup state revalidation failed: retained root parent `{first_retained_parent}` is not on the current canonical chain"
+                "startup state revalidation failed: retained replay root parent `{first_replayable_parent}` is not on the current canonical chain"
             )));
         }
 
-        let replay_chain = session.async_get_virtual_chain_from_block(first_retained_parent, None).await?;
+        let replay_chain = session.async_get_virtual_chain_from_block(first_replayable_parent, None).await?;
         if !replay_chain.removed.is_empty() {
             return Err(AtomicTokenError::Processing(
-                "startup state revalidation failed: expected empty removed chain from retained root parent".to_string(),
+                "startup state revalidation failed: expected empty removed chain from retained replay root parent".to_string(),
             ));
         }
-        if replay_chain.added.first().copied() != Some(first_retained_block_hash) {
+        if replay_chain.added.first().copied() != Some(first_replayable_block_hash) {
             return Err(AtomicTokenError::Processing(format!(
-                "startup state revalidation failed: canonical replay path does not start at retained root `{first_retained_block_hash}`"
+                "startup state revalidation failed: canonical replay path does not start at retained replay root `{first_replayable_block_hash}`"
             )));
         }
+        info!(
+            "[{IDENT}] Cryptix Atomic startup state revalidation canonical replay path resolved: {} block(s), sink={}",
+            replay_chain.added.len(),
+            sink
+        );
 
+        info!(
+            "[{IDENT}] Cryptix Atomic startup state revalidation loading acceptance data for {} block(s)",
+            replay_chain.added.len()
+        );
         let acceptance_data = session.async_get_blocks_acceptance_data(replay_chain.added.clone(), None).await?;
         if acceptance_data.len() != replay_chain.added.len() {
             return Err(AtomicTokenError::Processing(format!(
@@ -723,41 +799,185 @@ impl AtomicTokenService {
                 replay_chain.added.len()
             )));
         }
+        info!(
+            "[{IDENT}] Cryptix Atomic startup state revalidation loaded acceptance data for {} block(s)",
+            acceptance_data.len()
+        );
         let auth_inputs = self.processor.collect_auth_inputs_for_added_blocks(&replay_chain.added).await?;
 
-        let mut staged_state = loaded_state;
+        let mut staged_state = loaded_state.clone();
         staged_state.degraded = false;
         staged_state.live_correct = false;
-        staged_state.rollback_snapshot_window_to_parent(first_retained_block_hash)?;
+        info!(
+            "[{IDENT}] Cryptix Atomic startup state revalidation rolling back retained replay window to parent of {}",
+            first_replayable_block_hash
+        );
+        staged_state.rollback_snapshot_window_to_parent(first_replayable_block_hash)?;
 
         let replay_notification = VirtualChainChangedNotification::new(
             Arc::new(replay_chain.added.clone()),
             Arc::new(Vec::new()),
             Arc::new(acceptance_data),
         );
+        info!(
+            "[{IDENT}] Cryptix Atomic startup state revalidation replaying {} block(s)",
+            replay_chain.added.len()
+        );
         staged_state.apply_virtual_chain_change(&replay_notification, &auth_inputs, &self.processor.consensus_manager).await?;
+        info!(
+            "[{IDENT}] Cryptix Atomic startup state revalidation replay completed; verifying retained state hashes"
+        );
 
         let matching_prefix_len =
             expected_chain.iter().zip(replay_chain.added.iter()).take_while(|(expected, actual)| expected == actual).count();
-        for block_hash in expected_chain.iter().take(matching_prefix_len).copied() {
-            let expected_state_hash = expected_hashes.get(&block_hash).copied().ok_or_else(|| {
-                AtomicTokenError::Processing(format!(
-                    "startup state revalidation failed: missing persisted state hash for retained block `{block_hash}`"
-                ))
-            })?;
-            let replayed_state_hash = staged_state.get_state_hash_at_block(block_hash).ok_or_else(|| {
-                AtomicTokenError::Processing(format!(
-                    "startup state revalidation failed: replay did not reproduce retained block `{block_hash}`"
-                ))
-            })?;
-            if replayed_state_hash != expected_state_hash {
-                return Err(AtomicTokenError::Processing(format!(
-                    "startup state revalidation failed: retained state hash mismatch at block `{block_hash}`"
-                )));
+        if matching_prefix_len == 0 {
+            return Err(AtomicTokenError::Processing(
+                "startup state revalidation failed: canonical replay path has no retained prefix match".to_string(),
+            ));
+        }
+        if matching_prefix_len < expected_chain.len() {
+            let diverged_block = expected_chain[matching_prefix_len];
+            return Err(AtomicTokenError::Processing(format!(
+                "startup state revalidation failed: canonical replay path diverged before retained block `{diverged_block}`"
+            )));
+        }
+        let mut migrated_legacy_hashes = 0usize;
+        let mut refresh_checkpoint_hashes = false;
+        let final_replayed_block_hash = expected_chain
+            .get(matching_prefix_len - 1)
+            .copied()
+            .ok_or_else(|| AtomicTokenError::Processing("startup state revalidation failed: empty matching replay prefix".to_string()))?;
+        let final_expected_state_hash = expected_hashes.get(&final_replayed_block_hash).copied().ok_or_else(|| {
+            AtomicTokenError::Processing(format!(
+                "startup state revalidation failed: missing persisted state hash for retained block `{final_replayed_block_hash}`"
+            ))
+        })?;
+        let final_replayed_state_hash = staged_state.get_state_hash_at_block(final_replayed_block_hash).ok_or_else(|| {
+            AtomicTokenError::Processing(format!(
+                "startup state revalidation failed: replay did not reproduce retained block `{final_replayed_block_hash}`"
+            ))
+        })?;
+        if final_replayed_state_hash != final_expected_state_hash {
+            let final_legacy_state_hash = staged_state
+                .get_legacy_state_hash_at_block_without_processed_ops(final_replayed_block_hash)
+                .ok_or_else(|| {
+                    AtomicTokenError::Processing(format!(
+                        "startup state revalidation failed: unable to compute legacy retained state hash at block `{final_replayed_block_hash}`"
+                    ))
+                })?;
+            if final_legacy_state_hash == final_expected_state_hash {
+                migrated_legacy_hashes = matching_prefix_len;
+                refresh_checkpoint_hashes = true;
+                info!(
+                    "[{IDENT}] Cryptix Atomic retained state hash checkpoints use the legacy pre-processed-ops hash format; final retained block verified, migrating {} checkpoint(s)",
+                    migrated_legacy_hashes
+                );
+            } else {
+                let recomputed_hashes = loaded_state.recompute_state_hashes_for_retained_segment(&expected_chain)?;
+                let recomputed_final_state_hash = recomputed_hashes.get(&final_replayed_block_hash).copied().ok_or_else(|| {
+                    AtomicTokenError::Processing(format!(
+                        "startup state revalidation failed: unable to recompute retained state hash for final block `{final_replayed_block_hash}`"
+                    ))
+                })?;
+                if recomputed_final_state_hash == final_replayed_state_hash {
+                    let stale_checkpoint_count = expected_chain
+                        .iter()
+                        .filter(|block_hash| {
+                            expected_hashes.get(block_hash).copied()
+                                != recomputed_hashes.get(block_hash).copied()
+                        })
+                        .count();
+                    refresh_checkpoint_hashes = true;
+                    warn!(
+                        "[{IDENT}] Cryptix Atomic startup state revalidation found {} stale retained checkpoint hash(es) after processed-op pruning; deterministic replay matched the recomputed pruned final checkpoint {}, so refreshing checkpoint cache. stored={}, replayed={}",
+                        stale_checkpoint_count,
+                        final_replayed_block_hash,
+                        short_hex_for_log(&final_expected_state_hash),
+                        short_hex_for_log(&final_replayed_state_hash)
+                    );
+                } else {
+                    return Err(AtomicTokenError::Processing(format!(
+                        "startup state revalidation failed: retained state hash mismatch at final retained block `{final_replayed_block_hash}`"
+                    )));
+                }
+            }
+        } else {
+            let mut stale_checkpoint_count = 0usize;
+            let mut first_stale_checkpoint = None;
+            let mut last_hash_check_log = Instant::now();
+            for (idx, block_hash) in expected_chain.iter().take(matching_prefix_len).copied().enumerate() {
+                let expected_state_hash = expected_hashes.get(&block_hash).copied().ok_or_else(|| {
+                    AtomicTokenError::Processing(format!(
+                        "startup state revalidation failed: missing persisted state hash for retained block `{block_hash}`"
+                    ))
+                })?;
+                let replayed_state_hash = staged_state.get_state_hash_at_block(block_hash).ok_or_else(|| {
+                    AtomicTokenError::Processing(format!(
+                        "startup state revalidation failed: replay did not reproduce retained block `{block_hash}`"
+                    ))
+                })?;
+                if replayed_state_hash != expected_state_hash {
+                    stale_checkpoint_count = stale_checkpoint_count.saturating_add(1);
+                    first_stale_checkpoint.get_or_insert((block_hash, expected_state_hash, replayed_state_hash));
+                }
+                if matching_prefix_len >= 1024 && last_hash_check_log.elapsed() >= ATOMIC_LONG_OPERATION_LOG_INTERVAL {
+                    info!(
+                        "[{IDENT}] Cryptix Atomic startup state revalidation hash-check progress: {}/{} checkpoint(s), stale={}",
+                        idx.saturating_add(1),
+                        matching_prefix_len,
+                        stale_checkpoint_count
+                    );
+                    last_hash_check_log = Instant::now();
+                }
+            }
+            if let Some((block_hash, stored_hash, replayed_hash)) = first_stale_checkpoint {
+                let legacy_hash_matches = staged_state
+                    .get_legacy_state_hash_at_block_without_processed_ops(block_hash)
+                    .map(|legacy_hash| legacy_hash == stored_hash)
+                    .unwrap_or(false);
+                refresh_checkpoint_hashes = true;
+                warn!(
+                    "[{IDENT}] Cryptix Atomic startup state revalidation found {} stale retained checkpoint hash(es); final retained checkpoint {} matched deterministic replay, so refreshing checkpoint cache. first_mismatch={}, stored={}, replayed={}, legacy_format_match={}",
+                    stale_checkpoint_count,
+                    final_replayed_block_hash,
+                    block_hash,
+                    short_hex_for_log(&stored_hash),
+                    short_hex_for_log(&replayed_hash),
+                    legacy_hash_matches
+                );
+            } else {
+                info!(
+                    "[{IDENT}] Cryptix Atomic startup state revalidation verified {} retained state hash checkpoint(s)",
+                    matching_prefix_len
+                );
+            }
+            if refresh_checkpoint_hashes {
+                info!(
+                    "[{IDENT}] Cryptix Atomic startup state revalidation verified final retained checkpoint {}; checkpoint cache will be refreshed from deterministic replay",
+                    final_replayed_block_hash
+                );
+            } else {
+                info!(
+                    "[{IDENT}] Cryptix Atomic startup state revalidation verified final retained checkpoint {}",
+                    final_replayed_block_hash
+                );
             }
         }
+        if migrated_legacy_hashes > 0 {
+            info!(
+                "[{IDENT}] migrated {} retained Atomic state hash checkpoint(s) from legacy pre-processed-ops hash format",
+                migrated_legacy_hashes
+            );
+        }
 
-        staged_state.prune_history(self.max_retained_blocks);
+        let pruned_processed_ops = staged_state.prune_history(self.max_retained_blocks);
+        if refresh_checkpoint_hashes || pruned_processed_ops {
+            let refreshed_count = staged_state.refresh_retained_state_hashes_from_current_state()?;
+            info!(
+                "[{IDENT}] Cryptix Atomic refreshed {} retained checkpoint hash(es) after deterministic replay/pruning",
+                refreshed_count
+            );
+        }
         staged_state.degraded = false;
         staged_state.live_correct = true;
 
@@ -765,6 +985,26 @@ impl AtomicTokenService {
         *state = staged_state;
         persist_state_to_path(&self.processor.state_path, &state)?;
         Ok(true)
+    }
+
+    async fn revalidate_loaded_state_once_per_process(&self) -> AtomicTokenResult<bool> {
+        if self.retained_revalidation_failed.load(Ordering::SeqCst) {
+            return Err(AtomicTokenError::Processing(
+                "retained-chain revalidation already failed in this process; remote snapshot bootstrap is required".to_string(),
+            ));
+        }
+
+        match self.revalidate_loaded_state().await {
+            Ok(true) => {
+                self.retained_revalidation_failed.store(false, Ordering::SeqCst);
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(err) => {
+                self.retained_revalidation_failed.store(true, Ordering::SeqCst);
+                Err(err)
+            }
+        }
     }
 
     async fn ensure_bootstrap_serving_ready(&self) -> AtomicTokenResult<()> {
@@ -813,8 +1053,12 @@ impl AtomicTokenService {
         }
 
         let fp_header = session.async_get_header(fp).await?;
-        if sink_header.blue_score.saturating_sub(fp_header.blue_score) < self.expected_finality_depth {
-            return Err(AtomicTokenError::Processing("snapshot export failed: finality depth sanity check failed".to_string()));
+        let finality_distance = sink_header.blue_score.saturating_sub(fp_header.blue_score);
+        if finality_distance < self.expected_finality_depth {
+            return Err(AtomicTokenError::Processing(format!(
+                "snapshot export failed: finality depth sanity check failed (distance {}, required {}, sink {}, finality point {})",
+                finality_distance, self.expected_finality_depth, sink, fp
+            )));
         }
 
         Ok((fp, fp_header.daa_score))
@@ -833,10 +1077,15 @@ impl AtomicTokenService {
         let _refresh_guard = self.snapshot_refresh_lock.lock().await;
         let (anchor_hash, _anchor_daa_score) = self.current_snapshot_anchor().await?;
         let anchor_hash_bytes = hash_to_array(anchor_hash);
+        let local_anchor_state_hash = {
+            let state = self.processor.state.lock().await;
+            state.materialize_view_at_block(anchor_hash).map(|view| view.state_hash)
+        };
         let already_present = list_snapshot_catalog(&self.snapshot_store_dir)?.into_iter().any(|entry| {
             entry.manifest.protocol_version == self.protocol_version
                 && entry.manifest.network_id == self.network_id
                 && entry.manifest.at_block_hash == anchor_hash_bytes
+                && Some(entry.manifest.state_hash_at_fp) == local_anchor_state_hash
         });
         if already_present {
             let _ = self.prune_bootstrap_snapshot_store();
@@ -852,7 +1101,8 @@ impl AtomicTokenService {
     pub async fn get_sc_bootstrap_sources(&self) -> AtomicTokenResult<Vec<ScBootstrapSource>> {
         self.ensure_bootstrap_serving_ready().await?;
 
-        if let Err(err) = self.ensure_current_bootstrap_snapshot().await {
+        let refresh_error = self.ensure_current_bootstrap_snapshot().await.err();
+        if let Some(err) = &refresh_error {
             trace!("[{IDENT}] skipping bootstrap snapshot refresh: {err}");
         }
 
@@ -871,6 +1121,11 @@ impl AtomicTokenService {
                 window_end_block_hash: BlockHash::from_bytes(entry.manifest.window_end_block_hash),
             })
             .collect::<Vec<_>>();
+        if sources.is_empty() {
+            if let Some(err) = refresh_error {
+                info!("[{IDENT}] Atomic bootstrap snapshot currently unavailable: {err}");
+            }
+        }
         sources.sort_by(|a, b| b.at_daa_score.cmp(&a.at_daa_score).then(b.at_block_hash.as_bytes().cmp(&a.at_block_hash.as_bytes())));
         Ok(sources)
     }
@@ -1123,7 +1378,14 @@ impl AtomicTokenService {
                 }
             }
 
-            staged_state.prune_history(self.max_retained_blocks);
+            let pruned_processed_ops = staged_state.prune_history(self.max_retained_blocks);
+            if pruned_processed_ops {
+                let refreshed_count = staged_state.refresh_retained_state_hashes_from_current_state()?;
+                info!(
+                    "[{IDENT}] Cryptix Atomic refreshed {} retained checkpoint hash(es) after snapshot import pruning",
+                    refreshed_count
+                );
+            }
             staged_state.live_correct = !staged_state.degraded;
             {
                 let mut live_state = self.processor.state.lock().await;
@@ -1148,9 +1410,10 @@ impl AsyncService for AtomicTokenService {
         trace!("{} starting", SERVICE_IDENT);
         let shutdown_signal = self.shutdown.listener.clone();
         Box::pin(async move {
-            match self.revalidate_loaded_state().await {
+            info!("[{IDENT}] Cryptix Atomic service task started");
+            match self.revalidate_loaded_state_once_per_process().await {
                 Ok(true) => info!("[{IDENT}] Cryptix Atomic startup state revalidation completed successfully"),
-                Ok(false) => {}
+                Ok(false) => info!("[{IDENT}] Cryptix Atomic startup state has no retained verified chain state yet; indexing will build from local virtual-chain updates"),
                 Err(err) => {
                     warn!("[{IDENT}] Cryptix Atomic startup state revalidation failed: {err}");
                     self.processor.mark_degraded_best_effort(&format!("startup state revalidation failed: {err}")).await;
