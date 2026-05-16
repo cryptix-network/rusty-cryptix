@@ -513,6 +513,24 @@ pub struct AtomicTokenState {
     holders_by_asset: HashMap<[u8; 32], HashSet<[u8; 32]>>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AtomicTokenStateFootprint {
+    pub assets: usize,
+    pub balances: usize,
+    pub nonces: usize,
+    pub anchor_counts: usize,
+    pub processed_ops: usize,
+    pub block_journals: usize,
+    pub state_hash_checkpoints: usize,
+    pub event_sequence_checkpoints: usize,
+    pub retained_blocks: usize,
+    pub events: usize,
+    pub liquidity_vault_outpoints: usize,
+    pub known_owner_addresses: usize,
+    pub owners_with_balances: usize,
+    pub assets_with_holders: usize,
+}
+
 impl AtomicTokenState {
     pub fn new(protocol_version: u16, network_id: String) -> Self {
         Self {
@@ -537,6 +555,25 @@ impl AtomicTokenState {
             known_owner_addresses: Default::default(),
             balances_by_owner: Default::default(),
             holders_by_asset: Default::default(),
+        }
+    }
+
+    pub fn footprint(&self) -> AtomicTokenStateFootprint {
+        AtomicTokenStateFootprint {
+            assets: self.assets.len(),
+            balances: self.balances.len(),
+            nonces: self.nonces.len(),
+            anchor_counts: self.anchor_counts.len(),
+            processed_ops: self.processed_ops.len(),
+            block_journals: self.block_journals.len(),
+            state_hash_checkpoints: self.state_hash_by_block.len(),
+            event_sequence_checkpoints: self.event_sequence_by_block.len(),
+            retained_blocks: self.applied_chain_order.len(),
+            events: self.events.len(),
+            liquidity_vault_outpoints: self.liquidity_vault_outpoints.len(),
+            known_owner_addresses: self.known_owner_addresses.len(),
+            owners_with_balances: self.balances_by_owner.len(),
+            assets_with_holders: self.holders_by_asset.len(),
         }
     }
 
@@ -2498,35 +2535,33 @@ impl AtomicTokenState {
     }
 
     pub fn indexed_balances_by_owner(&self, owner_id: [u8; 32], include_assets: bool) -> Vec<TokenOwnerBalanceEntry> {
-        self.balances_by_owner
-            .get(&owner_id)
-            .into_iter()
-            .flat_map(|asset_ids| asset_ids.iter().copied())
-            .filter_map(|asset_id| {
-                let balance = self.balances.get(&BalanceKey { asset_id, owner_id }).copied().unwrap_or(0);
-                if balance == 0 {
-                    return None;
-                }
-                let asset = if include_assets { self.assets.get(&asset_id).cloned() } else { None };
-                Some((asset_id, balance, asset))
-            })
-            .collect()
+        let Some(asset_ids) = self.balances_by_owner.get(&owner_id) else {
+            return Vec::new();
+        };
+        let mut entries = Vec::with_capacity(asset_ids.len());
+        for asset_id in asset_ids.iter().copied() {
+            let balance = self.balances.get(&BalanceKey { asset_id, owner_id }).copied().unwrap_or(0);
+            if balance == 0 {
+                continue;
+            }
+            let asset = if include_assets { self.assets.get(&asset_id).cloned() } else { None };
+            entries.push((asset_id, balance, asset));
+        }
+        entries
     }
 
     pub fn indexed_holders_by_asset(&self, asset_id: [u8; 32]) -> Vec<TokenHolderEntry> {
-        self.holders_by_asset
-            .get(&asset_id)
-            .into_iter()
-            .flat_map(|owner_ids| owner_ids.iter().copied())
-            .filter_map(|owner_id| {
-                let balance = self.balances.get(&BalanceKey { asset_id, owner_id }).copied().unwrap_or(0);
-                if balance > 0 {
-                    Some((owner_id, balance))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        let Some(owner_ids) = self.holders_by_asset.get(&asset_id) else {
+            return Vec::new();
+        };
+        let mut entries = Vec::with_capacity(owner_ids.len());
+        for owner_id in owner_ids.iter().copied() {
+            let balance = self.balances.get(&BalanceKey { asset_id, owner_id }).copied().unwrap_or(0);
+            if balance > 0 {
+                entries.push((owner_id, balance));
+            }
+        }
+        entries
     }
 
     pub fn indexed_liquidity_holder_addresses(

@@ -2,7 +2,8 @@ use crate::{
     error::{AtomicTokenError, AtomicTokenResult},
     state::{
         AtomicTokenHealth, AtomicTokenReadContext, AtomicTokenReadView, AtomicTokenRuntimeState, AtomicTokenSnapshot,
-        AtomicTokenState, LiquidityHolderAddressState, ProcessedOp, TokenAsset, TokenEvent, TokenHolderEntry, TokenOwnerBalanceEntry,
+        AtomicTokenState, AtomicTokenStateFootprint, LiquidityHolderAddressState, ProcessedOp, TokenAsset, TokenEvent,
+        TokenHolderEntry, TokenOwnerBalanceEntry,
     },
     IDENT,
 };
@@ -71,6 +72,7 @@ pub const MAX_BOOTSTRAP_REPLAY_WINDOW_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const BOOTSTRAP_STORE_MAX_SNAPSHOTS_PER_NETWORK: usize = 16;
 const ATOMIC_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const ATOMIC_LONG_OPERATION_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const ATOMIC_SLOW_PERSIST_LOG_THRESHOLD: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 struct SnapshotManifestV1 {
@@ -263,16 +265,26 @@ impl AtomicTokenProcessor {
                 health.bootstrap_in_progress = bootstrap_in_progress;
                 health.runtime_state = state.runtime_state(bootstrap_in_progress);
                 let retained_blocks = state.applied_chain_order.len();
+                let footprint = state.footprint();
+                let state_file_bytes = std::fs::metadata(&self.state_path).ok().map(|metadata| metadata.len());
                 drop(state);
 
-                self.maybe_log_progress(added_count, removed_count, retained_blocks, health);
+                self.maybe_log_progress(added_count, removed_count, retained_blocks, health, footprint, state_file_bytes);
                 Ok(())
             }
             _ => Ok(()),
         }
     }
 
-    fn maybe_log_progress(&self, added_count: usize, removed_count: usize, retained_blocks: usize, health: AtomicTokenHealth) {
+    fn maybe_log_progress(
+        &self,
+        added_count: usize,
+        removed_count: usize,
+        retained_blocks: usize,
+        health: AtomicTokenHealth,
+        footprint: AtomicTokenStateFootprint,
+        state_file_bytes: Option<u64>,
+    ) {
         if added_count == 0 && removed_count == 0 {
             return;
         }
@@ -292,7 +304,7 @@ impl AtomicTokenProcessor {
         progress_log.last_runtime_state = Some(health.runtime_state);
         let last_applied = health.last_applied_block.map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string());
         info!(
-            "[{IDENT}] Cryptix Atomic indexed chain progress: +{}/-{} blocks ({} processed since startup, {} retained), runtime={}, live_correct={}, last_applied={}, event_seq={}, state_hash={}",
+            "[{IDENT}] Cryptix Atomic indexed chain progress: +{}/-{} blocks ({} processed since startup, {} retained), runtime={}, live_correct={}, last_applied={}, event_seq={}, state_hash={}, assets={}, balances={}, nonces={}, events={}, processed_ops={}, journals={}, checkpoints={}, owners={}, holder_assets={}, state_file={}",
             added_count,
             removed_count,
             total_processed,
@@ -302,6 +314,16 @@ impl AtomicTokenProcessor {
             last_applied,
             health.last_sequence,
             short_hex_for_log(&health.current_state_hash),
+            footprint.assets,
+            footprint.balances,
+            footprint.nonces,
+            footprint.events,
+            footprint.processed_ops,
+            footprint.block_journals,
+            footprint.state_hash_checkpoints,
+            footprint.owners_with_balances,
+            footprint.assets_with_holders,
+            state_file_bytes.map(format_bytes_for_log).unwrap_or_else(|| "n/a".to_string()),
         );
     }
 
@@ -572,6 +594,8 @@ impl AtomicTokenService {
             persist_state_to_path(&state_path, &state)?;
         }
         state.rebuild_runtime_caches();
+        let state_file_bytes = std::fs::metadata(&state_path).ok().map(|metadata| metadata.len());
+        log_state_footprint("loaded", state.footprint(), state_file_bytes);
 
         let consensus_notify_channel = Channel::<ConsensusNotification>::default();
         let listener_id = consensus_notifier.register_new_listener(
@@ -1762,12 +1786,16 @@ fn load_state_from_path(path: &Path, protocol_version: u16, network_id: &str) ->
 }
 
 fn persist_state_to_path(path: &Path, state: &AtomicTokenState) -> AtomicTokenResult<()> {
+    let started = Instant::now();
     let parent = path
         .parent()
         .ok_or_else(|| AtomicTokenError::Processing("failed persisting Atomic state: state path has no parent".to_string()))?;
     std::fs::create_dir_all(parent)
         .map_err(|e| AtomicTokenError::Processing(format!("failed creating Atomic state parent directory: {e}")))?;
+    let encode_started = Instant::now();
     let bytes = bincode::serialize(state).map_err(|e| AtomicTokenError::Processing(format!("failed encoding Atomic state: {e}")))?;
+    let encode_elapsed = encode_started.elapsed();
+    let byte_len = bytes.len() as u64;
 
     let tmp_path = path.with_extension("tmp");
     {
@@ -1779,6 +1807,16 @@ fn persist_state_to_path(path: &Path, state: &AtomicTokenState) -> AtomicTokenRe
 
     replace_file_cross_platform(&tmp_path, path)?;
     sync_parent_directory(parent);
+    let total_elapsed = started.elapsed();
+    if total_elapsed >= ATOMIC_SLOW_PERSIST_LOG_THRESHOLD {
+        info!(
+            "[{IDENT}] slow Atomic state persist: size={}, encode_ms={}, total_ms={}, path={}",
+            format_bytes_for_log(byte_len),
+            encode_elapsed.as_millis(),
+            total_elapsed.as_millis(),
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -2090,6 +2128,43 @@ fn short_hex_for_log(data: &[u8]) -> String {
         return hex_encode(data);
     }
     format!("{}...{}", hex_encode(&data[..4]), hex_encode(&data[data.len() - 4..]))
+}
+
+fn format_bytes_for_log(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GIB {
+        format!("{:.2} GiB", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{:.2} MiB", bytes_f / MIB)
+    } else if bytes_f >= KIB {
+        format!("{:.2} KiB", bytes_f / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn log_state_footprint(label: &str, footprint: AtomicTokenStateFootprint, state_file_bytes: Option<u64>) {
+    info!(
+        "[{IDENT}] Cryptix Atomic state footprint ({label}): assets={}, balances={}, nonces={}, anchor_counts={}, processed_ops={}, journals={}, checkpoints={}, event_checkpoints={}, retained_blocks={}, events={}, vaults={}, known_owner_addresses={}, owners={}, holder_assets={}, state_file={}",
+        footprint.assets,
+        footprint.balances,
+        footprint.nonces,
+        footprint.anchor_counts,
+        footprint.processed_ops,
+        footprint.block_journals,
+        footprint.state_hash_checkpoints,
+        footprint.event_sequence_checkpoints,
+        footprint.retained_blocks,
+        footprint.events,
+        footprint.liquidity_vault_outpoints,
+        footprint.known_owner_addresses,
+        footprint.owners_with_balances,
+        footprint.assets_with_holders,
+        state_file_bytes.map(format_bytes_for_log).unwrap_or_else(|| "n/a".to_string())
+    );
 }
 
 fn token_finality_depth_for_network_type(network_type: NetworkType) -> u64 {
