@@ -760,7 +760,11 @@ impl FlowContext {
     }
 
     pub fn is_strong_node_claims_p2p_enabled(&self) -> bool {
-        self.strong_node_claims_engine.should_advertise_service_bit(self.is_payload_hf_active())
+        self.strong_node_claims_engine.runtime_available(self.is_payload_hf_active())
+    }
+
+    pub fn should_advertise_strong_node_claims_service_bit(&self) -> bool {
+        self.strong_node_claims_engine.should_advertise_service_bit()
     }
 
     pub fn has_valid_block_producer_claim(&self, block_hash: Hash) -> bool {
@@ -1346,7 +1350,7 @@ impl ConnectionInitializer for FlowContext {
         if self.is_hfa_p2p_enabled() {
             self_version_message.services |= HFA_P2P_SERVICE_BIT;
         }
-        if self.is_strong_node_claims_p2p_enabled() {
+        if self.should_advertise_strong_node_claims_service_bit() {
             self_version_message.services |= STRONG_NODE_CLAIMS_P2P_SERVICE_BIT;
         }
         self_version_message.services |= P2P_SERVICE_BIT_ATOMIC;
@@ -1444,7 +1448,7 @@ impl ConnectionInitializer for FlowContext {
         let peer_atomic_enabled = (peer_version.services & P2P_SERVICE_BIT_ATOMIC) != 0;
         let local_archival_enabled = self.config.is_archival;
         let peer_archival_enabled = (peer_version.services & P2P_SERVICE_BIT_ARCHIVAL) != 0;
-        let local_strong_node_claims_enabled = self.is_strong_node_claims_p2p_enabled();
+        let local_strong_node_claims_enabled = self.should_advertise_strong_node_claims_service_bit();
         let peer_strong_node_claims_enabled = (peer_version.services & STRONG_NODE_CLAIMS_P2P_SERVICE_BIT) != 0;
         if enforce_hardfork_core && !peer_atomic_enabled {
             return Err(ProtocolError::OtherOwned("peer missing mandatory atomic service bit after hardfork".to_string()));

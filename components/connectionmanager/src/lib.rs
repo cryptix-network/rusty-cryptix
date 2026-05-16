@@ -775,7 +775,7 @@ impl ConnectionManager {
             return;
         }
         if enabled {
-            warn!("AntiFraud runtime switched: OFF -> ON; reason: {}", reason);
+            info!("AntiFraud runtime switched: OFF -> ON; reason: {}", reason);
         } else {
             warn!("AntiFraud runtime switched: ON -> OFF; reason: {}", reason);
         }

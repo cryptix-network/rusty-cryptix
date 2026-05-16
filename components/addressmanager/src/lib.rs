@@ -93,7 +93,7 @@ impl AddressManager {
         let extender = if self.local_net_addresses.is_empty() && !self.config.disable_upnp {
             let (net_address, ExtendHelper { gateway, local_addr, external_port }) = match self.upnp() {
                 Err(err) => {
-                    warn!("[UPnP] Error adding port mapping: {err}");
+                    info!("[UPnP] Port mapping unavailable: {err}; continuing without automatic public port mapping");
                     return None;
                 }
                 Ok(None) => return None,
@@ -215,7 +215,7 @@ impl AddressManager {
                     continue;
                 }
                 Err(GetGenericPortMappingEntryError::RequestError(err)) => {
-                    warn!("[UPnP] request existing port mapping err: {:?}", err);
+                    info!("[UPnP] Requesting existing port mappings failed: {:?}; trying to add a mapping anyway", err);
                     break false;
                 }
                 Err(GetGenericPortMappingEntryError::SpecifiedArrayIndexInvalid) => break false,

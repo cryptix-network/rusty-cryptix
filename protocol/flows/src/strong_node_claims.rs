@@ -139,7 +139,14 @@ impl StrongNodeClaimsEngine {
         self.enabled
     }
 
-    pub fn should_advertise_service_bit(&self, hardfork_active: bool) -> bool {
+    pub fn should_advertise_service_bit(&self) -> bool {
+        // The service bit is a protocol capability, not a statement about the
+        // local virtual DAA score. Fresh nodes still need to advertise support so
+        // already post-HF peers can admit them for IBD.
+        self.enabled
+    }
+
+    pub fn runtime_available(&self, hardfork_active: bool) -> bool {
         self.enabled && hardfork_active
     }
 
@@ -286,7 +293,7 @@ impl StrongNodeClaimsEngine {
         StrongNodeClaimsRuntimeSnapshot {
             enabled: self.enabled,
             hardfork_active,
-            runtime_available: self.enabled && hardfork_active,
+            runtime_available: self.runtime_available(hardfork_active),
             window_size: CLAIM_WINDOW_SIZE_BLOCKS as u32,
             conflict_total: state.conflict_total,
             entries,
@@ -814,7 +821,8 @@ mod tests {
         std::fs::create_dir_all(&temp_dir).expect("failed creating temp dir");
         let engine = StrongNodeClaimsEngine::new(true, "devnet", &temp_dir);
 
-        assert!(!engine.should_advertise_service_bit(false), "service bit must remain disabled pre-HF");
+        assert!(engine.should_advertise_service_bit(), "service bit must advertise protocol capability before local IBD reaches HF");
+        assert!(!engine.runtime_available(false), "runtime must remain disabled pre-HF");
 
         let claim = build_signed_claim_message(
             2,

@@ -159,13 +159,13 @@ impl AtomicBootstrapService {
         let retry_interval_sec = retry_interval_sec.max(5);
         if flow_context.config.net.is_mainnet() {
             if disable_dns_seed_sources && allow_peer_majority_fallback_override {
-                warn!(
+                info!(
                     "[atomic-bootstrap] mainnet DNS seed bootstrap disabled by operator (--nodnsseed); peer-only fallback ENABLED by explicit override"
                 );
             } else if disable_dns_seed_sources {
-                warn!("[atomic-bootstrap] mainnet DNS seed bootstrap disabled by operator (--nodnsseed); peer-only fallback DISABLED");
+                info!("[atomic-bootstrap] mainnet DNS seed bootstrap disabled by operator (--nodnsseed); peer-only fallback DISABLED");
             } else if allow_peer_majority_fallback_override {
-                warn!("[atomic-bootstrap] mainnet peer-only fallback override ENABLED; used only when no seed source is reachable");
+                info!("[atomic-bootstrap] mainnet peer-only fallback override ENABLED; used only when no seed source is reachable");
             } else {
                 info!("[atomic-bootstrap] mainnet peer-only fallback override DISABLED");
             }
@@ -585,6 +585,10 @@ impl AtomicBootstrapService {
         let healthy_state = health.runtime_state == AtomicTokenRuntimeState::Healthy;
         let should_audit_healthy_state = if healthy_state { self.should_run_health_audit().await } else { false };
         if healthy_state && !should_audit_healthy_state {
+            return Ok(false);
+        }
+        if health.runtime_state == AtomicTokenRuntimeState::NotReady && !self.flow_context.is_payload_hf_active() {
+            trace!("[atomic-bootstrap] bootstrap deferred until payload hardfork is active locally");
             return Ok(false);
         }
 
