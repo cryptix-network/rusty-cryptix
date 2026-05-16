@@ -2719,6 +2719,11 @@ impl AtomicTokenState {
         }
         let events = self.events.iter().filter(|event| event.sequence <= view.event_sequence_cutoff).cloned().collect::<Vec<_>>();
 
+        let state_hash_at_window_start_parent = self
+            .materialize_view_at_block(window_start_parent_block_hash)
+            .map(|view| view.state_hash)
+            .or_else(|| self.state_hash_by_block.get(&window_start_parent_block_hash).copied());
+
         Ok(AtomicTokenSnapshot {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             protocol_version: self.protocol_version,
@@ -2726,7 +2731,7 @@ impl AtomicTokenState {
             at_block_hash,
             at_daa_score,
             state_hash_at_fp: view.state_hash,
-            state_hash_at_window_start_parent: self.state_hash_by_block.get(&window_start_parent_block_hash).copied(),
+            state_hash_at_window_start_parent,
             window_start_block_hash,
             window_start_parent_block_hash,
             window_end_block_hash,
@@ -4177,6 +4182,27 @@ mod tests {
         assert!(snapshot.state.state_hash_by_block.contains_key(&block2));
         assert!(snapshot.state.state_hash_by_block.contains_key(&block3));
         assert_eq!(snapshot.state_hash_at_window_start_parent, window_start_parent_hash);
+    }
+
+    #[test]
+    fn export_snapshot_parent_hash_uses_materialized_state_not_stale_cache() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let auth_inputs = HashMap::new();
+        let block1 = BlockHash::from_u64_word(7101);
+        let block2 = BlockHash::from_u64_word(7102);
+        let block3 = BlockHash::from_u64_word(7103);
+
+        apply_block(&mut state, block1, vec![], &auth_inputs);
+        let expected_parent_hash = state.materialize_view_at_block(block1).expect("parent view should materialize").state_hash;
+        let stale_parent_hash = [9u8; 32];
+        state.state_hash_by_block.insert(block1, stale_parent_hash);
+        apply_block(&mut state, block2, vec![], &auth_inputs);
+        apply_block(&mut state, block3, vec![], &auth_inputs);
+
+        let snapshot = state.export_snapshot(block3, 77, block1, &[block2, block3]).expect("snapshot export must succeed");
+
+        assert_eq!(snapshot.state_hash_at_window_start_parent, Some(expected_parent_hash));
+        assert_ne!(snapshot.state_hash_at_window_start_parent, Some(stale_parent_hash));
     }
 
     #[test]

@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::atomic_bootstrap::{
-    AtomicBootstrapService, ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES, ATOMIC_BOOTSTRAP_REQUIRED_NON_SEED_SOURCES,
-    ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES,
+    AtomicBootstrapService, ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES,
+    ATOMIC_BOOTSTRAP_DEFAULT_SEED_CONFIRMED_NON_SEED_SOURCES, ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES,
 };
 use async_channel::unbounded;
 use cryptix_atomicindex::service::AtomicTokenService;
@@ -305,15 +305,22 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     info!("Payload HF activation DAA score: {}", config.params.payload_hf_activation_daa_score);
     info!("Cryptix Atomic Token v1: ENABLED");
     info!("Cryptix Atomic bootstrap worker: ENABLED; configured peer overrides: {}", args.atomic_bootstrap_peers.len());
-    let atomic_bootstrap_peer_quorum_min_sources =
+    let atomic_bootstrap_seed_confirmed_non_seed_min_sources =
+        args.atomic_bootstrap_peer_quorum_min_sources.unwrap_or(ATOMIC_BOOTSTRAP_DEFAULT_SEED_CONFIRMED_NON_SEED_SOURCES);
+    let atomic_bootstrap_peer_only_non_seed_min_sources =
         args.atomic_bootstrap_peer_quorum_min_sources.unwrap_or(ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES);
     info!(
         "Cryptix Atomic bootstrap quorum: default requires >= {} seed source(s) + >= {} independent peer/non-seed source(s)",
-        ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES, ATOMIC_BOOTSTRAP_REQUIRED_NON_SEED_SOURCES
+        ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES, ATOMIC_BOOTSTRAP_DEFAULT_SEED_CONFIRMED_NON_SEED_SOURCES
+    );
+    info!(
+        "Cryptix Atomic seed-confirmed bootstrap quorum: minimum independent peer/non-seed sources = {}{}",
+        atomic_bootstrap_seed_confirmed_non_seed_min_sources,
+        if args.atomic_bootstrap_peer_quorum_min_sources.is_some() { " (operator override)" } else { "" }
     );
     info!(
         "Cryptix Atomic peer-only bootstrap quorum: minimum independent peer/non-seed sources = {}{}",
-        atomic_bootstrap_peer_quorum_min_sources,
+        atomic_bootstrap_peer_only_non_seed_min_sources,
         if args.atomic_bootstrap_peer_quorum_min_sources.is_some() { " (operator override)" } else { "" }
     );
     info!("Cryptix Atomic bootstrap attestation policy: seed/peer quorum; manifests are not signer-attested");

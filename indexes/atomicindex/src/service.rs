@@ -1077,16 +1077,17 @@ impl AtomicTokenService {
         let _refresh_guard = self.snapshot_refresh_lock.lock().await;
         let (anchor_hash, _anchor_daa_score) = self.current_snapshot_anchor().await?;
         let anchor_hash_bytes = hash_to_array(anchor_hash);
-        let local_anchor_state_hash = {
+        let already_present = {
             let state = self.processor.state.lock().await;
-            state.materialize_view_at_block(anchor_hash).map(|view| view.state_hash)
+            let local_anchor_state_hash = state.materialize_view_at_block(anchor_hash).map(|view| view.state_hash);
+            list_snapshot_catalog(&self.snapshot_store_dir)?.into_iter().any(|entry| {
+                entry.manifest.protocol_version == self.protocol_version
+                    && entry.manifest.network_id == self.network_id
+                    && entry.manifest.at_block_hash == anchor_hash_bytes
+                    && Some(entry.manifest.state_hash_at_fp) == local_anchor_state_hash
+                    && cached_snapshot_parent_checkpoint_matches_current_state(&entry, &state)
+            })
         };
-        let already_present = list_snapshot_catalog(&self.snapshot_store_dir)?.into_iter().any(|entry| {
-            entry.manifest.protocol_version == self.protocol_version
-                && entry.manifest.network_id == self.network_id
-                && entry.manifest.at_block_hash == anchor_hash_bytes
-                && Some(entry.manifest.state_hash_at_fp) == local_anchor_state_hash
-        });
         if already_present {
             let _ = self.prune_bootstrap_snapshot_store();
             return Ok(());
@@ -1340,12 +1341,16 @@ impl AtomicTokenService {
             let mut staged_state = { self.processor.state.lock().await.clone() };
             staged_state.import_snapshot(snapshot.clone())?;
             staged_state.rollback_snapshot_window_to_parent(snapshot.window_start_block_hash)?;
+            let mut window_start_parent_hash_mismatch = false;
             if let Some(expected_hash) = snapshot.state_hash_at_window_start_parent {
                 let current_hash = staged_state.compute_state_hash();
                 if current_hash != expected_hash {
-                    return Err(AtomicTokenError::Processing(
-                        "snapshot import failed: state hash mismatch at window_start parent".to_string(),
-                    ));
+                    window_start_parent_hash_mismatch = true;
+                    warn!(
+                        "[{IDENT}] Atomic snapshot window_start parent checkpoint hash mismatch; continuing to verify replay at snapshot anchor. stored={}, replayed={}",
+                        short_hex_for_log(&expected_hash),
+                        short_hex_for_log(&current_hash)
+                    );
                 }
             }
 
@@ -1374,6 +1379,12 @@ impl AtomicTokenService {
                         return Err(AtomicTokenError::Processing(
                             "snapshot import failed: state hash mismatch at snapshot finality point".to_string(),
                         ));
+                    }
+                    if window_start_parent_hash_mismatch {
+                        info!(
+                            "[{IDENT}] Atomic snapshot parent checkpoint mismatch ignored after deterministic replay matched snapshot anchor {}",
+                            snapshot.at_block_hash
+                        );
                     }
                 }
             }
@@ -1411,12 +1422,19 @@ impl AsyncService for AtomicTokenService {
         let shutdown_signal = self.shutdown.listener.clone();
         Box::pin(async move {
             info!("[{IDENT}] Cryptix Atomic service task started");
-            match self.revalidate_loaded_state_once_per_process().await {
-                Ok(true) => info!("[{IDENT}] Cryptix Atomic startup state revalidation completed successfully"),
-                Ok(false) => info!("[{IDENT}] Cryptix Atomic startup state has no retained verified chain state yet; indexing will build from local virtual-chain updates"),
-                Err(err) => {
-                    warn!("[{IDENT}] Cryptix Atomic startup state revalidation failed: {err}");
-                    self.processor.mark_degraded_best_effort(&format!("startup state revalidation failed: {err}")).await;
+            let startup_health = self.get_health().await;
+            if startup_health.runtime_state == AtomicTokenRuntimeState::Degraded {
+                info!(
+                    "[{IDENT}] Cryptix Atomic startup state is degraded; deferring retained-chain revalidation to bootstrap worker so remote snapshot repair can be tried first"
+                );
+            } else {
+                match self.revalidate_loaded_state_once_per_process().await {
+                    Ok(true) => info!("[{IDENT}] Cryptix Atomic startup state revalidation completed successfully"),
+                    Ok(false) => info!("[{IDENT}] Cryptix Atomic startup state has no retained verified chain state yet; indexing will build from local virtual-chain updates"),
+                    Err(err) => {
+                        warn!("[{IDENT}] Cryptix Atomic startup state revalidation failed: {err}");
+                        self.processor.mark_degraded_best_effort(&format!("startup state revalidation failed: {err}")).await;
+                    }
                 }
             }
 
@@ -1914,6 +1932,53 @@ fn list_snapshot_catalog(snapshot_store_dir: &Path) -> AtomicTokenResult<Vec<Sna
         entries.push(SnapshotCatalogEntry { snapshot_id_hex, snapshot_path, manifest, manifest_bytes });
     }
     Ok(entries)
+}
+
+fn cached_snapshot_parent_checkpoint_matches_current_state(entry: &SnapshotCatalogEntry, state: &AtomicTokenState) -> bool {
+    let snapshot_bytes = match std::fs::read(&entry.snapshot_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            trace!(
+                "[{IDENT}] ignoring cached Atomic bootstrap snapshot `{}`: failed reading snapshot file: {err}",
+                entry.snapshot_path.display()
+            );
+            return false;
+        }
+    };
+    let snapshot: AtomicTokenSnapshot = match bincode::deserialize(&snapshot_bytes) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            trace!(
+                "[{IDENT}] ignoring cached Atomic bootstrap snapshot `{}`: failed decoding snapshot file: {err}",
+                entry.snapshot_path.display()
+            );
+            return false;
+        }
+    };
+
+    if hash_to_array(snapshot.at_block_hash) != entry.manifest.at_block_hash
+        || hash_to_array(snapshot.window_start_parent_block_hash) != entry.manifest.window_start_parent_block_hash
+    {
+        trace!(
+            "[{IDENT}] ignoring cached Atomic bootstrap snapshot `{}`: snapshot metadata does not match manifest",
+            entry.snapshot_path.display()
+        );
+        return false;
+    }
+
+    let expected_parent_hash = state
+        .materialize_view_at_block(snapshot.window_start_parent_block_hash)
+        .map(|view| view.state_hash)
+        .or_else(|| state.state_hash_by_block.get(&snapshot.window_start_parent_block_hash).copied());
+    if snapshot.state_hash_at_window_start_parent != expected_parent_hash {
+        trace!(
+            "[{IDENT}] ignoring cached Atomic bootstrap snapshot `{}`: stale window_start parent checkpoint",
+            entry.snapshot_path.display()
+        );
+        return false;
+    }
+
+    true
 }
 
 fn remove_file_if_exists(path: &Path) -> AtomicTokenResult<()> {

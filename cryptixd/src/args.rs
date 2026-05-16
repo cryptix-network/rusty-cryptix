@@ -396,7 +396,7 @@ pub fn cli() -> Command {
                 .value_name("N")
                 .require_equals(true)
                 .value_parser(clap::value_parser!(usize))
-                .help("Override the minimum independent non-seed sources required for peer-only Atomic bootstrap quorum. Values below 3 are intended for private/testing networks."),
+                .help("Override the minimum independent non-seed sources required for Atomic bootstrap quorum. On mainnet this applies to seed-confirmed quorum as >=1 seed + >=N non-seed sources and to peer-only fallback. Values below 3 are intended for private/testing networks."),
         )
         .arg(
             Arg::new("max-tracked-addresses")
