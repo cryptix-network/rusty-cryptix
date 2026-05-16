@@ -1,8 +1,8 @@
 use crate::{
     error::{AtomicTokenError, AtomicTokenResult},
     state::{
-        AtomicTokenHealth, AtomicTokenReadContext, AtomicTokenReadView, AtomicTokenSnapshot, AtomicTokenState,
-        LiquidityHolderAddressState, ProcessedOp, TokenAsset, TokenEvent, TokenHolderEntry, TokenOwnerBalanceEntry,
+        AtomicTokenHealth, AtomicTokenReadContext, AtomicTokenReadView, AtomicTokenRuntimeState, AtomicTokenSnapshot,
+        AtomicTokenState, LiquidityHolderAddressState, ProcessedOp, TokenAsset, TokenEvent, TokenHolderEntry, TokenOwnerBalanceEntry,
     },
     IDENT,
 };
@@ -35,13 +35,18 @@ use cryptix_core::{
 };
 use cryptix_notify::{connection::ChannelType, listener::ListenerLifespan, scope::VirtualChainChangedScope};
 use cryptix_utils::{channel::Channel, triggers::SingleTrigger};
+use hex::encode as hex_encode;
 use std::{
     collections::HashMap,
     fs::File,
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::Path,
     path::PathBuf,
-    sync::{atomic::AtomicBool, atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
+    },
+    time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
 
@@ -64,6 +69,7 @@ const SNAPSHOT_CHUNK_SIZE_MAX: usize = 4 * 1024 * 1024;
 pub const MAX_BOOTSTRAP_SNAPSHOT_FILE_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub const MAX_BOOTSTRAP_REPLAY_WINDOW_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const BOOTSTRAP_STORE_MAX_SNAPSHOTS_PER_NETWORK: usize = 16;
+const ATOMIC_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 struct SnapshotManifestV1 {
@@ -144,8 +150,16 @@ struct AtomicTokenProcessor {
     max_retained_blocks: usize,
     operation_lock: Mutex<()>,
     bootstrap_in_progress: AtomicBool,
+    processed_chain_blocks: AtomicU64,
+    progress_log: StdMutex<AtomicProgressLogState>,
     state: Mutex<AtomicTokenState>,
     state_path: PathBuf,
+}
+
+#[derive(Default)]
+struct AtomicProgressLogState {
+    last_log: Option<Instant>,
+    last_runtime_state: Option<AtomicTokenRuntimeState>,
 }
 
 impl AtomicTokenProcessor {
@@ -160,6 +174,8 @@ impl AtomicTokenProcessor {
             max_retained_blocks,
             operation_lock: Default::default(),
             bootstrap_in_progress: AtomicBool::new(false),
+            processed_chain_blocks: AtomicU64::new(0),
+            progress_log: Default::default(),
             state: Mutex::new(state),
             state_path,
         }
@@ -188,6 +204,8 @@ impl AtomicTokenProcessor {
         match notification {
             ConsensusNotification::UtxosChanged(_) => Ok(()),
             ConsensusNotification::VirtualChainChanged(msg) => {
+                let added_count = msg.added_chain_block_hashes.len();
+                let removed_count = msg.removed_chain_block_hashes.len();
                 let auth_inputs_snapshot = match self.collect_auth_inputs_for_added_blocks(msg.added_chain_block_hashes.as_ref()).await
                 {
                     Ok(value) => value,
@@ -216,10 +234,51 @@ impl AtomicTokenProcessor {
                     let _ = persist_state_to_path(&self.state_path, &state);
                     return Err(err);
                 }
+                let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
+                let mut health = state.get_health();
+                health.bootstrap_in_progress = bootstrap_in_progress;
+                health.runtime_state = state.runtime_state(bootstrap_in_progress);
+                let retained_blocks = state.applied_chain_order.len();
+                drop(state);
+
+                self.maybe_log_progress(added_count, removed_count, retained_blocks, health);
                 Ok(())
             }
             _ => Ok(()),
         }
+    }
+
+    fn maybe_log_progress(&self, added_count: usize, removed_count: usize, retained_blocks: usize, health: AtomicTokenHealth) {
+        if added_count == 0 && removed_count == 0 {
+            return;
+        }
+
+        let total_processed =
+            self.processed_chain_blocks.fetch_add(added_count as u64, Ordering::SeqCst).saturating_add(added_count as u64);
+        let now = Instant::now();
+        let mut progress_log = self.progress_log.lock().expect("Atomic progress log mutex poisoned");
+        let state_changed = progress_log.last_runtime_state != Some(health.runtime_state);
+        let should_log_by_time =
+            progress_log.last_log.map(|last_log| now.duration_since(last_log) >= ATOMIC_PROGRESS_LOG_INTERVAL).unwrap_or(true);
+        if !state_changed && !should_log_by_time {
+            return;
+        }
+
+        progress_log.last_log = Some(now);
+        progress_log.last_runtime_state = Some(health.runtime_state);
+        let last_applied = health.last_applied_block.map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string());
+        info!(
+            "[{IDENT}] Cryptix Atomic indexed chain progress: +{}/-{} blocks ({} processed since startup, {} retained), runtime={}, live_correct={}, last_applied={}, event_seq={}, state_hash={}",
+            added_count,
+            removed_count,
+            total_processed,
+            retained_blocks,
+            health.runtime_state.as_str(),
+            health.live_correct,
+            last_applied,
+            health.last_sequence,
+            short_hex_for_log(&health.current_state_hash),
+        );
     }
 
     async fn state_hash(&self) -> [u8; 32] {
@@ -1681,6 +1740,16 @@ fn validate_startup_constraints(config: &Config) -> AtomicTokenResult<()> {
     }
 
     Ok(())
+}
+
+fn short_hex_for_log(data: &[u8]) -> String {
+    if data.is_empty() {
+        return "<empty>".to_string();
+    }
+    if data.len() <= 8 {
+        return hex_encode(data);
+    }
+    format!("{}...{}", hex_encode(&data[..4]), hex_encode(&data[data.len() - 4..]))
 }
 
 fn token_finality_depth_for_network_type(network_type: NetworkType) -> u64 {
