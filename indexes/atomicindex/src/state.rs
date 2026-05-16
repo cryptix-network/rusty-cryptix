@@ -1046,6 +1046,7 @@ impl AtomicTokenState {
         if parsed.header.nonce != expected_nonce {
             return Err(NoopReason::BadNonce);
         }
+        let next_nonce = expected_nonce.checked_add(1).ok_or(NoopReason::BadNonce)?;
         if !spent_vault_inputs.is_empty() {
             match &parsed.op {
                 TokenOp::BuyLiquidityExactIn(_) | TokenOp::SellLiquidityExactIn(_) | TokenOp::ClaimLiquidityFees(_) => {}
@@ -1105,7 +1106,7 @@ impl AtomicTokenState {
         }
 
         self.record_nonce_before(nonce_key, journal);
-        self.nonces.insert(nonce_key, expected_nonce + 1);
+        self.nonces.insert(nonce_key, next_nonce);
         Ok(details)
     }
 
@@ -3214,6 +3215,30 @@ mod tests {
         assert!(!state.processed_ops.contains_key(&txid));
         assert!(!state.assets.contains_key(&hash_bytes(txid)));
         assert_eq!(state.next_event_sequence, 0);
+    }
+
+    #[test]
+    fn nonce_overflow_is_rejected_before_index_mutation() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let owner_script = test_script(8);
+        let owner_id = owner_id(&state, &owner_script);
+        let outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(2234), 0);
+        state.nonces.insert(NonceKey::owner(owner_id), u64::MAX);
+
+        let payload = payload_create_asset(0, u64::MAX, 8, owner_id, b"Overflow", b"OVF", b"");
+        let tx = token_tx(outpoint, owner_script.clone(), payload);
+        let txid = tx.id();
+        let mut auth_inputs = HashMap::new();
+        auth_inputs.insert(outpoint, UtxoEntry::new(1000, owner_script, 0, false));
+
+        apply_block(&mut state, BlockHash::from_u64_word(5321), vec![tx_ref(tx, BlockHash::from_u64_word(5000), 0, 0)], &auth_inputs);
+
+        assert!(state.degraded, "accepted nonce-overflow CAT op must fail closed");
+        assert!(!state.assets.contains_key(&hash_bytes(txid)), "overflowing nonce must be rejected before asset mutation");
+        assert_eq!(state.get_owner_nonce(owner_id), u64::MAX);
+        let processed = state.processed_ops.get(&txid).expect("overflowing tx should be recorded as noop");
+        assert_eq!(processed.apply_status, ApplyStatus::Noop);
+        assert_eq!(processed.noop_reason, NoopReason::InternalMalformedAcceptance);
     }
 
     #[test]

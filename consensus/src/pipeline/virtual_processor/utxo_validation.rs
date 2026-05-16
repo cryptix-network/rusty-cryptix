@@ -888,6 +888,14 @@ impl VirtualStateProcessor {
                 parsed_payload.nonce
             )));
         }
+        let Some(next_nonce) = expected_nonce.checked_add(1) else {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "nonce progression overflow for owner `{}` scope `{}` `{}`",
+                faster_hex::hex_string(&nonce_key.owner_id),
+                nonce_key.scope_kind,
+                faster_hex::hex_string(&nonce_key.scope_id)
+            )));
+        };
 
         if !spent_vault_inputs.is_empty() {
             match &parsed_payload.op {
@@ -913,14 +921,6 @@ impl VirtualStateProcessor {
         self.validate_replacement_anchor(tx, owner_id, atomic_state)?;
         self.apply_atomic_op_to_state(tx, tx.tx().id().as_bytes(), owner_id, parsed_payload.op, atomic_state)?;
 
-        let Some(next_nonce) = expected_nonce.checked_add(1) else {
-            return Err(TxRuleError::InvalidAtomicPayload(format!(
-                "nonce progression overflow for owner `{}` scope `{}` `{}`",
-                faster_hex::hex_string(&nonce_key.owner_id),
-                nonce_key.scope_kind,
-                faster_hex::hex_string(&nonce_key.scope_id)
-            )));
-        };
         atomic_state.next_nonces.insert(nonce_key, next_nonce);
         self.apply_anchor_deltas_to_atomic_state(tx, atomic_state);
         Ok(())
