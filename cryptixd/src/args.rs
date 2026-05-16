@@ -58,6 +58,7 @@ pub struct Args {
     #[serde(rename = "atomic-bootstrap-peer")]
     pub atomic_bootstrap_peers: Vec<ContextualNetAddress>,
     pub atomic_bootstrap_allow_peer_fallback: bool,
+    pub atomic_bootstrap_peer_quorum_min_sources: Option<usize>,
     pub reset_db: bool,
     #[serde(rename = "outpeers")]
     pub outbound_target: usize,
@@ -121,6 +122,7 @@ impl Default for Args {
             atomic_unsafe_skip_snapshot_finality_check: false,
             atomic_bootstrap_peers: vec![],
             atomic_bootstrap_allow_peer_fallback: false,
+            atomic_bootstrap_peer_quorum_min_sources: None,
             reset_db: false,
             outbound_target: 8,
             inbound_limit: 128,
@@ -388,6 +390,15 @@ pub fn cli() -> Command {
                 .help("Enable peer-only Atomic bootstrap fallback when no seed source is reachable or DNS seeds are disabled (mainnet safety override; disabled by default)."),
         )
         .arg(
+            Arg::new("atomic-bootstrap-peer-quorum-min-sources")
+                .long("atomic-bootstrap-peer-quorum-min-sources")
+                .visible_alias("atomic-bootstrap-peer-quorum")
+                .value_name("N")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(usize))
+                .help("Override the minimum independent non-seed sources required for peer-only Atomic bootstrap quorum. Values below 3 are intended for private/testing networks."),
+        )
+        .arg(
             Arg::new("max-tracked-addresses")
                 .long("max-tracked-addresses")
                 .require_equals(true)
@@ -613,6 +624,10 @@ impl Args {
                 "atomic-bootstrap-allow-peer-fallback",
                 defaults.atomic_bootstrap_allow_peer_fallback,
             ),
+            atomic_bootstrap_peer_quorum_min_sources: m
+                .get_one::<usize>("atomic-bootstrap-peer-quorum-min-sources")
+                .copied()
+                .or(defaults.atomic_bootstrap_peer_quorum_min_sources),
             testnet: arg_match_unwrap_or::<bool>(&m, "testnet", defaults.testnet),
             testnet_suffix: defaults.testnet_suffix,
             devnet: arg_match_unwrap_or::<bool>(&m, "devnet", defaults.devnet),
@@ -704,5 +719,18 @@ mod tests {
     fn antifraud_no_seed_alias_disables_seed_fetch() {
         let args = Args::parse(["cryptixd", "--antifraud-no-seed"]).expect("alias args should parse");
         assert!(!args.banserver);
+    }
+
+    #[test]
+    fn atomic_bootstrap_peer_quorum_min_sources_parses() {
+        let args =
+            Args::parse(["cryptixd", "--atomic-bootstrap-peer-quorum-min-sources=1"]).expect("quorum override args should parse");
+        assert_eq!(args.atomic_bootstrap_peer_quorum_min_sources, Some(1));
+    }
+
+    #[test]
+    fn atomic_bootstrap_peer_quorum_alias_parses() {
+        let args = Args::parse(["cryptixd", "--atomic-bootstrap-peer-quorum=2"]).expect("quorum alias args should parse");
+        assert_eq!(args.atomic_bootstrap_peer_quorum_min_sources, Some(2));
     }
 }

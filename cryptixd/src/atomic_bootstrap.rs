@@ -45,6 +45,7 @@ pub(crate) const ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES: usize = 1;
 pub(crate) const ATOMIC_BOOTSTRAP_REQUIRED_NON_SEED_SOURCES: usize = 2;
 pub(crate) const ATOMIC_BOOTSTRAP_REQUIRED_TOTAL_SOURCES: usize =
     ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES + ATOMIC_BOOTSTRAP_REQUIRED_NON_SEED_SOURCES;
+pub(crate) const ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES: usize = ATOMIC_BOOTSTRAP_REQUIRED_TOTAL_SOURCES;
 const MAX_MANIFEST_HEX_LEN: usize = 4 * 1024 * 1024;
 const MAX_ALLOWED_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
 const MAX_SNAPSHOT_FILE_SIZE_BYTES: u64 = MAX_BOOTSTRAP_SNAPSHOT_FILE_SIZE_BYTES;
@@ -123,6 +124,7 @@ struct SnapshotQuorumDecision {
 struct SnapshotQuorumPolicy {
     allow_peer_majority_fallback: bool,
     require_seed_confirmed_if_any_seed: bool,
+    peer_majority_min_sources: usize,
 }
 
 struct BootstrapSelection {
@@ -143,6 +145,7 @@ pub struct AtomicBootstrapService {
     bootstrap_attempt_lock: Mutex<()>,
     source_penalties: Mutex<HashMap<String, SourcePenalty>>,
     allow_peer_majority_fallback_override: bool,
+    peer_majority_min_sources: usize,
     shutdown: SingleTrigger,
 }
 
@@ -155,8 +158,14 @@ impl AtomicBootstrapService {
         retry_interval_sec: u64,
         atomic_data_dir: PathBuf,
         allow_peer_majority_fallback_override: bool,
+        peer_majority_min_sources_override: Option<usize>,
     ) -> Result<Self, String> {
         let retry_interval_sec = retry_interval_sec.max(5);
+        let peer_majority_min_sources =
+            peer_majority_min_sources_override.unwrap_or(ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES);
+        if peer_majority_min_sources == 0 {
+            return Err("Atomic peer-only bootstrap quorum minimum must be greater than 0".to_string());
+        }
         if flow_context.config.net.is_mainnet() {
             if disable_dns_seed_sources && allow_peer_majority_fallback_override {
                 info!(
@@ -170,6 +179,12 @@ impl AtomicBootstrapService {
                 info!("[atomic-bootstrap] mainnet peer-only fallback override DISABLED");
             }
         }
+        if let Some(override_value) = peer_majority_min_sources_override {
+            info!(
+                "[atomic-bootstrap] peer-only quorum minimum overridden: {} independent non-seed source(s) (default: {})",
+                override_value, ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES
+            );
+        }
         Ok(Self {
             atomic_token_service,
             flow_context,
@@ -181,6 +196,7 @@ impl AtomicBootstrapService {
             bootstrap_attempt_lock: Default::default(),
             source_penalties: Default::default(),
             allow_peer_majority_fallback_override,
+            peer_majority_min_sources,
             shutdown: Default::default(),
         })
     }
@@ -190,6 +206,7 @@ impl AtomicBootstrapService {
             self.flow_context.config.net.is_mainnet(),
             self.disable_dns_seed_sources,
             self.allow_peer_majority_fallback_override,
+            self.peer_majority_min_sources,
         )
     }
 
@@ -198,7 +215,10 @@ impl AtomicBootstrapService {
             if self.flow_context.config.net.is_mainnet() && !self.allow_peer_majority_fallback_override {
                 "no compatible bootstrap sources found (DNS seed bootstrap disabled by --nodnsseed; mainnet peer-only fallback is disabled unless --atomic-bootstrap-allow-peer-fallback is explicitly set)".to_string()
             } else {
-                "no compatible bootstrap sources found (DNS seed bootstrap disabled by --nodnsseed; add manual peers and/or at least 3 independent --atomic-bootstrap-peer sources for peer-only quorum)".to_string()
+                format!(
+                    "no compatible bootstrap sources found (DNS seed bootstrap disabled by --nodnsseed; add manual peers and/or at least {} independent --atomic-bootstrap-peer source(s) for peer-only quorum)",
+                    self.peer_majority_min_sources
+                )
             }
         } else {
             "no compatible bootstrap sources found".to_string()
@@ -378,6 +398,7 @@ impl AtomicBootstrapService {
             evidence,
             quorum_policy.allow_peer_majority_fallback,
             quorum_policy.require_seed_confirmed_if_any_seed,
+            quorum_policy.peer_majority_min_sources,
         )
         .map_err(|err| format!("atomic consensus state hash quorum unavailable for `{block_hash}`: {err}"))?;
 
@@ -718,6 +739,7 @@ impl AtomicBootstrapService {
             evidence,
             quorum_policy.allow_peer_majority_fallback,
             quorum_policy.require_seed_confirmed_if_any_seed,
+            quorum_policy.peer_majority_min_sources,
         )?;
         let mut selected_sources: Vec<SourceClient> = Vec::new();
         let mut selected_by_identity = HashMap::<String, usize>::new();
@@ -1332,14 +1354,21 @@ fn snapshot_quorum_policy_for_network(
     is_mainnet: bool,
     _disable_dns_seed_sources: bool,
     allow_peer_majority_fallback_override: bool,
+    peer_majority_min_sources: usize,
 ) -> SnapshotQuorumPolicy {
+    let peer_majority_min_sources = peer_majority_min_sources.max(1);
     if is_mainnet {
         SnapshotQuorumPolicy {
             allow_peer_majority_fallback: allow_peer_majority_fallback_override,
             require_seed_confirmed_if_any_seed: true,
+            peer_majority_min_sources,
         }
     } else {
-        SnapshotQuorumPolicy { allow_peer_majority_fallback: true, require_seed_confirmed_if_any_seed: false }
+        SnapshotQuorumPolicy {
+            allow_peer_majority_fallback: true,
+            require_seed_confirmed_if_any_seed: false,
+            peer_majority_min_sources,
+        }
     }
 }
 
@@ -1347,6 +1376,7 @@ fn select_snapshot_quorum(
     evidence: Vec<SnapshotSupportEvidence>,
     allow_peer_majority_fallback: bool,
     require_seed_confirmed_if_any_seed: bool,
+    peer_majority_min_sources: usize,
 ) -> Result<SnapshotQuorumDecision, String> {
     #[derive(Clone, Debug)]
     struct SnapshotCandidate {
@@ -1447,9 +1477,10 @@ fn select_snapshot_quorum(
         }));
     }
 
-    if total_non_seed_sources < ATOMIC_BOOTSTRAP_REQUIRED_TOTAL_SOURCES {
+    let peer_majority_min_sources = peer_majority_min_sources.max(1);
+    if total_non_seed_sources < peer_majority_min_sources {
         let fallback_err = format!(
-            "peer-majority bootstrap unavailable: only {total_non_seed_sources} independent non-seed source(s) available (minimum required: {ATOMIC_BOOTSTRAP_REQUIRED_TOTAL_SOURCES})"
+            "peer-majority bootstrap unavailable: only {total_non_seed_sources} independent non-seed source(s) available (minimum required: {peer_majority_min_sources})"
         );
         return Err(match seed_quorum_failure {
             Some(seed_err) => format!("{seed_err}; {fallback_err}"),
@@ -1490,7 +1521,7 @@ fn select_snapshot_quorum(
         snapshot_id: selected.snapshot_id.clone(),
         required_votes,
         policy_description: format!(
-            "{fallback_reason} (matching non-seed sources: {}/{total_non_seed_sources}, total support: {})",
+            "{fallback_reason} (minimum independent non-seed sources: {peer_majority_min_sources}, matching non-seed sources: {}/{total_non_seed_sources}, total support: {})",
             selected.non_seed_support, selected.support
         ),
     })
@@ -1601,7 +1632,8 @@ fn decode_hash32_hex(value: &str) -> Result<[u8; 32], String> {
 mod tests {
     use super::{
         select_snapshot_quorum, snapshot_quorum_policy_for_network, SnapshotSupportEvidence, SourceKind,
-        ATOMIC_BOOTSTRAP_REQUIRED_NON_SEED_SOURCES, ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES, ATOMIC_BOOTSTRAP_REQUIRED_TOTAL_SOURCES,
+        ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES, ATOMIC_BOOTSTRAP_REQUIRED_NON_SEED_SOURCES,
+        ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES, ATOMIC_BOOTSTRAP_REQUIRED_TOTAL_SOURCES,
     };
 
     fn evidence(
@@ -1631,6 +1663,7 @@ mod tests {
             ],
             true,
             true,
+            ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES,
         )
         .expect("seed + two additional sources should satisfy quorum");
 
@@ -1652,6 +1685,7 @@ mod tests {
             ],
             true,
             true,
+            ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES,
         )
         .expect_err("seed + one non-seed must not satisfy seed-confirmed quorum");
 
@@ -1669,6 +1703,7 @@ mod tests {
             ],
             true,
             true,
+            ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES,
         )
         .expect("3 of 4 non-seed sources should satisfy peer-majority quorum");
 
@@ -1690,6 +1725,7 @@ mod tests {
             ],
             true,
             false,
+            ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES,
         )
         .expect("when seed-confirmed quorum is unavailable, peer-majority fallback should still work");
 
@@ -1711,6 +1747,7 @@ mod tests {
             ],
             true,
             true,
+            ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES,
         )
         .expect_err("strict seed policy must not fallback to peer-majority while any seed is reachable");
 
@@ -1726,6 +1763,7 @@ mod tests {
             ],
             true,
             true,
+            ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES,
         )
         .expect_err("without seed, fewer than three non-seed sources must fail");
 
@@ -1745,12 +1783,24 @@ mod tests {
             ],
             true,
             true,
+            ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES,
         )
         .expect("2 of 3 non-seed sources should satisfy peer-majority quorum");
 
         assert_eq!(decision.snapshot_id, "snapshot-x");
         assert_eq!(decision.required_votes, 2);
         assert!(decision.policy_description.contains("peer-majority quorum"));
+    }
+
+    #[test]
+    fn quorum_policy_peer_majority_min_sources_override_accepts_single_source() {
+        let decision =
+            select_snapshot_quorum(vec![evidence("peer-1", "snapshot-x", SourceKind::Configured, 220, "xxxx")], true, true, 1)
+                .expect("explicit single-source peer quorum should allow private bootstrap testing");
+
+        assert_eq!(decision.snapshot_id, "snapshot-x");
+        assert_eq!(decision.required_votes, 1);
+        assert!(decision.policy_description.contains("minimum independent non-seed sources: 1"));
     }
 
     #[test]
@@ -1764,6 +1814,7 @@ mod tests {
             ],
             true,
             true,
+            ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES,
         )
         .expect_err("2 vs 2 split must fail majority quorum");
 
@@ -1781,6 +1832,7 @@ mod tests {
             ],
             true,
             true,
+            ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES,
         )
         .expect_err("seed and peer views from the same identity must not count as two independent additional votes");
 
@@ -1799,6 +1851,7 @@ mod tests {
             ],
             true,
             true,
+            ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES,
         )
         .expect_err("duplicate identities must not inflate non-seed majority quorum");
 
@@ -1816,6 +1869,7 @@ mod tests {
             ],
             false,
             true,
+            ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES,
         )
         .expect_err("peer-majority fallback should be rejected when disabled by policy");
 
@@ -1824,33 +1878,37 @@ mod tests {
 
     #[test]
     fn network_policy_mainnet_defaults_to_strict_seed_mode() {
-        let policy = snapshot_quorum_policy_for_network(true, false, false);
+        let policy = snapshot_quorum_policy_for_network(true, false, false, ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES);
 
         assert!(!policy.allow_peer_majority_fallback);
         assert!(policy.require_seed_confirmed_if_any_seed);
+        assert_eq!(policy.peer_majority_min_sources, ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES);
     }
 
     #[test]
     fn network_policy_mainnet_nodnsseed_keeps_peer_majority_disabled_by_default() {
-        let policy = snapshot_quorum_policy_for_network(true, true, false);
+        let policy = snapshot_quorum_policy_for_network(true, true, false, ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES);
 
         assert!(!policy.allow_peer_majority_fallback);
         assert!(policy.require_seed_confirmed_if_any_seed);
+        assert_eq!(policy.peer_majority_min_sources, ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES);
     }
 
     #[test]
     fn network_policy_mainnet_peer_fallback_requires_explicit_override() {
-        let policy = snapshot_quorum_policy_for_network(true, true, true);
+        let policy = snapshot_quorum_policy_for_network(true, true, true, ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES);
 
         assert!(policy.allow_peer_majority_fallback);
         assert!(policy.require_seed_confirmed_if_any_seed);
+        assert_eq!(policy.peer_majority_min_sources, ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES);
     }
 
     #[test]
     fn network_policy_non_mainnet_allows_peer_majority_mode() {
-        let policy = snapshot_quorum_policy_for_network(false, false, false);
+        let policy = snapshot_quorum_policy_for_network(false, false, false, ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES);
 
         assert!(policy.allow_peer_majority_fallback);
         assert!(!policy.require_seed_confirmed_if_any_seed);
+        assert_eq!(policy.peer_majority_min_sources, ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES);
     }
 }

@@ -1747,10 +1747,13 @@ mod tests {
 
     #[test]
     fn transport_hf_ignores_local_activation_override_before_network_hf() {
-        let mut params = MAINNET_PARAMS;
-        params.payload_hf_activation_daa_score = 1_111;
+        let canonical_activation = MAINNET_PARAMS.payload_hf_activation_daa_score;
+        assert!(canonical_activation > 0);
 
-        assert!(!is_transport_payload_hf_active(&params, 133_018));
+        let mut params = MAINNET_PARAMS;
+        params.payload_hf_activation_daa_score = canonical_activation - 1;
+
+        assert!(!is_transport_payload_hf_active(&params, canonical_activation - 1));
     }
 
     #[test]

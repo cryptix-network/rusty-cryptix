@@ -33,6 +33,7 @@ Feedback and contributions are always welcome.
 | `--enable-mainnet-mining` | switch | `true` (deprecated flag) | Backward-compatible flag; mainnet mining is enabled by default. |
 | `--utxoindex` | switch | `false` | Enable UTXO index. |
 | `--atomic-bootstrap-allow-peer-fallback` | switch | `false` | On mainnet, allow peer-only Atomic bootstrap fallback when no seed source is reachable. This must be set explicitly; `--nodnsseed` disables seed discovery but does not by itself lower the mainnet bootstrap safety policy. |
+| `--atomic-bootstrap-peer-quorum-min-sources=<N>` | integer | `3` | Override the minimum independent non-seed sources required for peer-only Atomic bootstrap quorum. Values below `3` are intended only for private/testing networks. Alias: `--atomic-bootstrap-peer-quorum=<N>`. |
 | `--max-tracked-addresses=<N>` | integer | `0` | Preallocated max addresses for UTXO change tracking. |
 | `--testnet` | switch | `false` | Use testnet. |
 | `--netsuffix=<N>` | integer | none | Optional testnet suffix (for dedicated parallel testnet variants). |
@@ -57,7 +58,7 @@ Feedback and contributions are always welcome.
 | `--banserver` | switch | `true` | Enable signed AntiFraud list synchronization from the primary seed endpoint. |
 | `--no-banserver`, `--antifraud-no-seed` | switch | `false` | Disable the AntiFraud seed endpoint and use peer-majority snapshots only (overrides config). |
 | `--disable-upnp` | switch | `false` | Disable UPnP. |
-| `--nodnsseed` | switch | `false` | Disable DNS peer seeding. This also disables Atomic bootstrap DNS seed sources. On mainnet, peer-majority Atomic bootstrap additionally requires `--atomic-bootstrap-allow-peer-fallback` and enough independent configured/connected peers for quorum. |
+| `--nodnsseed` | switch | `false` | Disable DNS peer seeding. This also disables Atomic bootstrap DNS seed sources. On mainnet, peer-majority Atomic bootstrap additionally requires `--atomic-bootstrap-allow-peer-fallback` and enough independent configured/connected peers for quorum. The peer-only minimum defaults to `3` and can be changed with `--atomic-bootstrap-peer-quorum-min-sources=<N>` for private/testing networks. |
 | `--nogrpc` | switch | `false` | Disable gRPC server. |
 | `--ram-scale=<FACTOR>` | float | `1.0` | Scale memory-bound internal limits. |
 | `--num-prealloc-utxos=<N>` | integer | none | Devnet preallocation count (`devnet-prealloc` feature only). |
