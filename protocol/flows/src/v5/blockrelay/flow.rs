@@ -129,18 +129,24 @@ impl HandleRelayInvsFlow {
                 }
             }
 
-            if self.ctx.is_ibd_running() && !session.async_is_nearly_synced().await {
+            let is_nearly_synced = session.async_is_nearly_synced().await;
+            if self.ctx.is_ibd_running() && !is_nearly_synced {
                 // Note: If the node is considered nearly synced we continue processing relay blocks even though an IBD is in progress.
                 // For instance this means that downloading a side-chain from a delayed node does not interop the normal flow of live blocks.
                 debug!("Got relay block {} while in IBD and the node is out of sync, continuing...", inv.hash);
                 continue;
             }
 
-            if !self.ctx.wait_for_valid_block_producer_claim(inv.hash).await {
+            if is_nearly_synced && !self.ctx.wait_for_valid_block_producer_claim(inv.hash).await {
                 return Err(ProtocolError::MisbehavingPeer(format!(
                     "relay block {} missing valid strong-node block producer claim",
                     inv.hash
                 )));
+            } else if !is_nearly_synced && !self.ctx.has_valid_block_producer_claim(inv.hash) {
+                debug!(
+                    "Relay block {} has no strong-node block producer claim yet, but node is not nearly synced; requesting it as a potential IBD trigger",
+                    inv.hash
+                );
             }
 
             // We keep the request scope alive until consensus processes the block

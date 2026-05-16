@@ -1004,6 +1004,52 @@ async fn atomic_same_owner_nonce_conflict_in_parallel_blocks_applies_once() {
 }
 
 #[tokio::test]
+async fn atomic_nonce_conflict_reorg_prefers_selected_branch_state() {
+    let mut ctx = liquidity_test_context();
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    for _ in 0..4 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let utxos = find_virtual_utxos_by_script(&ctx, &owner_script, 2);
+    let tx_fee = 10_000u64;
+    let parent = ctx.consensus.get_sink();
+
+    let create_a = payload_tx(
+        vec![TransactionInput::new(utxos[0].0, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(utxos[0].1.amount - tx_fee, owner_script.clone())],
+        payload_create_asset(0, 1, owner_id, b"ForkA", b"FKA"),
+    );
+    let asset_a = create_a.id().as_bytes();
+    let create_b = payload_tx(
+        vec![TransactionInput::new(utxos[1].0, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(utxos[1].1.amount - tx_fee, owner_script.clone())],
+        payload_create_asset(0, 1, owner_id, b"ForkB", b"FKB"),
+    );
+    let asset_b = create_b.id().as_bytes();
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let block_a = ctx.build_utxo_valid_block_with_parents_and_transactions(vec![parent], vec![create_a], 43, ctx.simulated_time);
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let block_b = ctx.build_utxo_valid_block_with_parents_and_transactions(vec![parent], vec![create_b], 44, ctx.simulated_time);
+    let block_b_hash = block_b.header.hash;
+
+    ctx.validate_and_insert_block(block_a.to_immutable()).await;
+    ctx.validate_and_insert_block(block_b.to_immutable()).await;
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let block_b_child = ctx.build_utxo_valid_block_with_parents_and_transactions(vec![block_b_hash], vec![], 45, ctx.simulated_time);
+    ctx.validate_and_insert_block(block_b_child.to_immutable()).await;
+
+    let atomic = ctx.consensus.virtual_atomic_state();
+    assert!(!atomic.assets.contains_key(&asset_a), "stale nonce branch asset must be removed after selected-branch reorg");
+    assert!(atomic.assets.contains_key(&asset_b), "selected branch asset must define the atomic state after reorg");
+    assert_eq!(atomic.next_nonces.get(&AtomicNonceKey::owner(owner_id)), Some(&2));
+}
+
+#[tokio::test]
 async fn liquidity_different_pools_can_advance_in_same_block() {
     let mut ctx = liquidity_test_context();
     let owner_redeem_script = p2sh_redeem_script();

@@ -4328,6 +4328,119 @@ mod tests {
     }
 
     #[test]
+    fn stress_reorg_snapshot_replay_matches_fresh_state() {
+        let network = "cryptix-simnet".to_string();
+        let owner_script = test_script(41);
+        let alice_script = test_script(42);
+        let bob_script = test_script(43);
+        let owner = owner_id(&AtomicTokenState::new(1, network.clone()), &owner_script);
+        let alice = owner_id(&AtomicTokenState::new(1, network.clone()), &alice_script);
+        let bob = owner_id(&AtomicTokenState::new(1, network.clone()), &bob_script);
+
+        let mut auth_inputs = HashMap::new();
+        let mut next_outpoint_tag = 6_000u64;
+        let mut make_tx = |script: &ScriptPublicKey, payload: Vec<u8>| {
+            let outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(next_outpoint_tag), 0);
+            next_outpoint_tag += 1;
+            auth_inputs.insert(outpoint, UtxoEntry::new(10_000, script.clone(), 0, false));
+            token_tx(outpoint, script.clone(), payload)
+        };
+
+        let create_tx = make_tx(&owner_script, payload_create_asset(0, 1, 8, owner, b"StressToken", b"STR", b""));
+        let asset_id = hash_bytes(create_tx.id());
+        let mint_tx = make_tx(&owner_script, payload_mint(0, 1, asset_id, owner, 10_000));
+        let owner_to_alice_tx = make_tx(&owner_script, payload_transfer(0, 2, asset_id, alice, 800));
+        let owner_to_bob_tx = make_tx(&owner_script, payload_transfer(0, 3, asset_id, bob, 500));
+        let alice_to_bob_tx = make_tx(&alice_script, payload_transfer(0, 1, asset_id, bob, 300));
+        let bob_to_alice_tx = make_tx(&bob_script, payload_transfer(0, 1, asset_id, alice, 125));
+        let owner_burn_tx = make_tx(&owner_script, payload_burn(0, 4, asset_id, 400));
+
+        let owner_mint_a_tx = make_tx(&owner_script, payload_mint(0, 5, asset_id, owner, 600));
+        let alice_burn_a_tx = make_tx(&alice_script, payload_burn(0, 2, asset_id, 50));
+        let bob_to_owner_a_tx = make_tx(&bob_script, payload_transfer(0, 2, asset_id, owner, 250));
+
+        let owner_burn_b_tx = make_tx(&owner_script, payload_burn(0, 5, asset_id, 300));
+        let alice_to_owner_b_tx = make_tx(&alice_script, payload_transfer(0, 2, asset_id, owner, 75));
+        let bob_burn_b_tx = make_tx(&bob_script, payload_burn(0, 2, asset_id, 125));
+
+        let block1 = BlockHash::from_u64_word(7_001);
+        let block2 = BlockHash::from_u64_word(7_002);
+        let block3 = BlockHash::from_u64_word(7_003);
+        let block4a = BlockHash::from_u64_word(7_004);
+        let block4b = BlockHash::from_u64_word(7_104);
+        let refs1 = vec![
+            tx_ref(create_tx.clone(), BlockHash::from_u64_word(8_001), 0, 0),
+            tx_ref(mint_tx.clone(), BlockHash::from_u64_word(8_001), 1, 0),
+        ];
+        let refs2 = vec![
+            tx_ref(owner_to_alice_tx.clone(), BlockHash::from_u64_word(8_002), 0, 0),
+            tx_ref(owner_to_bob_tx.clone(), BlockHash::from_u64_word(8_002), 1, 0),
+        ];
+        let refs3 = vec![
+            tx_ref(alice_to_bob_tx.clone(), BlockHash::from_u64_word(8_003), 0, 0),
+            tx_ref(bob_to_alice_tx.clone(), BlockHash::from_u64_word(8_003), 1, 0),
+            tx_ref(owner_burn_tx.clone(), BlockHash::from_u64_word(8_003), 2, 0),
+        ];
+        let refs4a = vec![
+            tx_ref(owner_mint_a_tx.clone(), BlockHash::from_u64_word(8_004), 0, 0),
+            tx_ref(alice_burn_a_tx.clone(), BlockHash::from_u64_word(8_004), 1, 0),
+            tx_ref(bob_to_owner_a_tx.clone(), BlockHash::from_u64_word(8_004), 2, 0),
+        ];
+        let refs4b = vec![
+            tx_ref(owner_burn_b_tx.clone(), BlockHash::from_u64_word(8_104), 0, 0),
+            tx_ref(alice_to_owner_b_tx.clone(), BlockHash::from_u64_word(8_104), 1, 0),
+            tx_ref(bob_burn_b_tx.clone(), BlockHash::from_u64_word(8_104), 2, 0),
+        ];
+
+        let mut canonical = AtomicTokenState::new(1, network.clone());
+        apply_block(&mut canonical, block1, refs1.clone(), &auth_inputs);
+        apply_block(&mut canonical, block2, refs2.clone(), &auth_inputs);
+        apply_block(&mut canonical, block3, refs3.clone(), &auth_inputs);
+        apply_block(&mut canonical, block4a, refs4a.clone(), &auth_inputs);
+        assert!(!canonical.degraded);
+        assert_eq!(canonical.get_balance(asset_id, owner), 9_150);
+        assert_eq!(canonical.get_balance(asset_id, alice), 575);
+        assert_eq!(canonical.get_balance(asset_id, bob), 425);
+        assert_eq!(canonical.get_asset(asset_id).expect("asset").total_supply, 10_150);
+
+        let snapshot_a = canonical
+            .export_snapshot(block4a, 9_004, BlockHash::from_u64_word(9_999), &[block1, block2, block3, block4a])
+            .expect("canonical snapshot export should succeed");
+
+        canonical.rollback_block(block4a).expect("rollback canonical tip");
+        apply_block(&mut canonical, block4b, refs4b.clone(), &auth_inputs);
+        assert!(!canonical.degraded);
+
+        let mut fresh_alt = AtomicTokenState::new(1, network.clone());
+        apply_block(&mut fresh_alt, block1, refs1.clone(), &auth_inputs);
+        apply_block(&mut fresh_alt, block2, refs2.clone(), &auth_inputs);
+        apply_block(&mut fresh_alt, block3, refs3.clone(), &auth_inputs);
+        apply_block(&mut fresh_alt, block4b, refs4b.clone(), &auth_inputs);
+
+        assert_eq!(canonical.compute_state_hash(), fresh_alt.compute_state_hash());
+        assert_eq!(canonical.get_balance(asset_id, owner), 8_075);
+        assert_eq!(canonical.get_balance(asset_id, alice), 550);
+        assert_eq!(canonical.get_balance(asset_id, bob), 550);
+        assert_eq!(canonical.get_asset(asset_id).expect("asset").total_supply, 9_175);
+        assert_eq!(canonical.get_token_nonce(owner, asset_id), 6);
+        assert_eq!(canonical.get_token_nonce(alice, asset_id), 3);
+        assert_eq!(canonical.get_token_nonce(bob, asset_id), 3);
+
+        let snapshot_b = canonical
+            .export_snapshot(block4b, 9_104, BlockHash::from_u64_word(9_999), &[block1, block2, block3, block4b])
+            .expect("alternative snapshot export should succeed");
+        let mut recovered = AtomicTokenState::new(1, network);
+        recovered.import_snapshot(snapshot_b.clone()).expect("snapshot import should succeed");
+        recovered.rollback_snapshot_window_to_parent(snapshot_b.window_start_block_hash).expect("snapshot rollback should succeed");
+        apply_block(&mut recovered, block1, refs1, &auth_inputs);
+        apply_block(&mut recovered, block2, refs2, &auth_inputs);
+        apply_block(&mut recovered, block3, refs3, &auth_inputs);
+        apply_block(&mut recovered, block4b, refs4b, &auth_inputs);
+        assert_eq!(recovered.compute_state_hash(), fresh_alt.compute_state_hash());
+        assert_ne!(snapshot_a.state_hash_at_fp, snapshot_b.state_hash_at_fp);
+    }
+
+    #[test]
     fn repeated_reorg_reaccept_events_remain_append_only() {
         let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
         let owner_script = test_script(17);

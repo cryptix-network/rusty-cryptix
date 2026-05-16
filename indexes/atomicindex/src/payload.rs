@@ -969,6 +969,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_deterministic_malformed_payload_corpus_is_total_and_deterministic() {
+        let mut seed = 0xA70C_2026_0516_1234u64;
+        for case in 0..10_000usize {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let len = (seed as usize) % 256;
+            let mut payload = vec![0u8; len];
+            for byte in payload.iter_mut() {
+                seed = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+                *byte = (seed >> 32) as u8;
+            }
+
+            if len >= 14 && case % 2 == 0 {
+                payload[0..3].copy_from_slice(&CRYPTIX_ATOMIC_TOKEN_MAGIC);
+                payload[3] = CRYPTIX_ATOMIC_TOKEN_VERSION;
+                payload[4] = (seed % 11) as u8;
+                payload[5] = if case % 17 == 0 { 1 } else { 0 };
+            }
+
+            let first = parse_atomic_token_payload(&payload);
+            let second = parse_atomic_token_payload(&payload);
+            assert_eq!(first, second, "parser result changed for deterministic corpus case {case}");
+        }
+    }
+
+    #[test]
     fn parse_buy_liquidity_rejects_zero_expected_pool_nonce() {
         let mut payload = build_header(6, 0, 1);
         payload.extend_from_slice(&[1u8; 32]); // asset_id
