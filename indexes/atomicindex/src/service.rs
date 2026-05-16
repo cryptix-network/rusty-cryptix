@@ -1135,13 +1135,7 @@ impl AtomicTokenService {
         .await;
         self.processor.set_bootstrap_in_progress(false);
 
-        if let Err(err) = import_result {
-            let mut state = self.processor.state.lock().await;
-            state.mark_degraded();
-            let _ = persist_state_to_path(&self.processor.state_path, &state);
-            return Err(err);
-        }
-        Ok(())
+        import_result
     }
 }
 
@@ -1406,7 +1400,9 @@ fn validate_snapshot_manifest(
             "snapshot import failed: manifest metadata does not match decoded snapshot contents".to_string(),
         ));
     }
-    let replay_window_bytes = encode_replay_window_transfer(&snapshot)?;
+    let replay_path = snapshot_replay_path(path);
+    let replay_window_bytes =
+        std::fs::read(&replay_path).map_err(|e| AtomicTokenError::Processing(format!("snapshot replay read failed: {e}")))?;
     if manifest.replay_window_size != replay_window_bytes.len() as u64 {
         return Err(AtomicTokenError::Processing("snapshot import failed: manifest replay window size mismatch".to_string()));
     }
@@ -1426,6 +1422,22 @@ fn validate_snapshot_manifest(
     let replay_window_chunk_hashes = chunk_hashes(&replay_window_bytes, manifest.replay_window_chunk_size as usize);
     if replay_window_chunk_hashes != manifest.replay_window_chunk_hashes {
         return Err(AtomicTokenError::Processing("snapshot import failed: manifest replay window chunk hashes mismatch".to_string()));
+    }
+    let replay_window: ReplayWindowTransferV1 = bincode::deserialize(&replay_window_bytes)
+        .map_err(|e| AtomicTokenError::Processing(format!("snapshot replay decode failed: {e}")))?;
+    if replay_window.protocol_version != snapshot.protocol_version
+        || replay_window.network_id != snapshot.network_id
+        || replay_window.window_start_block_hash != hash_to_array(snapshot.window_start_block_hash)
+        || replay_window.window_end_block_hash != hash_to_array(snapshot.window_end_block_hash)
+    {
+        return Err(AtomicTokenError::Processing(
+            "snapshot import failed: replay window metadata does not match decoded snapshot contents".to_string(),
+        ));
+    }
+    if replay_window.journals_in_window != snapshot.journals_in_window {
+        return Err(AtomicTokenError::Processing(
+            "snapshot import failed: replay window journals do not match decoded snapshot contents".to_string(),
+        ));
     }
     Ok(())
 }
@@ -1929,6 +1941,55 @@ mod tests {
 
         let catalog = list_snapshot_catalog(&dir).expect("list catalog");
         assert!(catalog.is_empty());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validate_snapshot_manifest_accepts_matching_replay_sidecar() {
+        let dir = unique_temp_dir("snapshot-manifest-replay");
+        let snapshot_path = dir.join("atomic-snapshot-1.bin");
+        let snapshot = minimal_snapshot(TOKEN_PROTOCOL_VERSION, "cryptix-simnet");
+        let snapshot_bytes = bincode::serialize(&snapshot).expect("encode snapshot");
+        let replay_window_bytes = encode_replay_window_transfer(&snapshot).expect("encode replay");
+        let manifest = build_snapshot_manifest(&snapshot_path, &snapshot_bytes, &replay_window_bytes, &snapshot).expect("manifest");
+        let manifest_bytes = borsh::to_vec(&manifest).expect("encode manifest");
+
+        fs::write(&snapshot_path, &snapshot_bytes).expect("write snapshot");
+        fs::write(snapshot_replay_path(&snapshot_path), replay_window_bytes).expect("write replay");
+        fs::write(snapshot_manifest_path(&snapshot_path), manifest_bytes).expect("write manifest");
+
+        validate_snapshot_manifest(&snapshot_path, &snapshot_bytes, TOKEN_PROTOCOL_VERSION, "cryptix-simnet")
+            .expect("manifest should validate against sidecar");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validate_snapshot_manifest_rejects_replay_sidecar_not_matching_snapshot_journals() {
+        let dir = unique_temp_dir("snapshot-manifest-replay-mismatch");
+        let snapshot_path = dir.join("atomic-snapshot-1.bin");
+        let snapshot = minimal_snapshot(TOKEN_PROTOCOL_VERSION, "cryptix-simnet");
+        let snapshot_bytes = bincode::serialize(&snapshot).expect("encode snapshot");
+        let mut replay_window = ReplayWindowTransferV1 {
+            protocol_version: snapshot.protocol_version,
+            network_id: snapshot.network_id.clone(),
+            window_start_block_hash: hash_to_array(snapshot.window_start_block_hash),
+            window_end_block_hash: hash_to_array(snapshot.window_end_block_hash),
+            journals_in_window: snapshot.journals_in_window.clone(),
+        };
+        replay_window.journals_in_window[0].1.added_processed_ops.push(BlockHash::from_u64_word(42));
+        let replay_window_bytes = bincode::serialize(&replay_window).expect("encode replay");
+        let manifest = build_snapshot_manifest(&snapshot_path, &snapshot_bytes, &replay_window_bytes, &snapshot).expect("manifest");
+        let manifest_bytes = borsh::to_vec(&manifest).expect("encode manifest");
+
+        fs::write(&snapshot_path, &snapshot_bytes).expect("write snapshot");
+        fs::write(snapshot_replay_path(&snapshot_path), replay_window_bytes).expect("write replay");
+        fs::write(snapshot_manifest_path(&snapshot_path), manifest_bytes).expect("write manifest");
+
+        let err = validate_snapshot_manifest(&snapshot_path, &snapshot_bytes, TOKEN_PROTOCOL_VERSION, "cryptix-simnet")
+            .expect_err("manifest sidecar semantics must be checked");
+        assert!(err.to_string().contains("replay window journals do not match decoded snapshot contents"));
 
         let _ = fs::remove_dir_all(dir);
     }

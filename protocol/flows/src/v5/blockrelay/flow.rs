@@ -137,14 +137,16 @@ impl HandleRelayInvsFlow {
                 continue;
             }
 
-            if is_nearly_synced && !self.ctx.wait_for_valid_block_producer_claim(inv.hash).await {
-                return Err(ProtocolError::MisbehavingPeer(format!(
-                    "relay block {} missing valid strong-node block producer claim",
-                    inv.hash
-                )));
-            } else if !is_nearly_synced && !self.ctx.has_valid_block_producer_claim(inv.hash) {
+            let has_valid_claim = if is_nearly_synced {
+                self.ctx.wait_for_valid_block_producer_claim(inv.hash).await
+            } else {
+                self.ctx.has_valid_block_producer_claim(inv.hash)
+            };
+            if !has_valid_claim {
+                // Strong-node claims are an overlay/gossip signal. Missing or delayed claim gossip must not partition
+                // otherwise valid post-HF blocks; consensus validation remains the source of truth for block acceptance.
                 debug!(
-                    "Relay block {} has no strong-node block producer claim yet, but node is not nearly synced; requesting it as a potential IBD trigger",
+                    "Relay block {} has no strong-node block producer claim yet; requesting block and deferring to consensus validation",
                     inv.hash
                 );
             }
