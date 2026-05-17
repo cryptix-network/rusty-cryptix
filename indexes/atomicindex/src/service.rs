@@ -278,20 +278,11 @@ impl AtomicTokenProcessor {
                 {
                     return Ok(());
                 } else if already_applied_prefix_len > 0 {
-                    debug!(
-                        "[{IDENT}] skipping {} already-applied Atomic virtual-chain block(s)",
-                        already_applied_prefix_len
-                    );
+                    debug!("[{IDENT}] skipping {} already-applied Atomic virtual-chain block(s)", already_applied_prefix_len);
                     VirtualChainChangedNotification::new(
                         Arc::new(msg.added_chain_block_hashes.iter().skip(already_applied_prefix_len).copied().collect()),
                         Arc::new(Vec::new()),
-                        Arc::new(
-                            msg.added_chain_blocks_acceptance_data
-                                .iter()
-                                .skip(already_applied_prefix_len)
-                                .cloned()
-                                .collect(),
-                        ),
+                        Arc::new(msg.added_chain_blocks_acceptance_data.iter().skip(already_applied_prefix_len).cloned().collect()),
                     )
                 } else {
                     msg
@@ -463,7 +454,8 @@ impl AtomicTokenProcessor {
                 return Some(None);
             }
 
-            if matches!(runtime_state, AtomicTokenRuntimeState::Degraded | AtomicTokenRuntimeState::NotReady) && !bootstrap_in_progress {
+            if matches!(runtime_state, AtomicTokenRuntimeState::Degraded | AtomicTokenRuntimeState::NotReady) && !bootstrap_in_progress
+            {
                 let last_applied_for_log = last_applied.map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string());
                 if matches!(runtime_state, AtomicTokenRuntimeState::Degraded) {
                     warn!(
@@ -1214,10 +1206,7 @@ impl AtomicTokenService {
         }
 
         state.live_correct = true;
-        info!(
-            "[{IDENT}] Cryptix Atomic startup state revalidation skipped: persisted V2 root matches retained tip {}",
-            last_applied
-        );
+        info!("[{IDENT}] Cryptix Atomic startup state revalidation skipped: persisted V2 root matches retained tip {}", last_applied);
         drop(state);
         self.processor.notify_state_progress();
         Ok(true)
@@ -1593,10 +1582,7 @@ impl AtomicTokenService {
             replay_chain.added.len(),
             sink
         );
-        info!(
-            "[{IDENT}] Cryptix Atomic local backfill loading acceptance data for {} block(s)",
-            replay_chain.added.len()
-        );
+        info!("[{IDENT}] Cryptix Atomic local backfill loading acceptance data for {} block(s)", replay_chain.added.len());
         let acceptance_data = session.async_get_blocks_acceptance_data(replay_chain.added.clone(), None).await?;
         if acceptance_data.len() != replay_chain.added.len() {
             return Err(AtomicTokenError::Processing(format!(
@@ -1606,8 +1592,11 @@ impl AtomicTokenService {
             )));
         }
         let auth_inputs = self.processor.collect_auth_inputs_for_added_blocks(&replay_chain.added).await?;
-        let notification =
-            VirtualChainChangedNotification::new(Arc::new(replay_chain.added.clone()), Arc::new(Vec::new()), Arc::new(acceptance_data));
+        let notification = VirtualChainChangedNotification::new(
+            Arc::new(replay_chain.added.clone()),
+            Arc::new(Vec::new()),
+            Arc::new(acceptance_data),
+        );
 
         self.processor.set_bootstrap_in_progress(true);
         let result = async {
@@ -1647,8 +1636,14 @@ impl AtomicTokenService {
             let footprint = state.footprint();
             let state_store_bytes = self.processor.state_store.approximate_size_bytes();
             drop(state);
-            self.processor
-                .maybe_log_progress(notification.added_chain_block_hashes.len(), 0, retained_blocks, health, footprint, state_store_bytes);
+            self.processor.maybe_log_progress(
+                notification.added_chain_block_hashes.len(),
+                0,
+                retained_blocks,
+                health,
+                footprint,
+                state_store_bytes,
+            );
             info!("[{IDENT}] Cryptix Atomic local selected-chain backfill completed successfully");
         }
         result

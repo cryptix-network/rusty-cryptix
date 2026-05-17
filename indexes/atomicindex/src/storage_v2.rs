@@ -7,7 +7,7 @@ use cryptix_consensus_core::{tx::TransactionOutpoint, Hash as BlockHash};
 use rocksdb::{checkpoint::Checkpoint, Options, WriteBatch, DB};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -712,9 +712,9 @@ impl AtomicStorageV2 {
     pub fn persist_revalidation_version(&self, version: u16) -> AtomicTokenResult<()> {
         let mut batch = WriteBatch::default();
         batch.put(META_REVALIDATION_VERSION, encode_value(&version, "revalidation version")?);
-        self.db
-            .write(batch)
-            .map_err(|err| AtomicTokenError::Processing(format!("failed committing Atomic DB schema v2 revalidation version: {err}")))?;
+        self.db.write(batch).map_err(|err| {
+            AtomicTokenError::Processing(format!("failed committing Atomic DB schema v2 revalidation version: {err}"))
+        })?;
         Ok(())
     }
 
@@ -775,24 +775,40 @@ impl AtomicStorageV2 {
         anchor_count_changes: impl IntoIterator<Item = ([u8; 32], Option<u64>)>,
         processed_op_changes: impl IntoIterator<Item = (BlockHash, Option<ProcessedOp>)>,
     ) -> AtomicTokenResult<()> {
-        for (asset_id, value) in asset_changes {
+        let asset_changes: Vec<_> = asset_changes.into_iter().collect();
+        let mut old_assets = HashMap::new();
+        let mut changed_asset_ids = HashSet::new();
+        let mut affected_known_owner_ids = HashSet::new();
+        for (asset_id, value) in asset_changes.iter() {
+            changed_asset_ids.insert(*asset_id);
+            if let Some(old_asset) = self.get_asset(asset_id)? {
+                collect_known_owner_ids(&old_asset, &mut affected_known_owner_ids);
+                old_assets.insert(*asset_id, old_asset);
+            }
+            if let Some(asset) = value {
+                collect_known_owner_ids(asset, &mut affected_known_owner_ids);
+            }
+        }
+
+        for (asset_id, value) in asset_changes.iter() {
             let logical_key = logical_asset_key(&asset_id);
-            if let Some(old_asset) = self.get_asset(&asset_id)? {
+            if let Some(old_asset) = old_assets.get(asset_id) {
                 delete_asset_secondary_indexes(batch, &old_asset);
             }
             match value {
                 Some(asset) => {
                     let encoded = encode_value(&asset, "asset")?;
-                    batch.put(asset_key(&asset_id), &encoded);
+                    batch.put(asset_key(asset_id), &encoded);
                     write_asset_secondary_indexes(batch, &asset)?;
                     root_changes.push((logical_key, Some(encoded)));
                 }
                 None => {
-                    batch.delete(asset_key(&asset_id));
+                    batch.delete(asset_key(asset_id));
                     root_changes.push((logical_key, None));
                 }
             }
         }
+        self.rewrite_known_owner_addresses_for_asset_changes(batch, &affected_known_owner_ids, &changed_asset_ids, &asset_changes)?;
         for (key, value) in balance_changes {
             let logical_key = logical_balance_key(&key);
             match value.filter(|amount| *amount > 0) {
@@ -845,6 +861,44 @@ impl AtomicStorageV2 {
                 }
                 None => {
                     batch.delete(processed_op_key(&txid));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn rewrite_known_owner_addresses_for_asset_changes(
+        &self,
+        batch: &mut WriteBatch,
+        owner_ids: &HashSet<[u8; 32]>,
+        changed_asset_ids: &HashSet<[u8; 32]>,
+        asset_changes: &[([u8; 32], Option<TokenAsset>)],
+    ) -> AtomicTokenResult<()> {
+        if owner_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut addresses = HashMap::new();
+        for (_, asset) in asset_changes.iter() {
+            if let Some(asset) = asset {
+                record_known_owner_addresses_for_asset(asset, Some(owner_ids), &mut addresses);
+            }
+        }
+        self.visit_all_assets(|asset_id, asset| {
+            if changed_asset_ids.contains(&asset_id) {
+                return Ok(());
+            }
+            record_known_owner_addresses_for_asset(&asset, Some(owner_ids), &mut addresses);
+            Ok(())
+        })?;
+
+        for owner_id in owner_ids {
+            match addresses.get(owner_id) {
+                Some(address) => {
+                    batch.put(known_owner_address_key(owner_id), encode_value(address, "known owner address")?);
+                }
+                None => {
+                    batch.delete(known_owner_address_key(owner_id));
                 }
             }
         }
@@ -1172,15 +1226,10 @@ fn write_asset_secondary_indexes(batch: &mut WriteBatch, asset: &TokenAsset) -> 
         return Ok(());
     };
     batch.put(liquidity_vault_key(&pool.vault_outpoint), encode_value(&asset.asset_id, "liquidity vault asset id")?);
-    for recipient in pool.fee_recipients.iter() {
-        let address = LiquidityHolderAddressState {
-            address_version: recipient.address_version,
-            address_payload: recipient.address_payload.clone(),
-        };
-        batch.put(known_owner_address_key(&recipient.owner_id), encode_value(&address, "known owner address")?);
-    }
-    for (owner_id, holder) in pool.holder_addresses.iter() {
-        batch.put(known_owner_address_key(owner_id), encode_value(holder, "known owner address")?);
+    let mut addresses = HashMap::new();
+    record_known_owner_addresses_for_asset(asset, None, &mut addresses);
+    for (owner_id, address) in addresses {
+        batch.put(known_owner_address_key(&owner_id), encode_value(&address, "known owner address")?);
     }
     Ok(())
 }
@@ -1188,6 +1237,43 @@ fn write_asset_secondary_indexes(batch: &mut WriteBatch, asset: &TokenAsset) -> 
 fn delete_asset_secondary_indexes(batch: &mut WriteBatch, asset: &TokenAsset) {
     if let Some(pool) = asset.liquidity.as_ref() {
         batch.delete(liquidity_vault_key(&pool.vault_outpoint));
+    }
+}
+
+fn collect_known_owner_ids(asset: &TokenAsset, out: &mut HashSet<[u8; 32]>) {
+    let Some(pool) = asset.liquidity.as_ref() else {
+        return;
+    };
+    for recipient in pool.fee_recipients.iter() {
+        out.insert(recipient.owner_id);
+    }
+    for owner_id in pool.holder_addresses.keys() {
+        out.insert(*owner_id);
+    }
+}
+
+fn record_known_owner_addresses_for_asset(
+    asset: &TokenAsset,
+    owner_filter: Option<&HashSet<[u8; 32]>>,
+    out: &mut HashMap<[u8; 32], LiquidityHolderAddressState>,
+) {
+    let Some(pool) = asset.liquidity.as_ref() else {
+        return;
+    };
+    for recipient in pool.fee_recipients.iter() {
+        if owner_filter.is_some_and(|owners| !owners.contains(&recipient.owner_id)) {
+            continue;
+        }
+        out.entry(recipient.owner_id).or_insert_with(|| LiquidityHolderAddressState {
+            address_version: recipient.address_version,
+            address_payload: recipient.address_payload.clone(),
+        });
+    }
+    for (owner_id, holder) in pool.holder_addresses.iter() {
+        if owner_filter.is_some_and(|owners| !owners.contains(owner_id)) {
+            continue;
+        }
+        out.entry(*owner_id).or_insert_with(|| holder.clone());
     }
 }
 
@@ -1352,9 +1438,15 @@ fn decode_event_key_suffix(suffix: &[u8]) -> AtomicTokenResult<u64> {
 #[cfg(test)]
 mod tests {
     use super::AtomicStorageV2;
-    use crate::state::{AtomicTokenState, BalanceKey, NonceKey};
-    use cryptix_consensus_core::Hash as BlockHash;
+    use crate::{
+        payload::SupplyMode,
+        state::{
+            AtomicTokenState, BalanceKey, LiquidityHolderAddressState, LiquidityPoolState, NonceKey, TokenAsset, TokenAssetClass,
+        },
+    };
+    use cryptix_consensus_core::{tx::TransactionOutpoint, Hash as BlockHash};
     use std::{
+        collections::HashMap,
         fs,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
@@ -1363,6 +1455,50 @@ mod tests {
     fn unique_temp_dir(name: &str) -> PathBuf {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("cryptix-atomic-{name}-{}-{nonce}", std::process::id()))
+    }
+
+    fn holder_address(marker: u8) -> LiquidityHolderAddressState {
+        LiquidityHolderAddressState { address_version: 0, address_payload: vec![marker; 32] }
+    }
+
+    fn liquidity_asset(asset_id: [u8; 32], holders: Vec<([u8; 32], LiquidityHolderAddressState)>) -> TokenAsset {
+        TokenAsset {
+            asset_id,
+            creator_owner_id: [1u8; 32],
+            asset_class: TokenAssetClass::Liquidity,
+            token_version: 1,
+            mint_authority_owner_id: [2u8; 32],
+            decimals: 8,
+            supply_mode: SupplyMode::Capped,
+            max_supply: 1_000_000,
+            total_supply: 1_000,
+            name: b"liquidity".to_vec(),
+            symbol: b"LIQ".to_vec(),
+            metadata: Vec::new(),
+            platform_tag: Vec::new(),
+            created_block_hash: None,
+            created_daa_score: None,
+            created_at: None,
+            liquidity: Some(LiquidityPoolState {
+                pool_nonce: 1,
+                curve_version: 1,
+                curve_mode: 0,
+                individual_virtual_cpay_reserves_sompi: 0,
+                individual_virtual_token_multiplier_bps: 0,
+                real_cpay_reserves_sompi: 1,
+                real_token_reserves: 1,
+                virtual_cpay_reserves_sompi: 1,
+                virtual_token_reserves: 1,
+                unclaimed_fee_total_sompi: 0,
+                fee_bps: 0,
+                fee_recipients: Vec::new(),
+                vault_outpoint: TransactionOutpoint { transaction_id: BlockHash::from_bytes(asset_id), index: asset_id[0] as u32 },
+                vault_value_sompi: 1,
+                unlock_target_sompi: 0,
+                unlocked: true,
+                holder_addresses: holders.into_iter().collect::<HashMap<_, _>>(),
+            }),
+        }
     }
 
     #[test]
@@ -1486,6 +1622,78 @@ mod tests {
         assert_eq!(runtime_state.applied_chain_order, vec![block_hash]);
         assert_eq!(store.get_balance(&key).expect("balance point read"), 900);
         assert_eq!(store.balances_by_owner(&owner_id).expect("owner index"), vec![(asset_id, 900)]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn asset_delta_removes_stale_known_owner_address_index() {
+        let dir = unique_temp_dir("known-owner-remove");
+        let genesis_hash = BlockHash::from_u64_word(9);
+        let store = AtomicStorageV2::open(&dir, 6, "cryptix-simnet".to_string(), genesis_hash).expect("open store");
+        let asset_id = [9u8; 32];
+        let old_owner = [11u8; 32];
+        let new_owner = [12u8; 32];
+
+        store
+            .apply_current_state_delta(
+                [(asset_id, Some(liquidity_asset(asset_id, vec![(old_owner, holder_address(0x11))])))],
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+            )
+            .expect("write initial asset");
+        assert_eq!(store.get_known_owner_address(&old_owner).expect("old owner"), Some(holder_address(0x11)));
+
+        store
+            .apply_current_state_delta(
+                [(asset_id, Some(liquidity_asset(asset_id, vec![(new_owner, holder_address(0x12))])))],
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+            )
+            .expect("replace asset holders");
+        assert_eq!(store.get_known_owner_address(&old_owner).expect("old owner removed"), None);
+        assert_eq!(store.get_known_owner_address(&new_owner).expect("new owner"), Some(holder_address(0x12)));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn asset_delta_preserves_known_owner_address_from_other_asset() {
+        let dir = unique_temp_dir("known-owner-shared");
+        let genesis_hash = BlockHash::from_u64_word(10);
+        let store = AtomicStorageV2::open(&dir, 6, "cryptix-simnet".to_string(), genesis_hash).expect("open store");
+        let asset_a = [13u8; 32];
+        let asset_b = [14u8; 32];
+        let shared_owner = [15u8; 32];
+
+        store
+            .apply_current_state_delta(
+                [
+                    (asset_a, Some(liquidity_asset(asset_a, vec![(shared_owner, holder_address(0x13))]))),
+                    (asset_b, Some(liquidity_asset(asset_b, vec![(shared_owner, holder_address(0x14))]))),
+                ],
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+            )
+            .expect("write assets");
+        assert!(store.get_known_owner_address(&shared_owner).expect("shared owner").is_some());
+
+        store
+            .apply_current_state_delta(
+                [(asset_b, None)],
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+            )
+            .expect("delete one asset");
+        assert_eq!(store.get_known_owner_address(&shared_owner).expect("shared owner preserved"), Some(holder_address(0x13)));
 
         let _ = fs::remove_dir_all(dir);
     }

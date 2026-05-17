@@ -3669,10 +3669,7 @@ impl AtomicTokenState {
             self.commit_rollback_to_store(last_applied, &journal, &[])?;
             rolled_back += 1;
             if should_log_progress && last_log.elapsed() >= LONG_ATOMIC_REPLAY_LOG_INTERVAL {
-                info!(
-                    "[{IDENT}] Cryptix Atomic retained replay rollback progress: {}/{} block(s)",
-                    rolled_back, rollback_total
-                );
+                info!("[{IDENT}] Cryptix Atomic retained replay rollback progress: {}/{} block(s)", rolled_back, rollback_total);
                 last_log = Instant::now();
             }
             if last_applied == window_start_block_hash {
