@@ -15,7 +15,7 @@ use crate::{
         },
         stores::{
             acceptance_data::{AcceptanceDataStoreReader, DbAcceptanceDataStore},
-            atomic_state::{AtomicConsensusState, AtomicNonceKey, DbAtomicStateStore},
+            atomic_state::{AtomicConsensusRootAccumulator, AtomicConsensusState, AtomicNonceKey, DbAtomicStateStore},
             block_transactions::{BlockTransactionsStoreReader, DbBlockTransactionsStore},
             daa::DbDaaStore,
             depth::{DbDepthStore, DepthStoreReader},
@@ -26,7 +26,7 @@ use crate::{
             pruning_utxoset::PruningUtxosetStores,
             reachability::DbReachabilityStore,
             relations::{DbRelationsStore, RelationsStoreReader},
-            selected_chain::{DbSelectedChainStore, SelectedChainStore},
+            selected_chain::{DbSelectedChainStore, SelectedChainStore, SelectedChainStoreReader},
             statuses::{DbStatusesStore, StatusesStore, StatusesStoreBatchExtensions, StatusesStoreReader},
             tips::{DbTipsStore, TipsStoreReader},
             utxo_diffs::{DbUtxoDiffsStore, UtxoDiffsStoreReader},
@@ -64,7 +64,7 @@ use cryptix_consensus_core::{
     header::Header,
     merkle::calc_hash_merkle_root,
     pruning::{PruningPointAtomicState, PruningPointsList},
-    tx::{MutableTransaction, Transaction, TransactionOutpoint, UtxoEntry, VerifiableTransaction},
+    tx::{MutableTransaction, PopulatedTransaction, Transaction, TransactionOutpoint, UtxoEntry, VerifiableTransaction},
     utxo::{
         utxo_diff::{ImmutableUtxoDiff, UtxoDiff},
         utxo_view::{UtxoView, UtxoViewComposition},
@@ -296,6 +296,7 @@ impl VirtualStateProcessor {
     }
 
     fn resolve_virtual(self: &Arc<Self>) {
+        self.repair_anchor_only_virtual_atomic_state_if_possible();
         let pruning_point = self.pruning_point_store.read().pruning_point().unwrap();
         let virtual_read = self.virtual_stores.upgradable_read();
         let prev_state = virtual_read.state.get().unwrap();
@@ -323,6 +324,9 @@ impl VirtualStateProcessor {
         drop(prune_guard);
         let prev_sink = prev_state.ghostdag_data.selected_parent;
         let mut accumulated_diff = prev_state.utxo_diff.clone().to_reversed();
+        if !self.ensure_current_atomic_store_matches_virtual(&virtual_read, &prev_state) {
+            return;
+        }
         let mut accumulated_atomic_state = self.atomic_state_store.attach_virtual_state(&prev_state.atomic_state);
         if let Err(err) = accumulated_atomic_state.apply_delta_rollback(&prev_state.atomic_diff) {
             warn!("failed rolling back virtual Atomic diff for previous sink `{prev_sink}`: {err}; keeping previous virtual state");
@@ -899,6 +903,44 @@ impl VirtualStateProcessor {
         }
     }
 
+    fn ensure_current_atomic_store_matches_virtual(&self, virtual_stores: &VirtualStores, virtual_state: &VirtualState) -> bool {
+        let expected = virtual_state.atomic_state.root_accumulator();
+        match self.atomic_state_store.read_current_root() {
+            Ok(Some(actual)) if actual == expected => return true,
+            Ok(Some(actual)) => {
+                warn!(
+                    "Atomic V2 current-state root mismatch before virtual resolve: virtual={}, current={}; attempting local selected-chain rebuild",
+                    faster_hex::hex_string(&AtomicConsensusState::root_only(expected).canonical_hash()),
+                    faster_hex::hex_string(&AtomicConsensusState::root_only(actual).canonical_hash())
+                );
+            }
+            Ok(None) if expected == Default::default() => return true,
+            Ok(None) => {
+                warn!(
+                    "Atomic V2 current-state KV store is missing while virtual root is {}; attempting local selected-chain rebuild",
+                    faster_hex::hex_string(&AtomicConsensusState::root_only(expected).canonical_hash())
+                );
+            }
+            Err(err) => {
+                warn!("failed reading Atomic V2 current-state root before virtual resolve: {err}; attempting local selected-chain rebuild");
+            }
+        }
+
+        match self.rebuild_current_atomic_store_from_selected_chain(virtual_state) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!("cannot repair Atomic V2 current-state KV store from local selected-chain data: {err}; trying virtual UTXO reconstruction");
+                match self.rebuild_current_atomic_store_from_virtual_utxo(virtual_stores, virtual_state) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        warn!("cannot repair Atomic V2 current-state KV store from virtual UTXO set: {err}; keeping previous virtual state");
+                        false
+                    }
+                }
+            }
+        }
+    }
+
     fn validate_mempool_transaction_impl(
         &self,
         mutable_tx: &mut MutableTransaction,
@@ -1169,6 +1211,9 @@ impl VirtualStateProcessor {
         let virtual_utxo_view = &virtual_read.utxo_set;
         let virtual_daa_score = virtual_state.daa_score;
         let virtual_past_median_time = virtual_state.past_median_time;
+        if !self.ensure_current_atomic_store_matches_virtual(&virtual_read, &virtual_state) {
+            return Err(TxRuleError::InvalidAtomicPayload("Atomic state is not ready for mempool validation".to_string()));
+        }
         self.validate_mempool_transaction_impl(
             mutable_tx,
             &virtual_state,
@@ -1189,6 +1234,12 @@ impl VirtualStateProcessor {
         let virtual_utxo_view = &virtual_read.utxo_set;
         let virtual_daa_score = virtual_state.daa_score;
         let virtual_past_median_time = virtual_state.past_median_time;
+        if !self.ensure_current_atomic_store_matches_virtual(&virtual_read, &virtual_state) {
+            return mutable_txs
+                .iter()
+                .map(|_| Err(TxRuleError::InvalidAtomicPayload("Atomic state is not ready for mempool validation".to_string())))
+                .collect();
+        }
 
         let mut results = self.thread_pool.install(|| {
             mutable_txs
@@ -1337,6 +1388,9 @@ impl VirtualStateProcessor {
         let virtual_read = self.virtual_stores.read();
         let virtual_state = virtual_read.state.get().unwrap();
         let virtual_utxo_view = &virtual_read.utxo_set;
+        if !self.ensure_current_atomic_store_matches_virtual(&virtual_read, &virtual_state) {
+            return Err(RuleError::KnownInvalid);
+        }
         let mut template_atomic_state = self.atomic_state_for_virtual_context(&virtual_state.atomic_state);
         let mut template_atomic_growth = AtomicBlockStateGrowth::default();
         self.order_block_template_transactions(&mut txs, &virtual_state, virtual_utxo_view);
@@ -1523,6 +1577,7 @@ impl VirtualStateProcessor {
             drop(pruning_utxoset_write);
         }
         self.recover_pre_hf_virtual_atomic_state();
+        self.repair_anchor_only_virtual_atomic_state_if_possible();
     }
 
     /// Initializes UTXO state of genesis and points virtual at genesis.
@@ -1728,6 +1783,363 @@ impl VirtualStateProcessor {
         self.db.write(batch).unwrap();
     }
 
+    fn repair_anchor_only_virtual_atomic_state_if_possible(&self) {
+        let virtual_read = self.virtual_stores.upgradable_read();
+        let Ok(virtual_state) = virtual_read.state.get() else {
+            return;
+        };
+        let expected_root = virtual_state.atomic_state.root_accumulator();
+        let current_root = match self.atomic_state_store.read_current_root() {
+            Ok(root) => root,
+            Err(err) => {
+                warn!("failed reading Atomic V2 current root while checking anchor-only repair: {err}");
+                None
+            }
+        };
+        if current_root == Some(expected_root) || current_root.is_none() && expected_root == Default::default() {
+            return;
+        }
+
+        let rebuilt = match Self::atomic_anchor_state_from_utxo_iterator(virtual_read.utxo_set.iterator(), "virtual UTXO set") {
+            Ok(state) => state,
+            Err(err) => {
+                warn!("failed reconstructing anchor-only Atomic V2 state from virtual UTXO set: {err}");
+                return;
+            }
+        };
+        let rebuilt_root = rebuilt.root_accumulator();
+
+        match self.selected_chain_has_atomic_payload_transactions() {
+            Ok(false) => {}
+            Ok(true) => {
+                warn!(
+                    "Atomic V2 anchor-only repair refused: selected chain contains Atomic payload transactions; snapshot or selected-chain deltas are required"
+                );
+                return;
+            }
+            Err(err) => {
+                warn!("Atomic V2 anchor-only repair refused: failed scanning selected chain for Atomic payload transactions: {err}");
+                return;
+            }
+        }
+
+        warn!(
+            "repairing Atomic V2 virtual/current state from anchor-only UTXO reconstruction: virtual={}, current={}, rebuilt={}",
+            faster_hex::hex_string(&AtomicConsensusState::root_only(expected_root).canonical_hash()),
+            current_root
+                .map(|root| faster_hex::hex_string(&AtomicConsensusState::root_only(root).canonical_hash()))
+                .unwrap_or_else(|| "missing".to_string()),
+            faster_hex::hex_string(&AtomicConsensusState::root_only(rebuilt_root).canonical_hash())
+        );
+
+        let mut updated_virtual_state = virtual_state.as_ref().clone();
+        updated_virtual_state.atomic_state = rebuilt.as_virtual_root_state();
+
+        let mut batch = WriteBatch::default();
+        let mut virtual_write = RwLockUpgradableReadGuard::upgrade(virtual_read);
+        self.atomic_state_store
+            .replace_current_overlay_batch(&mut batch, &rebuilt)
+            .expect("anchor-only Atomic V2 current-state repair should write");
+        virtual_write.state.set_batch(&mut batch, Arc::new(updated_virtual_state)).unwrap();
+        self.db.write(batch).unwrap();
+    }
+
+    fn selected_chain_has_atomic_payload_transactions(&self) -> Result<bool, String> {
+        let (tip_index, _) =
+            self.selected_chain_store.read().get_tip().map_err(|err| format!("selected chain tip unavailable: {err}"))?;
+        let selected_chain_read = self.selected_chain_store.read();
+        for index in 1..=tip_index {
+            let block_hash =
+                selected_chain_read.get_by_index(index).map_err(|err| format!("selected-chain index `{index}` unavailable: {err}"))?;
+            let txs = self
+                .block_transactions_store
+                .get(block_hash)
+                .map_err(|err| format!("selected-chain block `{block_hash}` transactions unavailable: {err}"))?;
+            for tx in txs.iter().skip(1) {
+                if !tx.subnetwork_id.is_payload() || tx.payload.is_empty() {
+                    continue;
+                }
+                match parse_atomic_payload(tx.payload.as_slice()) {
+                    Ok(None) => {}
+                    Ok(Some(_)) | Err(_) => return Ok(true),
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn rebuild_current_atomic_store_from_selected_chain(&self, virtual_state: &VirtualState) -> Result<(), String> {
+        let expected_root = virtual_state.atomic_state.root_accumulator();
+        let (tip_index, tip_hash) =
+            self.selected_chain_store.read().get_tip().map_err(|err| format!("selected chain tip unavailable: {err}"))?;
+        let selected_parent = virtual_state.ghostdag_data.selected_parent;
+        if tip_hash != selected_parent {
+            return Err(format!("selected-chain tip `{tip_hash}` does not match virtual selected parent `{selected_parent}`"));
+        }
+
+        let mut rebuilt = AtomicConsensusState::default();
+        let mut replayed_blocks = 0u64;
+        {
+            let selected_chain_read = self.selected_chain_store.read();
+            for index in 1..=tip_index {
+                let block_hash = selected_chain_read
+                    .get_by_index(index)
+                    .map_err(|err| format!("selected-chain index `{index}` unavailable: {err}"))?;
+                let delta = match self.atomic_state_store.get_delta(block_hash) {
+                    Ok(delta) => delta,
+                    Err(err) => {
+                        warn!(
+                            "Atomic V2 selected-chain delta replay is incomplete at block `{block_hash}` ({err}); rebuilding from local block data"
+                        );
+                        return self.rebuild_current_atomic_store_from_selected_chain_blocks(virtual_state, tip_index, tip_hash);
+                    }
+                };
+                rebuilt
+                    .apply_delta_forward(delta.as_ref())
+                    .map_err(|err| format!("failed replaying Atomic delta for selected-chain block `{block_hash}`: {err}"))?;
+                replayed_blocks += 1;
+            }
+        }
+
+        rebuilt
+            .apply_delta_forward(&virtual_state.atomic_diff)
+            .map_err(|err| format!("failed replaying virtual Atomic delta: {err}"))?;
+
+        let rebuilt_root = rebuilt.root_accumulator();
+        if rebuilt_root != expected_root {
+            warn!(
+                "Atomic V2 selected-chain delta replay root mismatch; rebuilding from local block data: virtual={}, rebuilt={} (selected blocks replayed: {}, tip: `{tip_hash}`)",
+                faster_hex::hex_string(&AtomicConsensusState::root_only(expected_root).canonical_hash()),
+                faster_hex::hex_string(&AtomicConsensusState::root_only(rebuilt_root).canonical_hash()),
+                replayed_blocks
+            );
+            return self.rebuild_current_atomic_store_from_selected_chain_blocks(virtual_state, tip_index, tip_hash);
+        }
+
+        let mut batch = WriteBatch::default();
+        self.atomic_state_store
+            .replace_current_overlay_batch(&mut batch, &rebuilt)
+            .map_err(|err| format!("failed writing rebuilt Atomic V2 current-state KV store: {err}"))?;
+        self.db.write(batch).map_err(|err| format!("failed committing rebuilt Atomic V2 current-state KV store: {err}"))?;
+        info!(
+            "rebuilt Atomic V2 current-state KV store from {} selected-chain block delta(s), root={}",
+            replayed_blocks,
+            faster_hex::hex_string(&AtomicConsensusState::root_only(expected_root).canonical_hash())
+        );
+        Ok(())
+    }
+
+    fn rebuild_current_atomic_store_from_selected_chain_blocks(
+        &self,
+        virtual_state: &VirtualState,
+        tip_index: u64,
+        tip_hash: Hash,
+    ) -> Result<(), String> {
+        let expected_root = virtual_state.atomic_state.root_accumulator();
+        let mut rebuilt = AtomicConsensusState::default();
+        let mut batch = WriteBatch::default();
+        let mut replayed_blocks = 0u64;
+        let mut replayed_transactions = 0u64;
+
+        {
+            let selected_chain_read = self.selected_chain_store.read();
+            let base_hash =
+                selected_chain_read.get_by_index(0).map_err(|err| format!("selected-chain base block unavailable: {err}"))?;
+            if base_hash != self.genesis.hash {
+                let base_hash_record = self.atomic_state_store.get_root_record(base_hash).map_err(|err| {
+                    format!(
+                        "selected-chain local block replay starts at non-genesis pruning point `{base_hash}` and has no usable Atomic snapshot: {err}"
+                    )
+                })?;
+                let empty_hash = AtomicConsensusState::default().canonical_hash();
+                if base_hash_record.state_hash != empty_hash {
+                    return Err(format!(
+                        "selected-chain local block replay starts at post-Atomic pruning point `{base_hash}`; import an Atomic V2 snapshot before replaying above it"
+                    ));
+                }
+            }
+
+            for index in 1..=tip_index {
+                let block_hash = selected_chain_read
+                    .get_by_index(index)
+                    .map_err(|err| format!("selected-chain index `{index}` unavailable: {err}"))?;
+                let pov_daa_score = self
+                    .headers_store
+                    .get_header(block_hash)
+                    .map_err(|err| format!("selected-chain block `{block_hash}` header unavailable: {err}"))?
+                    .daa_score;
+
+                rebuilt.begin_delta_tracking();
+                let accepted = self.replay_atomic_acceptance_for_block(block_hash, pov_daa_score, &mut rebuilt)?;
+                let delta = Arc::new(rebuilt.take_delta());
+                let state_hash = rebuilt.canonical_hash();
+                self.atomic_state_store
+                    .repair_batch_with_delta(&mut batch, block_hash, state_hash, delta)
+                    .map_err(|err| format!("failed writing repaired Atomic delta for selected-chain block `{block_hash}`: {err}"))?;
+
+                replayed_blocks += 1;
+                replayed_transactions += accepted;
+                if replayed_blocks % 5_000 == 0 {
+                    info!(
+                        "Atomic V2 local selected-chain replay progress: {}/{} block(s), {} accepted non-coinbase tx(s)",
+                        replayed_blocks, tip_index, replayed_transactions
+                    );
+                }
+            }
+        }
+
+        rebuilt
+            .apply_delta_forward(&virtual_state.atomic_diff)
+            .map_err(|err| format!("failed replaying virtual Atomic delta after local block replay: {err}"))?;
+
+        let rebuilt_root = rebuilt.root_accumulator();
+        if rebuilt_root != expected_root {
+            return Err(format!(
+                "local selected-chain block replay root mismatch: virtual={}, rebuilt={} (selected blocks replayed: {}, accepted non-coinbase txs replayed: {}, tip: `{tip_hash}`)",
+                faster_hex::hex_string(&AtomicConsensusState::root_only(expected_root).canonical_hash()),
+                faster_hex::hex_string(&AtomicConsensusState::root_only(rebuilt_root).canonical_hash()),
+                replayed_blocks,
+                replayed_transactions
+            ));
+        }
+
+        self.atomic_state_store
+            .replace_current_overlay_batch(&mut batch, &rebuilt)
+            .map_err(|err| format!("failed writing locally replayed Atomic V2 current-state KV store: {err}"))?;
+        self.db.write(batch).map_err(|err| format!("failed committing locally replayed Atomic V2 current-state KV store: {err}"))?;
+        info!(
+            "rebuilt Atomic V2 current-state KV store and repaired block deltas from local selected-chain block data: {} block(s), {} accepted non-coinbase tx(s), root={}",
+            replayed_blocks,
+            replayed_transactions,
+            faster_hex::hex_string(&AtomicConsensusState::root_only(expected_root).canonical_hash())
+        );
+        Ok(())
+    }
+
+    fn replay_atomic_acceptance_for_block(
+        &self,
+        block_hash: Hash,
+        pov_daa_score: u64,
+        atomic_state: &mut AtomicConsensusState,
+    ) -> Result<u64, String> {
+        let acceptance_data = self
+            .acceptance_data_store
+            .get(block_hash)
+            .map_err(|err| format!("block `{block_hash}` acceptance data unavailable: {err}"))?;
+        let utxo_diff =
+            self.utxo_diffs_store.get(block_hash).map_err(|err| format!("block `{block_hash}` UTXO diff unavailable: {err}"))?;
+        let mut growth = AtomicBlockStateGrowth::default();
+        let mut replayed_transactions = 0u64;
+
+        for accepted_block in acceptance_data.iter() {
+            let txs = self.block_transactions_store.get(accepted_block.block_hash).map_err(|err| {
+                format!(
+                    "accepted block `{}` transaction list unavailable while replaying `{block_hash}`: {err}",
+                    accepted_block.block_hash
+                )
+            })?;
+
+            for accepted_tx in accepted_block.accepted_transactions.iter() {
+                let tx = txs.get(accepted_tx.index_within_block as usize).ok_or_else(|| {
+                    format!(
+                        "accepted tx index `{}` is out of bounds for block `{}` while replaying `{block_hash}`",
+                        accepted_tx.index_within_block, accepted_block.block_hash
+                    )
+                })?;
+                if tx.id() != accepted_tx.transaction_id {
+                    return Err(format!(
+                        "accepted tx id mismatch for block `{}` index `{}` while replaying `{block_hash}`: acceptance={}, actual={}",
+                        accepted_block.block_hash,
+                        accepted_tx.index_within_block,
+                        accepted_tx.transaction_id,
+                        tx.id()
+                    ));
+                }
+                if tx.is_coinbase() {
+                    continue;
+                }
+
+                let mut entries = Vec::with_capacity(tx.inputs.len());
+                for input in tx.inputs.iter() {
+                    let entry = utxo_diff.removed().get(&input.previous_outpoint).ok_or_else(|| {
+                        format!(
+                            "accepted tx `{}` input `{}` has no removed UTXO entry in block `{block_hash}` diff",
+                            tx.id(),
+                            input.previous_outpoint
+                        )
+                    })?;
+                    entries.push(entry.clone());
+                }
+                let populated = PopulatedTransaction::new(tx, entries);
+                self.validate_and_apply_atomic_state_transition_with_growth(&populated, pov_daa_score, atomic_state, &mut growth)
+                    .map_err(|err| {
+                        format!(
+                            "failed replaying Atomic transition for accepted tx `{}` in block `{}` while rebuilding `{block_hash}`: {err}",
+                            tx.id(),
+                            accepted_block.block_hash
+                        )
+                    })?;
+                replayed_transactions += 1;
+            }
+        }
+
+        Ok(replayed_transactions)
+    }
+
+    fn rebuild_current_atomic_store_from_virtual_utxo(
+        &self,
+        virtual_stores: &VirtualStores,
+        virtual_state: &VirtualState,
+    ) -> Result<(), String> {
+        let expected_root = virtual_state.atomic_state.root_accumulator();
+        let rebuilt = Self::atomic_anchor_state_from_utxo_iterator(virtual_stores.utxo_set.iterator(), "virtual UTXO set")?;
+        let rebuilt_root = rebuilt.root_accumulator();
+        if rebuilt_root == expected_root {
+            self.replace_current_atomic_store(&rebuilt, "virtual UTXO set", expected_root)?;
+            return Ok(());
+        }
+
+        let legacy_rebuilt = Self::atomic_anchor_state_from_utxo_iterator_with_coinbase(
+            virtual_stores.utxo_set.iterator(),
+            "virtual UTXO set (legacy coinbase-inclusive)",
+        )?;
+        let legacy_rebuilt_root = legacy_rebuilt.root_accumulator();
+        if legacy_rebuilt_root == expected_root {
+            self.replace_current_atomic_store(
+                &legacy_rebuilt,
+                "virtual UTXO set using legacy coinbase-inclusive anchor reconstruction",
+                expected_root,
+            )?;
+            return Ok(());
+        }
+
+        Err(format!(
+            "virtual UTXO reconstruction root mismatch: virtual={}, rebuilt={}, legacy_coinbase_inclusive={} (this node needs selected-chain Atomic deltas or a compatible snapshot)",
+            faster_hex::hex_string(&AtomicConsensusState::root_only(expected_root).canonical_hash()),
+            faster_hex::hex_string(&AtomicConsensusState::root_only(rebuilt_root).canonical_hash()),
+            faster_hex::hex_string(&AtomicConsensusState::root_only(legacy_rebuilt_root).canonical_hash())
+        ))
+    }
+
+    fn replace_current_atomic_store(
+        &self,
+        state: &AtomicConsensusState,
+        source_label: &str,
+        expected_root: AtomicConsensusRootAccumulator,
+    ) -> Result<(), String> {
+        let mut batch = WriteBatch::default();
+        self.atomic_state_store
+            .replace_current_overlay_batch(&mut batch, state)
+            .map_err(|err| format!("failed writing UTXO-rebuilt Atomic V2 current-state KV store: {err}"))?;
+        self.db.write(batch).map_err(|err| format!("failed committing UTXO-rebuilt Atomic V2 current-state KV store: {err}"))?;
+        info!(
+            "rebuilt Atomic V2 current-state KV store from {}, root={}",
+            source_label,
+            faster_hex::hex_string(&AtomicConsensusState::root_only(expected_root).canonical_hash())
+        );
+        Ok(())
+    }
+
     fn reconstruct_pre_hf_pruning_point_atomic_state(&self, new_pruning_point: Hash) -> PruningImportResult<AtomicConsensusState> {
         let pruning_utxoset_read = self.pruning_utxoset_stores.read();
         Self::atomic_anchor_state_from_utxo_iterator(pruning_utxoset_read.utxo_set.iterator(), "pruning-point UTXO set").map_err(
@@ -1746,16 +2158,48 @@ impl VirtualStateProcessor {
     where
         E: std::fmt::Display,
     {
+        Self::atomic_anchor_state_from_utxo_iterator_inner(utxos, context, false)
+    }
+
+    fn atomic_anchor_state_from_utxo_iterator_with_coinbase<E>(
+        utxos: impl IntoIterator<Item = Result<(TransactionOutpoint, Arc<UtxoEntry>), E>>,
+        context: &str,
+    ) -> Result<AtomicConsensusState, String>
+    where
+        E: std::fmt::Display,
+    {
+        Self::atomic_anchor_state_from_utxo_iterator_inner(utxos, context, true)
+    }
+
+    fn atomic_anchor_state_from_utxo_iterator_inner<E>(
+        utxos: impl IntoIterator<Item = Result<(TransactionOutpoint, Arc<UtxoEntry>), E>>,
+        context: &str,
+        include_coinbase: bool,
+    ) -> Result<AtomicConsensusState, String>
+    where
+        E: std::fmt::Display,
+    {
         let mut state = AtomicConsensusState::default();
         for item in utxos {
             let (_outpoint, entry) = item.map_err(|err| format!("failed iterating {context}: {err}"))?;
-            Self::add_atomic_anchor_count(&mut state, &entry)?;
+            Self::add_atomic_anchor_count_with_policy(&mut state, &entry, include_coinbase)?;
         }
         state.validate_normalized()?;
         Ok(state)
     }
 
     fn add_atomic_anchor_count(state: &mut AtomicConsensusState, entry: &UtxoEntry) -> Result<(), String> {
+        Self::add_atomic_anchor_count_with_policy(state, entry, false)
+    }
+
+    fn add_atomic_anchor_count_with_policy(
+        state: &mut AtomicConsensusState,
+        entry: &UtxoEntry,
+        include_coinbase: bool,
+    ) -> Result<(), String> {
+        if entry.is_coinbase && !include_coinbase {
+            return Ok(());
+        }
         let Some(owner_id) = atomic_owner_id_from_script(&entry.script_public_key) else {
             return Ok(());
         };
@@ -1768,6 +2212,9 @@ impl VirtualStateProcessor {
     }
 
     fn remove_atomic_anchor_count(state: &mut AtomicConsensusState, entry: &UtxoEntry) -> Result<(), String> {
+        if entry.is_coinbase {
+            return Ok(());
+        }
         let Some(owner_id) = atomic_owner_id_from_script(&entry.script_public_key) else {
             return Ok(());
         };

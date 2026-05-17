@@ -569,9 +569,10 @@ fn pre_hf_atomic_state_reconstruction_counts_owner_utxos() {
 
     let utxos: Vec<Result<(TransactionOutpoint, Arc<UtxoEntry>), String>> = vec![
         Ok((TransactionOutpoint::new(Hash::from_u64_word(1), 0), Arc::new(UtxoEntry::new(10, owner_script.clone(), 1, false)))),
-        Ok((TransactionOutpoint::new(Hash::from_u64_word(2), 0), Arc::new(UtxoEntry::new(20, owner_script, 2, false)))),
+        Ok((TransactionOutpoint::new(Hash::from_u64_word(2), 0), Arc::new(UtxoEntry::new(20, owner_script.clone(), 2, false)))),
         Ok((TransactionOutpoint::new(Hash::from_u64_word(3), 0), Arc::new(UtxoEntry::new(30, second_owner_script, 3, false)))),
         Ok((TransactionOutpoint::new(Hash::from_u64_word(4), 0), Arc::new(UtxoEntry::new(40, non_owner_script, 4, false)))),
+        Ok((TransactionOutpoint::new(Hash::from_u64_word(5), 0), Arc::new(UtxoEntry::new(50, owner_script, 5, true)))),
     ];
 
     let state = super::processor::VirtualStateProcessor::atomic_anchor_state_from_utxo_iterator(utxos, "test UTXO set")
@@ -848,10 +849,72 @@ async fn payload_hf_activation_switches_live_without_restart() {
     ctx.simulated_time += ctx.consensus.params().target_time_per_block;
     let create_template = ctx.build_block_template_with_transactions(vec![create_tx], 200, ctx.simulated_time);
     ctx.validate_and_insert_block(create_template.block.to_immutable()).await;
+    let create_block_hash = ctx.consensus.get_sink();
 
     let atomic = ctx.consensus.virtual_atomic_state();
     assert!(atomic.assets.contains_key(&asset_id));
     assert_eq!(balance_of(&atomic, asset_id, owner_id), 100);
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let stabilize_template = ctx.build_block_template(201, ctx.simulated_time);
+    ctx.validate_and_insert_block(stabilize_template.block.to_immutable()).await;
+
+    ctx.consensus.clear_atomic_current_store_for_tests();
+    ctx.consensus.delete_atomic_state_record_for_tests(create_block_hash);
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let repair_template = ctx.build_block_template(202, ctx.simulated_time);
+    ctx.validate_and_insert_block(repair_template.block.to_immutable()).await;
+
+    let repaired_atomic = ctx.consensus.virtual_atomic_state();
+    assert!(repaired_atomic.assets.contains_key(&asset_id));
+    assert_eq!(balance_of(&repaired_atomic, asset_id, owner_id), 100);
+}
+
+#[tokio::test]
+async fn missing_current_store_and_missing_selected_chain_delta_rebuilds_from_virtual_utxo_when_root_matches() {
+    let activation_daa = 8;
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.coinbase_maturity = 0;
+            p.payload_hf_activation_daa_score = activation_daa;
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    while ctx.consensus.get_virtual_daa_score() < activation_daa {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+
+    let (anchor_outpoint, anchor_entry) = find_virtual_utxo_by_script(&ctx, &owner_script);
+    let tx_fee = 10_000u64;
+    let mut anchor_tx = Transaction::new(
+        TX_VERSION,
+        vec![TransactionInput::new(anchor_outpoint, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(anchor_entry.amount - tx_fee, owner_script.clone())],
+        0,
+        SUBNETWORK_ID_NATIVE,
+        0,
+        vec![],
+    );
+    anchor_tx.finalize();
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let anchor_template = ctx.build_block_template_with_transactions(vec![anchor_tx], 300, ctx.simulated_time);
+    ctx.validate_and_insert_block(anchor_template.block.to_immutable()).await;
+
+    let missing_delta_block = ctx.consensus.get_sink();
+    ctx.consensus.clear_atomic_current_store_for_tests();
+    ctx.consensus.delete_atomic_state_record_for_tests(missing_delta_block);
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let repair_template = ctx.build_block_template(301, ctx.simulated_time);
+    ctx.validate_and_insert_block(repair_template.block.to_immutable()).await;
+
+    let rebuilt = ctx.consensus.virtual_atomic_state();
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    assert!(rebuilt.has_anchor_count(&owner_id));
 }
 
 #[tokio::test]

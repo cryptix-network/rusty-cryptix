@@ -3649,6 +3649,16 @@ impl AtomicTokenState {
     }
 
     pub fn rollback_snapshot_window_to_parent_persisted(&mut self, window_start_block_hash: BlockHash) -> AtomicTokenResult<()> {
+        let rollback_total = self
+            .applied_chain_order
+            .iter()
+            .rev()
+            .position(|hash| *hash == window_start_block_hash)
+            .map(|index| index + 1)
+            .unwrap_or(self.applied_chain_order.len());
+        let should_log_progress = rollback_total >= 1024;
+        let mut rolled_back = 0usize;
+        let mut last_log = Instant::now();
         let mut found_window_start = false;
         while let Some(last_applied) = self.applied_chain_order.last().copied() {
             let journal = self.rollback_block_internal(last_applied, false).map_err(|_| {
@@ -3657,6 +3667,14 @@ impl AtomicTokenState {
                 ))
             })?;
             self.commit_rollback_to_store(last_applied, &journal, &[])?;
+            rolled_back += 1;
+            if should_log_progress && last_log.elapsed() >= LONG_ATOMIC_REPLAY_LOG_INTERVAL {
+                info!(
+                    "[{IDENT}] Cryptix Atomic retained replay rollback progress: {}/{} block(s)",
+                    rolled_back, rollback_total
+                );
+                last_log = Instant::now();
+            }
             if last_applied == window_start_block_hash {
                 found_window_start = true;
                 break;

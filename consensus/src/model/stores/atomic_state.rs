@@ -1604,6 +1604,32 @@ impl DbAtomicStateStore {
         self.write_current_root_batch(batch, state.root_accumulator())
     }
 
+    pub fn replace_current_overlay_batch(&self, batch: &mut WriteBatch, state: &AtomicConsensusState) -> Result<(), StoreError> {
+        for tag in [
+            ATOMIC_STATE_CURRENT_META_SUBPREFIX,
+            ATOMIC_STATE_CURRENT_NONCE_SUBPREFIX,
+            ATOMIC_STATE_CURRENT_ASSET_SUBPREFIX,
+            ATOMIC_STATE_CURRENT_BALANCE_SUBPREFIX,
+            ATOMIC_STATE_CURRENT_ANCHOR_SUBPREFIX,
+            ATOMIC_STATE_CURRENT_VAULT_SUBPREFIX,
+        ] {
+            self.clear_current_subprefix_batch(batch, tag)?;
+        }
+        self.write_current_overlay_batch(batch, state)
+    }
+
+    fn clear_current_subprefix_batch(&self, batch: &mut WriteBatch, tag: u8) -> Result<(), StoreError> {
+        let prefix = atomic_state_subprefix(tag);
+        for item in self.db.prefix_iterator(&prefix) {
+            let (key, _) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            batch.delete(key);
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn materialize_current_state_for_tests(&self, root_state: &AtomicConsensusState) -> AtomicConsensusState {
         let mut state = AtomicConsensusState::default();
@@ -1653,6 +1679,22 @@ impl DbAtomicStateStore {
             "materialized current Atomic test state does not match virtual root"
         );
         state
+    }
+
+    #[cfg(test)]
+    pub fn clear_current_store_for_tests(&self) {
+        let mut batch = WriteBatch::default();
+        for tag in [
+            ATOMIC_STATE_CURRENT_META_SUBPREFIX,
+            ATOMIC_STATE_CURRENT_NONCE_SUBPREFIX,
+            ATOMIC_STATE_CURRENT_ASSET_SUBPREFIX,
+            ATOMIC_STATE_CURRENT_BALANCE_SUBPREFIX,
+            ATOMIC_STATE_CURRENT_ANCHOR_SUBPREFIX,
+            ATOMIC_STATE_CURRENT_VAULT_SUBPREFIX,
+        ] {
+            self.clear_current_subprefix_batch(&mut batch, tag).expect("clear current Atomic subprefix");
+        }
+        self.db.write(batch).expect("clear current Atomic store");
     }
 
     #[cfg(test)]
@@ -1720,6 +1762,19 @@ impl DbAtomicStateStore {
         if self.root_access.has(hash)? {
             return Err(StoreError::HashAlreadyExists(hash));
         }
+        let root_record = Arc::new(AtomicConsensusStateRootRecord::new(state_hash, delta.as_ref()));
+        self.root_access.write(BatchDbWriter::new(batch), hash, AtomicConsensusStateRootEntry(root_record))?;
+        self.delta_access.write(BatchDbWriter::new(batch), hash, AtomicConsensusStateDeltaEntry(delta))?;
+        Ok(())
+    }
+
+    pub fn repair_batch_with_delta(
+        &self,
+        batch: &mut WriteBatch,
+        hash: Hash,
+        state_hash: [u8; 32],
+        delta: Arc<AtomicConsensusStateDelta>,
+    ) -> Result<(), StoreError> {
         let root_record = Arc::new(AtomicConsensusStateRootRecord::new(state_hash, delta.as_ref()));
         self.root_access.write(BatchDbWriter::new(batch), hash, AtomicConsensusStateRootEntry(root_record))?;
         self.delta_access.write(BatchDbWriter::new(batch), hash, AtomicConsensusStateDeltaEntry(delta))?;

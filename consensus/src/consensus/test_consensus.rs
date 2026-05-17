@@ -126,6 +126,16 @@ impl TestConsensus {
         self.consensus.atomic_state_store.materialize_current_state_for_tests(&state.atomic_state)
     }
 
+    #[cfg(test)]
+    pub fn clear_atomic_current_store_for_tests(&self) {
+        self.consensus.atomic_state_store.clear_current_store_for_tests();
+    }
+
+    #[cfg(test)]
+    pub fn delete_atomic_state_record_for_tests(&self, hash: Hash) {
+        self.consensus.atomic_state_store.delete(hash).expect("delete Atomic state record for test");
+    }
+
     pub fn build_header_with_parents(&self, hash: Hash, parents: Vec<Hash>) -> Header {
         let mut header = header_from_precomputed_hash(hash, parents);
         let ghostdag_data = self.consensus.services.ghostdag_primary_manager.ghostdag(header.direct_parents());

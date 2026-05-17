@@ -4,6 +4,7 @@ use cryptix_consensus_core::config::params::Params;
 use cryptix_consensus_core::constants::{MAX_SOMPI, SOMPI_PER_CRYPTIX};
 use cryptix_consensus_core::network::{NetworkId, NetworkType};
 use cryptix_consensus_core::tx::ScriptPublicKey;
+use cryptix_rpc_core::model::hash::RpcHash;
 use cryptix_rpc_core::model::message::{
     GetLiquidityPoolStateRequest, GetLiquidityQuoteRequest, GetTokenBalancesByOwnerRequest, GetTokenNonceRequest,
     GetTokenOwnerIdByAddressRequest, RpcLiquidityPoolState,
@@ -609,9 +610,13 @@ impl WalletDaemonService {
     }
 
     async fn fetch_liquidity_pool(&self, asset_id: &str) -> Result<RpcLiquidityPoolState, Status> {
+        self.fetch_liquidity_pool_at(asset_id, None).await
+    }
+
+    async fn fetch_liquidity_pool_at(&self, asset_id: &str, at_block_hash: Option<RpcHash>) -> Result<RpcLiquidityPoolState, Status> {
         let response = self
             .rpc()
-            .get_liquidity_pool_state_call(None, GetLiquidityPoolStateRequest { asset_id: asset_id.to_string(), at_block_hash: None })
+            .get_liquidity_pool_state_call(None, GetLiquidityPoolStateRequest { asset_id: asset_id.to_string(), at_block_hash })
             .await
             .map_err(Self::status_internal)?;
         response.pool.ok_or_else(|| Status::failed_precondition(format!("liquidity pool not found for asset_id {asset_id}")))
@@ -1786,8 +1791,6 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
                 .map_err(|err| Status::invalid_argument(format!("invalid sender_address: {err}")))?
         };
         let asset_id = Self::normalize_asset_id(request.asset_id.as_str());
-        let pool = self.fetch_liquidity_pool(asset_id.as_str()).await?;
-        Self::ensure_liquidity_outflow_unlocked(&pool, "liquidity sell")?;
         let quote = self
             .rpc()
             .get_liquidity_quote_call(
@@ -1801,6 +1804,8 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
             )
             .await
             .map_err(Self::status_internal)?;
+        let pool = self.fetch_liquidity_pool_at(asset_id.as_str(), Some(quote.context.at_block_hash)).await?;
+        Self::ensure_liquidity_outflow_unlocked(&pool, "liquidity sell")?;
         let token_out = Self::parse_u128(quote.amount_out.as_str(), "quote.amount_out")?;
         let cpay_in_sompi = Self::parse_u64(quote.exact_in_amount.as_str(), "quote.exact_in_amount")?;
         if cpay_in_sompi == 0 {
@@ -1874,7 +1879,6 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
                 .map_err(|err| Status::invalid_argument(format!("invalid sender_address: {err}")))?
         };
         let asset_id = Self::normalize_asset_id(request.asset_id.as_str());
-        let pool = self.fetch_liquidity_pool(asset_id.as_str()).await?;
         let quote = self
             .rpc()
             .get_liquidity_quote_call(
@@ -1888,6 +1892,8 @@ impl pb::cryptixwalletd_server::Cryptixwalletd for WalletDaemonService {
             )
             .await
             .map_err(Self::status_internal)?;
+        let pool = self.fetch_liquidity_pool_at(asset_id.as_str(), Some(quote.context.at_block_hash)).await?;
+        Self::ensure_liquidity_outflow_unlocked(&pool, "liquidity sell")?;
         let cpay_out = Self::parse_u64(quote.amount_out.as_str(), "quote.amount_out")?;
         if cpay_out < request.min_cpay_out_sompi {
             return Err(Status::failed_precondition(format!(

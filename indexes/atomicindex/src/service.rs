@@ -51,7 +51,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 const SERVICE_IDENT: &str = "cryptix-atomic-service";
 const TOKEN_PROTOCOL_VERSION: u16 = 6;
@@ -75,6 +75,7 @@ const SNAPSHOT_IMPORT_CHUNK_KEYS: usize = 4096;
 const BOOTSTRAP_STORE_MAX_SNAPSHOTS_PER_NETWORK: usize = 16;
 const ATOMIC_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const ATOMIC_LONG_OPERATION_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const ATOMIC_REVALIDATION_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 struct SnapshotManifestV2 {
@@ -189,6 +190,7 @@ struct AtomicTokenProcessor {
     bootstrap_in_progress: AtomicBool,
     processed_chain_blocks: AtomicU64,
     progress_log: StdMutex<AtomicProgressLogState>,
+    state_progress_notify: Notify,
     state: Mutex<AtomicTokenState>,
     state_store: Arc<AtomicStorageV2>,
 }
@@ -213,6 +215,7 @@ impl AtomicTokenProcessor {
             bootstrap_in_progress: AtomicBool::new(false),
             processed_chain_blocks: AtomicU64::new(0),
             progress_log: Default::default(),
+            state_progress_notify: Notify::new(),
             state: Mutex::new(state),
             state_store,
         }
@@ -220,6 +223,11 @@ impl AtomicTokenProcessor {
 
     fn set_bootstrap_in_progress(&self, value: bool) {
         self.bootstrap_in_progress.store(value, Ordering::SeqCst);
+        self.notify_state_progress();
+    }
+
+    fn notify_state_progress(&self) {
+        self.state_progress_notify.notify_waiters();
     }
 
     async fn collect_auth_inputs_for_added_blocks(
@@ -254,6 +262,40 @@ impl AtomicTokenProcessor {
         match notification {
             ConsensusNotification::UtxosChanged(_) => Ok(()),
             ConsensusNotification::VirtualChainChanged(msg) => {
+                let already_applied_prefix_len = {
+                    let state = self.state.lock().await;
+                    if msg.removed_chain_block_hashes.is_empty() {
+                        msg.added_chain_block_hashes
+                            .iter()
+                            .take_while(|block_hash| state.state_hash_by_block.contains_key(block_hash))
+                            .count()
+                    } else {
+                        0
+                    }
+                };
+                let msg = if already_applied_prefix_len == msg.added_chain_block_hashes.len()
+                    && msg.removed_chain_block_hashes.is_empty()
+                {
+                    return Ok(());
+                } else if already_applied_prefix_len > 0 {
+                    debug!(
+                        "[{IDENT}] skipping {} already-applied Atomic virtual-chain block(s)",
+                        already_applied_prefix_len
+                    );
+                    VirtualChainChangedNotification::new(
+                        Arc::new(msg.added_chain_block_hashes.iter().skip(already_applied_prefix_len).copied().collect()),
+                        Arc::new(Vec::new()),
+                        Arc::new(
+                            msg.added_chain_blocks_acceptance_data
+                                .iter()
+                                .skip(already_applied_prefix_len)
+                                .cloned()
+                                .collect(),
+                        ),
+                    )
+                } else {
+                    msg
+                };
                 let added_count = msg.added_chain_block_hashes.len();
                 let removed_count = msg.removed_chain_block_hashes.len();
                 let auth_inputs_snapshot = match self.collect_auth_inputs_for_added_blocks(msg.added_chain_block_hashes.as_ref()).await
@@ -278,6 +320,8 @@ impl AtomicTokenProcessor {
                         state.degraded,
                         state.next_event_sequence,
                     );
+                    drop(state);
+                    self.notify_state_progress();
                     return Err(err);
                 }
                 if let Some(pruned) = state.prune_history_with_details(self.max_retained_blocks) {
@@ -296,6 +340,8 @@ impl AtomicTokenProcessor {
                             state.degraded,
                             state.next_event_sequence,
                         );
+                        drop(state);
+                        self.notify_state_progress();
                         return Err(err);
                     }
                     if pruned.pruned_processed_ops {
@@ -312,6 +358,7 @@ impl AtomicTokenProcessor {
                 drop(state);
 
                 self.maybe_log_progress(added_count, removed_count, retained_blocks, health, footprint, state_store_bytes);
+                self.notify_state_progress();
                 Ok(())
             }
             _ => Ok(()),
@@ -346,7 +393,7 @@ impl AtomicTokenProcessor {
         progress_log.last_runtime_state = Some(health.runtime_state);
         let last_applied = health.last_applied_block.map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string());
         info!(
-            "[{IDENT}] Cryptix Atomic indexed chain progress: +{}/-{} blocks ({} processed since startup, {} retained), runtime={}, live_correct={}, last_applied={}, event_seq={}, state_hash={}, assets={}, balances={}, nonces={}, events={}, processed_ops={}, journals={}, checkpoints={}, owners={}, holder_assets={}, state_store={}",
+            "[{IDENT}] Cryptix Atomic indexed chain progress: +{}/-{} blocks ({} processed since startup, {} retained), runtime={}, live_correct={}, last_applied={}, event_seq={}, state_hash={}, events={}, journals={}, checkpoints={}, state_store={}",
             added_count,
             removed_count,
             total_processed,
@@ -356,15 +403,9 @@ impl AtomicTokenProcessor {
             last_applied,
             health.last_sequence,
             short_hex_for_log(&health.current_state_hash),
-            footprint.assets,
-            footprint.balances,
-            footprint.nonces,
             footprint.events,
-            footprint.processed_ops,
             footprint.block_journals,
             footprint.state_hash_checkpoints,
-            footprint.owners_with_balances,
-            footprint.assets_with_holders,
             state_store_bytes.map(format_bytes_for_log).unwrap_or_else(|| "n/a".to_string()),
         );
     }
@@ -375,11 +416,87 @@ impl AtomicTokenProcessor {
 
     async fn health(&self) -> AtomicTokenHealth {
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
-        let state = self.state.lock().await;
-        let mut health = state.get_health();
-        health.bootstrap_in_progress = bootstrap_in_progress;
-        health.runtime_state = state.runtime_state(bootstrap_in_progress);
+        let (mut health, last_applied) = {
+            let state = self.state.lock().await;
+            let mut health = state.get_health();
+            health.bootstrap_in_progress = bootstrap_in_progress;
+            health.runtime_state = state.runtime_state(bootstrap_in_progress);
+            (health, state.applied_chain_order.last().copied())
+        };
+        if matches!(health.runtime_state, AtomicTokenRuntimeState::Healthy) {
+            let sink = self.consensus_sink().await;
+            if last_applied != Some(sink) {
+                health.runtime_state = AtomicTokenRuntimeState::Recovering;
+                health.live_correct = false;
+            }
+        }
         health
+    }
+
+    async fn consensus_sink(&self) -> BlockHash {
+        let consensus = self.consensus_manager.consensus();
+        let session = consensus.session().await;
+        session.async_get_sink().await
+    }
+
+    async fn latest_read_sink(&self, requested_at_block_hash: Option<BlockHash>) -> Option<Option<BlockHash>> {
+        if requested_at_block_hash.is_some() {
+            return Some(None);
+        }
+
+        let target_sink = self.consensus_sink().await;
+        let mut logged_wait = false;
+        loop {
+            let notified = self.state_progress_notify.notified();
+            let current_sink = self.consensus_sink().await;
+            let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
+            let (last_applied, target_is_retained, runtime_state) = {
+                let state = self.state.lock().await;
+                (
+                    state.applied_chain_order.last().copied(),
+                    state.state_hash_by_block.contains_key(&target_sink),
+                    state.runtime_state(bootstrap_in_progress),
+                )
+            };
+
+            if target_is_retained || last_applied == Some(target_sink) || last_applied == Some(current_sink) {
+                return Some(None);
+            }
+
+            if matches!(runtime_state, AtomicTokenRuntimeState::Degraded | AtomicTokenRuntimeState::NotReady) && !bootstrap_in_progress {
+                let last_applied_for_log = last_applied.map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string());
+                if matches!(runtime_state, AtomicTokenRuntimeState::Degraded) {
+                    warn!(
+                        "[{IDENT}] refusing latest Atomic read while indexer is degraded: last_applied={}, target_sink={}, current_sink={}",
+                        last_applied_for_log, target_sink, current_sink
+                    );
+                } else {
+                    debug!(
+                        "[{IDENT}] latest Atomic read unavailable while indexer is initializing: last_applied={}, target_sink={}, current_sink={}",
+                        last_applied_for_log, target_sink, current_sink
+                    );
+                }
+                return None;
+            }
+
+            if !logged_wait {
+                debug!(
+                    "[{IDENT}] latest Atomic read waiting for indexer catch-up: last_applied={}, target_sink={}, current_sink={}",
+                    last_applied.map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string()),
+                    target_sink,
+                    current_sink
+                );
+                logged_wait = true;
+            }
+            notified.await;
+        }
+    }
+
+    fn state_matches_latest_sink(state: &AtomicTokenState, latest_sink: Option<BlockHash>) -> bool {
+        match latest_sink {
+            Some(sink) => state.applied_chain_order.last().copied() == Some(sink),
+            None => true,
+        }
     }
 
     async fn balance(&self, asset_id: [u8; 32], owner_id: [u8; 32]) -> u128 {
@@ -415,8 +532,12 @@ impl AtomicTokenProcessor {
         requested_at_block_hash: Option<BlockHash>,
         fallback_block_hash: BlockHash,
     ) -> Option<AtomicTokenReadContext> {
+        let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
         let state = self.state.lock().await;
+        if !Self::state_matches_latest_sink(&state, latest_sink) {
+            return None;
+        }
         let runtime_state = state.runtime_state(bootstrap_in_progress);
         match requested_at_block_hash {
             Some(at_block_hash) => state.materialize_context_at_block(at_block_hash, runtime_state),
@@ -431,8 +552,12 @@ impl AtomicTokenProcessor {
         requested_at_block_hash: Option<BlockHash>,
         fallback_block_hash: BlockHash,
     ) -> Option<(AtomicTokenReadContext, u128)> {
+        let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
         let state = self.state.lock().await;
+        if !Self::state_matches_latest_sink(&state, latest_sink) {
+            return None;
+        }
         let runtime_state = state.runtime_state(bootstrap_in_progress);
         let context = match requested_at_block_hash {
             Some(at_block_hash) => state.materialize_context_at_block(at_block_hash, runtime_state)?,
@@ -452,8 +577,12 @@ impl AtomicTokenProcessor {
         requested_at_block_hash: Option<BlockHash>,
         fallback_block_hash: BlockHash,
     ) -> Option<(AtomicTokenReadContext, u64)> {
+        let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
         let state = self.state.lock().await;
+        if !Self::state_matches_latest_sink(&state, latest_sink) {
+            return None;
+        }
         let runtime_state = state.runtime_state(bootstrap_in_progress);
         let context = match requested_at_block_hash {
             Some(at_block_hash) => state.materialize_context_at_block(at_block_hash, runtime_state)?,
@@ -475,8 +604,12 @@ impl AtomicTokenProcessor {
         requested_at_block_hash: Option<BlockHash>,
         fallback_block_hash: BlockHash,
     ) -> Option<(AtomicTokenReadContext, u64)> {
+        let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
         let state = self.state.lock().await;
+        if !Self::state_matches_latest_sink(&state, latest_sink) {
+            return None;
+        }
         let runtime_state = state.runtime_state(bootstrap_in_progress);
         let context = match requested_at_block_hash {
             Some(at_block_hash) => state.materialize_context_at_block(at_block_hash, runtime_state)?,
@@ -495,8 +628,12 @@ impl AtomicTokenProcessor {
         requested_at_block_hash: Option<BlockHash>,
         fallback_block_hash: BlockHash,
     ) -> Option<(AtomicTokenReadContext, Option<TokenAsset>)> {
+        let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
         let state = self.state.lock().await;
+        if !Self::state_matches_latest_sink(&state, latest_sink) {
+            return None;
+        }
         let runtime_state = state.runtime_state(bootstrap_in_progress);
         let context = match requested_at_block_hash {
             Some(at_block_hash) => state.materialize_context_at_block(at_block_hash, runtime_state)?,
@@ -515,8 +652,12 @@ impl AtomicTokenProcessor {
         requested_at_block_hash: Option<BlockHash>,
         fallback_block_hash: BlockHash,
     ) -> Option<(AtomicTokenReadContext, Option<ProcessedOp>)> {
+        let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
         let state = self.state.lock().await;
+        if !Self::state_matches_latest_sink(&state, latest_sink) {
+            return None;
+        }
         let runtime_state = state.runtime_state(bootstrap_in_progress);
         let context = match requested_at_block_hash {
             Some(at_block_hash) => state.materialize_context_at_block(at_block_hash, runtime_state)?,
@@ -537,8 +678,12 @@ impl AtomicTokenProcessor {
         requested_at_block_hash: Option<BlockHash>,
         fallback_block_hash: BlockHash,
     ) -> Option<(AtomicTokenReadContext, Vec<TokenAsset>, u64)> {
+        let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
         let state = self.state.lock().await;
+        if !Self::state_matches_latest_sink(&state, latest_sink) {
+            return None;
+        }
         let runtime_state = state.runtime_state(bootstrap_in_progress);
         match requested_at_block_hash {
             Some(at_block_hash) => {
@@ -561,8 +706,12 @@ impl AtomicTokenProcessor {
         requested_at_block_hash: Option<BlockHash>,
         fallback_block_hash: BlockHash,
     ) -> Option<AtomicTokenReadView> {
+        let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
         let state = self.state.lock().await;
+        if !Self::state_matches_latest_sink(&state, latest_sink) {
+            return None;
+        }
         let runtime_state = state.runtime_state(bootstrap_in_progress);
         let context = match requested_at_block_hash {
             Some(at_block_hash) => state.materialize_context_at_block(at_block_hash, runtime_state)?,
@@ -685,8 +834,12 @@ impl AtomicTokenProcessor {
         requested_at_block_hash: Option<BlockHash>,
         fallback_block_hash: BlockHash,
     ) -> Option<(AtomicTokenReadContext, Vec<TokenOwnerBalanceEntry>)> {
+        let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
         let state = self.state.lock().await;
+        if !Self::state_matches_latest_sink(&state, latest_sink) {
+            return None;
+        }
         let runtime_state = state.runtime_state(bootstrap_in_progress);
         match requested_at_block_hash {
             Some(at_block_hash) => {
@@ -708,8 +861,12 @@ impl AtomicTokenProcessor {
         requested_at_block_hash: Option<BlockHash>,
         fallback_block_hash: BlockHash,
     ) -> Option<(AtomicTokenReadContext, Vec<TokenHolderEntry>)> {
+        let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
         let state = self.state.lock().await;
+        if !Self::state_matches_latest_sink(&state, latest_sink) {
+            return None;
+        }
         let runtime_state = state.runtime_state(bootstrap_in_progress);
         match requested_at_block_hash {
             Some(at_block_hash) => {
@@ -732,8 +889,12 @@ impl AtomicTokenProcessor {
         fallback_block_hash: BlockHash,
     ) -> Option<(AtomicTokenReadContext, Option<TokenAsset>, Vec<TokenHolderEntry>, HashMap<[u8; 32], LiquidityHolderAddressState>)>
     {
+        let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
         let state = self.state.lock().await;
+        if !Self::state_matches_latest_sink(&state, latest_sink) {
+            return None;
+        }
         let runtime_state = state.runtime_state(bootstrap_in_progress);
         match requested_at_block_hash {
             Some(at_block_hash) => {
@@ -774,6 +935,8 @@ impl AtomicTokenProcessor {
         ) {
             warn!("[{IDENT}] failed persisting degraded Cryptix Atomic state: {err}");
         }
+        drop(state);
+        self.notify_state_progress();
     }
 }
 
@@ -1022,6 +1185,86 @@ impl AtomicTokenService {
         self.revalidate_loaded_state_once_per_process().await
     }
 
+    async fn accept_persisted_state_fast_path(&self) -> AtomicTokenResult<bool> {
+        if self.processor.state_store.revalidation_version()? != Some(ATOMIC_REVALIDATION_VERSION) {
+            return Ok(false);
+        }
+        let current_root = match self.processor.state_store.current_root()? {
+            Some(root) => root,
+            None => return Ok(false),
+        };
+
+        let mut state = self.processor.state.lock().await;
+        if state.degraded || !state.has_verified_state() {
+            return Ok(false);
+        }
+        if state.state_hash_by_block.len() != state.applied_chain_order.len()
+            || state.applied_chain_order.iter().any(|block_hash| !state.state_hash_by_block.contains_key(block_hash))
+        {
+            return Ok(false);
+        }
+        let Some(last_applied) = state.applied_chain_order.last().copied() else {
+            return Ok(false);
+        };
+        let Some(last_retained_hash) = state.state_hash_by_block.get(&last_applied).copied() else {
+            return Ok(false);
+        };
+        if current_root != last_retained_hash {
+            return Ok(false);
+        }
+
+        state.live_correct = true;
+        info!(
+            "[{IDENT}] Cryptix Atomic startup state revalidation skipped: persisted V2 root matches retained tip {}",
+            last_applied
+        );
+        drop(state);
+        self.processor.notify_state_progress();
+        Ok(true)
+    }
+
+    async fn catch_up_loaded_state_to_consensus_sink(&self) -> AtomicTokenResult<bool> {
+        let last_applied = { self.processor.state.lock().await.applied_chain_order.last().copied() };
+        let Some(last_applied) = last_applied else {
+            return Ok(false);
+        };
+
+        let consensus = self.processor.consensus_manager.consensus();
+        let session = consensus.session().await;
+        let sink = session.async_get_sink().await;
+        if last_applied == sink {
+            return Ok(false);
+        }
+
+        let replay_chain = session.async_get_virtual_chain_from_block(last_applied, None).await?;
+        if replay_chain.added.is_empty() && replay_chain.removed.is_empty() {
+            return Ok(false);
+        }
+        info!(
+            "[{IDENT}] Cryptix Atomic startup catch-up from retained tip {} to consensus sink {}: +{} / -{} block(s)",
+            last_applied,
+            sink,
+            replay_chain.added.len(),
+            replay_chain.removed.len()
+        );
+        let acceptance_data = session.async_get_blocks_acceptance_data(replay_chain.added.clone(), None).await?;
+        if acceptance_data.len() != replay_chain.added.len() {
+            return Err(AtomicTokenError::Processing(format!(
+                "startup Atomic catch-up failed: acceptance-data length mismatch ({} != {})",
+                acceptance_data.len(),
+                replay_chain.added.len()
+            )));
+        }
+        let notification = VirtualChainChangedNotification::new(
+            Arc::new(replay_chain.added.clone()),
+            Arc::new(replay_chain.removed.clone()),
+            Arc::new(acceptance_data),
+        );
+        self.processor.process(ConsensusNotification::VirtualChainChanged(notification)).await?;
+        info!("[{IDENT}] Cryptix Atomic startup catch-up completed successfully");
+        Ok(true)
+    }
+
     pub async fn get_indexed_balances_by_owner(
         &self,
         owner_id: [u8; 32],
@@ -1109,47 +1352,6 @@ impl AtomicTokenService {
                 "startup state revalidation failed: canonical replay path does not start at retained replay root `{first_replayable_block_hash}`"
             )));
         }
-        info!(
-            "[{IDENT}] Cryptix Atomic startup state revalidation canonical replay path resolved: {} block(s), sink={}",
-            replay_chain.added.len(),
-            sink
-        );
-
-        info!("[{IDENT}] Cryptix Atomic startup state revalidation loading acceptance data for {} block(s)", replay_chain.added.len());
-        let acceptance_data = session.async_get_blocks_acceptance_data(replay_chain.added.clone(), None).await?;
-        if acceptance_data.len() != replay_chain.added.len() {
-            return Err(AtomicTokenError::Processing(format!(
-                "startup state revalidation failed: acceptance-data length mismatch ({} != {})",
-                acceptance_data.len(),
-                replay_chain.added.len()
-            )));
-        }
-        info!("[{IDENT}] Cryptix Atomic startup state revalidation loaded acceptance data for {} block(s)", acceptance_data.len());
-        let auth_inputs = self.processor.collect_auth_inputs_for_added_blocks(&replay_chain.added).await?;
-
-        let temp_state_dir = unique_atomic_temp_dir("startup-revalidation");
-        self.processor.state_store.checkpoint_to(&temp_state_dir)?;
-        let temp_state_store =
-            Arc::new(AtomicStorageV2::open(&temp_state_dir, self.protocol_version, self.network_id.clone(), self.genesis_hash)?);
-        let mut staged_state = loaded_state.clone();
-        staged_state.attach_state_store(temp_state_store);
-        staged_state.degraded = false;
-        staged_state.live_correct = false;
-        info!(
-            "[{IDENT}] Cryptix Atomic startup state revalidation rolling back retained replay window to parent of {}",
-            first_replayable_block_hash
-        );
-        staged_state.rollback_snapshot_window_to_parent_persisted(first_replayable_block_hash)?;
-
-        let replay_notification = VirtualChainChangedNotification::new(
-            Arc::new(replay_chain.added.clone()),
-            Arc::new(Vec::new()),
-            Arc::new(acceptance_data),
-        );
-        info!("[{IDENT}] Cryptix Atomic startup state revalidation replaying {} block(s)", replay_chain.added.len());
-        staged_state.apply_virtual_chain_change(&replay_notification, &auth_inputs, &self.processor.consensus_manager).await?;
-        info!("[{IDENT}] Cryptix Atomic startup state revalidation replay completed; verifying retained state hashes");
-
         let matching_prefix_len =
             expected_chain.iter().zip(replay_chain.added.iter()).take_while(|(expected, actual)| expected == actual).count();
         if matching_prefix_len == 0 {
@@ -1163,6 +1365,45 @@ impl AtomicTokenService {
                 "startup state revalidation failed: canonical replay path diverged before retained block `{diverged_block}`"
             )));
         }
+        let replay_added = expected_chain.clone();
+        info!(
+            "[{IDENT}] Cryptix Atomic startup state revalidation canonical replay path resolved: {} retained block(s), sink={}",
+            replay_added.len(),
+            sink
+        );
+
+        info!("[{IDENT}] Cryptix Atomic startup state revalidation loading acceptance data for {} block(s)", replay_added.len());
+        let acceptance_data = session.async_get_blocks_acceptance_data(replay_added.clone(), None).await?;
+        if acceptance_data.len() != replay_added.len() {
+            return Err(AtomicTokenError::Processing(format!(
+                "startup state revalidation failed: acceptance-data length mismatch ({} != {})",
+                acceptance_data.len(),
+                replay_added.len()
+            )));
+        }
+        info!("[{IDENT}] Cryptix Atomic startup state revalidation loaded acceptance data for {} block(s)", acceptance_data.len());
+        let auth_inputs = self.processor.collect_auth_inputs_for_added_blocks(&replay_added).await?;
+
+        let temp_state_dir = unique_atomic_temp_dir("startup-revalidation");
+        self.processor.state_store.checkpoint_to(&temp_state_dir)?;
+        let temp_state_store =
+            Arc::new(AtomicStorageV2::open(&temp_state_dir, self.protocol_version, self.network_id.clone(), self.genesis_hash)?);
+        let mut staged_state = loaded_state.clone();
+        staged_state.attach_state_store(temp_state_store.clone());
+        staged_state.degraded = false;
+        staged_state.live_correct = false;
+        info!(
+            "[{IDENT}] Cryptix Atomic startup state revalidation rolling back retained replay window to parent of {}",
+            first_replayable_block_hash
+        );
+        staged_state.rollback_snapshot_window_to_parent_persisted(first_replayable_block_hash)?;
+
+        let replay_notification =
+            VirtualChainChangedNotification::new(Arc::new(replay_added.clone()), Arc::new(Vec::new()), Arc::new(acceptance_data));
+        info!("[{IDENT}] Cryptix Atomic startup state revalidation replaying {} block(s)", replay_added.len());
+        staged_state.apply_virtual_chain_change(&replay_notification, &auth_inputs, &self.processor.consensus_manager).await?;
+        info!("[{IDENT}] Cryptix Atomic startup state revalidation replay completed; verifying retained state hashes");
+
         let final_replayed_block_hash = expected_chain.get(matching_prefix_len - 1).copied().ok_or_else(|| {
             AtomicTokenError::Processing("startup state revalidation failed: empty matching replay prefix".to_string())
         })?;
@@ -1178,9 +1419,21 @@ impl AtomicTokenService {
         })?;
         let mut refreshed_retained_hashes = Vec::new();
         if final_replayed_state_hash != final_expected_state_hash {
-            return Err(AtomicTokenError::Processing(format!(
-                "startup state revalidation failed: retained state hash mismatch at final retained block `{final_replayed_block_hash}`"
-            )));
+            warn!(
+                "[{IDENT}] Cryptix Atomic startup state revalidation repaired stale final retained checkpoint {}; stored={}, replayed={}",
+                final_replayed_block_hash,
+                short_hex_for_log(&final_expected_state_hash),
+                short_hex_for_log(&final_replayed_state_hash)
+            );
+            refreshed_retained_hashes.reserve(matching_prefix_len);
+            for block_hash in expected_chain.iter().take(matching_prefix_len).copied() {
+                let replayed_state_hash = staged_state.get_state_hash_at_block(block_hash).ok_or_else(|| {
+                    AtomicTokenError::Processing(format!(
+                        "startup state revalidation failed: replay did not reproduce retained block `{block_hash}`"
+                    ))
+                })?;
+                refreshed_retained_hashes.push((block_hash, replayed_state_hash));
+            }
         } else {
             let mut stale_checkpoint_count = 0usize;
             let mut first_stale_checkpoint = None;
@@ -1239,9 +1492,25 @@ impl AtomicTokenService {
                 final_replayed_block_hash
             );
         }
-        drop(staged_state);
 
         let mut state = self.processor.state.lock().await;
+        if final_replayed_state_hash != final_expected_state_hash {
+            staged_state.degraded = false;
+            staged_state.live_correct = true;
+            if let Some(pruned) = staged_state.prune_history_with_details(self.max_retained_blocks) {
+                temp_state_store.prune_history(
+                    &pruned.pruned_hashes,
+                    &staged_state.applied_chain_order,
+                    pruned.last_pruned_event_sequence,
+                )?;
+                if pruned.pruned_processed_ops {
+                    info!("[{IDENT}] Cryptix Atomic pruned processed-op guard entries after startup state repair");
+                }
+            }
+            let repaired_state = copy_snapshot_store_into_active(&temp_state_store, self.processor.state_store.clone(), staged_state)?;
+            *state = repaired_state;
+            info!("[{IDENT}] Cryptix Atomic startup state revalidation repaired active V2 store from deterministic replay");
+        }
         if !refreshed_retained_hashes.is_empty() {
             let refreshed_count = self.processor.state_store.replace_state_hashes(refreshed_retained_hashes.iter().copied())?;
             for (block_hash, state_hash) in refreshed_retained_hashes {
@@ -1271,7 +1540,9 @@ impl AtomicTokenService {
             state.degraded,
             state.next_event_sequence,
         )?;
+        self.processor.state_store.persist_revalidation_version(ATOMIC_REVALIDATION_VERSION)?;
         drop(state);
+        self.processor.notify_state_progress();
         let _ = std::fs::remove_dir_all(temp_state_dir);
         Ok(true)
     }
@@ -1294,6 +1565,93 @@ impl AtomicTokenService {
                 Err(err)
             }
         }
+    }
+
+    async fn backfill_empty_state_from_local_selected_chain(&self) -> AtomicTokenResult<bool> {
+        {
+            let state = self.processor.state.lock().await;
+            if state.has_verified_state() {
+                return Ok(false);
+            }
+        }
+
+        let consensus = self.processor.consensus_manager.consensus();
+        let session = consensus.session().await;
+        let sink = session.async_get_sink().await;
+        let sink_header = session.async_get_header(sink).await?;
+        if sink_header.daa_score < self.payload_hf_activation_daa_score {
+            return Ok(false);
+        }
+
+        let replay_chain = session.async_get_virtual_chain_from_block(self.genesis_hash, None).await?;
+        if replay_chain.added.is_empty() {
+            return Ok(false);
+        }
+
+        info!(
+            "[{IDENT}] Cryptix Atomic has no retained V2 state; backfilling {} selected-chain block(s) from local block data to sink {}",
+            replay_chain.added.len(),
+            sink
+        );
+        info!(
+            "[{IDENT}] Cryptix Atomic local backfill loading acceptance data for {} block(s)",
+            replay_chain.added.len()
+        );
+        let acceptance_data = session.async_get_blocks_acceptance_data(replay_chain.added.clone(), None).await?;
+        if acceptance_data.len() != replay_chain.added.len() {
+            return Err(AtomicTokenError::Processing(format!(
+                "local Atomic backfill failed: acceptance-data length mismatch ({} != {})",
+                acceptance_data.len(),
+                replay_chain.added.len()
+            )));
+        }
+        let auth_inputs = self.processor.collect_auth_inputs_for_added_blocks(&replay_chain.added).await?;
+        let notification =
+            VirtualChainChangedNotification::new(Arc::new(replay_chain.added.clone()), Arc::new(Vec::new()), Arc::new(acceptance_data));
+
+        self.processor.set_bootstrap_in_progress(true);
+        let result = async {
+            let mut state = self.processor.state.lock().await;
+            if state.has_verified_state() {
+                return Ok(false);
+            }
+            state.apply_virtual_chain_change(&notification, &auth_inputs, &self.processor.consensus_manager).await?;
+            if let Some(pruned) = state.prune_history_with_details(self.max_retained_blocks) {
+                self.processor.state_store.prune_history(
+                    &pruned.pruned_hashes,
+                    &state.applied_chain_order,
+                    pruned.last_pruned_event_sequence,
+                )?;
+                if pruned.pruned_processed_ops {
+                    info!("[{IDENT}] Cryptix Atomic pruned processed-op guard entries after local backfill");
+                }
+            }
+            self.processor.state_store.persist_runtime_flags(
+                state.applied_chain_order.last().copied(),
+                state.applied_chain_order.len() as u64,
+                state.degraded,
+                state.next_event_sequence,
+            )?;
+            self.processor.state_store.persist_revalidation_version(ATOMIC_REVALIDATION_VERSION)?;
+            Ok(true)
+        }
+        .await;
+        self.processor.set_bootstrap_in_progress(false);
+
+        if result.as_ref().copied().unwrap_or(false) {
+            let state = self.processor.state.lock().await;
+            let mut health = state.get_health();
+            health.bootstrap_in_progress = false;
+            health.runtime_state = state.runtime_state(false);
+            let retained_blocks = state.applied_chain_order.len();
+            let footprint = state.footprint();
+            let state_store_bytes = self.processor.state_store.approximate_size_bytes();
+            drop(state);
+            self.processor
+                .maybe_log_progress(notification.added_chain_block_hashes.len(), 0, retained_blocks, health, footprint, state_store_bytes);
+            info!("[{IDENT}] Cryptix Atomic local selected-chain backfill completed successfully");
+        }
+        result
     }
 
     async fn ensure_bootstrap_serving_ready(&self) -> AtomicTokenResult<()> {
@@ -1782,6 +2140,8 @@ impl AtomicTokenService {
                 let mut live_state = self.processor.state.lock().await;
                 *live_state = active_state;
             }
+            self.processor.state_store.persist_revalidation_version(ATOMIC_REVALIDATION_VERSION)?;
+            self.processor.notify_state_progress();
             Ok(())
         }
         .await;
@@ -1807,14 +2167,50 @@ impl AsyncService for AtomicTokenService {
                     "[{IDENT}] Cryptix Atomic startup state is degraded; deferring retained-chain revalidation to bootstrap worker so remote snapshot repair can be tried first"
                 );
             } else {
-                match self.revalidate_loaded_state_once_per_process().await {
-                    Ok(true) => info!("[{IDENT}] Cryptix Atomic startup state revalidation completed successfully"),
-                    Ok(false) => info!("[{IDENT}] Cryptix Atomic startup state has no retained verified chain state yet; indexing will build from local virtual-chain updates"),
+                self.processor.set_bootstrap_in_progress(true);
+                let mut local_state_ready = false;
+                match self.accept_persisted_state_fast_path().await {
+                    Ok(true) => {
+                        local_state_ready = true;
+                    }
+                    Ok(false) => {
+                        match self.revalidate_loaded_state_once_per_process().await {
+                            Ok(true) => {
+                                info!("[{IDENT}] Cryptix Atomic startup state revalidation completed successfully");
+                                local_state_ready = true;
+                            }
+                            Ok(false) => match self.backfill_empty_state_from_local_selected_chain().await {
+                                Ok(true) => {
+                                    local_state_ready = true;
+                                }
+                                Ok(false) => info!(
+                                    "[{IDENT}] Cryptix Atomic startup state has no retained verified chain state yet; indexing will build from local virtual-chain updates"
+                                ),
+                                Err(err) => {
+                                    warn!("[{IDENT}] Cryptix Atomic local selected-chain backfill failed: {err}");
+                                    self.processor
+                                        .mark_degraded_best_effort(&format!("local selected-chain backfill failed: {err}"))
+                                        .await;
+                                }
+                            },
+                            Err(err) => {
+                                warn!("[{IDENT}] Cryptix Atomic startup state revalidation failed: {err}");
+                                self.processor.mark_degraded_best_effort(&format!("startup state revalidation failed: {err}")).await;
+                            }
+                        }
+                    }
                     Err(err) => {
-                        warn!("[{IDENT}] Cryptix Atomic startup state revalidation failed: {err}");
-                        self.processor.mark_degraded_best_effort(&format!("startup state revalidation failed: {err}")).await;
+                        warn!("[{IDENT}] Cryptix Atomic persisted-state fast path failed: {err}");
+                        self.processor.mark_degraded_best_effort(&format!("persisted-state fast path failed: {err}")).await;
                     }
                 }
+                if local_state_ready {
+                    if let Err(err) = self.catch_up_loaded_state_to_consensus_sink().await {
+                        warn!("[{IDENT}] Cryptix Atomic startup catch-up failed: {err}");
+                        self.processor.mark_degraded_best_effort(&format!("startup catch-up failed: {err}")).await;
+                    }
+                }
+                self.processor.set_bootstrap_in_progress(false);
             }
 
             loop {
@@ -2834,21 +3230,12 @@ fn format_bytes_for_log(bytes: u64) -> String {
 
 fn log_state_footprint(label: &str, footprint: AtomicTokenStateFootprint, state_store_bytes: Option<u64>) {
     info!(
-        "[{IDENT}] Cryptix Atomic state footprint ({label}): assets={}, balances={}, nonces={}, anchor_counts={}, processed_ops={}, journals={}, checkpoints={}, event_checkpoints={}, retained_blocks={}, events={}, vaults={}, known_owner_addresses={}, owners={}, holder_assets={}, state_store={}",
-        footprint.assets,
-        footprint.balances,
-        footprint.nonces,
-        footprint.anchor_counts,
-        footprint.processed_ops,
+        "[{IDENT}] Cryptix Atomic state footprint ({label}): retained_blocks={}, events={}, journals={}, checkpoints={}, event_checkpoints={}, state_store={}",
+        footprint.retained_blocks,
+        footprint.events,
         footprint.block_journals,
         footprint.state_hash_checkpoints,
         footprint.event_sequence_checkpoints,
-        footprint.retained_blocks,
-        footprint.events,
-        footprint.liquidity_vault_outpoints,
-        footprint.known_owner_addresses,
-        footprint.owners_with_balances,
-        footprint.assets_with_holders,
         state_store_bytes.map(format_bytes_for_log).unwrap_or_else(|| "n/a".to_string())
     );
 }

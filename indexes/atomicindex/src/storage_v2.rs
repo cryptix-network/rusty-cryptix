@@ -22,6 +22,7 @@ const META_CURRENT_HEIGHT: &[u8] = b"meta/atomic_current_height";
 const META_CURRENT_BLOCK_HASH: &[u8] = b"meta/atomic_current_block_hash";
 const META_DEGRADED: &[u8] = b"meta/atomic_degraded";
 const META_NEXT_EVENT_SEQUENCE: &[u8] = b"meta/atomic_next_event_sequence";
+const META_REVALIDATION_VERSION: &[u8] = b"meta/atomic_revalidation_version";
 
 const PREFIX_ASSET: &[u8] = b"asset/";
 const PREFIX_BALANCE: &[u8] = b"balance/";
@@ -144,6 +145,10 @@ impl AtomicStorageV2 {
 
     pub fn current_root(&self) -> AtomicTokenResult<Option<[u8; 32]>> {
         self.get_typed(META_CURRENT_ROOT)
+    }
+
+    pub fn revalidation_version(&self) -> AtomicTokenResult<Option<u16>> {
+        self.get_typed(META_REVALIDATION_VERSION)
     }
 
     pub fn get_asset(&self, asset_id: &[u8; 32]) -> AtomicTokenResult<Option<TokenAsset>> {
@@ -702,6 +707,15 @@ impl AtomicStorageV2 {
             .write(batch)
             .map_err(|err| AtomicTokenError::Processing(format!("failed refreshing Atomic DB schema v2 state hashes: {err}")))?;
         Ok(count)
+    }
+
+    pub fn persist_revalidation_version(&self, version: u16) -> AtomicTokenResult<()> {
+        let mut batch = WriteBatch::default();
+        batch.put(META_REVALIDATION_VERSION, encode_value(&version, "revalidation version")?);
+        self.db
+            .write(batch)
+            .map_err(|err| AtomicTokenError::Processing(format!("failed committing Atomic DB schema v2 revalidation version: {err}")))?;
+        Ok(())
     }
 
     pub fn prune_history(
