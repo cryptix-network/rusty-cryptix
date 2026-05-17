@@ -1703,16 +1703,27 @@ impl VirtualStateProcessor {
                 return;
             }
         };
-        if reconstructed.canonical_hash() == virtual_state.atomic_state.canonical_hash() {
+        let reconstructed_root = reconstructed.root_accumulator();
+        let virtual_matches = reconstructed.canonical_hash() == virtual_state.atomic_state.canonical_hash();
+        let current_matches = match self.atomic_state_store.read_current_root() {
+            Ok(Some(current_root)) => current_root == reconstructed_root,
+            Ok(None) => false,
+            Err(err) => {
+                warn!("failed reading pre-HF Atomic V2 current root; repairing from current UTXO set: {err}");
+                false
+            }
+        };
+        if virtual_matches && current_matches {
             return;
         }
 
         warn!("reconstructing pre-HF virtual atomic consensus state from the current UTXO set");
         let mut updated_virtual_state = virtual_state.as_ref().clone();
-        updated_virtual_state.atomic_state = reconstructed;
+        updated_virtual_state.atomic_state = reconstructed.as_virtual_root_state();
 
         let mut batch = WriteBatch::default();
         let mut virtual_write = RwLockUpgradableReadGuard::upgrade(virtual_read);
+        self.atomic_state_store.write_current_overlay_batch(&mut batch, &reconstructed).unwrap();
         virtual_write.state.set_batch(&mut batch, Arc::new(updated_virtual_state)).unwrap();
         self.db.write(batch).unwrap();
     }
