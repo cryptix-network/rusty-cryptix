@@ -12,6 +12,7 @@ use crate::{
         CreateLiquidityAssetOp, EventType, LiquidityRecipientAddress, MintOp, NoopReason, ParsedTokenPayload, SellLiquidityExactInOp,
         SupplyMode, TokenOp, TokenOpCode, CURRENT_LIQUIDITY_CURVE_VERSION, CURRENT_TOKEN_VERSION,
     },
+    storage_v2::AtomicStorageV2,
     IDENT,
 };
 use blake2b_simd::Params as Blake2bParams;
@@ -36,16 +37,15 @@ const CAT_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
 const OWNER_AUTH_SCHEME_PUBKEY: u8 = 0;
 const OWNER_AUTH_SCHEME_PUBKEY_ECDSA: u8 = 1;
 const OWNER_AUTH_SCHEME_SCRIPT_HASH: u8 = 2;
-const CAT_STATE_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_STATE_V1";
+const CAT_STATE_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_STATE_V2";
 const LONG_ATOMIC_REPLAY_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 const SECTION_ASSETS: u8 = 0xA1;
 const SECTION_BALANCES: u8 = 0xB1;
 const SECTION_NONCES: u8 = 0xC1;
 const SECTION_ANCHOR_COUNTS: u8 = 0xD1;
-const SECTION_PROCESSED_OPS: u8 = 0xE1;
-const CAT_EVENT_DOMAIN: &[u8] = b"CAT_EVT_V1";
-const CAT_EVENT_INSTANCE_DOMAIN: &[u8] = b"CAT_EVT_INSTANCE_V1";
+const CAT_EVENT_DOMAIN: &[u8] = b"CAT_EVT_V2";
+const CAT_EVENT_INSTANCE_DOMAIN: &[u8] = b"CAT_EVT_INSTANCE_V2";
 pub const SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 pub const NONCE_SCOPE_OWNER: u8 = 0;
 pub const NONCE_SCOPE_ASSET: u8 = 1;
@@ -174,6 +174,7 @@ impl AtomicTokenReadView {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AtomicTokenSnapshot {
     pub schema_version: u16,
@@ -190,6 +191,7 @@ pub struct AtomicTokenSnapshot {
     pub journals_in_window: Vec<(BlockHash, BlockJournal)>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AtomicTokenSnapshotState {
     pub assets: HashMap<[u8; 32], TokenAsset>,
@@ -371,6 +373,15 @@ struct JournalBuilder {
     seen_anchor_counts: HashSet<[u8; 32]>,
 }
 
+#[derive(Default)]
+struct StorageDelta {
+    assets: Vec<([u8; 32], Option<TokenAsset>)>,
+    balances: Vec<(BalanceKey, Option<u128>)>,
+    nonces: Vec<(NonceKey, Option<u64>)>,
+    anchor_counts: Vec<([u8; 32], Option<u64>)>,
+    processed_ops: Vec<(BlockHash, Option<ProcessedOp>)>,
+}
+
 impl JournalBuilder {
     fn into_block_journal(self) -> BlockJournal {
         BlockJournal {
@@ -411,6 +422,28 @@ pub fn nonce_key_for_op(owner_id: [u8; 32], op: &TokenOp) -> NonceKey {
         TokenOp::SellLiquidityExactIn(op) => NonceKey::asset(owner_id, op.asset_id),
         TokenOp::ClaimLiquidityFees(op) => NonceKey::asset(owner_id, op.asset_id),
     }
+}
+
+fn asset_matches_query(asset: &TokenAsset, query: &str) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+
+    let symbol = String::from_utf8_lossy(&asset.symbol).to_ascii_lowercase();
+    let name = String::from_utf8_lossy(&asset.name).to_ascii_lowercase();
+    let asset_id = hex_lower(&asset.asset_id);
+    symbol.contains(&query) || name.contains(&query) || asset_id.starts_with(&query)
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn validate_liquidity_claim_authorization(claimant_owner_id: [u8; 32], recipient_owner_id: [u8; 32]) -> Result<(), NoopReason> {
@@ -511,6 +544,18 @@ pub struct AtomicTokenState {
     balances_by_owner: HashMap<[u8; 32], HashSet<[u8; 32]>>,
     #[serde(skip, default)]
     holders_by_asset: HashMap<[u8; 32], HashSet<[u8; 32]>>,
+    #[serde(skip, default)]
+    state_store: Option<Arc<AtomicStorageV2>>,
+    #[serde(skip, default)]
+    deleted_assets: HashSet<[u8; 32]>,
+    #[serde(skip, default)]
+    deleted_balances: HashSet<BalanceKey>,
+    #[serde(skip, default)]
+    deleted_nonces: HashSet<NonceKey>,
+    #[serde(skip, default)]
+    deleted_anchor_counts: HashSet<[u8; 32]>,
+    #[serde(skip, default)]
+    deleted_processed_ops: HashSet<BlockHash>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -529,6 +574,12 @@ pub struct AtomicTokenStateFootprint {
     pub known_owner_addresses: usize,
     pub owners_with_balances: usize,
     pub assets_with_holders: usize,
+}
+
+pub struct AtomicTokenPruneResult {
+    pub pruned_hashes: Vec<BlockHash>,
+    pub last_pruned_event_sequence: Option<u64>,
+    pub pruned_processed_ops: bool,
 }
 
 impl AtomicTokenState {
@@ -555,7 +606,21 @@ impl AtomicTokenState {
             known_owner_addresses: Default::default(),
             balances_by_owner: Default::default(),
             holders_by_asset: Default::default(),
+            state_store: None,
+            deleted_assets: Default::default(),
+            deleted_balances: Default::default(),
+            deleted_nonces: Default::default(),
+            deleted_anchor_counts: Default::default(),
+            deleted_processed_ops: Default::default(),
         }
+    }
+
+    pub fn attach_state_store(&mut self, state_store: Arc<AtomicStorageV2>) {
+        self.state_store = Some(state_store);
+    }
+
+    pub fn detach_state_store(&mut self) {
+        self.state_store = None;
     }
 
     pub fn footprint(&self) -> AtomicTokenStateFootprint {
@@ -629,12 +694,127 @@ impl AtomicTokenState {
             .or_insert_with(|| LiquidityHolderAddressState { address_version, address_payload: address_payload.to_vec() });
     }
 
+    fn asset_value(&self, asset_id: &[u8; 32]) -> Option<TokenAsset> {
+        if let Some(asset) = self.assets.get(asset_id) {
+            return Some(asset.clone());
+        }
+        if self.deleted_assets.contains(asset_id) {
+            return None;
+        }
+        self.state_store.as_ref().and_then(|store| store.get_asset(asset_id).ok().flatten())
+    }
+
+    fn balance_value(&self, key: &BalanceKey) -> u128 {
+        if let Some(balance) = self.balances.get(key) {
+            return *balance;
+        }
+        if self.deleted_balances.contains(key) {
+            return 0;
+        }
+        self.state_store.as_ref().and_then(|store| store.get_balance(key).ok()).unwrap_or(0)
+    }
+
+    fn nonce_value(&self, key: &NonceKey) -> u64 {
+        if let Some(nonce) = self.nonces.get(key) {
+            return *nonce;
+        }
+        if self.deleted_nonces.contains(key) {
+            return 1;
+        }
+        self.state_store.as_ref().and_then(|store| store.get_nonce(key).ok()).unwrap_or(1)
+    }
+
+    fn anchor_count_value(&self, owner_id: &[u8; 32]) -> u64 {
+        if let Some(count) = self.anchor_counts.get(owner_id) {
+            return *count;
+        }
+        if self.deleted_anchor_counts.contains(owner_id) {
+            return 0;
+        }
+        self.state_store.as_ref().and_then(|store| store.get_anchor_count(owner_id).ok()).unwrap_or(0)
+    }
+
+    fn processed_op_value(&self, txid: &BlockHash) -> Option<ProcessedOp> {
+        if let Some(op) = self.processed_ops.get(txid) {
+            return Some(op.clone());
+        }
+        if self.deleted_processed_ops.contains(txid) {
+            return None;
+        }
+        self.state_store.as_ref().and_then(|store| store.get_processed_op(txid).ok().flatten())
+    }
+
+    fn clear_storage_overlay(&mut self) {
+        self.assets.clear();
+        self.balances.clear();
+        self.nonces.clear();
+        self.anchor_counts.clear();
+        self.processed_ops.clear();
+        self.deleted_assets.clear();
+        self.deleted_balances.clear();
+        self.deleted_nonces.clear();
+        self.deleted_anchor_counts.clear();
+        self.deleted_processed_ops.clear();
+        self.liquidity_vault_outpoints.clear();
+        self.known_owner_addresses.clear();
+        self.balances_by_owner.clear();
+        self.holders_by_asset.clear();
+    }
+
+    pub fn clear_persistent_state_overlay(&mut self) {
+        self.clear_storage_overlay();
+    }
+
+    fn storage_delta_for_applied_journal(&self, journal: &BlockJournal) -> StorageDelta {
+        let mut delta = StorageDelta::default();
+        for change in journal.changed_assets.iter() {
+            delta.assets.push((change.asset_id, self.asset_value(&change.asset_id)));
+        }
+        for change in journal.changed_balances.iter() {
+            let value = self.balance_value(&change.key);
+            delta.balances.push((change.key, (value > 0).then_some(value)));
+        }
+        for change in journal.changed_nonces.iter() {
+            let value = self.nonce_value(&change.key);
+            delta.nonces.push((change.key, (value != 1).then_some(value)));
+        }
+        for change in journal.changed_anchor_counts.iter() {
+            let value = self.anchor_count_value(&change.owner_id);
+            delta.anchor_counts.push((change.owner_id, (value > 0).then_some(value)));
+        }
+        for txid in journal.added_processed_ops.iter().copied() {
+            delta.processed_ops.push((txid, self.processed_op_value(&txid)));
+        }
+        delta
+    }
+
+    fn storage_delta_for_rollback_journal(journal: &BlockJournal) -> StorageDelta {
+        let mut delta = StorageDelta::default();
+        for change in journal.changed_assets.iter() {
+            delta.assets.push((change.asset_id, change.old_value.clone()));
+        }
+        for change in journal.changed_balances.iter() {
+            delta.balances.push((change.key, change.old_value));
+        }
+        for change in journal.changed_nonces.iter() {
+            delta.nonces.push((change.key, change.old_value));
+        }
+        for change in journal.changed_anchor_counts.iter() {
+            delta.anchor_counts.push((change.owner_id, change.old_value));
+        }
+        for txid in journal.added_processed_ops.iter().copied() {
+            delta.processed_ops.push((txid, None));
+        }
+        delta
+    }
+
     fn rebuild_balance_indices(&mut self) {
         self.balances_by_owner.clear();
         self.holders_by_asset.clear();
+        self.deleted_balances.clear();
         let keys = self.balances.keys().copied().collect::<Vec<_>>();
         for key in keys {
-            if self.balances.get(&key).copied().unwrap_or(0) > 0 {
+            if self.balance_value(&key) > 0 {
                 self.index_balance_key(key);
             }
         }
@@ -664,6 +844,7 @@ impl AtomicTokenState {
         if amount == 0 {
             self.remove_balance(key);
         } else {
+            self.deleted_balances.remove(&key);
             self.balances.insert(key, amount);
             self.index_balance_key(key);
         }
@@ -671,11 +852,15 @@ impl AtomicTokenState {
 
     fn remove_balance(&mut self, key: BalanceKey) {
         self.balances.remove(&key);
+        self.deleted_balances.insert(key);
         self.unindex_balance_key(key);
     }
 
     fn set_asset_state(&mut self, asset_id: [u8; 32], asset: TokenAsset) {
-        if let Some(previous_asset) = self.assets.insert(asset_id, asset.clone()) {
+        let previous_asset = self.asset_value(&asset_id);
+        self.deleted_assets.remove(&asset_id);
+        self.assets.insert(asset_id, asset.clone());
+        if let Some(previous_asset) = previous_asset {
             if let Some(previous_pool) = previous_asset.liquidity.as_ref() {
                 self.liquidity_vault_outpoints.remove(&previous_pool.vault_outpoint);
             }
@@ -692,6 +877,52 @@ impl AtomicTokenState {
                 }
             }
         }
+    }
+
+    fn remove_asset_state(&mut self, asset_id: [u8; 32]) {
+        let previous_asset = self.asset_value(&asset_id);
+        self.assets.remove(&asset_id);
+        self.deleted_assets.insert(asset_id);
+        if let Some(previous_asset) = previous_asset {
+            if let Some(previous_pool) = previous_asset.liquidity.as_ref() {
+                self.liquidity_vault_outpoints.remove(&previous_pool.vault_outpoint);
+            }
+        }
+        self.rebuild_known_owner_address_cache();
+    }
+
+    fn set_nonce_value(&mut self, key: NonceKey, value: u64) {
+        self.deleted_nonces.remove(&key);
+        self.nonces.insert(key, value);
+    }
+
+    fn remove_nonce_value(&mut self, key: NonceKey) {
+        self.nonces.remove(&key);
+        self.deleted_nonces.insert(key);
+    }
+
+    fn set_anchor_count_value(&mut self, owner_id: [u8; 32], value: u64) {
+        if value == 0 {
+            self.remove_anchor_count_value(owner_id);
+        } else {
+            self.deleted_anchor_counts.remove(&owner_id);
+            self.anchor_counts.insert(owner_id, value);
+        }
+    }
+
+    fn remove_anchor_count_value(&mut self, owner_id: [u8; 32]) {
+        self.anchor_counts.remove(&owner_id);
+        self.deleted_anchor_counts.insert(owner_id);
+    }
+
+    fn set_processed_op_value(&mut self, txid: BlockHash, op: ProcessedOp) {
+        self.deleted_processed_ops.remove(&txid);
+        self.processed_ops.insert(txid, op);
+    }
+
+    fn remove_processed_op_value(&mut self, txid: BlockHash) {
+        self.processed_ops.remove(&txid);
+        self.deleted_processed_ops.insert(txid);
     }
 
     pub fn mark_degraded(&mut self) {
@@ -726,6 +957,63 @@ impl AtomicTokenState {
         }
     }
 
+    fn commit_applied_block_to_store(
+        &mut self,
+        accepting_block_hash: BlockHash,
+        journal: &BlockJournal,
+        chain_index: u64,
+        event_sequence: u64,
+        new_events: &[TokenEvent],
+    ) -> AtomicTokenResult<Option<[u8; 32]>> {
+        let Some(store) = self.state_store.as_ref() else {
+            return Ok(None);
+        };
+        let delta = self.storage_delta_for_applied_journal(journal);
+        let root = store.commit_applied_block_delta(
+            delta.assets,
+            delta.balances,
+            delta.nonces,
+            delta.anchor_counts,
+            delta.processed_ops,
+            accepting_block_hash,
+            journal,
+            chain_index,
+            event_sequence,
+            new_events,
+            self.degraded,
+            self.next_event_sequence,
+        )?;
+        self.clear_storage_overlay();
+        Ok(Some(root))
+    }
+
+    fn commit_rollback_to_store(
+        &mut self,
+        removed_block_hash: BlockHash,
+        journal: &BlockJournal,
+        new_events: &[TokenEvent],
+    ) -> AtomicTokenResult<Option<[u8; 32]>> {
+        let Some(store) = self.state_store.as_ref() else {
+            return Ok(None);
+        };
+        let delta = Self::storage_delta_for_rollback_journal(journal);
+        let root = store.commit_rollback_delta(
+            delta.assets,
+            delta.balances,
+            delta.nonces,
+            delta.anchor_counts,
+            delta.processed_ops,
+            removed_block_hash,
+            self.applied_chain_order.last().copied(),
+            self.applied_chain_order.len() as u64,
+            new_events,
+            self.degraded,
+            self.next_event_sequence,
+        )?;
+        self.clear_storage_overlay();
+        Ok(Some(root))
+    }
+
     pub async fn apply_virtual_chain_change(
         &mut self,
         notification: &VirtualChainChangedNotification,
@@ -741,17 +1029,25 @@ impl AtomicTokenState {
         let should_log_long_replay = removed_total.saturating_add(added_total) >= 1024;
         let mut last_replay_log = Instant::now();
         if should_log_long_replay {
-            info!(
-                "[{IDENT}] Cryptix Atomic applying virtual-chain update: +{} / -{} block(s)",
-                added_total, removed_total
-            );
+            info!("[{IDENT}] Cryptix Atomic applying virtual-chain update: +{} / -{} block(s)", added_total, removed_total);
         }
 
         for (idx, removed_block_hash) in notification.removed_chain_block_hashes.iter().copied().enumerate() {
-            if self.rollback_block(removed_block_hash).is_err() {
+            let old_event_len = self.events.len();
+            let rollback_journal = match self.rollback_block(removed_block_hash) {
+                Ok(journal) => journal,
+                Err(()) => {
+                    self.mark_degraded();
+                    return Err(AtomicTokenError::Processing(format!(
+                        "Cryptix Atomic cannot rollback block `{removed_block_hash}` because journal is missing"
+                    )));
+                }
+            };
+            let new_events = self.events[old_event_len..].to_vec();
+            if let Err(err) = self.commit_rollback_to_store(removed_block_hash, &rollback_journal, &new_events) {
                 self.mark_degraded();
                 return Err(AtomicTokenError::Processing(format!(
-                    "Cryptix Atomic cannot rollback block `{removed_block_hash}` because journal is missing"
+                    "Cryptix Atomic failed persisting rollback for block `{removed_block_hash}`: {err}"
                 )));
             }
             if should_log_long_replay && last_replay_log.elapsed() >= LONG_ATOMIC_REPLAY_LOG_INTERVAL {
@@ -768,6 +1064,7 @@ impl AtomicTokenState {
         let session = consensus.session().await;
 
         for (idx, accepting_block_hash) in notification.added_chain_block_hashes.iter().copied().enumerate() {
+            let old_event_len = self.events.len();
             let accepting_header = session.async_get_header(accepting_block_hash).await.map_err(|err| {
                 self.mark_degraded();
                 AtomicTokenError::Processing(format!(
@@ -798,12 +1095,18 @@ impl AtomicTokenState {
                         &mut journal,
                     );
                 }
-                let state_hash = self.compute_state_hash();
-                self.block_journals.insert(accepting_block_hash, journal.into_block_journal());
-                self.state_hash_by_block.insert(accepting_block_hash, state_hash);
-                self.event_sequence_by_block.insert(accepting_block_hash, self.next_event_sequence);
-                self.applied_chain_order.push(accepting_block_hash);
                 self.mark_degraded();
+                let block_journal = journal.into_block_journal();
+                let event_sequence = self.next_event_sequence;
+                let chain_index = self.applied_chain_order.len() as u64;
+                let new_events = self.events[old_event_len..].to_vec();
+                let state_hash = self
+                    .commit_applied_block_to_store(accepting_block_hash, &block_journal, chain_index, event_sequence, &new_events)?
+                    .unwrap_or_else(|| self.compute_state_hash());
+                self.block_journals.insert(accepting_block_hash, block_journal);
+                self.state_hash_by_block.insert(accepting_block_hash, state_hash);
+                self.event_sequence_by_block.insert(accepting_block_hash, event_sequence);
+                self.applied_chain_order.push(accepting_block_hash);
                 return Err(AtomicTokenError::Degraded(format!(
                     "malformed acceptance data for accepting block `{accepting_block_hash}`: duplicate txid with incompatible semantics"
                 )));
@@ -822,17 +1125,19 @@ impl AtomicTokenState {
                 self.apply_anchor_deltas_for_tx(&tx_ref.tx, auth_inputs, &mut journal);
             }
 
-            let state_hash = self.compute_state_hash();
-            self.block_journals.insert(accepting_block_hash, journal.into_block_journal());
+            let block_journal = journal.into_block_journal();
+            let event_sequence = self.next_event_sequence;
+            let chain_index = self.applied_chain_order.len() as u64;
+            let new_events = self.events[old_event_len..].to_vec();
+            let state_hash = self
+                .commit_applied_block_to_store(accepting_block_hash, &block_journal, chain_index, event_sequence, &new_events)?
+                .unwrap_or_else(|| self.compute_state_hash());
+            self.block_journals.insert(accepting_block_hash, block_journal);
             self.state_hash_by_block.insert(accepting_block_hash, state_hash);
-            self.event_sequence_by_block.insert(accepting_block_hash, self.next_event_sequence);
+            self.event_sequence_by_block.insert(accepting_block_hash, event_sequence);
             self.applied_chain_order.push(accepting_block_hash);
             if should_log_long_replay && last_replay_log.elapsed() >= LONG_ATOMIC_REPLAY_LOG_INTERVAL {
-                info!(
-                    "[{IDENT}] Cryptix Atomic virtual-chain apply progress: {}/{} block(s)",
-                    idx.saturating_add(1),
-                    added_total
-                );
+                info!("[{IDENT}] Cryptix Atomic virtual-chain apply progress: {}/{} block(s)", idx.saturating_add(1), added_total);
                 last_replay_log = Instant::now();
             }
         }
@@ -848,11 +1153,15 @@ impl AtomicTokenState {
     }
 
     pub fn prune_history(&mut self, max_retained_blocks: usize) -> bool {
+        self.prune_history_with_details(max_retained_blocks).map(|result| result.pruned_processed_ops).unwrap_or(false)
+    }
+
+    pub fn prune_history_with_details(&mut self, max_retained_blocks: usize) -> Option<AtomicTokenPruneResult> {
         if max_retained_blocks == 0 {
-            return false;
+            return None;
         }
         if self.applied_chain_order.len() <= max_retained_blocks {
-            return false;
+            return None;
         }
 
         let prune_len = self.applied_chain_order.len().saturating_sub(max_retained_blocks);
@@ -861,7 +1170,7 @@ impl AtomicTokenState {
         let last_pruned_event_sequence =
             pruned_hashes.iter().filter_map(|block_hash| self.event_sequence_by_block.get(block_hash).copied()).max();
 
-        for block_hash in pruned_hashes {
+        for block_hash in pruned_hashes.iter().copied() {
             self.block_journals.remove(&block_hash);
             self.state_hash_by_block.remove(&block_hash);
             self.event_sequence_by_block.remove(&block_hash);
@@ -876,7 +1185,7 @@ impl AtomicTokenState {
             self.rebuild_event_id_index();
         }
 
-        pruned_processed_ops
+        Some(AtomicTokenPruneResult { pruned_hashes, last_pruned_event_sequence, pruned_processed_ops })
     }
 
     pub fn recompute_state_hashes_for_retained_segment(
@@ -905,7 +1214,8 @@ impl AtomicTokenState {
         }
         if &self.applied_chain_order[segment_start..=segment_end] != retained_segment {
             return Err(AtomicTokenError::Processing(
-                "failed refreshing retained state hash cache: requested blocks are not a contiguous retained chain segment".to_string(),
+                "failed refreshing retained state hash cache: requested blocks are not a contiguous retained chain segment"
+                    .to_string(),
             ));
         }
 
@@ -959,20 +1269,20 @@ impl AtomicTokenState {
         Ok(retained_suffix.len())
     }
 
-    fn rollback_block(&mut self, block_hash: BlockHash) -> Result<(), ()> {
+    fn rollback_block(&mut self, block_hash: BlockHash) -> Result<BlockJournal, ()> {
         self.rollback_block_internal(block_hash, true)
     }
 
-    fn rollback_block_internal(&mut self, block_hash: BlockHash, emit_reorg_events: bool) -> Result<(), ()> {
+    fn rollback_block_internal(&mut self, block_hash: BlockHash, emit_reorg_events: bool) -> Result<BlockJournal, ()> {
         let journal = self.block_journals.remove(&block_hash).ok_or(())?;
 
         for change in journal.changed_assets.iter().rev() {
             match &change.old_value {
                 Some(asset) => {
-                    self.assets.insert(change.asset_id, asset.clone());
+                    self.set_asset_state(change.asset_id, asset.clone());
                 }
                 None => {
-                    self.assets.remove(&change.asset_id);
+                    self.remove_asset_state(change.asset_id);
                 }
             }
         }
@@ -993,10 +1303,10 @@ impl AtomicTokenState {
         for change in journal.changed_nonces.iter().rev() {
             match change.old_value {
                 Some(value) => {
-                    self.nonces.insert(change.key, value);
+                    self.set_nonce_value(change.key, value);
                 }
                 None => {
-                    self.nonces.remove(&change.key);
+                    self.remove_nonce_value(change.key);
                 }
             }
         }
@@ -1004,16 +1314,16 @@ impl AtomicTokenState {
         for change in journal.changed_anchor_counts.iter().rev() {
             match change.old_value {
                 Some(value) => {
-                    self.anchor_counts.insert(change.owner_id, value);
+                    self.set_anchor_count_value(change.owner_id, value);
                 }
                 None => {
-                    self.anchor_counts.remove(&change.owner_id);
+                    self.remove_anchor_count_value(change.owner_id);
                 }
             }
         }
 
-        for txid in journal.added_processed_ops {
-            self.processed_ops.remove(&txid);
+        for txid in journal.added_processed_ops.iter().copied() {
+            self.remove_processed_op_value(txid);
         }
 
         if emit_reorg_events {
@@ -1048,7 +1358,7 @@ impl AtomicTokenState {
             self.applied_chain_order.pop();
         }
         self.applied_chain_order.retain(|h| *h != block_hash);
-        Ok(())
+        Ok(journal)
     }
 
     fn remove_events_for_rolled_back_results(&mut self, tx_results: &[TokenApplyResult]) {
@@ -1132,7 +1442,7 @@ impl AtomicTokenState {
             None => return,
         };
 
-        if self.processed_ops.contains_key(&tx.id()) {
+        if self.processed_op_value(&tx.id()).is_some() {
             return;
         }
 
@@ -1214,7 +1524,7 @@ impl AtomicTokenState {
         let owner_id = auth_context.owner_id;
         self.remember_owner_address(owner_id, auth_context.address_version, auth_context.address_payload.as_slice());
         let nonce_key = nonce_key_for_op(owner_id, &parsed.op);
-        let expected_nonce = self.nonces.get(&nonce_key).copied().unwrap_or(1);
+        let expected_nonce = self.nonce_value(&nonce_key);
         if parsed.header.nonce != expected_nonce {
             return Err(NoopReason::BadNonce);
         }
@@ -1278,7 +1588,7 @@ impl AtomicTokenState {
         }
 
         self.record_nonce_before(nonce_key, journal);
-        self.nonces.insert(nonce_key, next_nonce);
+        self.set_nonce_value(nonce_key, next_nonce);
         Ok(details)
     }
 
@@ -1289,7 +1599,7 @@ impl AtomicTokenState {
         auth_inputs: &HashMap<TransactionOutpoint, UtxoEntry>,
     ) -> Result<(), NoopReason> {
         let owner_id = auth_context.owner_id;
-        let before_count = self.anchor_counts.get(&owner_id).copied().unwrap_or(0);
+        let before_count = self.anchor_count_value(&owner_id);
         let mut spent_for_owner = 0u64;
         for input in tx.inputs.iter() {
             if let Some(entry) = auth_inputs.get(&input.previous_outpoint) {
@@ -1339,7 +1649,7 @@ impl AtomicTokenState {
 
         let owners: HashSet<[u8; 32]> = spent_counts.keys().copied().chain(created_counts.keys().copied()).collect();
         for owner_id in owners {
-            let old_count = self.anchor_counts.get(&owner_id).copied().unwrap_or(0);
+            let old_count = self.anchor_count_value(&owner_id);
             let spent = spent_counts.get(&owner_id).copied().unwrap_or(0);
             let created = created_counts.get(&owner_id).copied().unwrap_or(0);
             let new_count = old_count.saturating_sub(spent).saturating_add(created);
@@ -1349,9 +1659,9 @@ impl AtomicTokenState {
 
             self.record_anchor_count_before(owner_id, journal);
             if new_count == 0 {
-                self.anchor_counts.remove(&owner_id);
+                self.remove_anchor_count_value(owner_id);
             } else {
-                self.anchor_counts.insert(owner_id, new_count);
+                self.set_anchor_count_value(owner_id, new_count);
             }
         }
     }
@@ -1366,7 +1676,7 @@ impl AtomicTokenState {
         accepting_block_time: u64,
         journal: &mut JournalBuilder,
     ) -> Result<(), NoopReason> {
-        if self.assets.contains_key(&txid_bytes) {
+        if self.asset_value(&txid_bytes).is_some() {
             return Err(NoopReason::AssetAlreadyExists);
         }
 
@@ -1460,7 +1770,7 @@ impl AtomicTokenState {
             return Err(NoopReason::InvalidAmount);
         }
 
-        let mut asset = self.assets.get(&asset_id).cloned().ok_or(NoopReason::AssetNotFound)?;
+        let mut asset = self.asset_value(&asset_id).ok_or(NoopReason::AssetNotFound)?;
         let is_liquidity_asset = matches!(asset.asset_class, TokenAssetClass::Liquidity);
         if is_liquidity_asset {
             self.validate_liquidity_invariants(&asset)?;
@@ -1471,13 +1781,13 @@ impl AtomicTokenState {
 
         if from_key == to_key {
             // Self-transfers are valid nonce-bearing ops but must not mutate balances.
-            let sender_balance = self.balances.get(&from_key).copied().unwrap_or(0);
+            let sender_balance = self.balance_value(&from_key);
             sender_balance.checked_sub(amount).ok_or(NoopReason::InsufficientBalance)?;
             return Ok(());
         }
 
-        let sender_balance = self.balances.get(&from_key).copied().unwrap_or(0);
-        let receiver_balance = self.balances.get(&to_key).copied().unwrap_or(0);
+        let sender_balance = self.balance_value(&from_key);
+        let receiver_balance = self.balance_value(&to_key);
 
         let sender_after = sender_balance.checked_sub(amount).ok_or(NoopReason::InsufficientBalance)?;
         let receiver_after = receiver_balance.checked_add(amount).ok_or(NoopReason::BalanceOverflow)?;
@@ -1507,7 +1817,7 @@ impl AtomicTokenState {
             return Err(NoopReason::InvalidAmount);
         }
 
-        let mut asset = self.assets.get(&op.asset_id).cloned().ok_or(NoopReason::AssetNotFound)?;
+        let mut asset = self.asset_value(&op.asset_id).ok_or(NoopReason::AssetNotFound)?;
         if matches!(asset.asset_class, TokenAssetClass::Liquidity) {
             return Err(NoopReason::LegacyOpForLiquidityAsset);
         }
@@ -1521,7 +1831,7 @@ impl AtomicTokenState {
         }
 
         let receiver_key = BalanceKey { asset_id: op.asset_id, owner_id: op.to_owner_id };
-        let receiver_balance = self.balances.get(&receiver_key).copied().unwrap_or(0);
+        let receiver_balance = self.balance_value(&receiver_key);
         let receiver_after = receiver_balance.checked_add(op.amount).ok_or(NoopReason::BalanceOverflow)?;
 
         self.record_asset_before(op.asset_id, journal);
@@ -1544,12 +1854,12 @@ impl AtomicTokenState {
             return Err(NoopReason::InvalidAmount);
         }
 
-        let mut asset = self.assets.get(&asset_id).cloned().ok_or(NoopReason::AssetNotFound)?;
+        let mut asset = self.asset_value(&asset_id).ok_or(NoopReason::AssetNotFound)?;
         if matches!(asset.asset_class, TokenAssetClass::Liquidity) {
             return Err(NoopReason::LegacyOpForLiquidityAsset);
         }
         let sender_key = BalanceKey { asset_id, owner_id: sender_owner_id };
-        let sender_balance = self.balances.get(&sender_key).copied().unwrap_or(0);
+        let sender_balance = self.balance_value(&sender_key);
 
         let sender_after = sender_balance.checked_sub(amount).ok_or(NoopReason::InsufficientBalance)?;
         let supply_after = asset.total_supply.checked_sub(amount).ok_or(NoopReason::SupplyUnderflow)?;
@@ -1575,7 +1885,7 @@ impl AtomicTokenState {
     ) -> Result<u128, NoopReason> {
         let creator_owner_id = creator_auth.owner_id;
         let asset_id = tx.id().as_bytes();
-        if self.assets.contains_key(&asset_id) {
+        if self.asset_value(&asset_id).is_some() {
             return Err(NoopReason::AssetAlreadyExists);
         }
         if op.token_version != CURRENT_TOKEN_VERSION {
@@ -1650,7 +1960,7 @@ impl AtomicTokenState {
 
             let receiver_key = BalanceKey { asset_id, owner_id: creator_owner_id };
             self.record_balance_before(receiver_key, journal);
-            let receiver_balance = self.balances.get(&receiver_key).copied().unwrap_or(0);
+            let receiver_balance = self.balance_value(&receiver_key);
             let receiver_after = receiver_balance.checked_add(token_out).ok_or(NoopReason::BalanceOverflow)?;
             self.set_balance_amount(receiver_key, receiver_after);
             holder_addresses.insert(
@@ -1715,7 +2025,7 @@ impl AtomicTokenState {
         journal: &mut JournalBuilder,
     ) -> Result<u128, NoopReason> {
         let buyer_owner_id = buyer_auth.owner_id;
-        let mut asset = self.assets.get(&op.asset_id).cloned().ok_or(NoopReason::AssetNotFound)?;
+        let mut asset = self.asset_value(&op.asset_id).ok_or(NoopReason::AssetNotFound)?;
         if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
             return Err(NoopReason::LegacyOpForLiquidityAsset);
         }
@@ -1773,7 +2083,7 @@ impl AtomicTokenState {
             },
         );
 
-        let receiver_balance = self.balances.get(&receiver_key).copied().unwrap_or(0);
+        let receiver_balance = self.balance_value(&receiver_key);
         let receiver_after = receiver_balance.checked_add(token_out).ok_or(NoopReason::BalanceOverflow)?;
         self.set_balance_amount(receiver_key, receiver_after);
 
@@ -1792,7 +2102,7 @@ impl AtomicTokenState {
         auth_inputs: &HashMap<TransactionOutpoint, UtxoEntry>,
         journal: &mut JournalBuilder,
     ) -> Result<(), NoopReason> {
-        let mut asset = self.assets.get(&op.asset_id).cloned().ok_or(NoopReason::AssetNotFound)?;
+        let mut asset = self.asset_value(&op.asset_id).ok_or(NoopReason::AssetNotFound)?;
         if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
             return Err(NoopReason::LegacyOpForLiquidityAsset);
         }
@@ -1805,7 +2115,7 @@ impl AtomicTokenState {
         }
 
         let sender_key = BalanceKey { asset_id: op.asset_id, owner_id: seller_owner_id };
-        let sender_balance = self.balances.get(&sender_key).copied().unwrap_or(0);
+        let sender_balance = self.balance_value(&sender_key);
         let sender_after = sender_balance.checked_sub(op.token_in).ok_or(NoopReason::InsufficientBalance)?;
         let supply_after = asset.total_supply.checked_sub(op.token_in).ok_or(NoopReason::SupplyUnderflow)?;
 
@@ -1866,7 +2176,7 @@ impl AtomicTokenState {
         auth_inputs: &HashMap<TransactionOutpoint, UtxoEntry>,
         journal: &mut JournalBuilder,
     ) -> Result<(), NoopReason> {
-        let mut asset = self.assets.get(&op.asset_id).cloned().ok_or(NoopReason::AssetNotFound)?;
+        let mut asset = self.asset_value(&op.asset_id).ok_or(NoopReason::AssetNotFound)?;
         if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
             return Err(NoopReason::LegacyOpForLiquidityAsset);
         }
@@ -1935,7 +2245,17 @@ impl AtomicTokenState {
 
     fn find_liquidity_asset_by_vault_outpoint(&self, outpoint: TransactionOutpoint) -> Result<Option<[u8; 32]>, NoopReason> {
         if let Some(asset_id) = self.liquidity_vault_outpoints.get(&outpoint).copied() {
-            let asset = self.assets.get(&asset_id).ok_or(NoopReason::InternalMalformedAcceptance)?;
+            let asset = self.asset_value(&asset_id).ok_or(NoopReason::InternalMalformedAcceptance)?;
+            let pool = asset.liquidity.as_ref().ok_or(NoopReason::InternalMalformedAcceptance)?;
+            if !matches!(asset.asset_class, TokenAssetClass::Liquidity) || pool.vault_outpoint != outpoint {
+                return Err(NoopReason::InternalMalformedAcceptance);
+            }
+            return Ok(Some(asset_id));
+        }
+        if let Some(asset_id) =
+            self.state_store.as_ref().and_then(|store| store.get_liquidity_asset_by_vault_outpoint(&outpoint).ok().flatten())
+        {
+            let asset = self.asset_value(&asset_id).ok_or(NoopReason::InternalMalformedAcceptance)?;
             let pool = asset.liquidity.as_ref().ok_or(NoopReason::InternalMalformedAcceptance)?;
             if !matches!(asset.asset_class, TokenAssetClass::Liquidity) || pool.vault_outpoint != outpoint {
                 return Err(NoopReason::InternalMalformedAcceptance);
@@ -2324,7 +2644,7 @@ impl AtomicTokenState {
 
         journal.tx_results.push(TokenApplyResult { txid, apply_status, noop_reason, ordinal, event_id, details });
         journal.added_processed_ops.push(txid);
-        self.processed_ops.insert(txid, ProcessedOp { accepting_block_hash, apply_status, noop_reason });
+        self.set_processed_op_value(txid, ProcessedOp { accepting_block_hash, apply_status, noop_reason });
     }
 
     fn insert_internal_malformed_noop(
@@ -2339,7 +2659,7 @@ impl AtomicTokenState {
         if accepting_block_daa_score < self.payload_hf_activation_daa_score {
             return;
         }
-        if self.processed_ops.contains_key(&tx.id()) {
+        if self.processed_op_value(&tx.id()).is_some() {
             return;
         }
         if !tx.subnetwork_id.is_payload() || tx.payload.is_empty() {
@@ -2362,25 +2682,28 @@ impl AtomicTokenState {
 
     fn record_asset_before(&mut self, asset_id: [u8; 32], journal: &mut JournalBuilder) {
         if journal.seen_assets.insert(asset_id) {
-            journal.changed_assets.push(ChangedAsset { asset_id, old_value: self.assets.get(&asset_id).cloned() });
+            journal.changed_assets.push(ChangedAsset { asset_id, old_value: self.asset_value(&asset_id) });
         }
     }
 
     fn record_balance_before(&mut self, key: BalanceKey, journal: &mut JournalBuilder) {
         if journal.seen_balances.insert(key) {
-            journal.changed_balances.push(ChangedBalance { key, old_value: self.balances.get(&key).copied() });
+            let old_value = self.balance_value(&key);
+            journal.changed_balances.push(ChangedBalance { key, old_value: (old_value > 0).then_some(old_value) });
         }
     }
 
     fn record_nonce_before(&mut self, key: NonceKey, journal: &mut JournalBuilder) {
         if journal.seen_nonces.insert(key) {
-            journal.changed_nonces.push(ChangedNonce { key, old_value: self.nonces.get(&key).copied() });
+            let old_value = self.nonce_value(&key);
+            journal.changed_nonces.push(ChangedNonce { key, old_value: (old_value != 1).then_some(old_value) });
         }
     }
 
     fn record_anchor_count_before(&mut self, owner_id: [u8; 32], journal: &mut JournalBuilder) {
         if journal.seen_anchor_counts.insert(owner_id) {
-            journal.changed_anchor_counts.push(ChangedAnchorCount { owner_id, old_value: self.anchor_counts.get(&owner_id).copied() });
+            let old_value = self.anchor_count_value(&owner_id);
+            journal.changed_anchor_counts.push(ChangedAnchorCount { owner_id, old_value: (old_value > 0).then_some(old_value) });
         }
     }
 
@@ -2449,15 +2772,15 @@ impl AtomicTokenState {
     }
 
     pub fn get_balance(&self, asset_id: [u8; 32], owner_id: [u8; 32]) -> u128 {
-        self.balances.get(&BalanceKey { asset_id, owner_id }).copied().unwrap_or(0)
+        self.balance_value(&BalanceKey { asset_id, owner_id })
     }
 
     pub fn get_owner_nonce(&self, owner_id: [u8; 32]) -> u64 {
-        self.nonces.get(&NonceKey::owner(owner_id)).copied().unwrap_or(1)
+        self.nonce_value(&NonceKey::owner(owner_id))
     }
 
     pub fn get_token_nonce(&self, owner_id: [u8; 32], asset_id: [u8; 32]) -> u64 {
-        self.nonces.get(&NonceKey::asset(owner_id, asset_id)).copied().unwrap_or(1)
+        self.nonce_value(&NonceKey::asset(owner_id, asset_id))
     }
 
     pub fn get_nonce(&self, owner_id: [u8; 32]) -> u64 {
@@ -2465,11 +2788,15 @@ impl AtomicTokenState {
     }
 
     pub fn get_asset(&self, asset_id: [u8; 32]) -> Option<TokenAsset> {
-        self.assets.get(&asset_id).cloned()
+        self.asset_value(&asset_id)
+    }
+
+    pub fn get_anchor_count(&self, owner_id: [u8; 32]) -> u64 {
+        self.anchor_count_value(&owner_id)
     }
 
     pub fn get_op_status(&self, txid: BlockHash) -> Option<ProcessedOp> {
-        self.processed_ops.get(&txid).cloned()
+        self.processed_op_value(&txid)
     }
 
     pub fn get_state_hash(&self) -> [u8; 32] {
@@ -2534,29 +2861,284 @@ impl AtomicTokenState {
         }
     }
 
+    pub fn materialize_context_at_block(
+        &self,
+        at_block_hash: BlockHash,
+        runtime_state: AtomicTokenRuntimeState,
+    ) -> Option<AtomicTokenReadContext> {
+        let state_hash = self.state_hash_by_block.get(&at_block_hash).copied()?;
+        let event_sequence_cutoff = self.event_sequence_by_block.get(&at_block_hash).copied().unwrap_or(self.next_event_sequence);
+        Some(AtomicTokenReadContext {
+            at_block_hash,
+            state_hash,
+            is_degraded: self.degraded,
+            runtime_state,
+            event_sequence_cutoff,
+        })
+    }
+
+    fn retained_index(&self, at_block_hash: BlockHash) -> Option<usize> {
+        self.applied_chain_order.iter().position(|hash| *hash == at_block_hash)
+    }
+
+    pub fn get_asset_at_block(&self, asset_id: [u8; 32], at_block_hash: BlockHash) -> Option<Option<TokenAsset>> {
+        let target_index = self.retained_index(at_block_hash)?;
+        let mut value = self.asset_value(&asset_id);
+        for block_hash in self.applied_chain_order.iter().skip(target_index + 1).rev().copied() {
+            let journal = self.block_journals.get(&block_hash)?;
+            for change in journal.changed_assets.iter().rev() {
+                if change.asset_id == asset_id {
+                    value = change.old_value.clone();
+                    break;
+                }
+            }
+        }
+        Some(value)
+    }
+
+    pub fn get_balance_at_block(&self, key: BalanceKey, at_block_hash: BlockHash) -> Option<u128> {
+        let target_index = self.retained_index(at_block_hash)?;
+        let mut value = self.balance_value(&key);
+        for block_hash in self.applied_chain_order.iter().skip(target_index + 1).rev().copied() {
+            let journal = self.block_journals.get(&block_hash)?;
+            for change in journal.changed_balances.iter().rev() {
+                if change.key == key {
+                    value = change.old_value.unwrap_or(0);
+                    break;
+                }
+            }
+        }
+        Some(value)
+    }
+
+    pub fn get_nonce_at_block(&self, key: NonceKey, at_block_hash: BlockHash) -> Option<u64> {
+        let target_index = self.retained_index(at_block_hash)?;
+        let mut value = self.nonce_value(&key);
+        for block_hash in self.applied_chain_order.iter().skip(target_index + 1).rev().copied() {
+            let journal = self.block_journals.get(&block_hash)?;
+            for change in journal.changed_nonces.iter().rev() {
+                if change.key == key {
+                    value = change.old_value.unwrap_or(1);
+                    break;
+                }
+            }
+        }
+        Some(value)
+    }
+
+    pub fn get_anchor_count_at_block(&self, owner_id: [u8; 32], at_block_hash: BlockHash) -> Option<u64> {
+        let target_index = self.retained_index(at_block_hash)?;
+        let mut value = self.anchor_count_value(&owner_id);
+        for block_hash in self.applied_chain_order.iter().skip(target_index + 1).rev().copied() {
+            let journal = self.block_journals.get(&block_hash)?;
+            for change in journal.changed_anchor_counts.iter().rev() {
+                if change.owner_id == owner_id {
+                    value = change.old_value.unwrap_or(0);
+                    break;
+                }
+            }
+        }
+        Some(value)
+    }
+
+    pub fn get_processed_op_at_block(&self, txid: BlockHash, at_block_hash: BlockHash) -> Option<Option<ProcessedOp>> {
+        let target_index = self.retained_index(at_block_hash)?;
+        let mut value = self.processed_op_value(&txid);
+        for block_hash in self.applied_chain_order.iter().skip(target_index + 1).rev().copied() {
+            let journal = self.block_journals.get(&block_hash)?;
+            if journal.added_processed_ops.iter().any(|added| *added == txid) {
+                value = None;
+            }
+        }
+        Some(value)
+    }
+
+    pub fn indexed_assets_page(&self, offset: usize, limit: usize, query: &str) -> (Vec<TokenAsset>, u64) {
+        if self.assets.is_empty() && self.deleted_assets.is_empty() {
+            if let Some((assets, total)) = self.state_store.as_ref().and_then(|store| store.assets_page(offset, limit, query).ok()) {
+                return (assets, total);
+            }
+        }
+
+        let mut assets = self
+            .state_store
+            .as_ref()
+            .and_then(|store| store.assets_page(0, usize::MAX, query).ok())
+            .map(|(assets, _)| assets)
+            .unwrap_or_default();
+        assets.retain(|asset| !self.deleted_assets.contains(&asset.asset_id));
+        for asset in self.assets.values() {
+            if asset_matches_query(asset, query) {
+                if let Some(existing) = assets.iter_mut().find(|existing| existing.asset_id == asset.asset_id) {
+                    *existing = asset.clone();
+                } else {
+                    assets.push(asset.clone());
+                }
+            }
+        }
+        assets.sort_by(|a, b| a.asset_id.cmp(&b.asset_id));
+        let total = assets.len() as u64;
+        let page = assets.into_iter().skip(offset).take(limit).collect();
+        (page, total)
+    }
+
+    pub fn indexed_assets_page_at_block(
+        &self,
+        offset: usize,
+        limit: usize,
+        query: &str,
+        at_block_hash: BlockHash,
+    ) -> Option<(Vec<TokenAsset>, u64)> {
+        let target_index = self.retained_index(at_block_hash)?;
+
+        let mut changed_assets: HashMap<[u8; 32], Option<TokenAsset>> = HashMap::new();
+        for block_hash in self.applied_chain_order.iter().skip(target_index + 1).rev().copied() {
+            let journal = self.block_journals.get(&block_hash)?;
+            for change in journal.changed_assets.iter().rev() {
+                changed_assets.entry(change.asset_id).or_insert_with(|| change.old_value.clone());
+            }
+        }
+
+        if self.assets.is_empty() && self.deleted_assets.is_empty() {
+            if let Some(store) = self.state_store.as_ref() {
+                let excluded = changed_assets.keys().copied().collect::<HashSet<_>>();
+                let mut override_assets = changed_assets
+                    .into_values()
+                    .flatten()
+                    .filter(|asset| asset_matches_query(asset, query))
+                    .collect::<Vec<_>>();
+                override_assets.sort_by(|a, b| a.asset_id.cmp(&b.asset_id));
+
+                let mut total = 0u64;
+                let mut page = Vec::with_capacity(limit.min(1024));
+                let mut override_index = 0usize;
+                let mut emit_asset = |asset: TokenAsset| {
+                    if total >= offset as u64 && page.len() < limit {
+                        page.push(asset);
+                    }
+                    total = total.saturating_add(1);
+                };
+
+                store
+                    .visit_assets_excluding(query, &excluded, |base_asset| {
+                        while override_index < override_assets.len()
+                            && override_assets[override_index].asset_id < base_asset.asset_id
+                        {
+                            emit_asset(override_assets[override_index].clone());
+                            override_index += 1;
+                        }
+                        emit_asset(base_asset);
+                        Ok(())
+                    })
+                    .ok()?;
+                while override_index < override_assets.len() {
+                    emit_asset(override_assets[override_index].clone());
+                    override_index += 1;
+                }
+                return Some((page, total));
+            }
+        }
+
+        let mut view = self.materialize_view_at_block(at_block_hash)?;
+        let mut assets = view
+            .assets
+            .drain()
+            .map(|(_, asset)| asset)
+            .filter(|asset| asset_matches_query(asset, query))
+            .collect::<Vec<_>>();
+        assets.sort_by(|a, b| a.asset_id.cmp(&b.asset_id));
+        let total = assets.len() as u64;
+        let page = assets.into_iter().skip(offset).take(limit).collect();
+        Some((page, total))
+    }
+
     pub fn indexed_balances_by_owner(&self, owner_id: [u8; 32], include_assets: bool) -> Vec<TokenOwnerBalanceEntry> {
-        let Some(asset_ids) = self.balances_by_owner.get(&owner_id) else {
-            return Vec::new();
-        };
-        let mut entries = Vec::with_capacity(asset_ids.len());
-        for asset_id in asset_ids.iter().copied() {
-            let balance = self.balances.get(&BalanceKey { asset_id, owner_id }).copied().unwrap_or(0);
+        let mut by_asset: HashMap<[u8; 32], u128> = self
+            .state_store
+            .as_ref()
+            .and_then(|store| store.balances_by_owner(&owner_id).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if let Some(asset_ids) = self.balances_by_owner.get(&owner_id) {
+            for asset_id in asset_ids.iter().copied() {
+                let key = BalanceKey { asset_id, owner_id };
+                by_asset.insert(asset_id, self.balance_value(&key));
+            }
+        }
+        for key in self.deleted_balances.iter().filter(|key| key.owner_id == owner_id) {
+            by_asset.remove(&key.asset_id);
+        }
+
+        let mut entries = Vec::with_capacity(by_asset.len());
+        for (asset_id, balance) in by_asset {
             if balance == 0 {
                 continue;
             }
-            let asset = if include_assets { self.assets.get(&asset_id).cloned() } else { None };
+            let asset = if include_assets { self.asset_value(&asset_id) } else { None };
             entries.push((asset_id, balance, asset));
         }
         entries
     }
 
+    pub fn indexed_balances_by_owner_at_block(
+        &self,
+        owner_id: [u8; 32],
+        include_assets: bool,
+        at_block_hash: BlockHash,
+    ) -> Option<Vec<TokenOwnerBalanceEntry>> {
+        let target_index = self.retained_index(at_block_hash)?;
+        let mut by_asset: HashMap<[u8; 32], u128> =
+            self.indexed_balances_by_owner(owner_id, false).into_iter().map(|(asset_id, balance, _)| (asset_id, balance)).collect();
+
+        for block_hash in self.applied_chain_order.iter().skip(target_index + 1).rev().copied() {
+            let journal = self.block_journals.get(&block_hash)?;
+            for change in journal.changed_balances.iter().rev() {
+                if change.key.owner_id != owner_id {
+                    continue;
+                }
+                match change.old_value {
+                    Some(value) if value > 0 => {
+                        by_asset.insert(change.key.asset_id, value);
+                    }
+                    _ => {
+                        by_asset.remove(&change.key.asset_id);
+                    }
+                }
+            }
+        }
+
+        let mut entries = Vec::with_capacity(by_asset.len());
+        for (asset_id, balance) in by_asset {
+            if balance == 0 {
+                continue;
+            }
+            let asset = if include_assets { self.get_asset_at_block(asset_id, at_block_hash)? } else { None };
+            entries.push((asset_id, balance, asset));
+        }
+        Some(entries)
+    }
+
     pub fn indexed_holders_by_asset(&self, asset_id: [u8; 32]) -> Vec<TokenHolderEntry> {
-        let Some(owner_ids) = self.holders_by_asset.get(&asset_id) else {
-            return Vec::new();
-        };
-        let mut entries = Vec::with_capacity(owner_ids.len());
-        for owner_id in owner_ids.iter().copied() {
-            let balance = self.balances.get(&BalanceKey { asset_id, owner_id }).copied().unwrap_or(0);
+        let mut by_owner: HashMap<[u8; 32], u128> = self
+            .state_store
+            .as_ref()
+            .and_then(|store| store.holders_by_asset(&asset_id).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if let Some(owner_ids) = self.holders_by_asset.get(&asset_id) {
+            for owner_id in owner_ids.iter().copied() {
+                let key = BalanceKey { asset_id, owner_id };
+                by_owner.insert(owner_id, self.balance_value(&key));
+            }
+        }
+        for key in self.deleted_balances.iter().filter(|key| key.asset_id == asset_id) {
+            by_owner.remove(&key.owner_id);
+        }
+
+        let mut entries = Vec::with_capacity(by_owner.len());
+        for (owner_id, balance) in by_owner {
             if balance > 0 {
                 entries.push((owner_id, balance));
             }
@@ -2564,21 +3146,52 @@ impl AtomicTokenState {
         entries
     }
 
+    pub fn indexed_holders_by_asset_at_block(&self, asset_id: [u8; 32], at_block_hash: BlockHash) -> Option<Vec<TokenHolderEntry>> {
+        let target_index = self.retained_index(at_block_hash)?;
+        let mut by_owner: HashMap<[u8; 32], u128> =
+            self.indexed_holders_by_asset(asset_id).into_iter().map(|(owner_id, balance)| (owner_id, balance)).collect();
+
+        for block_hash in self.applied_chain_order.iter().skip(target_index + 1).rev().copied() {
+            let journal = self.block_journals.get(&block_hash)?;
+            for change in journal.changed_balances.iter().rev() {
+                if change.key.asset_id != asset_id {
+                    continue;
+                }
+                match change.old_value {
+                    Some(value) if value > 0 => {
+                        by_owner.insert(change.key.owner_id, value);
+                    }
+                    _ => {
+                        by_owner.remove(&change.key.owner_id);
+                    }
+                }
+            }
+        }
+
+        Some(by_owner.into_iter().filter(|(_, balance)| *balance > 0).collect())
+    }
+
     pub fn indexed_liquidity_holder_addresses(
         &self,
         asset_id: [u8; 32],
         holders: &[TokenHolderEntry],
     ) -> HashMap<[u8; 32], LiquidityHolderAddressState> {
-        let pool_holder_addresses =
-            self.assets.get(&asset_id).and_then(|asset| asset.liquidity.as_ref()).map(|pool| &pool.holder_addresses);
+        let asset = self.asset_value(&asset_id);
+        let pool_holder_addresses = asset.as_ref().and_then(|asset| asset.liquidity.as_ref()).map(|pool| &pool.holder_addresses);
 
         holders
             .iter()
             .filter_map(|(owner_id, _)| {
-                pool_holder_addresses
+                if let Some(holder) = pool_holder_addresses
                     .and_then(|addresses| addresses.get(owner_id))
                     .or_else(|| self.known_owner_addresses.get(owner_id))
-                    .map(|holder| (*owner_id, holder.clone()))
+                {
+                    return Some((*owner_id, holder.clone()));
+                }
+                self.state_store
+                    .as_ref()
+                    .and_then(|store| store.get_known_owner_address(owner_id).ok().flatten())
+                    .map(|holder| (*owner_id, holder))
             })
             .collect()
     }
@@ -2658,7 +3271,7 @@ impl AtomicTokenState {
             processed_ops,
             known_owner_addresses,
         };
-        view.state_hash = self.compute_state_hash_for_view(view.clone(), true);
+        view.state_hash = self.compute_state_hash_for_view(view.clone());
         Some(view)
     }
 
@@ -2678,11 +3291,7 @@ impl AtomicTokenState {
         self.state_hash_by_block.get(&at_block_hash).copied()
     }
 
-    pub fn get_legacy_state_hash_at_block_without_processed_ops(&self, at_block_hash: BlockHash) -> Option<[u8; 32]> {
-        let view = self.materialize_view_at_block(at_block_hash)?;
-        Some(self.compute_state_hash_for_view(view, false))
-    }
-
+    #[cfg(test)]
     pub fn export_snapshot(
         &self,
         at_block_hash: BlockHash,
@@ -2737,7 +3346,18 @@ impl AtomicTokenState {
             AtomicTokenError::Processing(format!("snapshot export failed: unable to materialize state at block `{at_block_hash}`"))
         })?;
         let applied_chain_order = self.applied_chain_order[window_start_index..=target_index].to_vec();
-        let state_hash_by_block = self.recompute_state_hashes_for_retained_segment(&applied_chain_order)?;
+        let mut state_hash_by_block = HashMap::with_capacity(applied_chain_order.len());
+        for block_hash in applied_chain_order.iter().copied() {
+            let state_hash = self.state_hash_by_block.get(&block_hash).copied().ok_or_else(|| {
+                AtomicTokenError::Processing(format!("snapshot export failed: missing state hash checkpoint for block `{block_hash}`"))
+            })?;
+            state_hash_by_block.insert(block_hash, state_hash);
+        }
+        if state_hash_by_block.get(&at_block_hash).copied() != Some(view.state_hash) {
+            return Err(AtomicTokenError::Processing(
+                "snapshot export failed: retained state hash checkpoint does not match materialized anchor state".to_string(),
+            ));
+        }
         let event_sequence_by_block: HashMap<BlockHash, u64> = applied_chain_order
             .iter()
             .filter_map(|hash| self.event_sequence_by_block.get(hash).copied().map(|seq| (*hash, seq)))
@@ -2786,6 +3406,116 @@ impl AtomicTokenState {
         })
     }
 
+    #[cfg(test)]
+    pub fn export_snapshot_consuming(
+        mut self,
+        at_block_hash: BlockHash,
+        at_daa_score: u64,
+        window_start_parent_block_hash: BlockHash,
+        window_blocks: &[BlockHash],
+    ) -> AtomicTokenResult<AtomicTokenSnapshot> {
+        if window_blocks.is_empty() {
+            return Err(AtomicTokenError::Processing("cannot export snapshot with empty rollback window".to_string()));
+        }
+
+        let target_index = self.applied_chain_order.iter().position(|hash| *hash == at_block_hash).ok_or_else(|| {
+            AtomicTokenError::Processing(format!("snapshot export failed: at_block_hash `{at_block_hash}` not found in applied chain"))
+        })?;
+        let window_start_block_hash = window_blocks[0];
+        let window_end_block_hash = *window_blocks.last().unwrap();
+        if window_end_block_hash != at_block_hash {
+            return Err(AtomicTokenError::Processing("snapshot export window end must match snapshot at_block_hash".to_string()));
+        }
+        let window_start_index =
+            self.applied_chain_order.iter().position(|hash| *hash == window_start_block_hash).ok_or_else(|| {
+                AtomicTokenError::Processing(format!(
+                    "snapshot export failed: window_start_block_hash `{window_start_block_hash}` not found in applied chain"
+                ))
+            })?;
+        if window_start_index > target_index {
+            return Err(AtomicTokenError::Processing(
+                "snapshot export failed: window_start_block_hash appears after at_block_hash".to_string(),
+            ));
+        }
+        let expected_window = &self.applied_chain_order[window_start_index..=target_index];
+        if expected_window != window_blocks {
+            return Err(AtomicTokenError::Processing(
+                "snapshot export failed: rollback window is not a contiguous canonical chain segment".to_string(),
+            ));
+        }
+        if window_start_index > 0 && self.applied_chain_order[window_start_index - 1] != window_start_parent_block_hash {
+            return Err(AtomicTokenError::Processing(
+                "snapshot export failed: window_start_parent_block_hash does not match canonical chain parent".to_string(),
+            ));
+        }
+
+        let applied_chain_order = self.applied_chain_order[window_start_index..=target_index].to_vec();
+        let mut state_hash_by_block = HashMap::with_capacity(applied_chain_order.len());
+        let mut event_sequence_by_block = HashMap::with_capacity(applied_chain_order.len());
+        for block_hash in applied_chain_order.iter().copied() {
+            let state_hash = self.state_hash_by_block.get(&block_hash).copied().ok_or_else(|| {
+                AtomicTokenError::Processing(format!("snapshot export failed: missing state hash checkpoint for block `{block_hash}`"))
+            })?;
+            let event_sequence = self.event_sequence_by_block.get(&block_hash).copied().ok_or_else(|| {
+                AtomicTokenError::Processing(format!("snapshot export failed: missing event sequence checkpoint for block `{block_hash}`"))
+            })?;
+            state_hash_by_block.insert(block_hash, state_hash);
+            event_sequence_by_block.insert(block_hash, event_sequence);
+        }
+
+        let mut journals_in_window = Vec::with_capacity(window_blocks.len());
+        for block_hash in window_blocks.iter().copied() {
+            let journal = self.block_journals.get(&block_hash).cloned().ok_or_else(|| {
+                AtomicTokenError::Processing(format!("missing block journal in snapshot window for block `{block_hash}`"))
+            })?;
+            journals_in_window.push((block_hash, journal));
+        }
+
+        for block_hash in self.applied_chain_order[target_index + 1..].iter().rev().copied().collect::<Vec<_>>() {
+            self.rollback_block_internal(block_hash, false).map_err(|_| {
+                AtomicTokenError::Processing(format!("snapshot export failed: missing journal while rolling back block `{block_hash}`"))
+            })?;
+        }
+
+        let state_hash_at_fp = self.compute_state_hash();
+        if state_hash_by_block.get(&at_block_hash).copied() != Some(state_hash_at_fp) {
+            return Err(AtomicTokenError::Processing(
+                "snapshot export failed: retained state hash checkpoint does not match materialized anchor state".to_string(),
+            ));
+        }
+        let state_hash_at_window_start_parent = self.state_hash_by_block.get(&window_start_parent_block_hash).copied();
+        let next_event_sequence = self.event_sequence_by_block.get(&at_block_hash).copied().unwrap_or(self.next_event_sequence);
+        self.events.retain(|event| event.sequence <= next_event_sequence);
+        self.rebuild_event_id_index();
+
+        Ok(AtomicTokenSnapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            protocol_version: self.protocol_version,
+            network_id: self.network_id,
+            at_block_hash,
+            at_daa_score,
+            state_hash_at_fp,
+            state_hash_at_window_start_parent,
+            window_start_block_hash,
+            window_start_parent_block_hash,
+            window_end_block_hash,
+            state: AtomicTokenSnapshotState {
+                assets: self.assets,
+                balances: self.balances,
+                nonces: self.nonces,
+                anchor_counts: self.anchor_counts,
+                processed_ops: self.processed_ops,
+                state_hash_by_block,
+                event_sequence_by_block,
+                applied_chain_order,
+                next_event_sequence,
+                events: self.events,
+            },
+            journals_in_window,
+        })
+    }
+
+    #[cfg(test)]
     pub fn import_snapshot(&mut self, snapshot: AtomicTokenSnapshot) -> AtomicTokenResult<()> {
         let expected_state_hash_at_fp = snapshot.state_hash_at_fp;
         if snapshot.schema_version != SNAPSHOT_SCHEMA_VERSION {
@@ -2904,6 +3634,7 @@ impl AtomicTokenState {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn rollback_snapshot_window_to_parent(&mut self, window_start_block_hash: BlockHash) -> AtomicTokenResult<()> {
         let mut found_window_start = false;
         while let Some(last_applied) = self.applied_chain_order.last().copied() {
@@ -2927,6 +3658,55 @@ impl AtomicTokenState {
         Ok(())
     }
 
+    pub fn rollback_snapshot_window_to_parent_persisted(&mut self, window_start_block_hash: BlockHash) -> AtomicTokenResult<()> {
+        let mut found_window_start = false;
+        while let Some(last_applied) = self.applied_chain_order.last().copied() {
+            let journal = self.rollback_block_internal(last_applied, false).map_err(|_| {
+                AtomicTokenError::Processing(format!(
+                    "snapshot import failed: missing journal while rolling back block `{last_applied}`"
+                ))
+            })?;
+            self.commit_rollback_to_store(last_applied, &journal, &[])?;
+            if last_applied == window_start_block_hash {
+                found_window_start = true;
+                break;
+            }
+        }
+
+        if !found_window_start {
+            return Err(AtomicTokenError::Processing(format!(
+                "snapshot import failed: window_start_block_hash `{window_start_block_hash}` not found in applied chain order"
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub fn rollback_to_block_persisted(&mut self, target_block_hash: BlockHash) -> AtomicTokenResult<()> {
+        let mut found_target = false;
+        while let Some(last_applied) = self.applied_chain_order.last().copied() {
+            if last_applied == target_block_hash {
+                found_target = true;
+                break;
+            }
+            let journal = self.rollback_block_internal(last_applied, false).map_err(|_| {
+                AtomicTokenError::Processing(format!(
+                    "snapshot export failed: missing journal while rolling back block `{last_applied}`"
+                ))
+            })?;
+            self.commit_rollback_to_store(last_applied, &journal, &[])?;
+        }
+
+        if !found_target {
+            return Err(AtomicTokenError::Processing(format!(
+                "snapshot export failed: target block `{target_block_hash}` not found in applied chain order"
+            )));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn validate_snapshot_chain_indexes(state: &AtomicTokenSnapshotState) -> AtomicTokenResult<()> {
         let expected_len = state.applied_chain_order.len();
         let unique_blocks: HashSet<BlockHash> = state.applied_chain_order.iter().copied().collect();
@@ -2955,12 +3735,15 @@ impl AtomicTokenState {
         Ok(())
     }
 
+    #[cfg(test)]
     fn validate_snapshot_processed_ops(
         processed_ops: &HashMap<BlockHash, ProcessedOp>,
         journals_in_window: &[(BlockHash, BlockJournal)],
     ) -> AtomicTokenResult<()> {
         let mut seen_window_txids = HashSet::new();
+        let mut accepting_blocks_in_window = HashSet::new();
         for (accepting_block_hash, journal) in journals_in_window.iter() {
+            accepting_blocks_in_window.insert(*accepting_block_hash);
             if journal.added_processed_ops.len() != journal.tx_results.len() {
                 return Err(AtomicTokenError::Processing(format!(
                     "snapshot import failed: journal tx-result length mismatch for block `{accepting_block_hash}`"
@@ -2998,19 +3781,22 @@ impl AtomicTokenState {
                 }
             }
         }
+        if processed_ops
+            .iter()
+            .any(|(txid, op)| accepting_blocks_in_window.contains(&op.accepting_block_hash) && !seen_window_txids.contains(txid))
+        {
+            return Err(AtomicTokenError::Processing(
+                "snapshot import failed: processed_ops contains entries outside the rollback window".to_string(),
+            ));
+        }
         Ok(())
     }
 
     pub fn compute_state_hash(&self) -> [u8; 32] {
-        self.compute_state_hash_with_processed_ops(true)
+        self.compute_state_hash_canonical()
     }
 
-    #[cfg(test)]
-    fn compute_legacy_state_hash_without_processed_ops(&self) -> [u8; 32] {
-        self.compute_state_hash_with_processed_ops(false)
-    }
-
-    fn compute_state_hash_for_view(&self, view: AtomicTokenReadView, include_processed_ops: bool) -> [u8; 32] {
+    fn compute_state_hash_for_view(&self, view: AtomicTokenReadView) -> [u8; 32] {
         let state = Self {
             protocol_version: self.protocol_version,
             network_id: self.network_id.clone(),
@@ -3033,11 +3819,33 @@ impl AtomicTokenState {
             known_owner_addresses: Default::default(),
             balances_by_owner: Default::default(),
             holders_by_asset: Default::default(),
+            state_store: None,
+            deleted_assets: Default::default(),
+            deleted_balances: Default::default(),
+            deleted_nonces: Default::default(),
+            deleted_anchor_counts: Default::default(),
+            deleted_processed_ops: Default::default(),
         };
-        state.compute_state_hash_with_processed_ops(include_processed_ops)
+        state.compute_state_hash_canonical()
     }
 
-    fn compute_state_hash_with_processed_ops(&self, include_processed_ops: bool) -> [u8; 32] {
+    fn compute_state_hash_canonical(&self) -> [u8; 32] {
+        if self.assets.is_empty()
+            && self.balances.is_empty()
+            && self.nonces.is_empty()
+            && self.anchor_counts.is_empty()
+            && self.processed_ops.is_empty()
+            && self.deleted_assets.is_empty()
+            && self.deleted_balances.is_empty()
+            && self.deleted_nonces.is_empty()
+            && self.deleted_anchor_counts.is_empty()
+            && self.deleted_processed_ops.is_empty()
+        {
+            if let Some(root) = self.state_store.as_ref().and_then(|store| store.current_root().ok().flatten()) {
+                return root;
+            }
+        }
+
         let network_id_bytes = self.network_id.as_bytes();
         let network_len = u16::try_from(network_id_bytes.len()).unwrap_or(0);
 
@@ -3051,10 +3859,6 @@ impl AtomicTokenState {
         self.hash_balances_section(&mut hasher);
         self.hash_nonces_section(&mut hasher);
         self.hash_anchor_counts_section(&mut hasher);
-        if include_processed_ops {
-            self.hash_processed_ops_section(&mut hasher);
-        }
-
         let digest = hasher.finalize();
         let mut out = [0u8; 32];
         out.copy_from_slice(digest.as_bytes());
@@ -3176,21 +3980,6 @@ impl AtomicTokenState {
         }
     }
 
-    fn hash_processed_ops_section(&self, hasher: &mut blake2b_simd::State) {
-        hasher.update(&[SECTION_PROCESSED_OPS]);
-        let mut txids: Vec<BlockHash> = self.processed_ops.keys().copied().collect();
-        txids.sort_unstable();
-        hasher.update(&(txids.len() as u32).to_le_bytes());
-
-        for txid in txids {
-            if let Some(op) = self.processed_ops.get(&txid) {
-                hasher.update(&txid.as_bytes());
-                hasher.update(&op.accepting_block_hash.as_bytes());
-                hasher.update(&[op.apply_status as u8]);
-                hasher.update(&(op.noop_reason as u16).to_le_bytes());
-            }
-        }
-    }
 }
 
 fn map_liquidity_math_error(err: LiquidityMathError) -> NoopReason {
@@ -3518,7 +4307,7 @@ mod tests {
 
         let hash = state.compute_state_hash();
         let hash_hex = to_hex(&hash);
-        assert_eq!(hash_hex, "e50e93ad14aab0b237e9717764b1174aaf39395b0fcbdc51eaf71ecfde614f8f");
+        assert_eq!(hash_hex, "456a93ce07e8c8e014768659f18ee3cd4e82ea0e1d2861511000aa724f3fd25b");
     }
 
     #[test]
@@ -4073,10 +4862,9 @@ mod tests {
     }
 
     #[test]
-    fn state_hash_commits_processed_ops() {
+    fn state_hash_ignores_prunable_processed_ops() {
         let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
         let before = state.compute_state_hash();
-        let legacy_before = state.compute_legacy_state_hash_without_processed_ops();
         state.processed_ops.insert(
             BlockHash::from_u64_word(99),
             ProcessedOp {
@@ -4086,9 +4874,7 @@ mod tests {
             },
         );
         let after = state.compute_state_hash();
-        let legacy_after = state.compute_legacy_state_hash_without_processed_ops();
-        assert_ne!(before, after);
-        assert_eq!(legacy_before, legacy_after);
+        assert_eq!(before, after);
     }
 
     #[test]
@@ -4153,7 +4939,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_history_refreshes_processed_op_committed_checkpoint_hashes() {
+    fn prune_history_keeps_committed_checkpoint_hashes_stable_when_processed_ops_are_pruned() {
         let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
         for index in 1..=4u64 {
             let block_hash = BlockHash::from_u64_word(index);
@@ -4162,9 +4948,7 @@ mod tests {
                 txid,
                 ProcessedOp { accepting_block_hash: block_hash, apply_status: ApplyStatus::Applied, noop_reason: NoopReason::None },
             );
-            state
-                .block_journals
-                .insert(block_hash, BlockJournal { added_processed_ops: vec![txid], ..Default::default() });
+            state.block_journals.insert(block_hash, BlockJournal { added_processed_ops: vec![txid], ..Default::default() });
             state.applied_chain_order.push(block_hash);
             state.state_hash_by_block.insert(block_hash, state.compute_state_hash());
             state.event_sequence_by_block.insert(block_hash, index);
@@ -4174,12 +4958,85 @@ mod tests {
 
         assert!(state.prune_history(2));
         assert_eq!(state.applied_chain_order, vec![BlockHash::from_u64_word(3), tip]);
-        assert_ne!(state.compute_state_hash(), stale_tip_hash);
+        assert_eq!(state.compute_state_hash(), stale_tip_hash);
         assert_eq!(state.get_state_hash_at_block(tip), Some(stale_tip_hash));
 
         let refreshed = state.refresh_retained_state_hashes_from_current_state().expect("refresh should succeed");
         assert_eq!(refreshed, 2);
-        assert_eq!(state.get_state_hash_at_block(tip), Some(state.compute_state_hash()));
+        assert_eq!(state.get_state_hash_at_block(tip), Some(stale_tip_hash));
+    }
+
+    #[test]
+    fn point_reads_rollback_only_requested_atomic_keys() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let asset_id = [0xA1; 32];
+        let owner = [0xB2; 32];
+        let receiver = [0xC3; 32];
+        let block1 = BlockHash::from_u64_word(91);
+        let block2 = BlockHash::from_u64_word(92);
+        let asset = TokenAsset {
+            asset_id,
+            creator_owner_id: owner,
+            asset_class: TokenAssetClass::Standard,
+            token_version: CURRENT_TOKEN_VERSION,
+            mint_authority_owner_id: owner,
+            decimals: 0,
+            supply_mode: SupplyMode::Capped,
+            max_supply: 10,
+            total_supply: 10,
+            name: b"Point".to_vec(),
+            symbol: b"PNT".to_vec(),
+            metadata: Vec::new(),
+            platform_tag: Vec::new(),
+            created_block_hash: Some(block1),
+            created_daa_score: Some(1),
+            created_at: Some(1),
+            liquidity: None,
+        };
+        let owner_balance = BalanceKey { asset_id, owner_id: owner };
+        let receiver_balance = BalanceKey { asset_id, owner_id: receiver };
+        let nonce_key = NonceKey::asset(owner, asset_id);
+
+        state.assets.insert(asset_id, asset.clone());
+        state.balances.insert(owner_balance, 10);
+        state.nonces.insert(nonce_key, 2);
+        state.applied_chain_order.push(block1);
+        state.block_journals.insert(
+            block1,
+            BlockJournal {
+                changed_assets: vec![ChangedAsset { asset_id, old_value: None }],
+                changed_balances: vec![ChangedBalance { key: owner_balance, old_value: None }],
+                changed_nonces: vec![ChangedNonce { key: nonce_key, old_value: None }],
+                ..Default::default()
+            },
+        );
+        state.state_hash_by_block.insert(block1, state.compute_state_hash());
+        state.event_sequence_by_block.insert(block1, 1);
+
+        state.balances.insert(owner_balance, 4);
+        state.balances.insert(receiver_balance, 6);
+        state.nonces.insert(nonce_key, 3);
+        state.applied_chain_order.push(block2);
+        state.block_journals.insert(
+            block2,
+            BlockJournal {
+                changed_balances: vec![
+                    ChangedBalance { key: owner_balance, old_value: Some(10) },
+                    ChangedBalance { key: receiver_balance, old_value: None },
+                ],
+                changed_nonces: vec![ChangedNonce { key: nonce_key, old_value: Some(2) }],
+                ..Default::default()
+            },
+        );
+        state.state_hash_by_block.insert(block2, state.compute_state_hash());
+        state.event_sequence_by_block.insert(block2, 2);
+
+        assert_eq!(state.get_balance_at_block(owner_balance, block1), Some(10));
+        assert_eq!(state.get_balance_at_block(receiver_balance, block1), Some(0));
+        assert_eq!(state.get_nonce_at_block(nonce_key, block1), Some(2));
+        assert_eq!(state.get_asset_at_block(asset_id, block1), Some(Some(asset)));
+        assert_eq!(state.indexed_balances_by_owner_at_block(owner, false, block1), Some(vec![(asset_id, 10, None)]));
+        assert_eq!(state.indexed_holders_by_asset_at_block(asset_id, block1), Some(vec![(owner, 10)]));
     }
 
     #[test]
@@ -4430,7 +5287,7 @@ mod tests {
 
         let mut recovered = AtomicTokenState::new(1, network);
         let err = recovered.import_snapshot(snapshot).expect_err("snapshot import must reject poisoned processed_ops");
-        assert!(matches!(err, AtomicTokenError::Processing(message) if message.contains("state hash mismatch")));
+        assert!(matches!(err, AtomicTokenError::Processing(message) if message.contains("outside the rollback window")));
         assert!(!expected_window_txids.contains(&poisoned_txid));
         assert_ne!(expected_state_hash, recovered.compute_state_hash());
     }
@@ -4468,7 +5325,7 @@ mod tests {
             NoopReason::None,
             3,
         );
-        assert_eq!(to_hex(&event_id), "21220baf58aacf015053fe5d86544bf015613e93c69ec268b9c19938ad7e4f5d");
+        assert_eq!(to_hex(&event_id), "79cf538d0a8adb0e976192502c9227a8cf59cf564d89dde65c0eaf5d3680b9cb");
     }
 
     #[test]

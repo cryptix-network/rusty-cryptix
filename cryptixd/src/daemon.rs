@@ -303,7 +303,7 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     }
     info!("Tx relay broadcast interval: {} ms", args.tx_relay_broadcast_interval_ms);
     info!("Payload HF activation DAA score: {}", config.params.payload_hf_activation_daa_score);
-    info!("Cryptix Atomic Token v1: ENABLED");
+    info!("Cryptix Atomic Token: ENABLED (storage v2)");
     info!("Cryptix Atomic bootstrap worker: ENABLED; configured peer overrides: {}", args.atomic_bootstrap_peers.len());
     let atomic_bootstrap_seed_confirmed_non_seed_min_sources =
         args.atomic_bootstrap_peer_quorum_min_sources.unwrap_or(ATOMIC_BOOTSTRAP_DEFAULT_SEED_CONFIRMED_NON_SEED_SOURCES);

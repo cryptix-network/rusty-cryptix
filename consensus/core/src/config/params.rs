@@ -95,6 +95,21 @@ pub struct Params {
     /// Effective payload byte pricing multiplier applied in mass calculation
     pub payload_weight_multiplier: u64,
 
+    /// Maximum number of new Atomic asset entries a single block may add.
+    pub atomic_max_new_assets_per_block: usize,
+
+    /// Maximum number of new Atomic balance entries a single block may add.
+    pub atomic_max_new_balance_keys_per_block: usize,
+
+    /// Maximum number of new Atomic nonce entries a single block may add.
+    pub atomic_max_new_nonce_keys_per_block: usize,
+
+    /// Maximum number of new Atomic liquidity pool entries a single block may add.
+    pub atomic_max_new_pools_per_block: usize,
+
+    /// Maximum number of new Atomic owner anchor count entries a single block may add.
+    pub atomic_max_new_anchor_owner_keys_per_block: usize,
+
     /// DAA score after which the pre-deflationary period switches to the deflationary period
     pub deflationary_phase_daa_score: u64,
 
@@ -365,10 +380,15 @@ pub const MAINNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     storage_mass_activation_daa_score: u64::MAX,
-    payload_hf_activation_daa_score: 999_999_999_991,
+    payload_hf_activation_daa_score: 1_111,
     payload_max_len_consensus: 8192,
     payload_max_len_standard: 2048,
     payload_weight_multiplier: 4,
+    atomic_max_new_assets_per_block: 256,
+    atomic_max_new_balance_keys_per_block: 4096,
+    atomic_max_new_nonce_keys_per_block: 4096,
+    atomic_max_new_pools_per_block: 64,
+    atomic_max_new_anchor_owner_keys_per_block: 8192,
 
     // deflationary_phase_daa_score is the DAA score after which the pre-deflationary period
     // switches to the deflationary period. This number is calculated as follows:
@@ -430,10 +450,15 @@ pub const TESTNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     storage_mass_activation_daa_score: u64::MAX,
-    payload_hf_activation_daa_score: 999_999_999_991,
+    payload_hf_activation_daa_score: 1_111,
     payload_max_len_consensus: 8192,
     payload_max_len_standard: 2048,
     payload_weight_multiplier: 4,
+    atomic_max_new_assets_per_block: 256,
+    atomic_max_new_balance_keys_per_block: 4096,
+    atomic_max_new_nonce_keys_per_block: 4096,
+    atomic_max_new_pools_per_block: 64,
+    atomic_max_new_anchor_owner_keys_per_block: 8192,
 
     // deflationary_phase_daa_score is the DAA score after which the pre-deflationary period
     // switches to the deflationary period. This number is calculated as follows:
@@ -494,10 +519,15 @@ pub const SIMNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     storage_mass_activation_daa_score: 0,
-    payload_hf_activation_daa_score: 999_999_999_991,
+    payload_hf_activation_daa_score: 1_111,
     payload_max_len_consensus: 8192,
     payload_max_len_standard: 2048,
     payload_weight_multiplier: 4,
+    atomic_max_new_assets_per_block: 256,
+    atomic_max_new_balance_keys_per_block: 4096,
+    atomic_max_new_nonce_keys_per_block: 4096,
+    atomic_max_new_pools_per_block: 64,
+    atomic_max_new_anchor_owner_keys_per_block: 8192,
 
     skip_proof_of_work: true, // For simnet only, PoW can be simulated by default
     max_block_level: 250,
@@ -544,10 +574,15 @@ pub const DEVNET_PARAMS: Params = Params {
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
     storage_mass_activation_daa_score: u64::MAX,
-    payload_hf_activation_daa_score: 999_999_999_991,
+    payload_hf_activation_daa_score: 1_111,
     payload_max_len_consensus: 8192,
     payload_max_len_standard: 2048,
     payload_weight_multiplier: 4,
+    atomic_max_new_assets_per_block: 256,
+    atomic_max_new_balance_keys_per_block: 4096,
+    atomic_max_new_nonce_keys_per_block: 4096,
+    atomic_max_new_pools_per_block: 64,
+    atomic_max_new_anchor_owner_keys_per_block: 8192,
 
     // deflationary_phase_daa_score is the DAA score after which the pre-deflationary period
     // switches to the deflationary period. This number is calculated as follows:

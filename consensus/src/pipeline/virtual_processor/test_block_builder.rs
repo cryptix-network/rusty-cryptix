@@ -45,7 +45,8 @@ impl TestBlockBuilder {
         let finality_point = ORIGIN; // No real finality point since we are not actually building virtual here
         let sink = virtual_state.ghostdag_data.selected_parent;
         let mut accumulated_diff = virtual_state.utxo_diff.clone().to_reversed();
-        let mut accumulated_atomic_state = virtual_state.atomic_state.clone();
+        let mut accumulated_atomic_state = self.atomic_state_store.attach_virtual_state(&virtual_state.atomic_state);
+        accumulated_atomic_state.apply_delta_rollback(&virtual_state.atomic_diff).unwrap();
         // Search for the sink block from the PoV of this virtual
         let (pov_sink, virtual_parent_candidates) = self.sink_search_algorithm(
             &virtual_read,

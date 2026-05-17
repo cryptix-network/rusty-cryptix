@@ -35,8 +35,8 @@ use tokio::{
 };
 
 const SERVICE_IDENT: &str = "atomic-bootstrap-service";
-const SNAPSHOT_MANIFEST_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_SNAPSHOT_MANIFEST_V1";
-const SNAPSHOT_ID_DOMAIN: &[u8] = b"CAT_SNAPSHOT_ID_V1";
+const SNAPSHOT_MANIFEST_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_SNAPSHOT_MANIFEST_V2";
+const SNAPSHOT_ID_DOMAIN: &[u8] = b"CAT_SNAPSHOT_ID_V2";
 const MAX_REMOTE_SOURCES: usize = 64;
 const RPC_CALL_TIMEOUT: Duration = Duration::from_secs(15);
 const SOURCE_FAILURE_THRESHOLD: u32 = 3;
@@ -54,7 +54,7 @@ const MAX_TOTAL_CHUNKS: usize = 65_536;
 const HEALTH_AUDIT_INTERVAL: Duration = Duration::from_secs(60);
 #[allow(dead_code)]
 #[derive(Clone, Debug, BorshDeserialize)]
-struct SnapshotManifestV1 {
+struct SnapshotManifestV2 {
     schema_version: u16,
     protocol_version: u16,
     network_id: String,
@@ -70,6 +70,7 @@ struct SnapshotManifestV1 {
     at_block_hash: [u8; 32],
     at_daa_score: u64,
     state_hash_at_fp: [u8; 32],
+    state_hash_at_window_start_parent: Option<[u8; 32]>,
     window_start_block_hash: [u8; 32],
     window_start_parent_block_hash: [u8; 32],
     window_end_block_hash: [u8; 32],
@@ -536,7 +537,7 @@ impl AtomicBootstrapService {
                 }
             };
 
-        let manifest = match SnapshotManifestV1::try_from_slice(&manifest_bytes) {
+        let manifest = match SnapshotManifestV2::try_from_slice(&manifest_bytes) {
             Ok(manifest) => manifest,
             Err(err) => {
                 for source in selected_sources {
@@ -629,7 +630,7 @@ impl AtomicBootstrapService {
                 required_votes
             );
             let manifest_bytes = self.fetch_manifest_bytes_with_quorum(&mut sources, &snapshot_id, required_votes).await?;
-            let manifest = SnapshotManifestV1::try_from_slice(&manifest_bytes)
+            let manifest = SnapshotManifestV2::try_from_slice(&manifest_bytes)
                 .map_err(|err| format!("snapshot manifest decode failed: {err}"))?;
 
             if manifest.protocol_version as u32 != protocol_version {
@@ -709,6 +710,12 @@ impl AtomicBootstrapService {
         }
         if health.runtime_state == AtomicTokenRuntimeState::NotReady && !self.flow_context.is_payload_hf_active() {
             trace!("[atomic-bootstrap] bootstrap deferred until payload hardfork is active locally");
+            return Ok(false);
+        }
+        if self.flow_context.is_ibd_running() {
+            info!(
+                "[atomic-bootstrap] bootstrap deferred while IBD is running; waiting for a stable local replay path before importing Atomic snapshot"
+            );
             return Ok(false);
         }
 
@@ -1004,7 +1011,7 @@ impl AtomicBootstrapService {
         Ok(winning_vote.manifest_bytes)
     }
 
-    fn validate_manifest_sanity(&self, manifest: &SnapshotManifestV1) -> Result<(), String> {
+    fn validate_manifest_sanity(&self, manifest: &SnapshotManifestV2) -> Result<(), String> {
         if manifest.snapshot_file_name.is_empty() {
             return Err("manifest snapshot_file_name cannot be empty".to_string());
         }
@@ -1079,7 +1086,7 @@ impl AtomicBootstrapService {
         &self,
         sources: &[SourceClient],
         snapshot_id: &str,
-        manifest: &SnapshotManifestV1,
+        manifest: &SnapshotManifestV2,
         output_path: &Path,
     ) -> Result<(), String> {
         let expected_total = manifest.snapshot_chunk_hashes.len() as u32;
@@ -1169,7 +1176,7 @@ impl AtomicBootstrapService {
         &self,
         sources: &[SourceClient],
         snapshot_id: &str,
-        manifest: &SnapshotManifestV1,
+        manifest: &SnapshotManifestV2,
         output_path: &Path,
     ) -> Result<(), String> {
         let expected_total = manifest.replay_window_chunk_hashes.len() as u32;

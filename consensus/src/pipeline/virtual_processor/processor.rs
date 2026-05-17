@@ -15,7 +15,7 @@ use crate::{
         },
         stores::{
             acceptance_data::{AcceptanceDataStoreReader, DbAcceptanceDataStore},
-            atomic_state::{AtomicConsensusState, AtomicNonceKey, AtomicStateStore, AtomicStateStoreReader, DbAtomicStateStore},
+            atomic_state::{AtomicConsensusState, AtomicNonceKey, DbAtomicStateStore},
             block_transactions::{BlockTransactionsStoreReader, DbBlockTransactionsStore},
             daa::DbDaaStore,
             depth::{DbDepthStore, DepthStoreReader},
@@ -39,7 +39,7 @@ use crate::{
     pipeline::{
         deps_manager::VirtualStateProcessingMessage,
         pruning_processor::processor::PruningProcessingMessage,
-        virtual_processor::utxo_validation::{atomic_nonce_key_for_op, UtxoProcessingContext},
+        virtual_processor::utxo_validation::{atomic_nonce_key_for_op, AtomicBlockStateGrowth, UtxoProcessingContext},
         ProcessingCounters,
     },
     processes::{
@@ -188,6 +188,12 @@ pub struct VirtualStateProcessor {
 
     // Storage mass hardfork DAA score
     pub(crate) storage_mass_activation_daa_score: u64,
+
+    pub(super) atomic_max_new_assets_per_block: usize,
+    pub(super) atomic_max_new_balance_keys_per_block: usize,
+    pub(super) atomic_max_new_nonce_keys_per_block: usize,
+    pub(super) atomic_max_new_pools_per_block: usize,
+    pub(super) atomic_max_new_anchor_owner_keys_per_block: usize,
 }
 
 impl VirtualStateProcessor {
@@ -250,6 +256,11 @@ impl VirtualStateProcessor {
             notification_root,
             counters,
             storage_mass_activation_daa_score: params.storage_mass_activation_daa_score,
+            atomic_max_new_assets_per_block: params.atomic_max_new_assets_per_block,
+            atomic_max_new_balance_keys_per_block: params.atomic_max_new_balance_keys_per_block,
+            atomic_max_new_nonce_keys_per_block: params.atomic_max_new_nonce_keys_per_block,
+            atomic_max_new_pools_per_block: params.atomic_max_new_pools_per_block,
+            atomic_max_new_anchor_owner_keys_per_block: params.atomic_max_new_anchor_owner_keys_per_block,
         }
     }
 
@@ -312,7 +323,11 @@ impl VirtualStateProcessor {
         drop(prune_guard);
         let prev_sink = prev_state.ghostdag_data.selected_parent;
         let mut accumulated_diff = prev_state.utxo_diff.clone().to_reversed();
-        let mut accumulated_atomic_state = prev_state.atomic_state.clone();
+        let mut accumulated_atomic_state = self.atomic_state_store.attach_virtual_state(&prev_state.atomic_state);
+        if let Err(err) = accumulated_atomic_state.apply_delta_rollback(&prev_state.atomic_diff) {
+            warn!("failed rolling back virtual Atomic diff for previous sink `{prev_sink}`: {err}; keeping previous virtual state");
+            return;
+        }
 
         let (new_sink, virtual_parent_candidates) = self.sink_search_algorithm(
             &virtual_read,
@@ -387,33 +402,6 @@ impl VirtualStateProcessor {
         }
     }
 
-    fn load_block_atomic_state(&self, block_hash: Hash) -> Option<AtomicConsensusState> {
-        match self.atomic_state_store.get(block_hash) {
-            Ok(state) => {
-                let mut state = state.as_ref().clone();
-                state.rebuild_liquidity_vault_outpoint_index();
-                Some(state)
-            }
-            Err(StoreError::KeyNotFound(_)) => {
-                let block_daa_score = self.headers_store.get_header(block_hash).unwrap().daa_score;
-                if self.transaction_validator.is_payload_hf_active(block_daa_score) {
-                    warn!(
-                        "missing persisted atomic consensus state for post-HF block `{block_hash}`; failing closed for this virtual resolve pass"
-                    );
-                    return None;
-                }
-                warn!("missing persisted pre-HF atomic consensus state for block `{block_hash}`; reconstructing when a UTXO view is available");
-                None
-            }
-            Err(err) => {
-                warn!(
-                    "failed reading atomic consensus state for block `{block_hash}`: {err}; failing closed for this virtual resolve pass"
-                );
-                None
-            }
-        }
-    }
-
     /// Calculates the UTXO state of `to` starting from the state of `from`.
     /// The provided `diff` is assumed to initially hold the UTXO diff of `from` from virtual.
     /// The function returns the top-most UTXO-valid block on `chain(to)` which is ideally
@@ -434,6 +422,8 @@ impl VirtualStateProcessor {
 
         let mut split_point: Option<Hash> = None;
 
+        let mut missing_pre_hf_atomic_delta = false;
+
         // Walk down to the reorg split point
         for current in self.reachability_service.default_backward_chain_iterator(from) {
             if self.reachability_service.is_chain_ancestor_of(current, to) {
@@ -444,20 +434,40 @@ impl VirtualStateProcessor {
             let mergeset_diff = self.utxo_diffs_store.get(current).unwrap();
             // Apply the diff in reverse
             diff.with_diff_in_place(&mergeset_diff.as_reversed()).unwrap();
+            match self.atomic_state_store.get_delta(current) {
+                Ok(delta) => {
+                    if let Err(err) = atomic_state.apply_delta_rollback(delta.as_ref()) {
+                        warn!("failed rolling back atomic delta for block `{current}`: {err}; keeping previous virtual sink");
+                        return from;
+                    }
+                }
+                Err(StoreError::KeyNotFound(_)) => {
+                    let block_daa_score = self.headers_store.get_header(current).unwrap().daa_score;
+                    if self.transaction_validator.is_payload_hf_active(block_daa_score) {
+                        warn!("missing persisted atomic delta for post-HF block `{current}`; keeping previous virtual sink");
+                        return from;
+                    }
+                    missing_pre_hf_atomic_delta = true;
+                }
+                Err(err) => {
+                    warn!("failed reading atomic delta for block `{current}`: {err}; keeping previous virtual sink");
+                    return from;
+                }
+            }
         }
 
         let split_point = split_point.expect("chain iterator was expected to reach the reorg split point");
         debug!("VIRTUAL PROCESSOR, found split point: {split_point}");
-        let Some(split_point_state) = self
-            .load_block_atomic_state(split_point)
-            .or_else(|| self.pre_hf_atomic_state_from_virtual_diff(stores, diff, split_point))
-        else {
-            warn!(
-                "cannot resolve virtual state because split point `{split_point}` has no usable atomic consensus state; keeping previous virtual sink"
-            );
-            return from;
-        };
-        *atomic_state = split_point_state;
+        if missing_pre_hf_atomic_delta {
+            let Some(split_point_state) = self.pre_hf_atomic_state_from_virtual_diff(stores, diff, split_point) else {
+                warn!(
+                    "cannot resolve virtual state because split point `{split_point}` has no reconstructable pre-HF atomic state; keeping previous virtual sink"
+                );
+                return from;
+            };
+            *atomic_state = split_point_state;
+        }
+        atomic_state.rebuild_liquidity_vault_outpoint_index();
 
         // A variable holding the most recent UTXO-valid block on `chain(to)` (note that it's maintained such
         // that 'diff' is always its UTXO diff from virtual)
@@ -477,15 +487,20 @@ impl VirtualStateProcessor {
             let mut needs_recompute = true;
             match self.utxo_diffs_store.get(current) {
                 Ok(mergeset_diff) => {
-                    if let Some(current_atomic_state) = self.load_block_atomic_state(current) {
-                        diff.with_diff_in_place(mergeset_diff.deref()).unwrap();
-                        *atomic_state = current_atomic_state;
-                        diff_point = current;
-                        needs_recompute = false;
-                    } else {
-                        warn!(
-                            "block `{current}` has cached UTXO diff but no usable atomic state; recomputing block UTXO/atomic state"
-                        );
+                    match self.atomic_state_store.get_delta(current) {
+                        Ok(delta) => {
+                            if let Err(err) = atomic_state.apply_delta_forward(delta.as_ref()) {
+                                warn!("block `{current}` has cached UTXO diff but invalid atomic delta ({err}); recomputing");
+                            } else {
+                                diff.with_diff_in_place(mergeset_diff.deref()).unwrap();
+                                diff_point = current;
+                                needs_recompute = false;
+                            }
+                        }
+                        Err(StoreError::KeyNotFound(_)) => {
+                            warn!("block `{current}` has cached UTXO diff but no atomic delta; recomputing block UTXO/atomic state");
+                        }
+                        Err(err) => panic!("unexpected error {err}"),
                     }
                 }
                 Err(StoreError::KeyNotFound(_)) => {}
@@ -545,13 +560,15 @@ impl VirtualStateProcessor {
         mergeset_diff: UtxoDiff,
         multiset: MuHash,
         acceptance_data: AcceptanceData,
-        atomic_state: AtomicConsensusState,
+        mut atomic_state: AtomicConsensusState,
     ) {
+        let atomic_state_hash = atomic_state.canonical_hash();
+        let atomic_delta = Arc::new(atomic_state.take_delta());
         let mut batch = WriteBatch::default();
         self.utxo_diffs_store.insert_batch(&mut batch, current, Arc::new(mergeset_diff)).unwrap();
         self.utxo_multisets_store.insert_batch(&mut batch, current, multiset).unwrap();
         self.acceptance_data_store.insert_batch(&mut batch, current, Arc::new(acceptance_data)).unwrap();
-        self.atomic_state_store.insert_batch(&mut batch, current, Arc::new(atomic_state)).unwrap();
+        self.atomic_state_store.insert_batch_with_delta(&mut batch, current, atomic_state_hash, atomic_delta).unwrap();
         let write_guard = self.statuses_store.set_batch(&mut batch, current, StatusUTXOValid).unwrap();
         self.db.write(batch).unwrap();
         // Calling the drops explicitly after the batch is written in order to avoid possible errors.
@@ -604,6 +621,8 @@ impl VirtualStateProcessor {
         // Update the accumulated diff
         accumulated_diff.with_diff_in_place(&ctx.mergeset_diff).unwrap();
 
+        let atomic_diff = ctx.atomic_state.take_delta();
+
         // Build the new virtual state
         Ok(Arc::new(VirtualState::new(
             virtual_parents,
@@ -615,6 +634,7 @@ impl VirtualStateProcessor {
             ctx.accepted_tx_ids,
             ctx.mergeset_rewards,
             virtual_daa_window.mergeset_non_daa,
+            atomic_diff,
             ctx.atomic_state,
             virtual_ghostdag_data,
         )))
@@ -633,6 +653,12 @@ impl VirtualStateProcessor {
 
         // Apply the accumulated diff to the virtual UTXO set
         virtual_write.utxo_set.write_diff_batch(&mut batch, accumulated_diff).unwrap();
+
+        self.atomic_state_store.write_current_overlay_batch(&mut batch, &new_virtual_state.atomic_state).unwrap();
+
+        let mut compact_virtual_state = new_virtual_state.as_ref().clone();
+        compact_virtual_state.atomic_state = compact_virtual_state.atomic_state.as_virtual_root_state();
+        let new_virtual_state = Arc::new(compact_virtual_state);
 
         // Update virtual state
         virtual_write.state.set_batch(&mut batch, new_virtual_state).unwrap();
@@ -867,6 +893,14 @@ impl VirtualStateProcessor {
         (virtual_parents, ghostdag_data)
     }
 
+    fn atomic_state_for_virtual_context(&self, atomic_state: &AtomicConsensusState) -> AtomicConsensusState {
+        if atomic_state.is_disk_backed() {
+            atomic_state.clone()
+        } else {
+            self.atomic_state_store.attach_virtual_state(atomic_state)
+        }
+    }
+
     fn validate_mempool_transaction_impl(
         &self,
         mutable_tx: &mut MutableTransaction,
@@ -883,8 +917,14 @@ impl VirtualStateProcessor {
             virtual_past_median_time,
             args,
         )?;
-        let mut atomic_state = virtual_state.atomic_state.clone();
-        self.validate_and_apply_atomic_state_transition(&mutable_tx.as_verifiable(), virtual_daa_score, &mut atomic_state)?;
+        let mut atomic_state = self.atomic_state_for_virtual_context(&virtual_state.atomic_state);
+        let mut atomic_growth = AtomicBlockStateGrowth::default();
+        self.validate_and_apply_atomic_state_transition_with_growth(
+            &mutable_tx.as_verifiable(),
+            virtual_daa_score,
+            &mut atomic_state,
+            &mut atomic_growth,
+        )?;
         Ok(())
     }
 
@@ -1031,7 +1071,7 @@ impl VirtualStateProcessor {
         };
 
         for (child_pos, (_, info)) in atomic_items.iter().enumerate() {
-            let nonce_baseline = atomic_state.next_nonces.get(&info.nonce_key).copied().unwrap_or(1);
+            let nonce_baseline = atomic_state.next_nonce(&info.nonce_key);
             if info.nonce > nonce_baseline {
                 if let Some(previous_nonce) = info.nonce.checked_sub(1) {
                     if let Some(parents) = by_nonce.get(&(info.nonce_key, previous_nonce)) {
@@ -1043,12 +1083,7 @@ impl VirtualStateProcessor {
             }
 
             if let Some((asset_id, pool_nonce)) = info.pool {
-                let pool_baseline = atomic_state
-                    .assets
-                    .get(&asset_id)
-                    .and_then(|asset| asset.liquidity.as_ref())
-                    .map(|pool| pool.pool_nonce)
-                    .unwrap_or(1);
+                let pool_baseline = atomic_state.pool_nonce(&asset_id);
                 if pool_nonce > pool_baseline {
                     if let Some(previous_pool_nonce) = pool_nonce.checked_sub(1) {
                         if let Some(parents) = by_pool.get(&(asset_id, previous_pool_nonce)) {
@@ -1061,7 +1096,7 @@ impl VirtualStateProcessor {
             }
 
             if let Some(asset_id) = info.references_asset_id {
-                if !atomic_state.assets.contains_key(&asset_id) {
+                if !atomic_state.has_asset(&asset_id) {
                     if let Some(parents) = by_created_asset.get(&asset_id) {
                         for parent in parents.iter().copied() {
                             add_dependency(parent, child_pos);
@@ -1121,7 +1156,8 @@ impl VirtualStateProcessor {
             return;
         }
 
-        let mut ordered_indices = Self::order_atomic_indices(&atomic_items, &virtual_state.atomic_state);
+        let atomic_state = self.atomic_state_for_virtual_context(&virtual_state.atomic_state);
+        let mut ordered_indices = Self::order_atomic_indices(&atomic_items, &atomic_state);
         ordered_indices.extend(non_atomic_indices);
         if ordered_indices.len() == txs.len() {
             let ordered = ordered_indices.into_iter().map(|idx| txs[idx].clone()).collect();
@@ -1187,18 +1223,23 @@ impl VirtualStateProcessor {
                 Err(err) => results[idx] = Err(err),
             }
         }
-        let ordered_atomic_indices = Self::order_atomic_indices(&ordered_atomic_items, &virtual_state.atomic_state);
+        let ordering_atomic_state = self.atomic_state_for_virtual_context(&virtual_state.atomic_state);
+        let ordered_atomic_indices = Self::order_atomic_indices(&ordered_atomic_items, &ordering_atomic_state);
         ordered_non_atomic_indices.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
-        let mut atomic_state = virtual_state.atomic_state.clone();
+        let mut atomic_state = self.atomic_state_for_virtual_context(&virtual_state.atomic_state);
+        let mut atomic_growth = AtomicBlockStateGrowth::default();
         for idx in ordered_atomic_indices.into_iter() {
             if results[idx].is_err() {
                 continue;
             }
             let mtx = &mut mutable_txs[idx];
-            if let Err(err) =
-                self.validate_and_apply_atomic_state_transition(&mtx.as_verifiable(), virtual_daa_score, &mut atomic_state)
-            {
+            if let Err(err) = self.validate_and_apply_atomic_state_transition_with_growth(
+                &mtx.as_verifiable(),
+                virtual_daa_score,
+                &mut atomic_state,
+                &mut atomic_growth,
+            ) {
                 results[idx] = Err(err);
             }
         }
@@ -1207,9 +1248,12 @@ impl VirtualStateProcessor {
                 continue;
             }
             let mtx = &mut mutable_txs[idx];
-            if let Err(err) =
-                self.validate_and_apply_atomic_state_transition(&mtx.as_verifiable(), virtual_daa_score, &mut atomic_state)
-            {
+            if let Err(err) = self.validate_and_apply_atomic_state_transition_with_growth(
+                &mtx.as_verifiable(),
+                virtual_daa_score,
+                &mut atomic_state,
+                &mut atomic_growth,
+            ) {
                 results[idx] = Err(err);
             }
         }
@@ -1248,11 +1292,17 @@ impl VirtualStateProcessor {
         virtual_state: &VirtualState,
         utxo_view: &V,
         atomic_state: &mut AtomicConsensusState,
+        atomic_growth: &mut AtomicBlockStateGrowth,
     ) -> Vec<TxResult<u64>> {
         txs.iter()
             .map(|tx| {
                 let validated = self.validate_block_template_transaction(tx, virtual_state, utxo_view)?;
-                self.validate_and_apply_atomic_state_transition(&validated, virtual_state.daa_score, atomic_state)?;
+                self.validate_and_apply_atomic_state_transition_with_growth(
+                    &validated,
+                    virtual_state.daa_score,
+                    atomic_state,
+                    atomic_growth,
+                )?;
                 Ok(validated.calculated_fee)
             })
             .collect()
@@ -1289,7 +1339,8 @@ impl VirtualStateProcessor {
         let virtual_read = self.virtual_stores.read();
         let virtual_state = virtual_read.state.get().unwrap();
         let virtual_utxo_view = &virtual_read.utxo_set;
-        let mut template_atomic_state = virtual_state.atomic_state.clone();
+        let mut template_atomic_state = self.atomic_state_for_virtual_context(&virtual_state.atomic_state);
+        let mut template_atomic_growth = AtomicBlockStateGrowth::default();
         self.order_block_template_transactions(&mut txs, &virtual_state, virtual_utxo_view);
 
         let mut invalid_transactions = HashMap::new();
@@ -1298,6 +1349,7 @@ impl VirtualStateProcessor {
             &virtual_state,
             &virtual_utxo_view,
             &mut template_atomic_state,
+            &mut template_atomic_growth,
         );
         for (tx, res) in txs.iter().zip(results) {
             match res {
@@ -1325,6 +1377,7 @@ impl VirtualStateProcessor {
                 &virtual_state,
                 &virtual_utxo_view,
                 &mut template_atomic_state,
+                &mut template_atomic_growth,
             );
             for (tx, res) in next_batch.into_iter().zip(next_batch_results) {
                 match res {
@@ -1364,13 +1417,17 @@ impl VirtualStateProcessor {
     ) -> Result<(), RuleError> {
         // Search for invalid transactions
         let mut invalid_transactions = HashMap::new();
-        let mut atomic_state = virtual_state.atomic_state.clone();
+        let mut atomic_state = self.atomic_state_for_virtual_context(&virtual_state.atomic_state);
+        let mut atomic_growth = AtomicBlockStateGrowth::default();
         for tx in txs.iter() {
             match self.validate_block_template_transaction(tx, virtual_state, utxo_view) {
                 Ok(validated) => {
-                    if let Err(e) =
-                        self.validate_and_apply_atomic_state_transition(&validated, virtual_state.daa_score, &mut atomic_state)
-                    {
+                    if let Err(e) = self.validate_and_apply_atomic_state_transition_with_growth(
+                        &validated,
+                        virtual_state.daa_score,
+                        &mut atomic_state,
+                        &mut atomic_growth,
+                    ) {
                         invalid_transactions.insert(tx.id(), e);
                     }
                 }
@@ -1507,50 +1564,29 @@ impl VirtualStateProcessor {
         info!("Importing the UTXO set of the pruning point {}", new_pruning_point);
         let new_pruning_point_header = self.headers_store.get_header(new_pruning_point).unwrap();
         let payload_hf_active = self.transaction_validator.is_payload_hf_active(new_pruning_point_header.daa_score);
-        let (pruning_point_atomic_state, should_persist_pruning_point_atomic_state, should_replace_pruning_point_atomic_state) =
-            if payload_hf_active {
-                let state = match self.atomic_state_store.get(new_pruning_point) {
-                    Ok(state) => state.as_ref().clone(),
-                    Err(StoreError::KeyNotFound(_)) => {
-                        return Err(PruningImportError::NewPruningPointMissingAtomicState(new_pruning_point));
-                    }
-                    Err(err) => {
-                        return Err(PruningImportError::AtomicStateStoreError(format!(
-                            "failed reading pruning-point atomic state for `{new_pruning_point}`: {err}"
-                        )));
-                    }
-                };
-                (state, false, false)
-            } else {
-                let reconstructed = self.reconstruct_pre_hf_pruning_point_atomic_state(new_pruning_point)?;
-                let (should_persist, should_replace) = match self.atomic_state_store.get(new_pruning_point) {
-                    Ok(existing_state) => {
-                        let existing_hash = existing_state.canonical_hash();
-                        let reconstructed_hash = reconstructed.canonical_hash();
-                        if existing_hash != reconstructed_hash {
-                            warn!(
-                            "replacing pre-HF pruning-point atomic consensus state for `{new_pruning_point}` with UTXO-derived state"
-                        );
-                            (true, true)
-                        } else {
-                            (false, false)
-                        }
-                    }
-                    Err(StoreError::KeyNotFound(_)) => {
-                        info!(
-                        "reconstructed missing pre-HF pruning-point atomic consensus state for `{new_pruning_point}` from imported UTXO set"
-                    );
-                        (true, false)
-                    }
-                    Err(err) => {
-                        return Err(PruningImportError::AtomicStateStoreError(format!(
-                            "failed reading pruning-point atomic state for `{new_pruning_point}`: {err}"
-                        )));
-                    }
-                };
-                (reconstructed, should_persist, should_replace)
-            };
         let imported_utxo_multiset_hash = imported_utxo_multiset.finalize();
+        let pruning_point_atomic_state = if payload_hf_active {
+            let root = self.atomic_state_store.get_root_record(new_pruning_point).map_err(|err| match err {
+                StoreError::KeyNotFound(_) => PruningImportError::NewPruningPointMissingAtomicState(new_pruning_point),
+                err => PruningImportError::AtomicStateStoreError(format!(
+                    "failed reading pruning-point atomic root for `{new_pruning_point}`: {err}"
+                )),
+            })?;
+            let imported_state_commitment =
+                AtomicConsensusState::header_commitment(imported_utxo_multiset_hash, root.state_hash, true);
+            if imported_state_commitment != new_pruning_point_header.utxo_commitment {
+                return Err(PruningImportError::ImportedStateCommitmentMismatch(
+                    new_pruning_point_header.utxo_commitment,
+                    imported_state_commitment,
+                ));
+            }
+            return Err(PruningImportError::AtomicStateStoreError(
+                "post-HF pruning import carries only the Atomic root; import an Atomic V2 snapshot for the pruning point before using the UTXO set"
+                    .to_string(),
+            ));
+        } else {
+            self.reconstruct_pre_hf_pruning_point_atomic_state(new_pruning_point)?
+        };
         let imported_state_commitment =
             pruning_point_atomic_state.header_commitment_for_state(imported_utxo_multiset_hash, payload_hf_active);
         if imported_state_commitment != new_pruning_point_header.utxo_commitment {
@@ -1595,19 +1631,34 @@ impl VirtualStateProcessor {
             return Err(PruningImportError::NewPruningPointTxErrors);
         }
 
-        if should_persist_pruning_point_atomic_state {
-            if should_replace_pruning_point_atomic_state {
-                self.atomic_state_store.delete(new_pruning_point).map_err(|err| {
-                    PruningImportError::AtomicStateStoreError(format!(
-                        "failed deleting stale pruning-point atomic state for `{new_pruning_point}`: {err}"
-                    ))
-                })?;
+        if !payload_hf_active {
+            let reconstructed_hash = pruning_point_atomic_state.canonical_hash();
+            match self.atomic_state_store.get_root_record(new_pruning_point) {
+                Ok(existing_root) if existing_root.state_hash == reconstructed_hash => {}
+                Ok(_) => {
+                    return Err(PruningImportError::AtomicStateStoreError(format!(
+                        "existing pre-HF pruning-point atomic root for `{new_pruning_point}` differs from reconstructed root"
+                    )));
+                }
+                Err(StoreError::KeyNotFound(_)) => {
+                    let mut batch = WriteBatch::default();
+                    self.atomic_state_store.insert_root_batch(&mut batch, new_pruning_point, reconstructed_hash).map_err(|err| {
+                        PruningImportError::AtomicStateStoreError(format!(
+                            "failed writing reconstructed pruning-point atomic root for `{new_pruning_point}`: {err}"
+                        ))
+                    })?;
+                    self.db.write(batch).map_err(|err| {
+                        PruningImportError::AtomicStateStoreError(format!(
+                            "failed committing reconstructed pruning-point atomic root for `{new_pruning_point}`: {err}"
+                        ))
+                    })?;
+                }
+                Err(err) => {
+                    return Err(PruningImportError::AtomicStateStoreError(format!(
+                        "failed reading pruning-point atomic root for `{new_pruning_point}`: {err}"
+                    )));
+                }
             }
-            self.atomic_state_store.insert(new_pruning_point, Arc::new(pruning_point_atomic_state.clone())).map_err(|err| {
-                PruningImportError::AtomicStateStoreError(format!(
-                    "failed writing reconstructed pruning-point atomic state for `{new_pruning_point}`: {err}"
-                ))
-            })?;
         }
 
         {
@@ -1699,10 +1750,11 @@ impl VirtualStateProcessor {
         let Some(owner_id) = atomic_owner_id_from_script(&entry.script_public_key) else {
             return Ok(());
         };
-        let count = state.anchor_counts.entry(owner_id).or_insert(0);
-        *count = count
+        let count = state
+            .anchor_count(&owner_id)
             .checked_add(1)
             .ok_or_else(|| format!("atomic anchor count overflow for owner `{}`", faster_hex::hex_string(&owner_id)))?;
+        state.set_anchor_count(owner_id, count);
         Ok(())
     }
 
@@ -1711,15 +1763,10 @@ impl VirtualStateProcessor {
             return Ok(());
         };
         let count = state
-            .anchor_counts
-            .get_mut(&owner_id)
-            .ok_or_else(|| format!("atomic anchor count underflow for owner `{}`", faster_hex::hex_string(&owner_id)))?;
-        *count = count
+            .anchor_count(&owner_id)
             .checked_sub(1)
             .ok_or_else(|| format!("atomic anchor count underflow for owner `{}`", faster_hex::hex_string(&owner_id)))?;
-        if *count == 0 {
-            state.anchor_counts.remove(&owner_id);
-        }
+        state.set_anchor_count(owner_id, count);
         Ok(())
     }
 
@@ -1768,58 +1815,39 @@ impl VirtualStateProcessor {
         imported_atomic_state: PruningPointAtomicState,
     ) -> PruningImportResult<()> {
         let expected_hash = imported_atomic_state.state_hash;
-        let computed_hash = AtomicConsensusState::hash_canonical_bytes(&imported_atomic_state.serialized_state);
-        if computed_hash != expected_hash {
-            return Err(PruningImportError::AtomicStateStoreError(format!(
-                "imported pruning-point atomic state hash mismatch for `{new_pruning_point}`"
-            )));
-        }
-
-        let decoded_state = AtomicConsensusState::from_canonical_bytes(&imported_atomic_state.serialized_state).map_err(|err| {
-            PruningImportError::AtomicStateStoreError(format!(
-                "failed decoding pruning-point atomic state for `{new_pruning_point}`: {err}"
-            ))
-        })?;
-        decoded_state.validate_normalized().map_err(|err| {
-            PruningImportError::AtomicStateStoreError(format!(
-                "imported pruning-point atomic state for `{new_pruning_point}` is not normalized: {err}"
-            ))
-        })?;
-
-        let decoded_hash = decoded_state.canonical_hash();
-        if decoded_hash != expected_hash {
-            return Err(PruningImportError::AtomicStateStoreError(format!(
-                "decoded pruning-point atomic state hash mismatch for `{new_pruning_point}`"
-            )));
-        }
-
-        match self.atomic_state_store.get(new_pruning_point) {
-            Ok(existing_state) => {
-                if existing_state.canonical_hash() != expected_hash {
+        match self.atomic_state_store.get_root_record(new_pruning_point) {
+            Ok(existing_root) => {
+                if existing_root.state_hash != expected_hash {
                     return Err(PruningImportError::AtomicStateStoreError(format!(
-                        "existing pruning-point atomic state for `{new_pruning_point}` differs from imported state"
+                        "existing pruning-point atomic root for `{new_pruning_point}` differs from imported root"
                     )));
                 }
                 Ok(())
             }
             Err(StoreError::KeyNotFound(_)) => {
-                self.atomic_state_store.insert(new_pruning_point, Arc::new(decoded_state)).map_err(|err| {
+                let mut batch = WriteBatch::default();
+                self.atomic_state_store.insert_root_batch(&mut batch, new_pruning_point, expected_hash).map_err(|err| {
                     PruningImportError::AtomicStateStoreError(format!(
-                        "failed writing pruning-point atomic state for `{new_pruning_point}`: {err}"
+                        "failed writing pruning-point atomic root for `{new_pruning_point}`: {err}"
+                    ))
+                })?;
+                self.db.write(batch).map_err(|err| {
+                    PruningImportError::AtomicStateStoreError(format!(
+                        "failed committing pruning-point atomic root for `{new_pruning_point}`: {err}"
                     ))
                 })
             }
             Err(err) => Err(PruningImportError::AtomicStateStoreError(format!(
-                "failed reading pruning-point atomic state for `{new_pruning_point}`: {err}"
+                "failed reading pruning-point atomic root for `{new_pruning_point}`: {err}"
             ))),
         }
     }
 
     pub fn get_atomic_state_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {
-        match self.atomic_state_store.get(block_hash) {
-            Ok(state) => Ok(Some(state.canonical_hash())),
+        match self.atomic_state_store.get_root_record(block_hash) {
+            Ok(root) => Ok(Some(root.state_hash)),
             Err(StoreError::KeyNotFound(_)) => Ok(None),
-            Err(_) => Err(ConsensusError::General("failed reading atomic consensus state")),
+            Err(_) => Err(ConsensusError::General("failed reading atomic consensus root")),
         }
     }
 

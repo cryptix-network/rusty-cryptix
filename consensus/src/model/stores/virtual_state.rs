@@ -7,7 +7,7 @@ use cryptix_consensus_core::{
     block::VirtualStateApproxId, coinbase::BlockRewardData, config::genesis::GenesisBlock, tx::TransactionId,
     utxo::utxo_diff::UtxoDiff, BlockHashMap, BlockHashSet, HashMapCustomHasher,
 };
-use cryptix_database::prelude::{BatchDbWriter, CachedDbItem, DbKey, DirectDbWriter, StoreResultExtensions};
+use cryptix_database::prelude::{BatchDbWriter, CachedDbItem, DirectDbWriter, StoreResultExtensions};
 use cryptix_database::prelude::{CachePolicy, StoreResult};
 use cryptix_database::prelude::{StoreError, DB};
 use cryptix_database::registry::DatabaseStorePrefixes;
@@ -16,7 +16,7 @@ use cryptix_muhash::MuHash;
 use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};
 
-use super::atomic_state::AtomicConsensusState;
+use super::atomic_state::{AtomicConsensusState, AtomicConsensusStateDelta};
 use super::ghostdag::GhostdagData;
 use super::utxo_set::DbUtxoSetStore;
 
@@ -33,39 +33,9 @@ pub struct VirtualState {
     pub mergeset_rewards: BlockHashMap<BlockRewardData>,
     pub mergeset_non_daa: BlockHashSet,
     #[serde(default)]
+    pub atomic_diff: AtomicConsensusStateDelta,
+    #[serde(default)]
     pub atomic_state: AtomicConsensusState,
-}
-
-#[derive(Clone, Serialize, Deserialize, Default)]
-struct LegacyVirtualState {
-    parents: Vec<Hash>,
-    ghostdag_data: GhostdagData,
-    daa_score: u64,
-    bits: u32,
-    past_median_time: u64,
-    multiset: MuHash,
-    utxo_diff: UtxoDiff,
-    accepted_tx_ids: Vec<TransactionId>,
-    mergeset_rewards: BlockHashMap<BlockRewardData>,
-    mergeset_non_daa: BlockHashSet,
-}
-
-impl From<LegacyVirtualState> for VirtualState {
-    fn from(value: LegacyVirtualState) -> Self {
-        Self {
-            parents: value.parents,
-            ghostdag_data: value.ghostdag_data,
-            daa_score: value.daa_score,
-            bits: value.bits,
-            past_median_time: value.past_median_time,
-            multiset: value.multiset,
-            utxo_diff: value.utxo_diff,
-            accepted_tx_ids: value.accepted_tx_ids,
-            mergeset_rewards: value.mergeset_rewards,
-            mergeset_non_daa: value.mergeset_non_daa,
-            atomic_state: AtomicConsensusState::default(),
-        }
-    }
 }
 
 impl VirtualState {
@@ -79,6 +49,7 @@ impl VirtualState {
         accepted_tx_ids: Vec<TransactionId>,
         mergeset_rewards: BlockHashMap<BlockRewardData>,
         mergeset_non_daa: BlockHashSet,
+        atomic_diff: AtomicConsensusStateDelta,
         atomic_state: AtomicConsensusState,
         ghostdag_data: GhostdagData,
     ) -> Self {
@@ -93,6 +64,7 @@ impl VirtualState {
             accepted_tx_ids,
             mergeset_rewards,
             mergeset_non_daa,
+            atomic_diff,
             atomic_state,
         }
     }
@@ -109,6 +81,7 @@ impl VirtualState {
             accepted_tx_ids: genesis.build_genesis_transactions().into_iter().map(|tx| tx.id()).collect(),
             mergeset_rewards: BlockHashMap::new(),
             mergeset_non_daa: BlockHashSet::from_iter(std::iter::once(genesis.hash)),
+            atomic_diff: AtomicConsensusStateDelta::default(),
             atomic_state: AtomicConsensusState::default(),
         }
     }
@@ -213,32 +186,8 @@ impl DbVirtualStateStore {
         Self::new(self.db.clone(), self.lkg_virtual_state.clone())
     }
 
-    fn read_legacy_and_migrate(&self) -> StoreResult<Arc<VirtualState>> {
-        let Some(slice) = self.db.get_pinned(&self.key)? else {
-            return Err(StoreError::KeyNotFound(DbKey::prefix_only(&self.key)));
-        };
-        let legacy_state: LegacyVirtualState = bincode::deserialize(slice.as_ref())?;
-        let upgraded_state = Arc::new(VirtualState::from(legacy_state));
-
-        // Persist in the current format so future reads use the fast path.
-        let mut access = self.access.clone();
-        access.write(DirectDbWriter::new(&self.db), &upgraded_state)?;
-        Ok(upgraded_state)
-    }
-
     fn read_compatible(&self) -> StoreResult<Arc<VirtualState>> {
-        match self.access.read() {
-            Ok(state) => Ok(state),
-            Err(StoreError::DeserializationError(err))
-                if matches!(
-                    err.as_ref(),
-                    bincode::ErrorKind::Io(io_error) if io_error.kind() == std::io::ErrorKind::UnexpectedEof
-                ) =>
-            {
-                self.read_legacy_and_migrate()
-            }
-            Err(err) => Err(err),
-        }
+        self.access.read()
     }
 
     pub fn is_initialized(&self) -> StoreResult<bool> {
@@ -265,44 +214,5 @@ impl VirtualStateStore for DbVirtualStateStore {
     fn set(&mut self, state: Arc<VirtualState>) -> StoreResult<()> {
         self.lkg_virtual_state.store(state.clone()); // Keep the LKG cache up-to-date
         self.access.write(DirectDbWriter::new(&self.db), &state)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use cryptix_database::{create_temp_db, prelude::ConnBuilder};
-
-    #[test]
-    fn test_virtual_state_legacy_bytes_are_migrated_on_read() {
-        let (_lifetime, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let key: Vec<u8> = DatabaseStorePrefixes::VirtualState.into();
-        let legacy_state = LegacyVirtualState {
-            parents: vec![1.into()],
-            ghostdag_data: GhostdagData::default(),
-            daa_score: 42,
-            bits: 7,
-            past_median_time: 99,
-            multiset: MuHash::new(),
-            utxo_diff: UtxoDiff::default(),
-            accepted_tx_ids: vec![],
-            mergeset_rewards: BlockHashMap::default(),
-            mergeset_non_daa: BlockHashSet::default(),
-        };
-        let legacy_bytes = bincode::serialize(&legacy_state).unwrap();
-        db.put(&key, legacy_bytes).unwrap();
-
-        let lkg = LkgVirtualState::default();
-        let store = DbVirtualStateStore::new(db.clone(), lkg);
-        let state = store.get().unwrap();
-        assert!(state.atomic_state.next_nonces.is_empty());
-        assert!(state.atomic_state.assets.is_empty());
-        assert!(state.atomic_state.balances.is_empty());
-        assert!(state.atomic_state.anchor_counts.is_empty());
-
-        let migrated_bytes = db.get_pinned(&key).unwrap().unwrap();
-        let migrated_state: Arc<VirtualState> = bincode::deserialize(migrated_bytes.as_ref()).unwrap();
-        assert_eq!(migrated_state.daa_score, 42);
-        assert!(migrated_state.atomic_state.next_nonces.is_empty());
     }
 }

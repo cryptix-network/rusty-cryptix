@@ -40,7 +40,7 @@ use crate::{
     model::{
         services::reachability::{MTReachabilityService, ReachabilityService},
         stores::{
-            atomic_state::{AtomicConsensusState, AtomicStateStoreReader, DbAtomicStateStore},
+            atomic_state::DbAtomicStateStore,
             depth::DbDepthStore,
             ghostdag::{DbGhostdagStore, GhostdagData, GhostdagStore, GhostdagStoreReader},
             headers::{DbHeadersStore, HeaderStore, HeaderStoreReader},
@@ -908,20 +908,11 @@ impl PruningProofManager {
             }
         }
 
-        let atomic_state = match self.atomic_state_store.get(pruning_point) {
-            Ok(state) => {
-                if let Err(err) = state.validate_normalized() {
-                    warn!("pruning-point atomic state for `{pruning_point}` is not normalized while building trusted data: {err}");
-                    None
-                } else {
-                    let serialized_state = state.to_canonical_bytes();
-                    let state_hash = AtomicConsensusState::hash_canonical_bytes(&serialized_state);
-                    Some(PruningPointAtomicState { serialized_state, state_hash })
-                }
-            }
+        let atomic_state = match self.atomic_state_store.get_root_record(pruning_point) {
+            Ok(root) => Some(PruningPointAtomicState { state_hash: root.state_hash }),
             Err(StoreError::KeyNotFound(_)) => None,
             Err(err) => {
-                warn!("failed reading pruning-point atomic state for `{pruning_point}` while building trusted data: {err}");
+                warn!("failed reading pruning-point atomic root for `{pruning_point}` while building trusted data: {err}");
                 None
             }
         };

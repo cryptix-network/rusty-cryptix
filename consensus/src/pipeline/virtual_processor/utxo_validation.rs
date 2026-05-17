@@ -85,18 +85,102 @@ struct VaultTransition {
     output_value: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AtomicStateGrowthLimits {
+    pub max_new_assets: usize,
+    pub max_new_balance_keys: usize,
+    pub max_new_nonce_keys: usize,
+    pub max_new_pools: usize,
+    pub max_new_anchor_owner_keys: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AtomicStateGrowth {
+    new_assets: usize,
+    new_balance_keys: usize,
+    new_nonce_keys: usize,
+    new_pools: usize,
+    new_anchor_owner_keys: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct AtomicBlockStateGrowth {
+    used: AtomicStateGrowth,
+}
+
+impl AtomicBlockStateGrowth {
+    fn ensure_can_add(self, delta: AtomicStateGrowth, limits: AtomicStateGrowthLimits) -> TxResult<()> {
+        fn ensure_limit(current: usize, delta: usize, limit: usize, label: &str) -> TxResult<()> {
+            let total = current.saturating_add(delta);
+            if total > limit {
+                Err(TxRuleError::InvalidAtomicPayload(format!(
+                    "atomic state growth limit exceeded for {label}: block would create `{total}`, limit is `{limit}`"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+
+        ensure_limit(self.used.new_assets, delta.new_assets, limits.max_new_assets, "assets")?;
+        ensure_limit(self.used.new_balance_keys, delta.new_balance_keys, limits.max_new_balance_keys, "balance keys")?;
+        ensure_limit(self.used.new_nonce_keys, delta.new_nonce_keys, limits.max_new_nonce_keys, "nonce keys")?;
+        ensure_limit(self.used.new_pools, delta.new_pools, limits.max_new_pools, "liquidity pools")?;
+        ensure_limit(
+            self.used.new_anchor_owner_keys,
+            delta.new_anchor_owner_keys,
+            limits.max_new_anchor_owner_keys,
+            "anchor owner keys",
+        )?;
+        Ok(())
+    }
+
+    fn commit(&mut self, delta: AtomicStateGrowth) {
+        self.used.new_assets = self.used.new_assets.saturating_add(delta.new_assets);
+        self.used.new_balance_keys = self.used.new_balance_keys.saturating_add(delta.new_balance_keys);
+        self.used.new_nonce_keys = self.used.new_nonce_keys.saturating_add(delta.new_nonce_keys);
+        self.used.new_pools = self.used.new_pools.saturating_add(delta.new_pools);
+        self.used.new_anchor_owner_keys = self.used.new_anchor_owner_keys.saturating_add(delta.new_anchor_owner_keys);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         atomic_op_allows_liquidity_vault_output, calculate_trade_fee, cpmm_buy, cpmm_sell,
         initial_virtual_cpay_reserves_sompi_for_curve, initial_virtual_token_reserves_for_curve, min_gross_input_for_token_out,
-        validate_liquidity_claim_authorization, validate_liquidity_creation_parameters, AtomicPayloadOp, DEFAULT_LIQUIDITY_CURVE_MODE,
-        INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI, INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS,
-        INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI, INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS, INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI,
-        INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS, INITIAL_REAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
-        INITIAL_VIRTUAL_TOKEN_RESERVES, LIQUIDITY_CURVE_MODE_AGGRESSIVE, LIQUIDITY_CURVE_MODE_BASIC, LIQUIDITY_CURVE_MODE_INDIVIDUAL,
-        LIQUIDITY_TOKEN_SUPPLY_RAW, MAX_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SUPPLY_RAW,
+        validate_liquidity_claim_authorization, validate_liquidity_creation_parameters, AtomicBlockStateGrowth, AtomicPayloadOp,
+        AtomicStateGrowth, AtomicStateGrowthLimits, DEFAULT_LIQUIDITY_CURVE_MODE, INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI,
+        INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS, INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
+        INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS, INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI, INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS,
+        INITIAL_REAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_TOKEN_RESERVES,
+        LIQUIDITY_CURVE_MODE_AGGRESSIVE, LIQUIDITY_CURVE_MODE_BASIC, LIQUIDITY_CURVE_MODE_INDIVIDUAL, LIQUIDITY_TOKEN_SUPPLY_RAW,
+        MAX_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SUPPLY_RAW,
     };
+
+    #[test]
+    fn atomic_state_growth_limits_reject_block_state_spam() {
+        let limits = AtomicStateGrowthLimits {
+            max_new_assets: 1,
+            max_new_balance_keys: 2,
+            max_new_nonce_keys: 2,
+            max_new_pools: 1,
+            max_new_anchor_owner_keys: 2,
+        };
+        let mut growth = AtomicBlockStateGrowth::default();
+        let first =
+            AtomicStateGrowth { new_assets: 1, new_balance_keys: 1, new_nonce_keys: 1, new_pools: 1, new_anchor_owner_keys: 1 };
+        growth.ensure_can_add(first, limits).expect("first growth fits");
+        growth.commit(first);
+
+        let second =
+            AtomicStateGrowth { new_assets: 0, new_balance_keys: 1, new_nonce_keys: 1, new_pools: 0, new_anchor_owner_keys: 1 };
+        growth.ensure_can_add(second, limits).expect("second growth fits exactly");
+        growth.commit(second);
+
+        let rejected =
+            AtomicStateGrowth { new_assets: 0, new_balance_keys: 1, new_nonce_keys: 0, new_pools: 0, new_anchor_owner_keys: 0 };
+        assert!(growth.ensure_can_add(rejected, limits).is_err());
+    }
 
     #[test]
     fn liquidity_claims_require_matching_recipient_owner() {
@@ -621,9 +705,10 @@ impl<'a> UtxoProcessingContext<'a> {
     pub fn new(
         ghostdag_data: Refs<'a, GhostdagData>,
         selected_parent_multiset_hash: MuHash,
-        selected_parent_atomic_state: AtomicConsensusState,
+        mut selected_parent_atomic_state: AtomicConsensusState,
     ) -> Self {
         let mergeset_size = ghostdag_data.mergeset_size();
+        selected_parent_atomic_state.begin_delta_tracking();
         Self {
             ghostdag_data,
             multiset_hash: selected_parent_multiset_hash,
@@ -825,10 +910,12 @@ impl VirtualStateProcessor {
     ) -> Vec<(ValidatedTransaction<'a>, u32)> {
         validated_transactions.sort_by_key(|(_, tx_index)| *tx_index);
 
+        let mut growth = AtomicBlockStateGrowth::default();
         let mut filtered = Vec::with_capacity(validated_transactions.len());
         for (validated_tx, tx_index) in validated_transactions.into_iter() {
             let tx_id = validated_tx.id();
-            match self.validate_and_apply_atomic_state_transition(&validated_tx, pov_daa_score, atomic_state) {
+            match self.validate_and_apply_atomic_state_transition_with_growth(&validated_tx, pov_daa_score, atomic_state, &mut growth)
+            {
                 Ok(()) => filtered.push((validated_tx, tx_index)),
                 Err(err) => {
                     info!("Rejecting transaction {} due to transaction rule error at block tx index {}: {}", tx_id, tx_index, err);
@@ -837,6 +924,122 @@ impl VirtualStateProcessor {
         }
 
         filtered
+    }
+
+    pub(super) fn atomic_state_growth_limits(&self) -> AtomicStateGrowthLimits {
+        AtomicStateGrowthLimits {
+            max_new_assets: self.atomic_max_new_assets_per_block,
+            max_new_balance_keys: self.atomic_max_new_balance_keys_per_block,
+            max_new_nonce_keys: self.atomic_max_new_nonce_keys_per_block,
+            max_new_pools: self.atomic_max_new_pools_per_block,
+            max_new_anchor_owner_keys: self.atomic_max_new_anchor_owner_keys_per_block,
+        }
+    }
+
+    pub(super) fn validate_and_apply_atomic_state_transition_with_growth(
+        &self,
+        tx: &impl VerifiableTransaction,
+        pov_daa_score: u64,
+        atomic_state: &mut AtomicConsensusState,
+        growth: &mut AtomicBlockStateGrowth,
+    ) -> TxResult<()> {
+        let delta = self.estimate_atomic_state_growth_for_tx(tx, pov_daa_score, atomic_state)?;
+        growth.ensure_can_add(delta, self.atomic_state_growth_limits())?;
+        self.validate_and_apply_atomic_state_transition(tx, pov_daa_score, atomic_state)?;
+        growth.commit(delta);
+        Ok(())
+    }
+
+    fn estimate_atomic_state_growth_for_tx(
+        &self,
+        tx: &impl VerifiableTransaction,
+        pov_daa_score: u64,
+        atomic_state: &AtomicConsensusState,
+    ) -> TxResult<AtomicStateGrowth> {
+        let mut growth = AtomicStateGrowth::default();
+        let tx_ref = tx.tx();
+
+        let mut new_anchor_owner_ids = HashSet::new();
+        for output in tx_ref.outputs.iter() {
+            let Some(owner_id) = atomic_owner_id_from_script(&output.script_public_key) else {
+                continue;
+            };
+            if !atomic_state.has_anchor_count(&owner_id) {
+                new_anchor_owner_ids.insert(owner_id);
+            }
+        }
+        growth.new_anchor_owner_keys = new_anchor_owner_ids.len();
+
+        if !self.transaction_validator.is_payload_hf_active(pov_daa_score)
+            || !tx_ref.subnetwork_id.is_payload()
+            || tx_ref.payload.is_empty()
+        {
+            return Ok(growth);
+        }
+
+        let Some(parsed_payload) = parse_atomic_payload(tx_ref.payload.as_slice()).map_err(TxRuleError::InvalidAtomicPayload)? else {
+            return Ok(growth);
+        };
+
+        let owner_id = self.resolve_atomic_owner_from_populated_tx(tx, parsed_payload.auth_input_index)?;
+        let nonce_key = atomic_nonce_key_for_op(owner_id, &parsed_payload.op);
+        if !atomic_state.has_nonce(&nonce_key) {
+            growth.new_nonce_keys = 1;
+        }
+
+        match &parsed_payload.op {
+            AtomicPayloadOp::CreateAsset { .. } => {
+                let asset_id = tx_ref.id().as_bytes();
+                if !atomic_state.has_asset(&asset_id) {
+                    growth.new_assets = 1;
+                }
+            }
+            AtomicPayloadOp::CreateAssetWithMint { initial_mint_amount, initial_mint_to_owner_id, .. } => {
+                let asset_id = tx_ref.id().as_bytes();
+                if !atomic_state.has_asset(&asset_id) {
+                    growth.new_assets = 1;
+                }
+                let receiver_key = AtomicBalanceKey { asset_id, owner_id: *initial_mint_to_owner_id };
+                if *initial_mint_amount > 0 && !atomic_state.has_balance(&receiver_key) {
+                    growth.new_balance_keys = growth.new_balance_keys.saturating_add(1);
+                }
+            }
+            AtomicPayloadOp::CreateLiquidityAsset { launch_buy_sompi, .. } => {
+                let asset_id = tx_ref.id().as_bytes();
+                if !atomic_state.has_asset(&asset_id) {
+                    growth.new_assets = 1;
+                    growth.new_pools = 1;
+                }
+                let receiver_key = AtomicBalanceKey { asset_id, owner_id };
+                if *launch_buy_sompi > 0 && !atomic_state.has_balance(&receiver_key) {
+                    growth.new_balance_keys = growth.new_balance_keys.saturating_add(1);
+                }
+            }
+            AtomicPayloadOp::Transfer { asset_id, to_owner_id, amount } => {
+                let from_key = AtomicBalanceKey { asset_id: *asset_id, owner_id };
+                let to_key = AtomicBalanceKey { asset_id: *asset_id, owner_id: *to_owner_id };
+                if *amount > 0 && from_key != to_key && !atomic_state.has_balance(&to_key) {
+                    growth.new_balance_keys = growth.new_balance_keys.saturating_add(1);
+                }
+            }
+            AtomicPayloadOp::Mint { asset_id, to_owner_id, amount } => {
+                let receiver_key = AtomicBalanceKey { asset_id: *asset_id, owner_id: *to_owner_id };
+                if *amount > 0 && !atomic_state.has_balance(&receiver_key) {
+                    growth.new_balance_keys = growth.new_balance_keys.saturating_add(1);
+                }
+            }
+            AtomicPayloadOp::BuyLiquidityExactIn { asset_id, .. } => {
+                let receiver_key = AtomicBalanceKey { asset_id: *asset_id, owner_id };
+                if !atomic_state.has_balance(&receiver_key) {
+                    growth.new_balance_keys = growth.new_balance_keys.saturating_add(1);
+                }
+            }
+            AtomicPayloadOp::Burn { .. }
+            | AtomicPayloadOp::SellLiquidityExactIn { .. }
+            | AtomicPayloadOp::ClaimLiquidityFees { .. } => {}
+        }
+
+        Ok(growth)
     }
 
     pub(crate) fn validate_and_apply_atomic_state_transition(
@@ -877,7 +1080,7 @@ impl VirtualStateProcessor {
         let owner_id = self.resolve_atomic_owner_from_populated_tx(tx, parsed_payload.auth_input_index)?;
 
         let nonce_key = atomic_nonce_key_for_op(owner_id, &parsed_payload.op);
-        let expected_nonce = atomic_state.next_nonces.get(&nonce_key).copied().unwrap_or(1);
+        let expected_nonce = atomic_state.next_nonce(&nonce_key);
         if parsed_payload.nonce != expected_nonce {
             return Err(TxRuleError::InvalidAtomicPayload(format!(
                 "nonce baseline violation for owner `{}` scope `{}` `{}`: expected `{}`, got `{}`",
@@ -921,7 +1124,7 @@ impl VirtualStateProcessor {
         self.validate_replacement_anchor(tx, owner_id, atomic_state)?;
         self.apply_atomic_op_to_state(tx, tx.tx().id().as_bytes(), owner_id, parsed_payload.op, atomic_state)?;
 
-        atomic_state.next_nonces.insert(nonce_key, next_nonce);
+        atomic_state.set_next_nonce(nonce_key, next_nonce);
         self.apply_anchor_deltas_to_atomic_state(tx, atomic_state);
         Ok(())
     }
@@ -947,7 +1150,7 @@ impl VirtualStateProcessor {
         owner_id: [u8; 32],
         atomic_state: &AtomicConsensusState,
     ) -> TxResult<()> {
-        let before_count = atomic_state.anchor_counts.get(&owner_id).copied().unwrap_or(0);
+        let before_count = atomic_state.anchor_count(&owner_id);
         let mut spent_for_owner = 0u64;
         for (_, entry) in tx.populated_inputs() {
             if atomic_owner_id_from_script(&entry.script_public_key) == Some(owner_id) {
@@ -989,15 +1192,11 @@ impl VirtualStateProcessor {
 
         let owners: HashSet<[u8; 32]> = spent_counts.keys().copied().chain(created_counts.keys().copied()).collect();
         for owner_id in owners {
-            let old_count = atomic_state.anchor_counts.get(&owner_id).copied().unwrap_or(0);
+            let old_count = atomic_state.anchor_count(&owner_id);
             let spent = spent_counts.get(&owner_id).copied().unwrap_or(0);
             let created = created_counts.get(&owner_id).copied().unwrap_or(0);
             let new_count = old_count.saturating_sub(spent).saturating_add(created);
-            if new_count == 0 {
-                atomic_state.anchor_counts.remove(&owner_id);
-            } else {
-                atomic_state.anchor_counts.insert(owner_id, new_count);
-            }
+            atomic_state.set_anchor_count(owner_id, new_count);
         }
     }
 
@@ -1022,7 +1221,7 @@ impl VirtualStateProcessor {
                 platform_tag,
             } => {
                 let asset_id = tx_id_bytes;
-                if atomic_state.assets.contains_key(&asset_id) {
+                if atomic_state.has_asset(&asset_id) {
                     return Err(TxRuleError::InvalidAtomicPayload(format!(
                         "asset `{}` already exists",
                         faster_hex::hex_string(&asset_id)
@@ -1061,7 +1260,7 @@ impl VirtualStateProcessor {
                 platform_tag,
             } => {
                 let asset_id = tx_id_bytes;
-                if atomic_state.assets.contains_key(&asset_id) {
+                if atomic_state.has_asset(&asset_id) {
                     return Err(TxRuleError::InvalidAtomicPayload(format!(
                         "asset `{}` already exists",
                         faster_hex::hex_string(&asset_id)
@@ -1080,14 +1279,14 @@ impl VirtualStateProcessor {
                         )));
                     }
                     let receiver_key = AtomicBalanceKey { asset_id, owner_id: initial_mint_to_owner_id };
-                    let receiver_balance = atomic_state.balances.get(&receiver_key).copied().unwrap_or(0);
+                    let receiver_balance = atomic_state.balance(&receiver_key);
                     let receiver_after = receiver_balance.checked_add(initial_mint_amount).ok_or_else(|| {
                         TxRuleError::InvalidAtomicPayload(format!(
                             "balance overflow while create-and-mint asset `{}`",
                             faster_hex::hex_string(&asset_id)
                         ))
                     })?;
-                    atomic_state.balances.insert(receiver_key, receiver_after);
+                    atomic_state.set_balance(receiver_key, receiver_after);
                     total_supply = initial_mint_amount;
                 }
                 self.insert_atomic_asset_state(
@@ -1125,7 +1324,7 @@ impl VirtualStateProcessor {
                 liquidity_unlock_target_sompi,
             } => {
                 let asset_id = tx_id_bytes;
-                if atomic_state.assets.contains_key(&asset_id) {
+                if atomic_state.has_asset(&asset_id) {
                     return Err(TxRuleError::InvalidAtomicPayload(format!(
                         "asset `{}` already exists",
                         faster_hex::hex_string(&asset_id)
@@ -1202,14 +1401,14 @@ impl VirtualStateProcessor {
                     total_supply = token_out;
 
                     let receiver_key = AtomicBalanceKey { asset_id, owner_id };
-                    let receiver_balance = atomic_state.balances.get(&receiver_key).copied().unwrap_or(0);
+                    let receiver_balance = atomic_state.balance(&receiver_key);
                     let receiver_after = receiver_balance.checked_add(token_out).ok_or_else(|| {
                         TxRuleError::InvalidAtomicPayload(format!(
                             "balance overflow while launch-buy minting liquidity asset `{}`",
                             faster_hex::hex_string(&asset_id)
                         ))
                     })?;
-                    atomic_state.balances.insert(receiver_key, receiver_after);
+                    atomic_state.set_balance(receiver_key, receiver_after);
                 }
 
                 let vault_outpoint = TransactionOutpoint::new(tx.tx().id(), vault_output_index);
@@ -1245,7 +1444,7 @@ impl VirtualStateProcessor {
                 self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
             }
             AtomicPayloadOp::Transfer { asset_id, to_owner_id, amount } => {
-                if !atomic_state.assets.contains_key(&asset_id) {
+                if !atomic_state.has_asset(&asset_id) {
                     return Err(TxRuleError::InvalidAtomicPayload(format!(
                         "transfer references unknown asset `{}`",
                         faster_hex::hex_string(&asset_id)
@@ -1255,7 +1454,7 @@ impl VirtualStateProcessor {
                 let from_key = AtomicBalanceKey { asset_id, owner_id };
                 let to_key = AtomicBalanceKey { asset_id, owner_id: to_owner_id };
 
-                let sender_balance = atomic_state.balances.get(&from_key).copied().unwrap_or(0);
+                let sender_balance = atomic_state.balance(&from_key);
                 if from_key == to_key {
                     sender_balance.checked_sub(amount).ok_or_else(|| {
                         TxRuleError::InvalidAtomicPayload(format!(
@@ -1264,7 +1463,7 @@ impl VirtualStateProcessor {
                         ))
                     })?;
                 } else {
-                    let receiver_balance = atomic_state.balances.get(&to_key).copied().unwrap_or(0);
+                    let receiver_balance = atomic_state.balance(&to_key);
                     let sender_after = sender_balance.checked_sub(amount).ok_or_else(|| {
                         TxRuleError::InvalidAtomicPayload(format!(
                             "insufficient balance for transfer of asset `{}`",
@@ -1279,15 +1478,15 @@ impl VirtualStateProcessor {
                     })?;
 
                     if sender_after == 0 {
-                        atomic_state.balances.remove(&from_key);
+                        atomic_state.set_balance(from_key, 0);
                     } else {
-                        atomic_state.balances.insert(from_key, sender_after);
+                        atomic_state.set_balance(from_key, sender_after);
                     }
-                    atomic_state.balances.insert(to_key, receiver_after);
+                    atomic_state.set_balance(to_key, receiver_after);
                 }
             }
             AtomicPayloadOp::Mint { asset_id, to_owner_id, amount } => {
-                let mut asset = atomic_state.assets.get(&asset_id).cloned().ok_or_else(|| {
+                let mut asset = atomic_state.cloned_asset(&asset_id).ok_or_else(|| {
                     TxRuleError::InvalidAtomicPayload(format!("mint references unknown asset `{}`", faster_hex::hex_string(&asset_id)))
                 })?;
                 if matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
@@ -1320,7 +1519,7 @@ impl VirtualStateProcessor {
                 }
 
                 let receiver_key = AtomicBalanceKey { asset_id, owner_id: to_owner_id };
-                let receiver_balance = atomic_state.balances.get(&receiver_key).copied().unwrap_or(0);
+                let receiver_balance = atomic_state.balance(&receiver_key);
                 let receiver_after = receiver_balance.checked_add(amount).ok_or_else(|| {
                     TxRuleError::InvalidAtomicPayload(format!(
                         "balance overflow while minting asset `{}`",
@@ -1330,10 +1529,10 @@ impl VirtualStateProcessor {
 
                 asset.total_supply = new_total_supply;
                 self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
-                atomic_state.balances.insert(receiver_key, receiver_after);
+                atomic_state.set_balance(receiver_key, receiver_after);
             }
             AtomicPayloadOp::Burn { asset_id, amount } => {
-                let mut asset = atomic_state.assets.get(&asset_id).cloned().ok_or_else(|| {
+                let mut asset = atomic_state.cloned_asset(&asset_id).ok_or_else(|| {
                     TxRuleError::InvalidAtomicPayload(format!("burn references unknown asset `{}`", faster_hex::hex_string(&asset_id)))
                 })?;
                 if matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
@@ -1343,7 +1542,7 @@ impl VirtualStateProcessor {
                     )));
                 }
                 let sender_key = AtomicBalanceKey { asset_id, owner_id };
-                let sender_balance = atomic_state.balances.get(&sender_key).copied().unwrap_or(0);
+                let sender_balance = atomic_state.balance(&sender_key);
 
                 let sender_after = sender_balance.checked_sub(amount).ok_or_else(|| {
                     TxRuleError::InvalidAtomicPayload(format!(
@@ -1361,13 +1560,13 @@ impl VirtualStateProcessor {
                 asset.total_supply = supply_after;
                 self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
                 if sender_after == 0 {
-                    atomic_state.balances.remove(&sender_key);
+                    atomic_state.set_balance(sender_key, 0);
                 } else {
-                    atomic_state.balances.insert(sender_key, sender_after);
+                    atomic_state.set_balance(sender_key, sender_after);
                 }
             }
             AtomicPayloadOp::BuyLiquidityExactIn { asset_id, expected_pool_nonce, cpay_in_sompi, min_token_out } => {
-                let mut asset = atomic_state.assets.get(&asset_id).cloned().ok_or_else(|| {
+                let mut asset = atomic_state.cloned_asset(&asset_id).ok_or_else(|| {
                     TxRuleError::InvalidAtomicPayload(format!("buy references unknown asset `{}`", faster_hex::hex_string(&asset_id)))
                 })?;
                 if !matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
@@ -1451,14 +1650,14 @@ impl VirtualStateProcessor {
                     .ok_or_else(|| TxRuleError::InvalidAtomicPayload("pool nonce overflow".to_string()))?;
 
                 let receiver_key = AtomicBalanceKey { asset_id, owner_id };
-                let receiver_balance = atomic_state.balances.get(&receiver_key).copied().unwrap_or(0);
+                let receiver_balance = atomic_state.balance(&receiver_key);
                 let receiver_after = receiver_balance.checked_add(token_out).ok_or_else(|| {
                     TxRuleError::InvalidAtomicPayload(format!(
                         "receiver balance overflow while buying liquidity asset `{}`",
                         faster_hex::hex_string(&asset_id)
                     ))
                 })?;
-                atomic_state.balances.insert(receiver_key, receiver_after);
+                atomic_state.set_balance(receiver_key, receiver_after);
                 asset.total_supply = asset.total_supply.checked_add(token_out).ok_or_else(|| {
                     TxRuleError::InvalidAtomicPayload(format!(
                         "total_supply overflow while buying liquidity asset `{}`",
@@ -1476,7 +1675,7 @@ impl VirtualStateProcessor {
                 min_cpay_out_sompi,
                 cpay_receive_output_index,
             } => {
-                let mut asset = atomic_state.assets.get(&asset_id).cloned().ok_or_else(|| {
+                let mut asset = atomic_state.cloned_asset(&asset_id).ok_or_else(|| {
                     TxRuleError::InvalidAtomicPayload(format!("sell references unknown asset `{}`", faster_hex::hex_string(&asset_id)))
                 })?;
                 if !matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
@@ -1507,7 +1706,7 @@ impl VirtualStateProcessor {
                     )));
                 }
                 let sender_key = AtomicBalanceKey { asset_id, owner_id };
-                let sender_balance = atomic_state.balances.get(&sender_key).copied().unwrap_or(0);
+                let sender_balance = atomic_state.balance(&sender_key);
                 let sender_after = sender_balance.checked_sub(token_in).ok_or_else(|| {
                     TxRuleError::InvalidAtomicPayload(format!(
                         "insufficient balance for sell in liquidity asset `{}`",
@@ -1571,9 +1770,9 @@ impl VirtualStateProcessor {
                     .ok_or_else(|| TxRuleError::InvalidAtomicPayload("pool nonce overflow".to_string()))?;
 
                 if sender_after == 0 {
-                    atomic_state.balances.remove(&sender_key);
+                    atomic_state.set_balance(sender_key, 0);
                 } else {
-                    atomic_state.balances.insert(sender_key, sender_after);
+                    atomic_state.set_balance(sender_key, sender_after);
                 }
 
                 asset.total_supply = supply_after;
@@ -1588,7 +1787,7 @@ impl VirtualStateProcessor {
                 claim_amount_sompi,
                 claim_receive_output_index,
             } => {
-                let mut asset = atomic_state.assets.get(&asset_id).cloned().ok_or_else(|| {
+                let mut asset = atomic_state.cloned_asset(&asset_id).ok_or_else(|| {
                     TxRuleError::InvalidAtomicPayload(format!(
                         "claim references unknown asset `{}`",
                         faster_hex::hex_string(&asset_id)
@@ -1680,27 +1879,7 @@ impl VirtualStateProcessor {
         asset_id: [u8; 32],
         asset: AtomicAssetState,
     ) -> TxResult<()> {
-        if let Some(previous_asset) = atomic_state.assets.insert(asset_id, asset.clone()) {
-            if let Some(previous_pool) = previous_asset.liquidity.as_ref() {
-                atomic_state.liquidity_vault_outpoints.remove(&previous_pool.vault_outpoint);
-            }
-        }
-
-        if matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
-            let pool = asset.liquidity.as_ref().ok_or_else(|| {
-                TxRuleError::InvalidAtomicPayload(format!("liquidity state missing for asset `{}`", faster_hex::hex_string(&asset_id)))
-            })?;
-            if let Some(previous_asset_id) = atomic_state.liquidity_vault_outpoints.insert(pool.vault_outpoint, asset_id) {
-                if previous_asset_id != asset_id {
-                    return Err(TxRuleError::InvalidAtomicPayload(format!(
-                        "multiple liquidity assets share vault outpoint `{}`",
-                        pool.vault_outpoint
-                    )));
-                }
-            }
-        }
-
-        Ok(())
+        atomic_state.set_asset(asset_id, asset).map_err(TxRuleError::InvalidAtomicPayload)
     }
 
     fn collect_spent_liquidity_vault_inputs(
@@ -1729,41 +1908,7 @@ impl VirtualStateProcessor {
         atomic_state: &AtomicConsensusState,
         outpoint: TransactionOutpoint,
     ) -> TxResult<Option<[u8; 32]>> {
-        if let Some(asset_id) = atomic_state.liquidity_vault_outpoints.get(&outpoint).copied() {
-            let asset = atomic_state.assets.get(&asset_id).ok_or_else(|| {
-                TxRuleError::InvalidAtomicPayload(format!(
-                    "liquidity vault index references missing asset `{}`",
-                    faster_hex::hex_string(&asset_id)
-                ))
-            })?;
-            let pool = asset.liquidity.as_ref().ok_or_else(|| {
-                TxRuleError::InvalidAtomicPayload(format!(
-                    "liquidity vault index references asset `{}` without liquidity state",
-                    faster_hex::hex_string(&asset_id)
-                ))
-            })?;
-            if !matches!(asset.asset_class, AtomicAssetClass::Liquidity) || pool.vault_outpoint != outpoint {
-                return Err(TxRuleError::InvalidAtomicPayload(format!("liquidity vault index mismatch for outpoint `{}`", outpoint)));
-            }
-            return Ok(Some(asset_id));
-        }
-
-        let mut matched = None;
-        for (asset_id, asset) in atomic_state.assets.iter() {
-            let Some(pool) = asset.liquidity.as_ref() else {
-                continue;
-            };
-            if !matches!(asset.asset_class, AtomicAssetClass::Liquidity) || pool.vault_outpoint != outpoint {
-                continue;
-            }
-            if matched.replace(*asset_id).is_some() {
-                return Err(TxRuleError::InvalidAtomicPayload(format!(
-                    "multiple liquidity assets share vault outpoint `{}`",
-                    outpoint
-                )));
-            }
-        }
-        Ok(matched)
+        atomic_state.liquidity_asset_by_vault_outpoint(outpoint).map_err(TxRuleError::InvalidAtomicPayload)
     }
 
     fn resolve_create_liquidity_vault_output(&self, tx: &impl VerifiableTransaction) -> TxResult<(u32, u64)> {

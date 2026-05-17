@@ -1,10 +1,12 @@
 use crate::{
     error::{AtomicTokenError, AtomicTokenResult},
     state::{
-        AtomicTokenHealth, AtomicTokenReadContext, AtomicTokenReadView, AtomicTokenRuntimeState, AtomicTokenSnapshot,
-        AtomicTokenState, AtomicTokenStateFootprint, LiquidityHolderAddressState, ProcessedOp, TokenAsset, TokenEvent,
+        AtomicTokenHealth, AtomicTokenReadContext, AtomicTokenReadView, AtomicTokenRuntimeState, AtomicTokenState,
+        AtomicTokenStateFootprint, BalanceKey, LiquidityHolderAddressState, NonceKey, ProcessedOp, TokenAsset, TokenEvent,
         TokenHolderEntry, TokenOwnerBalanceEntry,
     },
+    payload::TokenOp,
+    storage_v2::{AtomicStorageSnapshotCounts, AtomicStorageV2},
     IDENT,
 };
 use async_channel::Receiver;
@@ -30,6 +32,7 @@ use cryptix_consensus_notify::{
 };
 use cryptix_consensusmanager::ConsensusManager;
 use cryptix_core::{
+    debug,
     info,
     task::service::{AsyncService, AsyncServiceFuture},
     trace, warn,
@@ -38,16 +41,16 @@ use cryptix_notify::{connection::ChannelType, listener::ListenerLifespan, scope:
 use cryptix_utils::{channel::Channel, triggers::SingleTrigger};
 use hex::encode as hex_encode;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
-    io::{ErrorKind, Read, Seek, SeekFrom, Write},
+    io::{BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
     path::Path,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex as StdMutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
 
@@ -63,19 +66,19 @@ const TOKEN_REPLAY_OVERLAP_TESTNET: usize = 12_000;
 const TOKEN_REPLAY_OVERLAP_DEVNET: usize = 12_000;
 const TOKEN_REPLAY_OVERLAP_SIMNET: usize = 120_000;
 const TOKEN_HISTORY_RETENTION_SLACK_BLOCKS: usize = 2048;
-const SNAPSHOT_MANIFEST_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_SNAPSHOT_MANIFEST_V1";
-const SNAPSHOT_ID_DOMAIN: &[u8] = b"CAT_SNAPSHOT_ID_V1";
+const SNAPSHOT_MANIFEST_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_SNAPSHOT_MANIFEST_V2";
+const SNAPSHOT_ID_DOMAIN: &[u8] = b"CAT_SNAPSHOT_ID_V2";
 const SNAPSHOT_CHUNK_SIZE_DEFAULT: usize = 1024 * 1024;
 const SNAPSHOT_CHUNK_SIZE_MAX: usize = 4 * 1024 * 1024;
 pub const MAX_BOOTSTRAP_SNAPSHOT_FILE_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub const MAX_BOOTSTRAP_REPLAY_WINDOW_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const SNAPSHOT_IMPORT_CHUNK_KEYS: usize = 4096;
 const BOOTSTRAP_STORE_MAX_SNAPSHOTS_PER_NETWORK: usize = 16;
 const ATOMIC_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const ATOMIC_LONG_OPERATION_LOG_INTERVAL: Duration = Duration::from_secs(5);
-const ATOMIC_SLOW_PERSIST_LOG_THRESHOLD: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
-struct SnapshotManifestV1 {
+struct SnapshotManifestV2 {
     schema_version: u16,
     protocol_version: u16,
     network_id: String,
@@ -91,13 +94,14 @@ struct SnapshotManifestV1 {
     at_block_hash: [u8; 32],
     at_daa_score: u64,
     state_hash_at_fp: [u8; 32],
+    state_hash_at_window_start_parent: Option<[u8; 32]>,
     window_start_block_hash: [u8; 32],
     window_start_parent_block_hash: [u8; 32],
     window_end_block_hash: [u8; 32],
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct ReplayWindowTransferV1 {
+struct ReplayWindowTransferV2 {
     protocol_version: u16,
     network_id: String,
     window_start_block_hash: [u8; 32],
@@ -105,11 +109,42 @@ struct ReplayWindowTransferV1 {
     journals_in_window: Vec<(BlockHash, crate::state::BlockJournal)>,
 }
 
+#[derive(serde::Serialize)]
+struct ReplayWindowTransferV2Ref<'a> {
+    protocol_version: u16,
+    network_id: &'a str,
+    window_start_block_hash: [u8; 32],
+    window_end_block_hash: [u8; 32],
+    journals_in_window: &'a [(BlockHash, crate::state::BlockJournal)],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SnapshotFileHeaderV2 {
+    schema_version: u16,
+    protocol_version: u16,
+    network_id: String,
+    at_block_hash: BlockHash,
+    at_daa_score: u64,
+    state_hash_at_fp: [u8; 32],
+    state_hash_at_window_start_parent: Option<[u8; 32]>,
+    window_start_block_hash: BlockHash,
+    window_start_parent_block_hash: BlockHash,
+    window_end_block_hash: BlockHash,
+    next_event_sequence: u64,
+    counts: AtomicStorageSnapshotCounts,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedSnapshotFileV2 {
+    header: SnapshotFileHeaderV2,
+    replay_window: ReplayWindowTransferV2,
+}
+
 #[derive(Clone, Debug)]
 struct SnapshotCatalogEntry {
     snapshot_id_hex: String,
     snapshot_path: PathBuf,
-    manifest: SnapshotManifestV1,
+    manifest: SnapshotManifestV2,
     manifest_bytes: Vec<u8>,
 }
 
@@ -156,7 +191,7 @@ struct AtomicTokenProcessor {
     processed_chain_blocks: AtomicU64,
     progress_log: StdMutex<AtomicProgressLogState>,
     state: Mutex<AtomicTokenState>,
-    state_path: PathBuf,
+    state_store: Arc<AtomicStorageV2>,
 }
 
 #[derive(Default)]
@@ -170,7 +205,7 @@ impl AtomicTokenProcessor {
         consensus_manager: Arc<ConsensusManager>,
         max_retained_blocks: usize,
         state: AtomicTokenState,
-        state_path: PathBuf,
+        state_store: Arc<AtomicStorageV2>,
     ) -> Self {
         Self {
             consensus_manager,
@@ -180,7 +215,7 @@ impl AtomicTokenProcessor {
             processed_chain_blocks: AtomicU64::new(0),
             progress_log: Default::default(),
             state: Mutex::new(state),
-            state_path,
+            state_store,
         }
     }
 
@@ -205,20 +240,12 @@ impl AtomicTokenProcessor {
             let utxo_diff = session.async_get_block_utxo_diff(block_hash).await?;
             auth_inputs.extend(utxo_diff.remove.iter().map(|(outpoint, entry)| (*outpoint, entry.clone())));
             if should_log_progress && last_log.elapsed() >= ATOMIC_LONG_OPERATION_LOG_INTERVAL {
-                info!(
-                    "[{IDENT}] collecting Atomic auth inputs progress: {}/{} block(s)",
-                    idx.saturating_add(1),
-                    total
-                );
+                info!("[{IDENT}] collecting Atomic auth inputs progress: {}/{} block(s)", idx.saturating_add(1), total);
                 last_log = Instant::now();
             }
         }
         if should_log_progress {
-            info!(
-                "[{IDENT}] collected Atomic auth inputs for {} replay block(s): {} spent output(s)",
-                total,
-                auth_inputs.len()
-            );
+            info!("[{IDENT}] collected Atomic auth inputs for {} replay block(s): {} spent output(s)", total, auth_inputs.len());
         }
         Ok(auth_inputs)
     }
@@ -246,19 +273,35 @@ impl AtomicTokenProcessor {
                         warn!("[{IDENT}] marking Cryptix Atomic degraded after processing error: {err}");
                     }
                     state.mark_degraded();
-                    let _ = persist_state_to_path(&self.state_path, &state);
+                    let _ = self.state_store.persist_runtime_flags(
+                        state.applied_chain_order.last().copied(),
+                        state.applied_chain_order.len() as u64,
+                        state.degraded,
+                        state.next_event_sequence,
+                    );
                     return Err(err);
                 }
-                if state.prune_history(self.max_retained_blocks) {
-                    trace!("[{IDENT}] Cryptix Atomic pruning removed processed op guard entries");
-                }
-                if let Err(err) = persist_state_to_path(&self.state_path, &state) {
-                    if !state.degraded {
-                        warn!("[{IDENT}] marking Cryptix Atomic degraded after persistence error: {err}");
+                if let Some(pruned) = state.prune_history_with_details(self.max_retained_blocks) {
+                    if let Err(err) = self.state_store.prune_history(
+                        &pruned.pruned_hashes,
+                        &state.applied_chain_order,
+                        pruned.last_pruned_event_sequence,
+                    ) {
+                        if !state.degraded {
+                            warn!("[{IDENT}] marking Cryptix Atomic degraded after history prune persistence error: {err}");
+                        }
+                        state.mark_degraded();
+                        let _ = self.state_store.persist_runtime_flags(
+                            state.applied_chain_order.last().copied(),
+                            state.applied_chain_order.len() as u64,
+                            state.degraded,
+                            state.next_event_sequence,
+                        );
+                        return Err(err);
                     }
-                    state.mark_degraded();
-                    let _ = persist_state_to_path(&self.state_path, &state);
-                    return Err(err);
+                    if pruned.pruned_processed_ops {
+                        trace!("[{IDENT}] Cryptix Atomic pruning removed processed op guard entries");
+                    }
                 }
                 let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
                 let mut health = state.get_health();
@@ -266,10 +309,10 @@ impl AtomicTokenProcessor {
                 health.runtime_state = state.runtime_state(bootstrap_in_progress);
                 let retained_blocks = state.applied_chain_order.len();
                 let footprint = state.footprint();
-                let state_file_bytes = std::fs::metadata(&self.state_path).ok().map(|metadata| metadata.len());
+                let state_store_bytes = self.state_store.approximate_size_bytes();
                 drop(state);
 
-                self.maybe_log_progress(added_count, removed_count, retained_blocks, health, footprint, state_file_bytes);
+                self.maybe_log_progress(added_count, removed_count, retained_blocks, health, footprint, state_store_bytes);
                 Ok(())
             }
             _ => Ok(()),
@@ -283,7 +326,7 @@ impl AtomicTokenProcessor {
         retained_blocks: usize,
         health: AtomicTokenHealth,
         footprint: AtomicTokenStateFootprint,
-        state_file_bytes: Option<u64>,
+        state_store_bytes: Option<u64>,
     ) {
         if added_count == 0 && removed_count == 0 {
             return;
@@ -304,7 +347,7 @@ impl AtomicTokenProcessor {
         progress_log.last_runtime_state = Some(health.runtime_state);
         let last_applied = health.last_applied_block.map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string());
         info!(
-            "[{IDENT}] Cryptix Atomic indexed chain progress: +{}/-{} blocks ({} processed since startup, {} retained), runtime={}, live_correct={}, last_applied={}, event_seq={}, state_hash={}, assets={}, balances={}, nonces={}, events={}, processed_ops={}, journals={}, checkpoints={}, owners={}, holder_assets={}, state_file={}",
+            "[{IDENT}] Cryptix Atomic indexed chain progress: +{}/-{} blocks ({} processed since startup, {} retained), runtime={}, live_correct={}, last_applied={}, event_seq={}, state_hash={}, assets={}, balances={}, nonces={}, events={}, processed_ops={}, journals={}, checkpoints={}, owners={}, holder_assets={}, state_store={}",
             added_count,
             removed_count,
             total_processed,
@@ -323,7 +366,7 @@ impl AtomicTokenProcessor {
             footprint.state_hash_checkpoints,
             footprint.owners_with_balances,
             footprint.assets_with_holders,
-            state_file_bytes.map(format_bytes_for_log).unwrap_or_else(|| "n/a".to_string()),
+            state_store_bytes.map(format_bytes_for_log).unwrap_or_else(|| "n/a".to_string()),
         );
     }
 
@@ -368,24 +411,6 @@ impl AtomicTokenProcessor {
         self.state.lock().await.get_events_since_capped(after_sequence, limit, max_sequence)
     }
 
-    async fn read_view(
-        &self,
-        requested_at_block_hash: Option<BlockHash>,
-        fallback_block_hash: BlockHash,
-    ) -> Option<AtomicTokenReadView> {
-        let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
-        let state = self.state.lock().await;
-        let runtime_state = state.runtime_state(bootstrap_in_progress);
-        let mut view = match requested_at_block_hash {
-            Some(at_block_hash) => state.materialize_view_at_block(at_block_hash),
-            None => Some(state.materialize_latest_view(fallback_block_hash)),
-        };
-        if let Some(view) = view.as_mut() {
-            view.runtime_state = runtime_state;
-        }
-        view
-    }
-
     async fn read_context(
         &self,
         requested_at_block_hash: Option<BlockHash>,
@@ -395,13 +420,263 @@ impl AtomicTokenProcessor {
         let state = self.state.lock().await;
         let runtime_state = state.runtime_state(bootstrap_in_progress);
         match requested_at_block_hash {
-            Some(at_block_hash) => {
-                let mut view = state.materialize_view_at_block(at_block_hash)?;
-                view.runtime_state = runtime_state;
-                Some(view.context())
-            }
+            Some(at_block_hash) => state.materialize_context_at_block(at_block_hash, runtime_state),
             None => Some(state.materialize_latest_context(fallback_block_hash, runtime_state)),
         }
+    }
+
+    async fn balance_read(
+        &self,
+        asset_id: [u8; 32],
+        owner_id: [u8; 32],
+        requested_at_block_hash: Option<BlockHash>,
+        fallback_block_hash: BlockHash,
+    ) -> Option<(AtomicTokenReadContext, u128)> {
+        let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
+        let state = self.state.lock().await;
+        let runtime_state = state.runtime_state(bootstrap_in_progress);
+        let context = match requested_at_block_hash {
+            Some(at_block_hash) => state.materialize_context_at_block(at_block_hash, runtime_state)?,
+            None => state.materialize_latest_context(fallback_block_hash, runtime_state),
+        };
+        let key = BalanceKey { asset_id, owner_id };
+        let balance = match requested_at_block_hash {
+            Some(at_block_hash) => state.get_balance_at_block(key, at_block_hash)?,
+            None => state.get_balance(asset_id, owner_id),
+        };
+        Some((context, balance))
+    }
+
+    async fn nonce_read(
+        &self,
+        key: NonceKey,
+        requested_at_block_hash: Option<BlockHash>,
+        fallback_block_hash: BlockHash,
+    ) -> Option<(AtomicTokenReadContext, u64)> {
+        let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
+        let state = self.state.lock().await;
+        let runtime_state = state.runtime_state(bootstrap_in_progress);
+        let context = match requested_at_block_hash {
+            Some(at_block_hash) => state.materialize_context_at_block(at_block_hash, runtime_state)?,
+            None => state.materialize_latest_context(fallback_block_hash, runtime_state),
+        };
+        let nonce = match requested_at_block_hash {
+            Some(at_block_hash) => state.get_nonce_at_block(key, at_block_hash)?,
+            None => match key.scope_kind {
+                crate::state::NONCE_SCOPE_ASSET => state.get_token_nonce(key.owner_id, key.scope_id),
+                _ => state.get_owner_nonce(key.owner_id),
+            },
+        };
+        Some((context, nonce))
+    }
+
+    async fn anchor_count_read(
+        &self,
+        owner_id: [u8; 32],
+        requested_at_block_hash: Option<BlockHash>,
+        fallback_block_hash: BlockHash,
+    ) -> Option<(AtomicTokenReadContext, u64)> {
+        let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
+        let state = self.state.lock().await;
+        let runtime_state = state.runtime_state(bootstrap_in_progress);
+        let context = match requested_at_block_hash {
+            Some(at_block_hash) => state.materialize_context_at_block(at_block_hash, runtime_state)?,
+            None => state.materialize_latest_context(fallback_block_hash, runtime_state),
+        };
+        let anchor_count = match requested_at_block_hash {
+            Some(at_block_hash) => state.get_anchor_count_at_block(owner_id, at_block_hash)?,
+            None => state.get_anchor_count(owner_id),
+        };
+        Some((context, anchor_count))
+    }
+
+    async fn asset_read(
+        &self,
+        asset_id: [u8; 32],
+        requested_at_block_hash: Option<BlockHash>,
+        fallback_block_hash: BlockHash,
+    ) -> Option<(AtomicTokenReadContext, Option<TokenAsset>)> {
+        let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
+        let state = self.state.lock().await;
+        let runtime_state = state.runtime_state(bootstrap_in_progress);
+        let context = match requested_at_block_hash {
+            Some(at_block_hash) => state.materialize_context_at_block(at_block_hash, runtime_state)?,
+            None => state.materialize_latest_context(fallback_block_hash, runtime_state),
+        };
+        let asset = match requested_at_block_hash {
+            Some(at_block_hash) => state.get_asset_at_block(asset_id, at_block_hash)?,
+            None => state.get_asset(asset_id),
+        };
+        Some((context, asset))
+    }
+
+    async fn op_status_read(
+        &self,
+        txid: BlockHash,
+        requested_at_block_hash: Option<BlockHash>,
+        fallback_block_hash: BlockHash,
+    ) -> Option<(AtomicTokenReadContext, Option<ProcessedOp>)> {
+        let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
+        let state = self.state.lock().await;
+        let runtime_state = state.runtime_state(bootstrap_in_progress);
+        let context = match requested_at_block_hash {
+            Some(at_block_hash) => state.materialize_context_at_block(at_block_hash, runtime_state)?,
+            None => state.materialize_latest_context(fallback_block_hash, runtime_state),
+        };
+        let status = match requested_at_block_hash {
+            Some(at_block_hash) => state.get_processed_op_at_block(txid, at_block_hash)?,
+            None => state.get_op_status(txid),
+        };
+        Some((context, status))
+    }
+
+    async fn assets_page(
+        &self,
+        offset: usize,
+        limit: usize,
+        query: String,
+        requested_at_block_hash: Option<BlockHash>,
+        fallback_block_hash: BlockHash,
+    ) -> Option<(AtomicTokenReadContext, Vec<TokenAsset>, u64)> {
+        let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
+        let state = self.state.lock().await;
+        let runtime_state = state.runtime_state(bootstrap_in_progress);
+        match requested_at_block_hash {
+            Some(at_block_hash) => {
+                let context = state.materialize_context_at_block(at_block_hash, runtime_state)?;
+                let (assets, total) = state.indexed_assets_page_at_block(offset, limit, &query, at_block_hash)?;
+                Some((context, assets, total))
+            }
+            None => {
+                let context = state.materialize_latest_context(fallback_block_hash, runtime_state);
+                let (assets, total) = state.indexed_assets_page(offset, limit, &query);
+                Some((context, assets, total))
+            }
+        }
+    }
+
+    async fn simulation_view(
+        &self,
+        owner_id: [u8; 32],
+        op: &TokenOp,
+        requested_at_block_hash: Option<BlockHash>,
+        fallback_block_hash: BlockHash,
+    ) -> Option<AtomicTokenReadView> {
+        let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
+        let state = self.state.lock().await;
+        let runtime_state = state.runtime_state(bootstrap_in_progress);
+        let context = match requested_at_block_hash {
+            Some(at_block_hash) => state.materialize_context_at_block(at_block_hash, runtime_state)?,
+            None => state.materialize_latest_context(fallback_block_hash, runtime_state),
+        };
+        let mut view = AtomicTokenReadView {
+            at_block_hash: context.at_block_hash,
+            state_hash: context.state_hash,
+            is_degraded: context.is_degraded,
+            runtime_state: context.runtime_state,
+            event_sequence_cutoff: context.event_sequence_cutoff,
+            assets: HashMap::new(),
+            balances: HashMap::new(),
+            nonces: HashMap::new(),
+            anchor_counts: HashMap::new(),
+            processed_ops: HashMap::new(),
+            known_owner_addresses: HashMap::new(),
+        };
+
+        let nonce_key = crate::state::nonce_key_for_op(owner_id, op);
+        let nonce = match requested_at_block_hash {
+            Some(at_block_hash) => state.get_nonce_at_block(nonce_key, at_block_hash)?,
+            None => match nonce_key.scope_kind {
+                crate::state::NONCE_SCOPE_ASSET => state.get_token_nonce(owner_id, nonce_key.scope_id),
+                _ => state.get_owner_nonce(owner_id),
+            },
+        };
+        view.nonces.insert(nonce_key, nonce);
+
+        fn read_asset(
+            state: &AtomicTokenState,
+            requested_at_block_hash: Option<BlockHash>,
+            asset_id: [u8; 32],
+        ) -> Option<Option<TokenAsset>> {
+            match requested_at_block_hash {
+                Some(at_block_hash) => state.get_asset_at_block(asset_id, at_block_hash),
+                None => Some(state.get_asset(asset_id)),
+            }
+        }
+
+        fn read_balance(
+            state: &AtomicTokenState,
+            requested_at_block_hash: Option<BlockHash>,
+            asset_id: [u8; 32],
+            owner_id: [u8; 32],
+        ) -> Option<u128> {
+            let key = BalanceKey { asset_id, owner_id };
+            match requested_at_block_hash {
+                Some(at_block_hash) => state.get_balance_at_block(key, at_block_hash),
+                None => Some(state.get_balance(asset_id, owner_id)),
+            }
+        }
+
+        match op {
+            TokenOp::CreateAsset(_) | TokenOp::CreateAssetWithMint(_) | TokenOp::CreateLiquidityAsset(_) => {}
+            TokenOp::Transfer(op) => {
+                if let Some(asset) = read_asset(&state, requested_at_block_hash, op.asset_id)? {
+                    view.assets.insert(op.asset_id, asset);
+                }
+                let sender_key = BalanceKey { asset_id: op.asset_id, owner_id };
+                let sender_balance = read_balance(&state, requested_at_block_hash, op.asset_id, owner_id)?;
+                if sender_balance > 0 {
+                    view.balances.insert(sender_key, sender_balance);
+                }
+                let receiver_key = BalanceKey { asset_id: op.asset_id, owner_id: op.to_owner_id };
+                let receiver_balance = read_balance(&state, requested_at_block_hash, op.asset_id, op.to_owner_id)?;
+                if receiver_balance > 0 {
+                    view.balances.insert(receiver_key, receiver_balance);
+                }
+            }
+            TokenOp::Mint(op) => {
+                if let Some(asset) = read_asset(&state, requested_at_block_hash, op.asset_id)? {
+                    view.assets.insert(op.asset_id, asset);
+                }
+                let receiver_key = BalanceKey { asset_id: op.asset_id, owner_id: op.to_owner_id };
+                let receiver_balance = read_balance(&state, requested_at_block_hash, op.asset_id, op.to_owner_id)?;
+                if receiver_balance > 0 {
+                    view.balances.insert(receiver_key, receiver_balance);
+                }
+            }
+            TokenOp::Burn(op) => {
+                if let Some(asset) = read_asset(&state, requested_at_block_hash, op.asset_id)? {
+                    view.assets.insert(op.asset_id, asset);
+                }
+                let sender_key = BalanceKey { asset_id: op.asset_id, owner_id };
+                let sender_balance = read_balance(&state, requested_at_block_hash, op.asset_id, owner_id)?;
+                if sender_balance > 0 {
+                    view.balances.insert(sender_key, sender_balance);
+                }
+            }
+            TokenOp::BuyLiquidityExactIn(op) => {
+                if let Some(asset) = read_asset(&state, requested_at_block_hash, op.asset_id)? {
+                    view.assets.insert(op.asset_id, asset);
+                }
+            }
+            TokenOp::SellLiquidityExactIn(op) => {
+                if let Some(asset) = read_asset(&state, requested_at_block_hash, op.asset_id)? {
+                    view.assets.insert(op.asset_id, asset);
+                }
+                let sender_key = BalanceKey { asset_id: op.asset_id, owner_id };
+                let sender_balance = read_balance(&state, requested_at_block_hash, op.asset_id, owner_id)?;
+                if sender_balance > 0 {
+                    view.balances.insert(sender_key, sender_balance);
+                }
+            }
+            TokenOp::ClaimLiquidityFees(op) => {
+                if let Some(asset) = read_asset(&state, requested_at_block_hash, op.asset_id)? {
+                    view.assets.insert(op.asset_id, asset);
+                }
+            }
+        }
+
+        Some(view)
     }
 
     async fn indexed_balances_by_owner(
@@ -416,20 +691,9 @@ impl AtomicTokenProcessor {
         let runtime_state = state.runtime_state(bootstrap_in_progress);
         match requested_at_block_hash {
             Some(at_block_hash) => {
-                let mut view = state.materialize_view_at_block(at_block_hash)?;
-                view.runtime_state = runtime_state;
-                let balances = view
-                    .balances
-                    .iter()
-                    .filter_map(|(key, balance)| {
-                        if key.owner_id != owner_id || *balance == 0 {
-                            return None;
-                        }
-                        let asset = if include_assets { view.assets.get(&key.asset_id).cloned() } else { None };
-                        Some((key.asset_id, *balance, asset))
-                    })
-                    .collect();
-                Some((view.context(), balances))
+                let context = state.materialize_context_at_block(at_block_hash, runtime_state)?;
+                let balances = state.indexed_balances_by_owner_at_block(owner_id, include_assets, at_block_hash)?;
+                Some((context, balances))
             }
             None => {
                 let context = state.materialize_latest_context(fallback_block_hash, runtime_state);
@@ -450,22 +714,9 @@ impl AtomicTokenProcessor {
         let runtime_state = state.runtime_state(bootstrap_in_progress);
         match requested_at_block_hash {
             Some(at_block_hash) => {
-                let mut view = state.materialize_view_at_block(at_block_hash)?;
-                view.runtime_state = runtime_state;
-                let holders = view
-                    .balances
-                    .iter()
-                    .filter_map(
-                        |(key, balance)| {
-                            if key.asset_id == asset_id && *balance > 0 {
-                                Some((key.owner_id, *balance))
-                            } else {
-                                None
-                            }
-                        },
-                    )
-                    .collect();
-                Some((view.context(), holders))
+                let context = state.materialize_context_at_block(at_block_hash, runtime_state)?;
+                let holders = state.indexed_holders_by_asset_at_block(asset_id, at_block_hash)?;
+                Some((context, holders))
             }
             None => {
                 let context = state.materialize_latest_context(fallback_block_hash, runtime_state);
@@ -487,34 +738,18 @@ impl AtomicTokenProcessor {
         let runtime_state = state.runtime_state(bootstrap_in_progress);
         match requested_at_block_hash {
             Some(at_block_hash) => {
-                let mut view = state.materialize_view_at_block(at_block_hash)?;
-                view.runtime_state = runtime_state;
-                let asset = view.assets.get(&asset_id).cloned();
-                let holders = view
-                    .balances
-                    .iter()
-                    .filter_map(
-                        |(key, balance)| {
-                            if key.asset_id == asset_id && *balance > 0 {
-                                Some((key.owner_id, *balance))
-                            } else {
-                                None
-                            }
-                        },
-                    )
-                    .collect::<Vec<_>>();
+                let context = state.materialize_context_at_block(at_block_hash, runtime_state)?;
+                let asset = state.get_asset_at_block(asset_id, at_block_hash)?;
+                let holders = state.indexed_holders_by_asset_at_block(asset_id, at_block_hash)?;
                 let pool_holder_addresses =
                     asset.as_ref().and_then(|asset| asset.liquidity.as_ref()).map(|pool| &pool.holder_addresses);
                 let owner_to_address_state = holders
                     .iter()
                     .filter_map(|(owner_id, _)| {
-                        pool_holder_addresses
-                            .and_then(|addresses| addresses.get(owner_id))
-                            .or_else(|| view.known_owner_addresses.get(owner_id))
-                            .map(|holder| (*owner_id, holder.clone()))
+                        pool_holder_addresses.and_then(|addresses| addresses.get(owner_id)).map(|holder| (*owner_id, holder.clone()))
                     })
                     .collect();
-                Some((view.context(), asset, holders, owner_to_address_state))
+                Some((context, asset, holders, owner_to_address_state))
             }
             None => {
                 let context = state.materialize_latest_context(fallback_block_hash, runtime_state);
@@ -526,18 +761,18 @@ impl AtomicTokenProcessor {
         }
     }
 
-    async fn persist_state(&self) -> AtomicTokenResult<()> {
-        let state = self.state.lock().await;
-        persist_state_to_path(&self.state_path, &state)
-    }
-
     async fn mark_degraded_best_effort(&self, reason: &str) {
         let mut state = self.state.lock().await;
         if !state.degraded {
             warn!("[{IDENT}] marking Cryptix Atomic degraded: {reason}");
         }
         state.mark_degraded();
-        if let Err(err) = persist_state_to_path(&self.state_path, &state) {
+        if let Err(err) = self.state_store.persist_runtime_flags(
+            state.applied_chain_order.last().copied(),
+            state.applied_chain_order.len() as u64,
+            state.degraded,
+            state.next_event_sequence,
+        ) {
             warn!("[{IDENT}] failed persisting degraded Cryptix Atomic state: {err}");
         }
     }
@@ -551,6 +786,7 @@ pub struct AtomicTokenService {
     expected_finality_depth: u64,
     replay_overlap: usize,
     max_retained_blocks: usize,
+    payload_hf_activation_daa_score: u64,
     genesis_hash: BlockHash,
     unsafe_skip_snapshot_finality_check: bool,
     atomic_data_dir: PathBuf,
@@ -581,21 +817,28 @@ impl AtomicTokenService {
         let snapshot_store_dir = atomic_data_dir.join("bootstrap");
         std::fs::create_dir_all(&snapshot_store_dir)
             .map_err(|e| AtomicTokenError::Processing(format!("failed to create Atomic bootstrap directory: {e}")))?;
-        let state_path = atomic_data_dir.join("state.bin");
-        let mut state = load_state_from_path(&state_path, TOKEN_PROTOCOL_VERSION, &network_id)?
-            .unwrap_or_else(|| AtomicTokenState::new(TOKEN_PROTOCOL_VERSION, network_id.clone()));
+        let state_store = Arc::new(AtomicStorageV2::open(
+            atomic_data_dir.join("state-v2"),
+            TOKEN_PROTOCOL_VERSION,
+            network_id.clone(),
+            config.params.genesis.hash,
+        )?);
+        let mut state =
+            state_store.load_runtime_state()?.unwrap_or_else(|| AtomicTokenState::new(TOKEN_PROTOCOL_VERSION, network_id.clone()));
+        state.attach_state_store(state_store.clone());
         state.set_payload_hf_activation_daa_score(config.params.payload_hf_activation_daa_score);
         if state.degraded && !state.has_verified_state() {
             warn!(
                 "[{IDENT}] persisted Atomic state is degraded but has no verified chain anchor; resetting Atomic index state so local block replay can rebuild it"
             );
             state = AtomicTokenState::new(TOKEN_PROTOCOL_VERSION, network_id.clone());
+            state.attach_state_store(state_store.clone());
             state.set_payload_hf_activation_daa_score(config.params.payload_hf_activation_daa_score);
-            persist_state_to_path(&state_path, &state)?;
+            state_store.persist_state(&state)?;
         }
         state.rebuild_runtime_caches();
-        let state_file_bytes = std::fs::metadata(&state_path).ok().map(|metadata| metadata.len());
-        log_state_footprint("loaded", state.footprint(), state_file_bytes);
+        let state_store_bytes = state_store.approximate_size_bytes();
+        log_state_footprint("loaded", state.footprint(), state_store_bytes);
 
         let consensus_notify_channel = Channel::<ConsensusNotification>::default();
         let listener_id = consensus_notifier.register_new_listener(
@@ -616,12 +859,13 @@ impl AtomicTokenService {
         }
         Ok(Self {
             recv_channel: consensus_notify_channel.receiver(),
-            processor: Arc::new(AtomicTokenProcessor::new(consensus_manager, max_retained_blocks, state, state_path)),
+            processor: Arc::new(AtomicTokenProcessor::new(consensus_manager, max_retained_blocks, state, state_store)),
             shutdown: Default::default(),
             retained_revalidation_failed: AtomicBool::new(false),
             expected_finality_depth,
             replay_overlap,
             max_retained_blocks,
+            payload_hf_activation_daa_score: config.params.payload_hf_activation_daa_score,
             genesis_hash: config.params.genesis.hash,
             unsafe_skip_snapshot_finality_check: config.atomic_unsafe_skip_snapshot_finality_check,
             atomic_data_dir,
@@ -654,7 +898,7 @@ impl AtomicTokenService {
     }
 
     pub async fn get_state_hash_at_block(&self, at_block_hash: BlockHash) -> Option<[u8; 32]> {
-        self.processor.state.lock().await.materialize_view_at_block(at_block_hash).map(|view| view.state_hash)
+        self.processor.state.lock().await.get_state_hash_at_block(at_block_hash)
     }
 
     pub async fn mark_degraded_and_persist(&self, reason: &str) -> AtomicTokenResult<()> {
@@ -664,7 +908,12 @@ impl AtomicTokenService {
             warn!("[{IDENT}] marking Cryptix Atomic state degraded: {reason}");
         }
         state.mark_degraded();
-        persist_state_to_path(&self.processor.state_path, &state)
+        self.processor.state_store.persist_runtime_flags(
+            state.applied_chain_order.last().copied(),
+            state.applied_chain_order.len() as u64,
+            state.degraded,
+            state.next_event_sequence,
+        )
     }
 
     pub async fn get_balance(&self, asset_id: [u8; 32], owner_id: [u8; 32]) -> u128 {
@@ -699,12 +948,68 @@ impl AtomicTokenService {
         self.processor.events_since_capped(after_sequence, limit, max_sequence).await
     }
 
-    pub async fn get_read_view(&self, requested_at_block_hash: Option<BlockHash>) -> Option<AtomicTokenReadView> {
-        self.processor.read_view(requested_at_block_hash, self.genesis_hash).await
-    }
-
     pub async fn get_read_context(&self, requested_at_block_hash: Option<BlockHash>) -> Option<AtomicTokenReadContext> {
         self.processor.read_context(requested_at_block_hash, self.genesis_hash).await
+    }
+
+    pub async fn get_balance_with_context(
+        &self,
+        asset_id: [u8; 32],
+        owner_id: [u8; 32],
+        requested_at_block_hash: Option<BlockHash>,
+    ) -> Option<(AtomicTokenReadContext, u128)> {
+        self.processor.balance_read(asset_id, owner_id, requested_at_block_hash, self.genesis_hash).await
+    }
+
+    pub async fn get_nonce_with_context(
+        &self,
+        key: NonceKey,
+        requested_at_block_hash: Option<BlockHash>,
+    ) -> Option<(AtomicTokenReadContext, u64)> {
+        self.processor.nonce_read(key, requested_at_block_hash, self.genesis_hash).await
+    }
+
+    pub async fn get_anchor_count_with_context(
+        &self,
+        owner_id: [u8; 32],
+        requested_at_block_hash: Option<BlockHash>,
+    ) -> Option<(AtomicTokenReadContext, u64)> {
+        self.processor.anchor_count_read(owner_id, requested_at_block_hash, self.genesis_hash).await
+    }
+
+    pub async fn get_asset_with_context(
+        &self,
+        asset_id: [u8; 32],
+        requested_at_block_hash: Option<BlockHash>,
+    ) -> Option<(AtomicTokenReadContext, Option<TokenAsset>)> {
+        self.processor.asset_read(asset_id, requested_at_block_hash, self.genesis_hash).await
+    }
+
+    pub async fn get_op_status_with_context(
+        &self,
+        txid: BlockHash,
+        requested_at_block_hash: Option<BlockHash>,
+    ) -> Option<(AtomicTokenReadContext, Option<ProcessedOp>)> {
+        self.processor.op_status_read(txid, requested_at_block_hash, self.genesis_hash).await
+    }
+
+    pub async fn get_assets_page(
+        &self,
+        offset: usize,
+        limit: usize,
+        query: String,
+        requested_at_block_hash: Option<BlockHash>,
+    ) -> Option<(AtomicTokenReadContext, Vec<TokenAsset>, u64)> {
+        self.processor.assets_page(offset, limit, query, requested_at_block_hash, self.genesis_hash).await
+    }
+
+    pub async fn get_simulation_view(
+        &self,
+        owner_id: [u8; 32],
+        op: &TokenOp,
+        requested_at_block_hash: Option<BlockHash>,
+    ) -> Option<AtomicTokenReadView> {
+        self.processor.simulation_view(owner_id, op, requested_at_block_hash, self.genesis_hash).await
     }
 
     pub async fn revalidate_retained_state_once(&self) -> AtomicTokenResult<bool> {
@@ -811,10 +1116,7 @@ impl AtomicTokenService {
             sink
         );
 
-        info!(
-            "[{IDENT}] Cryptix Atomic startup state revalidation loading acceptance data for {} block(s)",
-            replay_chain.added.len()
-        );
+        info!("[{IDENT}] Cryptix Atomic startup state revalidation loading acceptance data for {} block(s)", replay_chain.added.len());
         let acceptance_data = session.async_get_blocks_acceptance_data(replay_chain.added.clone(), None).await?;
         if acceptance_data.len() != replay_chain.added.len() {
             return Err(AtomicTokenError::Processing(format!(
@@ -823,34 +1125,35 @@ impl AtomicTokenService {
                 replay_chain.added.len()
             )));
         }
-        info!(
-            "[{IDENT}] Cryptix Atomic startup state revalidation loaded acceptance data for {} block(s)",
-            acceptance_data.len()
-        );
+        info!("[{IDENT}] Cryptix Atomic startup state revalidation loaded acceptance data for {} block(s)", acceptance_data.len());
         let auth_inputs = self.processor.collect_auth_inputs_for_added_blocks(&replay_chain.added).await?;
 
+        let temp_state_dir = unique_atomic_temp_dir("startup-revalidation");
+        self.processor.state_store.checkpoint_to(&temp_state_dir)?;
+        let temp_state_store = Arc::new(AtomicStorageV2::open(
+            &temp_state_dir,
+            self.protocol_version,
+            self.network_id.clone(),
+            self.genesis_hash,
+        )?);
         let mut staged_state = loaded_state.clone();
+        staged_state.attach_state_store(temp_state_store);
         staged_state.degraded = false;
         staged_state.live_correct = false;
         info!(
             "[{IDENT}] Cryptix Atomic startup state revalidation rolling back retained replay window to parent of {}",
             first_replayable_block_hash
         );
-        staged_state.rollback_snapshot_window_to_parent(first_replayable_block_hash)?;
+        staged_state.rollback_snapshot_window_to_parent_persisted(first_replayable_block_hash)?;
 
         let replay_notification = VirtualChainChangedNotification::new(
             Arc::new(replay_chain.added.clone()),
             Arc::new(Vec::new()),
             Arc::new(acceptance_data),
         );
-        info!(
-            "[{IDENT}] Cryptix Atomic startup state revalidation replaying {} block(s)",
-            replay_chain.added.len()
-        );
+        info!("[{IDENT}] Cryptix Atomic startup state revalidation replaying {} block(s)", replay_chain.added.len());
         staged_state.apply_virtual_chain_change(&replay_notification, &auth_inputs, &self.processor.consensus_manager).await?;
-        info!(
-            "[{IDENT}] Cryptix Atomic startup state revalidation replay completed; verifying retained state hashes"
-        );
+        info!("[{IDENT}] Cryptix Atomic startup state revalidation replay completed; verifying retained state hashes");
 
         let matching_prefix_len =
             expected_chain.iter().zip(replay_chain.added.iter()).take_while(|(expected, actual)| expected == actual).count();
@@ -865,12 +1168,9 @@ impl AtomicTokenService {
                 "startup state revalidation failed: canonical replay path diverged before retained block `{diverged_block}`"
             )));
         }
-        let mut migrated_legacy_hashes = 0usize;
-        let mut refresh_checkpoint_hashes = false;
-        let final_replayed_block_hash = expected_chain
-            .get(matching_prefix_len - 1)
-            .copied()
-            .ok_or_else(|| AtomicTokenError::Processing("startup state revalidation failed: empty matching replay prefix".to_string()))?;
+        let final_replayed_block_hash = expected_chain.get(matching_prefix_len - 1).copied().ok_or_else(|| {
+            AtomicTokenError::Processing("startup state revalidation failed: empty matching replay prefix".to_string())
+        })?;
         let final_expected_state_hash = expected_hashes.get(&final_replayed_block_hash).copied().ok_or_else(|| {
             AtomicTokenError::Processing(format!(
                 "startup state revalidation failed: missing persisted state hash for retained block `{final_replayed_block_hash}`"
@@ -882,49 +1182,9 @@ impl AtomicTokenService {
             ))
         })?;
         if final_replayed_state_hash != final_expected_state_hash {
-            let final_legacy_state_hash = staged_state
-                .get_legacy_state_hash_at_block_without_processed_ops(final_replayed_block_hash)
-                .ok_or_else(|| {
-                    AtomicTokenError::Processing(format!(
-                        "startup state revalidation failed: unable to compute legacy retained state hash at block `{final_replayed_block_hash}`"
-                    ))
-                })?;
-            if final_legacy_state_hash == final_expected_state_hash {
-                migrated_legacy_hashes = matching_prefix_len;
-                refresh_checkpoint_hashes = true;
-                info!(
-                    "[{IDENT}] Cryptix Atomic retained state hash checkpoints use the legacy pre-processed-ops hash format; final retained block verified, migrating {} checkpoint(s)",
-                    migrated_legacy_hashes
-                );
-            } else {
-                let recomputed_hashes = loaded_state.recompute_state_hashes_for_retained_segment(&expected_chain)?;
-                let recomputed_final_state_hash = recomputed_hashes.get(&final_replayed_block_hash).copied().ok_or_else(|| {
-                    AtomicTokenError::Processing(format!(
-                        "startup state revalidation failed: unable to recompute retained state hash for final block `{final_replayed_block_hash}`"
-                    ))
-                })?;
-                if recomputed_final_state_hash == final_replayed_state_hash {
-                    let stale_checkpoint_count = expected_chain
-                        .iter()
-                        .filter(|block_hash| {
-                            expected_hashes.get(block_hash).copied()
-                                != recomputed_hashes.get(block_hash).copied()
-                        })
-                        .count();
-                    refresh_checkpoint_hashes = true;
-                    warn!(
-                        "[{IDENT}] Cryptix Atomic startup state revalidation found {} stale retained checkpoint hash(es) after processed-op pruning; deterministic replay matched the recomputed pruned final checkpoint {}, so refreshing checkpoint cache. stored={}, replayed={}",
-                        stale_checkpoint_count,
-                        final_replayed_block_hash,
-                        short_hex_for_log(&final_expected_state_hash),
-                        short_hex_for_log(&final_replayed_state_hash)
-                    );
-                } else {
-                    return Err(AtomicTokenError::Processing(format!(
-                        "startup state revalidation failed: retained state hash mismatch at final retained block `{final_replayed_block_hash}`"
-                    )));
-                }
-            }
+            return Err(AtomicTokenError::Processing(format!(
+                "startup state revalidation failed: retained state hash mismatch at final retained block `{final_replayed_block_hash}`"
+            )));
         } else {
             let mut stale_checkpoint_count = 0usize;
             let mut first_stale_checkpoint = None;
@@ -955,59 +1215,47 @@ impl AtomicTokenService {
                 }
             }
             if let Some((block_hash, stored_hash, replayed_hash)) = first_stale_checkpoint {
-                let legacy_hash_matches = staged_state
-                    .get_legacy_state_hash_at_block_without_processed_ops(block_hash)
-                    .map(|legacy_hash| legacy_hash == stored_hash)
-                    .unwrap_or(false);
-                refresh_checkpoint_hashes = true;
-                warn!(
-                    "[{IDENT}] Cryptix Atomic startup state revalidation found {} stale retained checkpoint hash(es); final retained checkpoint {} matched deterministic replay, so refreshing checkpoint cache. first_mismatch={}, stored={}, replayed={}, legacy_format_match={}",
+                return Err(AtomicTokenError::Processing(format!(
+                    "startup state revalidation failed: retained state hash mismatch at block `{block_hash}` ({} stale checkpoint(s), stored={}, replayed={})",
                     stale_checkpoint_count,
-                    final_replayed_block_hash,
-                    block_hash,
                     short_hex_for_log(&stored_hash),
-                    short_hex_for_log(&replayed_hash),
-                    legacy_hash_matches
-                );
+                    short_hex_for_log(&replayed_hash)
+                )));
             } else {
                 info!(
                     "[{IDENT}] Cryptix Atomic startup state revalidation verified {} retained state hash checkpoint(s)",
                     matching_prefix_len
                 );
             }
-            if refresh_checkpoint_hashes {
-                info!(
-                    "[{IDENT}] Cryptix Atomic startup state revalidation verified final retained checkpoint {}; checkpoint cache will be refreshed from deterministic replay",
-                    final_replayed_block_hash
-                );
-            } else {
-                info!(
-                    "[{IDENT}] Cryptix Atomic startup state revalidation verified final retained checkpoint {}",
-                    final_replayed_block_hash
-                );
-            }
-        }
-        if migrated_legacy_hashes > 0 {
             info!(
-                "[{IDENT}] migrated {} retained Atomic state hash checkpoint(s) from legacy pre-processed-ops hash format",
-                migrated_legacy_hashes
+                "[{IDENT}] Cryptix Atomic startup state revalidation verified final retained checkpoint {}",
+                final_replayed_block_hash
             );
         }
-
-        let pruned_processed_ops = staged_state.prune_history(self.max_retained_blocks);
-        if refresh_checkpoint_hashes || pruned_processed_ops {
-            let refreshed_count = staged_state.refresh_retained_state_hashes_from_current_state()?;
-            info!(
-                "[{IDENT}] Cryptix Atomic refreshed {} retained checkpoint hash(es) after deterministic replay/pruning",
-                refreshed_count
-            );
-        }
-        staged_state.degraded = false;
-        staged_state.live_correct = true;
+        drop(staged_state);
 
         let mut state = self.processor.state.lock().await;
-        *state = staged_state;
-        persist_state_to_path(&self.processor.state_path, &state)?;
+        if let Some(pruned) = state.prune_history_with_details(self.max_retained_blocks) {
+            self.processor.state_store.prune_history(
+                &pruned.pruned_hashes,
+                &state.applied_chain_order,
+                pruned.last_pruned_event_sequence,
+            )?;
+            if pruned.pruned_processed_ops {
+                info!("[{IDENT}] Cryptix Atomic pruned processed-op guard entries after startup state revalidation");
+            }
+        }
+        state.degraded = false;
+        state.live_correct = true;
+
+        self.processor.state_store.persist_runtime_flags(
+            state.applied_chain_order.last().copied(),
+            state.applied_chain_order.len() as u64,
+            state.degraded,
+            state.next_event_sequence,
+        )?;
+        drop(state);
+        let _ = std::fs::remove_dir_all(temp_state_dir);
         Ok(true)
     }
 
@@ -1103,7 +1351,7 @@ impl AtomicTokenService {
         let anchor_hash_bytes = hash_to_array(anchor_hash);
         let already_present = {
             let state = self.processor.state.lock().await;
-            let local_anchor_state_hash = state.materialize_view_at_block(anchor_hash).map(|view| view.state_hash);
+            let local_anchor_state_hash = state.get_state_hash_at_block(anchor_hash);
             list_snapshot_catalog(&self.snapshot_store_dir)?.into_iter().any(|entry| {
                 entry.manifest.protocol_version == self.protocol_version
                     && entry.manifest.network_id == self.network_id
@@ -1148,7 +1396,12 @@ impl AtomicTokenService {
             .collect::<Vec<_>>();
         if sources.is_empty() {
             if let Some(err) = refresh_error {
-                info!("[{IDENT}] Atomic bootstrap snapshot currently unavailable: {err}");
+                let err = err.to_string();
+                if err.contains("finality depth sanity check failed") {
+                    debug!("[{IDENT}] Atomic bootstrap snapshot not finality-safe yet: {err}");
+                } else {
+                    info!("[{IDENT}] Atomic bootstrap snapshot currently unavailable: {err}");
+                }
             }
         }
         sources.sort_by(|a, b| b.at_daa_score.cmp(&a.at_daa_score).then(b.at_block_hash.as_bytes().cmp(&a.at_block_hash.as_bytes())));
@@ -1258,46 +1511,94 @@ impl AtomicTokenService {
         let _operation_guard = self.processor.operation_lock.lock().await;
         let (anchor_hash, anchor_daa_score) = self.current_snapshot_anchor().await?;
 
-        let snapshot = {
-            let state = self.processor.state.lock().await;
-            let anchor_index = state.applied_chain_order.iter().position(|hash| *hash == anchor_hash).ok_or_else(|| {
-                AtomicTokenError::Processing(
-                    "snapshot export failed: snapshot anchor not found in local Atomic chain order".to_string(),
-                )
+        let temp_state_dir = unique_atomic_temp_dir("snapshot-export");
+        self.processor.state_store.checkpoint_to(&temp_state_dir)?;
+        let temp_state_store = Arc::new(AtomicStorageV2::open(
+            &temp_state_dir,
+            self.protocol_version,
+            self.network_id.clone(),
+            self.genesis_hash,
+        )?);
+        let mut state = temp_state_store.load_runtime_state()?.ok_or_else(|| {
+            AtomicTokenError::Processing("snapshot export failed: no persisted Atomic V2 state is available".to_string())
+        })?;
+        state.attach_state_store(temp_state_store.clone());
+        state.rollback_to_block_persisted(anchor_hash)?;
+
+        let anchor_index = state.applied_chain_order.iter().position(|hash| *hash == anchor_hash).ok_or_else(|| {
+            AtomicTokenError::Processing("snapshot export failed: snapshot anchor not found in local Atomic chain order".to_string())
+        })?;
+        let start_index = anchor_index.saturating_sub(self.replay_overlap.saturating_sub(1));
+        let window_blocks = state.applied_chain_order[start_index..=anchor_index].to_vec();
+        let window_start_block_hash = *window_blocks.first().ok_or_else(|| {
+            AtomicTokenError::Processing("snapshot export failed: empty replay window".to_string())
+        })?;
+        let window_start_parent_block_hash =
+            if start_index > 0 { state.applied_chain_order[start_index - 1] } else { self.genesis_hash };
+        let state_hash_at_window_start_parent = if start_index > 0 {
+            state.state_hash_by_block.get(&window_start_parent_block_hash).copied()
+        } else {
+            None
+        };
+        let state_hash_at_fp = state.compute_state_hash();
+        let mut journals_in_window = Vec::with_capacity(window_blocks.len());
+        for block_hash in window_blocks.iter().copied() {
+            let journal = state.block_journals.get(&block_hash).cloned().ok_or_else(|| {
+                AtomicTokenError::Processing(format!("snapshot export failed: missing journal for replay block `{block_hash}`"))
             })?;
-            let start_index = anchor_index.saturating_sub(self.replay_overlap.saturating_sub(1));
-            let window_blocks = state.applied_chain_order[start_index..=anchor_index].to_vec();
-            let window_start_parent_block_hash =
-                if start_index > 0 { state.applied_chain_order[start_index - 1] } else { self.genesis_hash };
-            state.export_snapshot(anchor_hash, anchor_daa_score, window_start_parent_block_hash, &window_blocks)?
+            journals_in_window.push((block_hash, journal));
+        }
+        let counts = temp_state_store.snapshot_counts()?;
+        let header = SnapshotFileHeaderV2 {
+            schema_version: crate::state::SNAPSHOT_SCHEMA_VERSION,
+            protocol_version: self.protocol_version,
+            network_id: self.network_id.clone(),
+            at_block_hash: anchor_hash,
+            at_daa_score: anchor_daa_score,
+            state_hash_at_fp,
+            state_hash_at_window_start_parent,
+            window_start_block_hash,
+            window_start_parent_block_hash,
+            window_end_block_hash: anchor_hash,
+            next_event_sequence: state.next_event_sequence,
+            counts,
         };
 
-        let bytes = bincode::serialize(&snapshot).map_err(|e| AtomicTokenError::Processing(format!("snapshot encode failed: {e}")))?;
-        let replay_window_bytes = encode_replay_window_transfer(&snapshot)?;
-        validate_snapshot_blob_size_limits(bytes.len() as u64, replay_window_bytes.len() as u64, "snapshot export")?;
-        std::fs::write(path.as_ref(), &bytes).map_err(|e| AtomicTokenError::Processing(format!("snapshot write failed: {e}")))?;
-        std::fs::write(snapshot_replay_path(path.as_ref()), &replay_window_bytes)
-            .map_err(|e| AtomicTokenError::Processing(format!("snapshot replay write failed: {e}")))?;
+        let snapshot_path = path.as_ref();
+        write_snapshot_file_from_store(snapshot_path, &header, &temp_state_store)?;
+        let replay_path = snapshot_replay_path(snapshot_path);
+        write_replay_window_transfer_parts(
+            header.protocol_version,
+            &header.network_id,
+            header.window_start_block_hash,
+            header.window_end_block_hash,
+            &journals_in_window,
+            &replay_path,
+        )?;
 
-        let manifest = build_snapshot_manifest(path.as_ref(), &bytes, &replay_window_bytes, &snapshot)?;
+        let manifest = build_snapshot_manifest_from_files_v2(snapshot_path, &replay_path, &header)?;
         let manifest_bytes =
             borsh::to_vec(&manifest).map_err(|e| AtomicTokenError::Processing(format!("snapshot manifest encode failed: {e}")))?;
-        std::fs::write(snapshot_manifest_path(path.as_ref()), manifest_bytes)
+        std::fs::write(snapshot_manifest_path(snapshot_path), manifest_bytes)
             .map_err(|e| AtomicTokenError::Processing(format!("snapshot manifest write failed: {e}")))?;
 
         // Keep a bootstrap-store copy so peers can serve this snapshot via getSc* APIs.
         let store_snapshot_path = self.snapshot_store_dir.join(&manifest.snapshot_file_name);
-        if store_snapshot_path != path.as_ref() {
-            std::fs::write(&store_snapshot_path, &bytes)
-                .map_err(|e| AtomicTokenError::Processing(format!("snapshot store write failed: {e}")))?;
-            std::fs::write(snapshot_replay_path(&store_snapshot_path), &replay_window_bytes)
-                .map_err(|e| AtomicTokenError::Processing(format!("snapshot store replay write failed: {e}")))?;
-            let store_manifest = build_snapshot_manifest(&store_snapshot_path, &bytes, &replay_window_bytes, &snapshot)?;
+        if store_snapshot_path != snapshot_path {
+            std::fs::copy(snapshot_path, &store_snapshot_path)
+                .map_err(|e| AtomicTokenError::Processing(format!("snapshot store copy failed: {e}")))?;
+            let store_replay_path = snapshot_replay_path(&store_snapshot_path);
+            std::fs::copy(&replay_path, &store_replay_path)
+                .map_err(|e| AtomicTokenError::Processing(format!("snapshot store replay copy failed: {e}")))?;
+            let store_manifest = build_snapshot_manifest_from_files_v2(&store_snapshot_path, &store_replay_path, &header)?;
             let store_manifest_bytes = borsh::to_vec(&store_manifest)
                 .map_err(|e| AtomicTokenError::Processing(format!("snapshot store manifest encode failed: {e}")))?;
             std::fs::write(snapshot_manifest_path(&store_snapshot_path), store_manifest_bytes)
                 .map_err(|e| AtomicTokenError::Processing(format!("snapshot store manifest write failed: {e}")))?;
         }
+        drop(state);
+        drop(temp_state_store);
+        let _ = std::fs::remove_dir_all(temp_state_dir);
         let _ = self.prune_bootstrap_snapshot_store();
         Ok(())
     }
@@ -1306,17 +1607,33 @@ impl AtomicTokenService {
         let _operation_guard = self.processor.operation_lock.lock().await;
         self.processor.set_bootstrap_in_progress(true);
         let import_result: AtomicTokenResult<()> = async {
-            let bytes =
-                std::fs::read(path.as_ref()).map_err(|e| AtomicTokenError::Processing(format!("snapshot read failed: {e}")))?;
-            validate_snapshot_manifest(path.as_ref(), &bytes, self.protocol_version, &self.network_id)?;
-            let snapshot: AtomicTokenSnapshot =
-                bincode::deserialize(&bytes).map_err(|e| AtomicTokenError::Processing(format!("snapshot decode failed: {e}")))?;
+            let path_ref = path.as_ref();
+            let snapshot_size = std::fs::metadata(path_ref)
+                .map_err(|e| AtomicTokenError::Processing(format!("snapshot metadata read failed: {e}")))?
+                .len();
+            validate_snapshot_blob_size_limits(snapshot_size, 0, "snapshot import")?;
+            info!(
+                "[{IDENT}] Atomic snapshot import verifying manifest and snapshot file: path={}, bytes={}",
+                path_ref.display(),
+                snapshot_size
+            );
+            let validated_snapshot = validate_snapshot_manifest_and_decode(path_ref, self.protocol_version, &self.network_id)?;
+            let snapshot_header = validated_snapshot.header.clone();
+            let snapshot_at_block_hash = snapshot_header.at_block_hash;
+            let snapshot_state_hash_at_fp = snapshot_header.state_hash_at_fp;
+            let snapshot_state_hash_at_window_start_parent = snapshot_header.state_hash_at_window_start_parent;
+            let snapshot_window_start_block_hash = snapshot_header.window_start_block_hash;
+            let snapshot_window_start_parent_hash = snapshot_header.window_start_parent_block_hash;
+            info!(
+                "[{IDENT}] Atomic snapshot import decoded: anchor={}, window_start={}, parent={}",
+                snapshot_at_block_hash, snapshot_window_start_block_hash, snapshot_window_start_parent_hash
+            );
 
             let consensus = self.processor.consensus_manager.consensus();
             let session = consensus.session().await;
             let sink = session.async_get_sink().await;
             let fp = session.async_finality_point().await;
-            let is_ancestor = session.async_is_chain_ancestor_of(snapshot.at_block_hash, sink).await?;
+            let is_ancestor = session.async_is_chain_ancestor_of(snapshot_at_block_hash, sink).await?;
             if !is_ancestor {
                 return Err(AtomicTokenError::Processing(
                     "snapshot import failed: snapshot at_block_hash is not ancestor of current sink".to_string(),
@@ -1324,11 +1641,11 @@ impl AtomicTokenService {
             }
             let sink_header = session.async_get_header(sink).await?;
             if !self.unsafe_skip_snapshot_finality_check {
-                let finalized_by_current_fp = session.async_is_chain_ancestor_of(snapshot.at_block_hash, fp).await?;
+                let finalized_by_current_fp = session.async_is_chain_ancestor_of(snapshot_at_block_hash, fp).await?;
                 if !finalized_by_current_fp {
                     return Err(AtomicTokenError::Processing(format!(
                         "snapshot import failed: at_block_hash `{}` is not finalized by current finality point `{}`",
-                        snapshot.at_block_hash, fp
+                        snapshot_at_block_hash, fp
                     )));
                 }
                 let fp_header = session.async_get_header(fp).await?;
@@ -1339,18 +1656,23 @@ impl AtomicTokenService {
                 }
             }
 
-            let replay_chain = session.async_get_virtual_chain_from_block(snapshot.window_start_parent_block_hash, None).await?;
+            let replay_chain = session.async_get_virtual_chain_from_block(snapshot_window_start_parent_hash, None).await?;
             if !replay_chain.removed.is_empty() {
                 return Err(AtomicTokenError::Processing(
                     "snapshot import failed: expected empty removed chain for replay path".to_string(),
                 ));
             }
 
-            if replay_chain.added.first().copied().map(|first| first != snapshot.window_start_block_hash).unwrap_or(true) {
+            if replay_chain.added.first().copied().map(|first| first != snapshot_window_start_block_hash).unwrap_or(true) {
                 return Err(AtomicTokenError::Processing(
                     "snapshot import failed: replay path does not start with snapshot window_start_block_hash".to_string(),
                 ));
             }
+            let replay_total = replay_chain.added.len();
+            info!(
+                "[{IDENT}] Atomic snapshot import replay path ready: {} block(s) from {} to current sink {}",
+                replay_total, snapshot_window_start_block_hash, sink
+            );
 
             let acceptance_data = session.async_get_blocks_acceptance_data(replay_chain.added.clone(), None).await?;
             if acceptance_data.len() != replay_chain.added.len() {
@@ -1362,11 +1684,19 @@ impl AtomicTokenService {
             }
 
             // Stage snapshot import and deterministic replay off-line, then swap into live state only if fully verified.
-            let mut staged_state = { self.processor.state.lock().await.clone() };
-            staged_state.import_snapshot(snapshot.clone())?;
-            staged_state.rollback_snapshot_window_to_parent(snapshot.window_start_block_hash)?;
+            let temp_state_dir = unique_atomic_temp_dir("snapshot-import");
+            let _temp_state_cleanup = RemoveDirOnDrop::new(temp_state_dir.clone());
+            let temp_state_store = Arc::new(AtomicStorageV2::open(
+                &temp_state_dir,
+                self.protocol_version,
+                self.network_id.clone(),
+                self.genesis_hash,
+            )?);
+            let mut staged_state = import_snapshot_file_into_store(path_ref, &validated_snapshot, temp_state_store.clone())?;
+            staged_state.set_payload_hf_activation_daa_score(self.payload_hf_activation_daa_score);
+            staged_state.rollback_snapshot_window_to_parent_persisted(snapshot_window_start_block_hash)?;
             let mut window_start_parent_hash_mismatch = false;
-            if let Some(expected_hash) = snapshot.state_hash_at_window_start_parent {
+            if let Some(expected_hash) = snapshot_state_hash_at_window_start_parent {
                 let current_hash = staged_state.compute_state_hash();
                 if current_hash != expected_hash {
                     window_start_parent_hash_mismatch = true;
@@ -1378,7 +1708,9 @@ impl AtomicTokenService {
                 }
             }
 
-            for (accepting_block_hash, acceptance) in replay_chain.added.into_iter().zip(acceptance_data.into_iter()) {
+            let mut last_import_replay_log = Instant::now();
+            for (idx, (accepting_block_hash, acceptance)) in replay_chain.added.into_iter().zip(acceptance_data.into_iter()).enumerate()
+            {
                 let utxo_diff = session.async_get_block_utxo_diff(accepting_block_hash).await?;
                 let auth_inputs: HashMap<TransactionOutpoint, UtxoEntry> =
                     utxo_diff.remove.iter().map(|(outpoint, entry)| (*outpoint, entry.clone())).collect();
@@ -1397,9 +1729,9 @@ impl AtomicTokenService {
                     )));
                 }
 
-                if accepting_block_hash == snapshot.at_block_hash {
+                if accepting_block_hash == snapshot_at_block_hash {
                     let current_hash = staged_state.compute_state_hash();
-                    if current_hash != snapshot.state_hash_at_fp {
+                    if current_hash != snapshot_state_hash_at_fp {
                         return Err(AtomicTokenError::Processing(
                             "snapshot import failed: state hash mismatch at snapshot finality point".to_string(),
                         ));
@@ -1407,26 +1739,39 @@ impl AtomicTokenService {
                     if window_start_parent_hash_mismatch {
                         info!(
                             "[{IDENT}] Atomic snapshot parent checkpoint mismatch ignored after deterministic replay matched snapshot anchor {}",
-                            snapshot.at_block_hash
+                            snapshot_at_block_hash
                         );
                     }
                 }
+                if replay_total >= 1024
+                    && (last_import_replay_log.elapsed() >= ATOMIC_LONG_OPERATION_LOG_INTERVAL || idx + 1 == replay_total)
+                {
+                    info!(
+                        "[{IDENT}] Atomic snapshot import replay progress: {}/{} block(s)",
+                        idx + 1,
+                        replay_total
+                    );
+                    last_import_replay_log = Instant::now();
+                }
             }
 
-            let pruned_processed_ops = staged_state.prune_history(self.max_retained_blocks);
-            if pruned_processed_ops {
-                let refreshed_count = staged_state.refresh_retained_state_hashes_from_current_state()?;
-                info!(
-                    "[{IDENT}] Cryptix Atomic refreshed {} retained checkpoint hash(es) after snapshot import pruning",
-                    refreshed_count
-                );
+            if let Some(pruned) = staged_state.prune_history_with_details(self.max_retained_blocks) {
+                temp_state_store.prune_history(
+                    &pruned.pruned_hashes,
+                    &staged_state.applied_chain_order,
+                    pruned.last_pruned_event_sequence,
+                )?;
+                if pruned.pruned_processed_ops {
+                    info!("[{IDENT}] Cryptix Atomic pruned processed-op guard entries after snapshot import");
+                }
             }
             staged_state.live_correct = !staged_state.degraded;
+            let active_state =
+                copy_snapshot_store_into_active(&temp_state_store, self.processor.state_store.clone(), staged_state)?;
             {
                 let mut live_state = self.processor.state.lock().await;
-                *live_state = staged_state;
+                *live_state = active_state;
             }
-            self.processor.persist_state().await?;
             Ok(())
         }
         .await;
@@ -1506,6 +1851,7 @@ fn snapshot_replay_path(snapshot_path: &Path) -> PathBuf {
     snapshot_path.with_extension("replay.bin")
 }
 
+#[cfg(test)]
 fn hash_snapshot_bytes(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Blake2bParams::new().hash_length(32).to_state();
     hasher.update(SNAPSHOT_MANIFEST_DOMAIN);
@@ -1523,6 +1869,7 @@ fn hash_chunk_bytes(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
+#[cfg(test)]
 fn chunk_hashes(bytes: &[u8], chunk_size: usize) -> Vec<[u8; 32]> {
     if bytes.is_empty() {
         return Vec::new();
@@ -1538,6 +1885,44 @@ fn chunk_hashes(bytes: &[u8], chunk_size: usize) -> Vec<[u8; 32]> {
     hashes
 }
 
+fn hash_file_and_chunks(path: &Path, chunk_size: usize, label: &str) -> AtomicTokenResult<(u64, [u8; 32], Vec<[u8; 32]>)> {
+    if chunk_size == 0 {
+        return Err(AtomicTokenError::Processing(format!("{label} failed: chunk size must be greater than zero")));
+    }
+    if chunk_size > SNAPSHOT_CHUNK_SIZE_MAX {
+        return Err(AtomicTokenError::Processing(format!(
+            "{label} failed: chunk size `{chunk_size}` exceeds maximum `{SNAPSHOT_CHUNK_SIZE_MAX}`"
+        )));
+    }
+
+    let mut file =
+        File::open(path).map_err(|e| AtomicTokenError::Processing(format!("{label} failed: open `{}`: {e}", path.display())))?;
+    let mut whole_hasher = Blake2bParams::new().hash_length(32).to_state();
+    whole_hasher.update(SNAPSHOT_MANIFEST_DOMAIN);
+
+    let mut buf = vec![0u8; chunk_size];
+    let mut total_size = 0u64;
+    let mut chunks = Vec::new();
+    loop {
+        let read = file
+            .read(&mut buf)
+            .map_err(|e| AtomicTokenError::Processing(format!("{label} failed: read `{}`: {e}", path.display())))?;
+        if read == 0 {
+            break;
+        }
+        total_size = total_size
+            .checked_add(read as u64)
+            .ok_or_else(|| AtomicTokenError::Processing(format!("{label} failed: file size overflow")))?;
+        whole_hasher.update(&buf[..read]);
+        chunks.push(hash_chunk_bytes(&buf[..read]));
+    }
+
+    let digest = whole_hasher.finalize();
+    let mut whole_hash = [0u8; 32];
+    whole_hash.copy_from_slice(digest.as_bytes());
+    Ok((total_size, whole_hash, chunks))
+}
+
 fn verify_chunk_hash(chunk_data: &[u8], expected_hashes: &[[u8; 32]], chunk_index: u32) -> AtomicTokenResult<()> {
     let idx = chunk_index as usize;
     let expected = expected_hashes
@@ -1550,15 +1935,82 @@ fn verify_chunk_hash(chunk_data: &[u8], expected_hashes: &[[u8; 32]], chunk_inde
     Ok(())
 }
 
-fn encode_replay_window_transfer(snapshot: &AtomicTokenSnapshot) -> AtomicTokenResult<Vec<u8>> {
-    bincode::serialize(&ReplayWindowTransferV1 {
-        protocol_version: snapshot.protocol_version,
-        network_id: snapshot.network_id.clone(),
-        window_start_block_hash: hash_to_array(snapshot.window_start_block_hash),
-        window_end_block_hash: hash_to_array(snapshot.window_end_block_hash),
-        journals_in_window: snapshot.journals_in_window.clone(),
-    })
-    .map_err(|e| AtomicTokenError::Processing(format!("failed encoding replay window transfer: {e}")))
+fn write_snapshot_file_from_store(
+    path: &Path,
+    header: &SnapshotFileHeaderV2,
+    store: &AtomicStorageV2,
+) -> AtomicTokenResult<()> {
+    let file = File::create(path)
+        .map_err(|e| AtomicTokenError::Processing(format!("snapshot write failed: create `{}`: {e}", path.display())))?;
+    let mut writer = BufWriter::new(file);
+    bincode::serialize_into(&mut writer, header)
+        .map_err(|e| AtomicTokenError::Processing(format!("snapshot header encode failed: {e}")))?;
+    store.visit_all_state_hashes(|block_hash, state_hash| {
+        bincode::serialize_into(&mut writer, &(block_hash, state_hash))
+            .map_err(|e| AtomicTokenError::Processing(format!("snapshot state hash encode failed: {e}")))
+    })?;
+    store.visit_all_event_sequences(|block_hash, sequence| {
+        bincode::serialize_into(&mut writer, &(block_hash, sequence))
+            .map_err(|e| AtomicTokenError::Processing(format!("snapshot event sequence encode failed: {e}")))
+    })?;
+    store.visit_all_chain_order(|index, block_hash| {
+        bincode::serialize_into(&mut writer, &(index, block_hash))
+            .map_err(|e| AtomicTokenError::Processing(format!("snapshot chain order encode failed: {e}")))
+    })?;
+    store.visit_all_events(|event| {
+        bincode::serialize_into(&mut writer, &event)
+            .map_err(|e| AtomicTokenError::Processing(format!("snapshot event encode failed: {e}")))
+    })?;
+    store.visit_all_assets(|asset_id, asset| {
+        bincode::serialize_into(&mut writer, &(asset_id, asset))
+            .map_err(|e| AtomicTokenError::Processing(format!("snapshot asset encode failed: {e}")))
+    })?;
+    store.visit_all_balances(|key, amount| {
+        bincode::serialize_into(&mut writer, &(key, amount))
+            .map_err(|e| AtomicTokenError::Processing(format!("snapshot balance encode failed: {e}")))
+    })?;
+    store.visit_all_nonces(|key, nonce| {
+        bincode::serialize_into(&mut writer, &(key, nonce))
+            .map_err(|e| AtomicTokenError::Processing(format!("snapshot nonce encode failed: {e}")))
+    })?;
+    store.visit_all_anchor_counts(|owner_id, count| {
+        bincode::serialize_into(&mut writer, &(owner_id, count))
+            .map_err(|e| AtomicTokenError::Processing(format!("snapshot anchor count encode failed: {e}")))
+    })?;
+    store.visit_all_processed_ops(|txid, op| {
+        bincode::serialize_into(&mut writer, &(txid, op))
+            .map_err(|e| AtomicTokenError::Processing(format!("snapshot processed-op encode failed: {e}")))
+    })?;
+    writer
+        .flush()
+        .map_err(|e| AtomicTokenError::Processing(format!("snapshot write failed: flush `{}`: {e}", path.display())))?;
+    Ok(())
+}
+
+fn write_replay_window_transfer_parts(
+    protocol_version: u16,
+    network_id: &str,
+    window_start_block_hash: BlockHash,
+    window_end_block_hash: BlockHash,
+    journals_in_window: &[(BlockHash, crate::state::BlockJournal)],
+    path: &Path,
+) -> AtomicTokenResult<()> {
+    let file = File::create(path)
+        .map_err(|e| AtomicTokenError::Processing(format!("snapshot replay write failed: create `{}`: {e}", path.display())))?;
+    let mut writer = BufWriter::new(file);
+    let transfer = ReplayWindowTransferV2Ref {
+        protocol_version,
+        network_id,
+        window_start_block_hash: hash_to_array(window_start_block_hash),
+        window_end_block_hash: hash_to_array(window_end_block_hash),
+        journals_in_window,
+    };
+    bincode::serialize_into(&mut writer, &transfer)
+        .map_err(|e| AtomicTokenError::Processing(format!("failed encoding replay window transfer: {e}")))?;
+    writer
+        .flush()
+        .map_err(|e| AtomicTokenError::Processing(format!("snapshot replay write failed: flush `{}`: {e}", path.display())))?;
+    Ok(())
 }
 
 fn validate_snapshot_blob_size_limits(snapshot_size: u64, replay_size: u64, context: &str) -> AtomicTokenResult<()> {
@@ -1598,12 +2050,425 @@ fn hash_to_array(hash: BlockHash) -> [u8; 32] {
     hash.as_bytes()
 }
 
+fn build_snapshot_manifest_from_files_v2(
+    path: &Path,
+    replay_path: &Path,
+    header: &SnapshotFileHeaderV2,
+) -> AtomicTokenResult<SnapshotManifestV2> {
+    let snapshot_file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AtomicTokenError::Processing("snapshot export failed: invalid snapshot file name".to_string()))?
+        .to_string();
+    let snapshot_chunk_size = SNAPSHOT_CHUNK_SIZE_DEFAULT as u32;
+    let replay_window_chunk_size = SNAPSHOT_CHUNK_SIZE_DEFAULT as u32;
+    let (snapshot_file_size, snapshot_file_hash, snapshot_chunk_hashes) =
+        hash_file_and_chunks(path, snapshot_chunk_size as usize, "snapshot export")?;
+    let (replay_window_size, replay_window_hash, replay_window_chunk_hashes) =
+        hash_file_and_chunks(replay_path, replay_window_chunk_size as usize, "snapshot replay export")?;
+    validate_snapshot_blob_size_limits(snapshot_file_size, replay_window_size, "snapshot export")?;
+    Ok(SnapshotManifestV2 {
+        schema_version: header.schema_version,
+        protocol_version: header.protocol_version,
+        network_id: header.network_id.clone(),
+        snapshot_file_name,
+        snapshot_file_size,
+        snapshot_file_hash,
+        snapshot_chunk_size,
+        snapshot_chunk_hashes,
+        replay_window_size,
+        replay_window_hash,
+        replay_window_chunk_size,
+        replay_window_chunk_hashes,
+        at_block_hash: hash_to_array(header.at_block_hash),
+        at_daa_score: header.at_daa_score,
+        state_hash_at_fp: header.state_hash_at_fp,
+        state_hash_at_window_start_parent: header.state_hash_at_window_start_parent,
+        window_start_block_hash: hash_to_array(header.window_start_block_hash),
+        window_start_parent_block_hash: hash_to_array(header.window_start_parent_block_hash),
+        window_end_block_hash: hash_to_array(header.window_end_block_hash),
+    })
+}
+
+#[derive(Default)]
+struct SnapshotStateImportChunk {
+    assets: Vec<([u8; 32], Option<TokenAsset>)>,
+    balances: Vec<(BalanceKey, Option<u128>)>,
+    nonces: Vec<(NonceKey, Option<u64>)>,
+    anchor_counts: Vec<([u8; 32], Option<u64>)>,
+    processed_ops: Vec<(BlockHash, Option<ProcessedOp>)>,
+}
+
+impl SnapshotStateImportChunk {
+    fn len(&self) -> usize {
+        self.assets.len()
+            + self.balances.len()
+            + self.nonces.len()
+            + self.anchor_counts.len()
+            + self.processed_ops.len()
+    }
+
+    fn flush_if_full(&mut self, store: &AtomicStorageV2) -> AtomicTokenResult<()> {
+        if self.len() >= SNAPSHOT_IMPORT_CHUNK_KEYS {
+            self.flush(store)?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, store: &AtomicStorageV2) -> AtomicTokenResult<()> {
+        if self.len() == 0 {
+            return Ok(());
+        }
+        let assets = std::mem::take(&mut self.assets);
+        let balances = std::mem::take(&mut self.balances);
+        let nonces = std::mem::take(&mut self.nonces);
+        let anchor_counts = std::mem::take(&mut self.anchor_counts);
+        let processed_ops = std::mem::take(&mut self.processed_ops);
+        store.apply_current_state_delta(assets, balances, nonces, anchor_counts, processed_ops)?;
+        Ok(())
+    }
+}
+
+struct RemoveDirOnDrop {
+    path: PathBuf,
+}
+
+impl RemoveDirOnDrop {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn read_snapshot_record<T: serde::de::DeserializeOwned>(
+    reader: &mut BufReader<File>,
+    label: &str,
+) -> AtomicTokenResult<T> {
+    bincode::deserialize_from(reader)
+        .map_err(|e| AtomicTokenError::Processing(format!("snapshot import failed: {label} decode failed: {e}")))
+}
+
+fn count_to_usize(count: u64, label: &str) -> AtomicTokenResult<usize> {
+    usize::try_from(count)
+        .map_err(|_| AtomicTokenError::Processing(format!("snapshot import failed: {label} count does not fit in usize")))
+}
+
+fn expected_processed_ops_for_replay_window(
+    replay_window: &ReplayWindowTransferV2,
+) -> AtomicTokenResult<(HashMap<BlockHash, ProcessedOp>, HashSet<BlockHash>)> {
+    let mut expected_processed_ops = HashMap::new();
+    let mut accepting_blocks_in_window = HashSet::new();
+    for (accepting_block_hash, journal) in replay_window.journals_in_window.iter() {
+        accepting_blocks_in_window.insert(*accepting_block_hash);
+        if journal.added_processed_ops.len() != journal.tx_results.len() {
+            return Err(AtomicTokenError::Processing(format!(
+                "snapshot import failed: journal tx-result length mismatch for block `{accepting_block_hash}`"
+            )));
+        }
+        for (txid, tx_result) in journal.added_processed_ops.iter().copied().zip(journal.tx_results.iter()) {
+            if tx_result.txid != txid {
+                return Err(AtomicTokenError::Processing(format!(
+                    "snapshot import failed: journal txid mismatch for block `{accepting_block_hash}`"
+                )));
+            }
+            let expected = ProcessedOp {
+                accepting_block_hash: *accepting_block_hash,
+                apply_status: tx_result.apply_status,
+                noop_reason: tx_result.noop_reason,
+            };
+            if expected_processed_ops.insert(txid, expected).is_some() {
+                return Err(AtomicTokenError::Processing(format!(
+                    "snapshot import failed: duplicate processed txid `{txid}` in rollback window journals"
+                )));
+            }
+        }
+    }
+    Ok((expected_processed_ops, accepting_blocks_in_window))
+}
+
+fn validate_snapshot_runtime_header(
+    state: &AtomicTokenState,
+    header: &SnapshotFileHeaderV2,
+    replay_window: &ReplayWindowTransferV2,
+) -> AtomicTokenResult<()> {
+    if header.schema_version != crate::state::SNAPSHOT_SCHEMA_VERSION {
+        return Err(AtomicTokenError::SnapshotSchemaMismatch {
+            expected: crate::state::SNAPSHOT_SCHEMA_VERSION,
+            actual: header.schema_version,
+        });
+    }
+    if header.window_end_block_hash != header.at_block_hash {
+        return Err(AtomicTokenError::Processing(
+            "snapshot import failed: window_end_block_hash must equal at_block_hash".to_string(),
+        ));
+    }
+    if state.applied_chain_order.last().copied() != Some(header.at_block_hash) {
+        return Err(AtomicTokenError::Processing(
+            "snapshot import failed: applied_chain_order must end at at_block_hash".to_string(),
+        ));
+    }
+    let expected_len = state.applied_chain_order.len();
+    let unique_blocks: HashSet<BlockHash> = state.applied_chain_order.iter().copied().collect();
+    if unique_blocks.len() != expected_len {
+        return Err(AtomicTokenError::Processing(
+            "snapshot import failed: applied_chain_order contains duplicate block hashes".to_string(),
+        ));
+    }
+    if state.state_hash_by_block.len() != expected_len
+        || state.applied_chain_order.iter().any(|hash| !state.state_hash_by_block.contains_key(hash))
+    {
+        return Err(AtomicTokenError::Processing(
+            "snapshot import failed: state_hash_by_block must match applied_chain_order exactly".to_string(),
+        ));
+    }
+    if state.event_sequence_by_block.len() != expected_len
+        || state.applied_chain_order.iter().any(|hash| !state.event_sequence_by_block.contains_key(hash))
+    {
+        return Err(AtomicTokenError::Processing(
+            "snapshot import failed: event_sequence_by_block must match applied_chain_order exactly".to_string(),
+        ));
+    }
+    if state.state_hash_by_block.get(&header.at_block_hash).copied() != Some(header.state_hash_at_fp) {
+        return Err(AtomicTokenError::Processing(
+            "snapshot import failed: state_hash_by_block does not match state_hash_at_fp for at_block_hash".to_string(),
+        ));
+    }
+    if state.events.iter().any(|event| event.sequence > header.next_event_sequence) {
+        return Err(AtomicTokenError::Processing(
+            "snapshot import failed: event sequence exceeds next_event_sequence".to_string(),
+        ));
+    }
+    let window_start_index =
+        state.applied_chain_order.iter().position(|hash| *hash == header.window_start_block_hash).ok_or_else(|| {
+            AtomicTokenError::Processing(format!(
+                "snapshot import failed: window_start_block_hash `{}` not found in applied_chain_order",
+                header.window_start_block_hash
+            ))
+        })?;
+    let expected_window_len = state.applied_chain_order.len() - window_start_index;
+    if replay_window.journals_in_window.len() != expected_window_len {
+        return Err(AtomicTokenError::Processing(format!(
+            "snapshot import failed: journals_in_window length mismatch ({} != {})",
+            replay_window.journals_in_window.len(),
+            expected_window_len
+        )));
+    }
+    for (offset, (block_hash, _)) in replay_window.journals_in_window.iter().enumerate() {
+        let expected_hash = state.applied_chain_order[window_start_index + offset];
+        if *block_hash != expected_hash {
+            return Err(AtomicTokenError::Processing(
+                "snapshot import failed: journals_in_window order does not match canonical chain path".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn import_snapshot_file_into_store(
+    path: &Path,
+    validated: &ValidatedSnapshotFileV2,
+    store: Arc<AtomicStorageV2>,
+) -> AtomicTokenResult<AtomicTokenState> {
+    let snapshot_size = std::fs::metadata(path)
+        .map_err(|e| AtomicTokenError::Processing(format!("snapshot import failed: metadata read failed: {e}")))?
+        .len();
+    let file = File::open(path)
+        .map_err(|e| AtomicTokenError::Processing(format!("snapshot import failed: open `{}`: {e}", path.display())))?;
+    let mut reader = BufReader::new(file);
+    let decoded_header: SnapshotFileHeaderV2 = read_snapshot_record(&mut reader, "snapshot header")?;
+    if decoded_header != validated.header {
+        return Err(AtomicTokenError::Processing(
+            "snapshot import failed: decoded snapshot header changed after manifest validation".to_string(),
+        ));
+    }
+    let header = &validated.header;
+    let counts = header.counts;
+
+    let mut state = AtomicTokenState::new(header.protocol_version, header.network_id.clone());
+    state.degraded = false;
+    state.live_correct = false;
+    state.next_event_sequence = header.next_event_sequence;
+
+    for _ in 0..counts.state_hashes {
+        let (block_hash, state_hash): (BlockHash, [u8; 32]) = read_snapshot_record(&mut reader, "state hash")?;
+        if state.state_hash_by_block.insert(block_hash, state_hash).is_some() {
+            return Err(AtomicTokenError::Processing(format!(
+                "snapshot import failed: duplicate state hash checkpoint for block `{block_hash}`"
+            )));
+        }
+    }
+    for _ in 0..counts.event_sequences {
+        let (block_hash, sequence): (BlockHash, u64) = read_snapshot_record(&mut reader, "event sequence")?;
+        if state.event_sequence_by_block.insert(block_hash, sequence).is_some() {
+            return Err(AtomicTokenError::Processing(format!(
+                "snapshot import failed: duplicate event sequence checkpoint for block `{block_hash}`"
+            )));
+        }
+    }
+
+    let mut chain_order_entries = Vec::with_capacity(count_to_usize(counts.chain_order, "chain order")?);
+    for _ in 0..counts.chain_order {
+        let (index, block_hash): (u64, BlockHash) = read_snapshot_record(&mut reader, "chain order")?;
+        chain_order_entries.push((index, block_hash));
+    }
+    chain_order_entries.sort_by_key(|(index, _)| *index);
+    for (expected_index, (index, block_hash)) in chain_order_entries.into_iter().enumerate() {
+        if index != expected_index as u64 {
+            return Err(AtomicTokenError::Processing(
+                "snapshot import failed: chain_order indexes must be contiguous from zero".to_string(),
+            ));
+        }
+        state.applied_chain_order.push(block_hash);
+    }
+
+    state.events.reserve(count_to_usize(counts.events, "events")?);
+    for _ in 0..counts.events {
+        let event: TokenEvent = read_snapshot_record(&mut reader, "event")?;
+        state.events.push(event);
+    }
+    state.block_journals = validated.replay_window.journals_in_window.iter().cloned().collect();
+    state.rebuild_event_id_index();
+    validate_snapshot_runtime_header(&state, header, &validated.replay_window)?;
+
+    store.persist_state(&state)?;
+    state.attach_state_store(store.clone());
+    state.clear_persistent_state_overlay();
+
+    let (expected_processed_ops, accepting_blocks_in_window) = expected_processed_ops_for_replay_window(&validated.replay_window)?;
+    let mut seen_window_processed_ops = HashSet::new();
+    let mut chunk = SnapshotStateImportChunk::default();
+    for _ in 0..counts.assets {
+        let (asset_id, asset): ([u8; 32], TokenAsset) = read_snapshot_record(&mut reader, "asset")?;
+        if asset.asset_id != asset_id {
+            return Err(AtomicTokenError::Processing("snapshot import failed: asset key/id mismatch".to_string()));
+        }
+        chunk.assets.push((asset_id, Some(asset)));
+        chunk.flush_if_full(&store)?;
+    }
+    for _ in 0..counts.balances {
+        let (key, amount): (BalanceKey, u128) = read_snapshot_record(&mut reader, "balance")?;
+        chunk.balances.push((key, (amount > 0).then_some(amount)));
+        chunk.flush_if_full(&store)?;
+    }
+    for _ in 0..counts.nonces {
+        let (key, nonce): (NonceKey, u64) = read_snapshot_record(&mut reader, "nonce")?;
+        chunk.nonces.push((key, (nonce != 1).then_some(nonce)));
+        chunk.flush_if_full(&store)?;
+    }
+    for _ in 0..counts.anchor_counts {
+        let (owner_id, count): ([u8; 32], u64) = read_snapshot_record(&mut reader, "anchor count")?;
+        chunk.anchor_counts.push((owner_id, (count > 0).then_some(count)));
+        chunk.flush_if_full(&store)?;
+    }
+    for _ in 0..counts.processed_ops {
+        let (txid, op): (BlockHash, ProcessedOp) = read_snapshot_record(&mut reader, "processed op")?;
+        if accepting_blocks_in_window.contains(&op.accepting_block_hash) {
+            match expected_processed_ops.get(&txid) {
+                Some(expected) if *expected == op => {
+                    seen_window_processed_ops.insert(txid);
+                }
+                Some(_) => {
+                    return Err(AtomicTokenError::Processing(format!(
+                        "snapshot import failed: processed txid `{txid}` does not match rollback window journal"
+                    )));
+                }
+                None => {
+                    return Err(AtomicTokenError::Processing(
+                        "snapshot import failed: processed_ops contains entries outside the rollback window".to_string(),
+                    ));
+                }
+            }
+        }
+        chunk.processed_ops.push((txid, Some(op)));
+        chunk.flush_if_full(&store)?;
+    }
+    chunk.flush(&store)?;
+    for txid in expected_processed_ops.keys() {
+        if !seen_window_processed_ops.contains(txid) {
+            return Err(AtomicTokenError::Processing(format!(
+                "snapshot import failed: processed txid `{txid}` is missing from snapshot processed_ops"
+            )));
+        }
+    }
+
+    let decoded_pos = reader
+        .stream_position()
+        .map_err(|e| AtomicTokenError::Processing(format!("snapshot import failed: decode position check failed: {e}")))?;
+    if decoded_pos != snapshot_size {
+        return Err(AtomicTokenError::Processing(
+            "snapshot import failed: trailing bytes after snapshot payload".to_string(),
+        ));
+    }
+    let imported_root = store.current_root()?.ok_or_else(|| {
+        AtomicTokenError::Processing("snapshot import failed: imported V2 store has no current root".to_string())
+    })?;
+    if imported_root != header.state_hash_at_fp {
+        return Err(AtomicTokenError::Processing("snapshot import failed: state hash mismatch at snapshot at_block_hash".to_string()));
+    }
+    Ok(state)
+}
+
+fn copy_all_persistent_state_keys(source: &AtomicStorageV2, target: &AtomicStorageV2) -> AtomicTokenResult<[u8; 32]> {
+    let mut chunk = SnapshotStateImportChunk::default();
+    source.visit_all_assets(|asset_id, asset| {
+        chunk.assets.push((asset_id, Some(asset)));
+        chunk.flush_if_full(target)
+    })?;
+    source.visit_all_balances(|key, amount| {
+        chunk.balances.push((key, (amount > 0).then_some(amount)));
+        chunk.flush_if_full(target)
+    })?;
+    source.visit_all_nonces(|key, nonce| {
+        chunk.nonces.push((key, (nonce != 1).then_some(nonce)));
+        chunk.flush_if_full(target)
+    })?;
+    source.visit_all_anchor_counts(|owner_id, count| {
+        chunk.anchor_counts.push((owner_id, (count > 0).then_some(count)));
+        chunk.flush_if_full(target)
+    })?;
+    source.visit_all_processed_ops(|txid, op| {
+        chunk.processed_ops.push((txid, Some(op)));
+        chunk.flush_if_full(target)
+    })?;
+    chunk.flush(target)?;
+    target
+        .current_root()?
+        .ok_or_else(|| AtomicTokenError::Processing("Atomic DB copy failed: target V2 store has no current root".to_string()))
+}
+
+fn copy_snapshot_store_into_active(
+    source: &AtomicStorageV2,
+    target: Arc<AtomicStorageV2>,
+    mut state: AtomicTokenState,
+) -> AtomicTokenResult<AtomicTokenState> {
+    let expected_root = source.current_root()?.ok_or_else(|| {
+        AtomicTokenError::Processing("snapshot import failed: staged V2 store has no current root".to_string())
+    })?;
+    state.clear_persistent_state_overlay();
+    target.persist_state(&state)?;
+    let copied_root = copy_all_persistent_state_keys(source, &target)?;
+    if copied_root != expected_root {
+        return Err(AtomicTokenError::Processing(
+            "snapshot import failed: active V2 store root mismatch after snapshot swap".to_string(),
+        ));
+    }
+    state.clear_persistent_state_overlay();
+    state.attach_state_store(target);
+    Ok(state)
+}
+
+#[cfg(test)]
 fn build_snapshot_manifest(
     path: &Path,
     snapshot_bytes: &[u8],
     replay_window_bytes: &[u8],
-    snapshot: &AtomicTokenSnapshot,
-) -> AtomicTokenResult<SnapshotManifestV1> {
+    header: &SnapshotFileHeaderV2,
+) -> AtomicTokenResult<SnapshotManifestV2> {
     let snapshot_file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1614,10 +2479,10 @@ fn build_snapshot_manifest(
     let snapshot_file_size = snapshot_bytes.len() as u64;
     let replay_window_size = replay_window_bytes.len() as u64;
     validate_snapshot_blob_size_limits(snapshot_file_size, replay_window_size, "snapshot export")?;
-    Ok(SnapshotManifestV1 {
-        schema_version: snapshot.schema_version,
-        protocol_version: snapshot.protocol_version,
-        network_id: snapshot.network_id.clone(),
+    Ok(SnapshotManifestV2 {
+        schema_version: header.schema_version,
+        protocol_version: header.protocol_version,
+        network_id: header.network_id.clone(),
         snapshot_file_name,
         snapshot_file_size,
         snapshot_file_hash: hash_snapshot_bytes(snapshot_bytes),
@@ -1627,24 +2492,24 @@ fn build_snapshot_manifest(
         replay_window_hash: hash_snapshot_bytes(replay_window_bytes),
         replay_window_chunk_size,
         replay_window_chunk_hashes: chunk_hashes(replay_window_bytes, replay_window_chunk_size as usize),
-        at_block_hash: hash_to_array(snapshot.at_block_hash),
-        at_daa_score: snapshot.at_daa_score,
-        state_hash_at_fp: snapshot.state_hash_at_fp,
-        window_start_block_hash: hash_to_array(snapshot.window_start_block_hash),
-        window_start_parent_block_hash: hash_to_array(snapshot.window_start_parent_block_hash),
-        window_end_block_hash: hash_to_array(snapshot.window_end_block_hash),
+        at_block_hash: hash_to_array(header.at_block_hash),
+        at_daa_score: header.at_daa_score,
+        state_hash_at_fp: header.state_hash_at_fp,
+        state_hash_at_window_start_parent: header.state_hash_at_window_start_parent,
+        window_start_block_hash: hash_to_array(header.window_start_block_hash),
+        window_start_parent_block_hash: hash_to_array(header.window_start_parent_block_hash),
+        window_end_block_hash: hash_to_array(header.window_end_block_hash),
     })
 }
 
-fn validate_snapshot_manifest(
+fn validate_snapshot_manifest_and_decode(
     path: &Path,
-    snapshot_bytes: &[u8],
     expected_protocol_version: u16,
     expected_network_id: &str,
-) -> AtomicTokenResult<()> {
+) -> AtomicTokenResult<ValidatedSnapshotFileV2> {
     let manifest_bytes = std::fs::read(snapshot_manifest_path(path))
         .map_err(|e| AtomicTokenError::Processing(format!("snapshot manifest read failed: {e}")))?;
-    let manifest = SnapshotManifestV1::try_from_slice(&manifest_bytes)
+    let manifest = SnapshotManifestV2::try_from_slice(&manifest_bytes)
         .map_err(|e| AtomicTokenError::Processing(format!("snapshot manifest decode failed: {e}")))?;
 
     let snapshot_file_name = path
@@ -1667,220 +2532,73 @@ fn validate_snapshot_manifest(
         });
     }
     validate_snapshot_blob_size_limits(manifest.snapshot_file_size, manifest.replay_window_size, "snapshot import")?;
-    if manifest.snapshot_file_size != snapshot_bytes.len() as u64 {
+    let (snapshot_file_size, snapshot_file_hash, snapshot_chunk_hashes) =
+        hash_file_and_chunks(path, manifest.snapshot_chunk_size as usize, "snapshot import")?;
+    if manifest.snapshot_file_size != snapshot_file_size {
         return Err(AtomicTokenError::Processing("snapshot import failed: manifest snapshot size mismatch".to_string()));
     }
-    let expected_hash = hash_snapshot_bytes(snapshot_bytes);
-    if manifest.snapshot_file_hash != expected_hash {
+    if manifest.snapshot_file_hash != snapshot_file_hash {
         return Err(AtomicTokenError::Processing("snapshot import failed: manifest snapshot hash mismatch".to_string()));
     }
-    if manifest.snapshot_chunk_size == 0 {
-        return Err(AtomicTokenError::Processing(
-            "snapshot import failed: manifest snapshot_chunk_size must be greater than zero".to_string(),
-        ));
-    }
-    if manifest.snapshot_chunk_size as usize > SNAPSHOT_CHUNK_SIZE_MAX {
-        return Err(AtomicTokenError::Processing(format!(
-            "snapshot import failed: manifest snapshot_chunk_size exceeds maximum `{SNAPSHOT_CHUNK_SIZE_MAX}`"
-        )));
-    }
-    let snapshot_chunk_hashes = chunk_hashes(snapshot_bytes, manifest.snapshot_chunk_size as usize);
     if snapshot_chunk_hashes != manifest.snapshot_chunk_hashes {
         return Err(AtomicTokenError::Processing("snapshot import failed: manifest snapshot chunk hashes mismatch".to_string()));
     }
 
-    let snapshot: AtomicTokenSnapshot =
-        bincode::deserialize(snapshot_bytes).map_err(|e| AtomicTokenError::Processing(format!("snapshot decode failed: {e}")))?;
-    if snapshot.schema_version != manifest.schema_version
-        || snapshot.protocol_version != manifest.protocol_version
-        || snapshot.network_id != manifest.network_id
-        || hash_to_array(snapshot.at_block_hash) != manifest.at_block_hash
-        || snapshot.at_daa_score != manifest.at_daa_score
-        || snapshot.state_hash_at_fp != manifest.state_hash_at_fp
-        || hash_to_array(snapshot.window_start_block_hash) != manifest.window_start_block_hash
-        || hash_to_array(snapshot.window_start_parent_block_hash) != manifest.window_start_parent_block_hash
-        || hash_to_array(snapshot.window_end_block_hash) != manifest.window_end_block_hash
+    let mut snapshot_file =
+        File::open(path).map_err(|e| AtomicTokenError::Processing(format!("snapshot read failed: open `{}`: {e}", path.display())))?;
+    let header: SnapshotFileHeaderV2 = bincode::deserialize_from(&mut snapshot_file)
+        .map_err(|e| AtomicTokenError::Processing(format!("snapshot header decode failed: {e}")))?;
+    if header.schema_version != manifest.schema_version
+        || header.protocol_version != manifest.protocol_version
+        || header.network_id != manifest.network_id
+        || hash_to_array(header.at_block_hash) != manifest.at_block_hash
+        || header.at_daa_score != manifest.at_daa_score
+        || header.state_hash_at_fp != manifest.state_hash_at_fp
+        || header.state_hash_at_window_start_parent != manifest.state_hash_at_window_start_parent
+        || hash_to_array(header.window_start_block_hash) != manifest.window_start_block_hash
+        || hash_to_array(header.window_start_parent_block_hash) != manifest.window_start_parent_block_hash
+        || hash_to_array(header.window_end_block_hash) != manifest.window_end_block_hash
     {
         return Err(AtomicTokenError::Processing(
-            "snapshot import failed: manifest metadata does not match decoded snapshot contents".to_string(),
+            "snapshot import failed: manifest metadata does not match decoded snapshot header".to_string(),
         ));
     }
     let replay_path = snapshot_replay_path(path);
-    let replay_window_bytes =
-        std::fs::read(&replay_path).map_err(|e| AtomicTokenError::Processing(format!("snapshot replay read failed: {e}")))?;
-    if manifest.replay_window_size != replay_window_bytes.len() as u64 {
+    let (replay_window_size, replay_window_hash, replay_window_chunk_hashes) =
+        hash_file_and_chunks(&replay_path, manifest.replay_window_chunk_size as usize, "snapshot replay import")?;
+    if manifest.replay_window_size != replay_window_size {
         return Err(AtomicTokenError::Processing("snapshot import failed: manifest replay window size mismatch".to_string()));
     }
-    if manifest.replay_window_hash != hash_snapshot_bytes(&replay_window_bytes) {
+    if manifest.replay_window_hash != replay_window_hash {
         return Err(AtomicTokenError::Processing("snapshot import failed: manifest replay window hash mismatch".to_string()));
     }
-    if manifest.replay_window_chunk_size == 0 {
-        return Err(AtomicTokenError::Processing(
-            "snapshot import failed: manifest replay_window_chunk_size must be greater than zero".to_string(),
-        ));
-    }
-    if manifest.replay_window_chunk_size as usize > SNAPSHOT_CHUNK_SIZE_MAX {
-        return Err(AtomicTokenError::Processing(format!(
-            "snapshot import failed: manifest replay_window_chunk_size exceeds maximum `{SNAPSHOT_CHUNK_SIZE_MAX}`"
-        )));
-    }
-    let replay_window_chunk_hashes = chunk_hashes(&replay_window_bytes, manifest.replay_window_chunk_size as usize);
     if replay_window_chunk_hashes != manifest.replay_window_chunk_hashes {
         return Err(AtomicTokenError::Processing("snapshot import failed: manifest replay window chunk hashes mismatch".to_string()));
     }
-    let replay_window: ReplayWindowTransferV1 = bincode::deserialize(&replay_window_bytes)
+    let mut replay_file = File::open(&replay_path)
+        .map_err(|e| AtomicTokenError::Processing(format!("snapshot replay read failed: open `{}`: {e}", replay_path.display())))?;
+    let replay_window: ReplayWindowTransferV2 = bincode::deserialize_from(&mut replay_file)
         .map_err(|e| AtomicTokenError::Processing(format!("snapshot replay decode failed: {e}")))?;
-    if replay_window.protocol_version != snapshot.protocol_version
-        || replay_window.network_id != snapshot.network_id
-        || replay_window.window_start_block_hash != hash_to_array(snapshot.window_start_block_hash)
-        || replay_window.window_end_block_hash != hash_to_array(snapshot.window_end_block_hash)
+    let replay_decoded_pos = replay_file
+        .seek(SeekFrom::Current(0))
+        .map_err(|e| AtomicTokenError::Processing(format!("snapshot replay decode position check failed: {e}")))?;
+    if replay_decoded_pos != manifest.replay_window_size {
+        return Err(AtomicTokenError::Processing(
+            "snapshot import failed: trailing bytes after replay window payload".to_string(),
+        ));
+    }
+    if replay_window.protocol_version != header.protocol_version
+        || replay_window.network_id != header.network_id
+        || replay_window.window_start_block_hash != hash_to_array(header.window_start_block_hash)
+        || replay_window.window_end_block_hash != hash_to_array(header.window_end_block_hash)
     {
         return Err(AtomicTokenError::Processing(
             "snapshot import failed: replay window metadata does not match decoded snapshot contents".to_string(),
         ));
     }
-    if replay_window.journals_in_window != snapshot.journals_in_window {
-        return Err(AtomicTokenError::Processing(
-            "snapshot import failed: replay window journals do not match decoded snapshot contents".to_string(),
-        ));
-    }
-    Ok(())
+    expected_processed_ops_for_replay_window(&replay_window)?;
+    Ok(ValidatedSnapshotFileV2 { header, replay_window })
 }
-
-fn load_state_from_path(path: &Path, protocol_version: u16, network_id: &str) -> AtomicTokenResult<Option<AtomicTokenState>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = std::fs::read(path).map_err(|e| AtomicTokenError::Processing(format!("failed reading Atomic state file: {e}")))?;
-    let mut state: AtomicTokenState = match bincode::deserialize(&bytes) {
-        Ok(state) => state,
-        Err(err) => {
-            warn!(
-                "[{IDENT}] ignoring unreadable persisted Atomic state at `{}`; verified bootstrap/replay repair is required ({err})",
-                path.display()
-            );
-            return Ok(None);
-        }
-    };
-    if state.protocol_version != protocol_version {
-        warn!(
-            "[{IDENT}] ignoring persisted Atomic state at `{}` due to protocol mismatch (expected {}, got {})",
-            path.display(),
-            protocol_version,
-            state.protocol_version
-        );
-        return Ok(None);
-    }
-    if state.network_id != network_id {
-        warn!(
-            "[{IDENT}] ignoring persisted Atomic state at `{}` due to network mismatch (expected `{}`, got `{}`)",
-            path.display(),
-            network_id,
-            state.network_id
-        );
-        return Ok(None);
-    }
-    state.live_correct = false;
-    state.rebuild_event_id_index();
-    Ok(Some(state))
-}
-
-fn persist_state_to_path(path: &Path, state: &AtomicTokenState) -> AtomicTokenResult<()> {
-    let started = Instant::now();
-    let parent = path
-        .parent()
-        .ok_or_else(|| AtomicTokenError::Processing("failed persisting Atomic state: state path has no parent".to_string()))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|e| AtomicTokenError::Processing(format!("failed creating Atomic state parent directory: {e}")))?;
-    let encode_started = Instant::now();
-    let bytes = bincode::serialize(state).map_err(|e| AtomicTokenError::Processing(format!("failed encoding Atomic state: {e}")))?;
-    let encode_elapsed = encode_started.elapsed();
-    let byte_len = bytes.len() as u64;
-
-    let tmp_path = path.with_extension("tmp");
-    {
-        let mut tmp_file = File::create(&tmp_path)
-            .map_err(|e| AtomicTokenError::Processing(format!("failed creating Atomic state temp file: {e}")))?;
-        tmp_file.write_all(&bytes).map_err(|e| AtomicTokenError::Processing(format!("failed writing Atomic state temp file: {e}")))?;
-        tmp_file.sync_all().map_err(|e| AtomicTokenError::Processing(format!("failed syncing Atomic state temp file: {e}")))?;
-    }
-
-    replace_file_cross_platform(&tmp_path, path)?;
-    sync_parent_directory(parent);
-    let total_elapsed = started.elapsed();
-    if total_elapsed >= ATOMIC_SLOW_PERSIST_LOG_THRESHOLD {
-        info!(
-            "[{IDENT}] slow Atomic state persist: size={}, encode_ms={}, total_ms={}, path={}",
-            format_bytes_for_log(byte_len),
-            encode_elapsed.as_millis(),
-            total_elapsed.as_millis(),
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn replace_file_cross_platform(source: &Path, target: &Path) -> AtomicTokenResult<()> {
-    std::fs::rename(source, target).map_err(|err| AtomicTokenError::Processing(format!("failed replacing Atomic state file: {err}")))
-}
-
-#[cfg(target_os = "windows")]
-fn replace_file_cross_platform(source: &Path, target: &Path) -> AtomicTokenResult<()> {
-    if !target.exists() {
-        return std::fs::rename(source, target)
-            .map_err(|err| AtomicTokenError::Processing(format!("failed replacing Atomic state file: {err}")));
-    }
-
-    const REPLACEFILE_WRITE_THROUGH: u32 = 0x00000002;
-    let source_wide = encode_windows_path(source);
-    let target_wide = encode_windows_path(target);
-
-    let replaced = unsafe {
-        ReplaceFileW(
-            target_wide.as_ptr(),
-            source_wide.as_ptr(),
-            std::ptr::null(),
-            REPLACEFILE_WRITE_THROUGH,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if replaced == 0 {
-        return Err(AtomicTokenError::Processing(format!("failed replacing Atomic state file: {}", std::io::Error::last_os_error())));
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-#[link(name = "Kernel32")]
-unsafe extern "system" {
-    fn ReplaceFileW(
-        lpReplacedFileName: *const u16,
-        lpReplacementFileName: *const u16,
-        lpBackupFileName: *const u16,
-        dwReplaceFlags: u32,
-        lpExclude: *mut std::ffi::c_void,
-        lpReserved: *mut std::ffi::c_void,
-    ) -> i32;
-}
-
-#[cfg(target_os = "windows")]
-fn encode_windows_path(path: &Path) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
-}
-
-#[cfg(not(target_os = "windows"))]
-fn sync_parent_directory(parent: &Path) {
-    if let Ok(dir) = File::open(parent) {
-        let _ = dir.sync_all();
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn sync_parent_directory(_parent: &Path) {}
 
 fn snapshot_id_from_manifest(manifest_bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Blake2bParams::new().hash_length(32).to_state();
@@ -1918,7 +2636,7 @@ fn list_snapshot_catalog(snapshot_store_dir: &Path) -> AtomicTokenResult<Vec<Sna
 
         let manifest_bytes =
             std::fs::read(&path).map_err(|e| AtomicTokenError::Processing(format!("failed reading snapshot manifest file: {e}")))?;
-        let manifest = SnapshotManifestV1::try_from_slice(&manifest_bytes)
+        let manifest = SnapshotManifestV2::try_from_slice(&manifest_bytes)
             .map_err(|e| AtomicTokenError::Processing(format!("failed decoding snapshot manifest file: {e}")))?;
         if validate_snapshot_blob_size_limits(manifest.snapshot_file_size, manifest.replay_window_size, "snapshot catalog validation")
             .is_err()
@@ -1973,42 +2691,19 @@ fn list_snapshot_catalog(snapshot_store_dir: &Path) -> AtomicTokenResult<Vec<Sna
 }
 
 fn cached_snapshot_parent_checkpoint_matches_current_state(entry: &SnapshotCatalogEntry, state: &AtomicTokenState) -> bool {
-    let snapshot_bytes = match std::fs::read(&entry.snapshot_path) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            trace!(
-                "[{IDENT}] ignoring cached Atomic bootstrap snapshot `{}`: failed reading snapshot file: {err}",
-                entry.snapshot_path.display()
-            );
-            return false;
-        }
-    };
-    let snapshot: AtomicTokenSnapshot = match bincode::deserialize(&snapshot_bytes) {
-        Ok(snapshot) => snapshot,
-        Err(err) => {
-            trace!(
-                "[{IDENT}] ignoring cached Atomic bootstrap snapshot `{}`: failed decoding snapshot file: {err}",
-                entry.snapshot_path.display()
-            );
-            return false;
-        }
-    };
-
-    if hash_to_array(snapshot.at_block_hash) != entry.manifest.at_block_hash
-        || hash_to_array(snapshot.window_start_parent_block_hash) != entry.manifest.window_start_parent_block_hash
-    {
-        trace!(
-            "[{IDENT}] ignoring cached Atomic bootstrap snapshot `{}`: snapshot metadata does not match manifest",
-            entry.snapshot_path.display()
-        );
-        return false;
-    }
-
     let expected_parent_hash = state
-        .materialize_view_at_block(snapshot.window_start_parent_block_hash)
-        .map(|view| view.state_hash)
-        .or_else(|| state.state_hash_by_block.get(&snapshot.window_start_parent_block_hash).copied());
-    if snapshot.state_hash_at_window_start_parent != expected_parent_hash {
+        .state_hash_by_block
+        .get(&BlockHash::from_bytes(entry.manifest.window_start_parent_block_hash))
+        .copied()
+        .or_else(|| {
+            state
+                .materialize_context_at_block(
+                    BlockHash::from_bytes(entry.manifest.window_start_parent_block_hash),
+                    state.runtime_state(false),
+                )
+                .map(|context| context.state_hash)
+        });
+    if entry.manifest.state_hash_at_window_start_parent != expected_parent_hash {
         trace!(
             "[{IDENT}] ignoring cached Atomic bootstrap snapshot `{}`: stale window_start parent checkpoint",
             entry.snapshot_path.display()
@@ -2130,6 +2825,11 @@ fn short_hex_for_log(data: &[u8]) -> String {
     format!("{}...{}", hex_encode(&data[..4]), hex_encode(&data[data.len() - 4..]))
 }
 
+fn unique_atomic_temp_dir(label: &str) -> PathBuf {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_nanos()).unwrap_or(0);
+    std::env::temp_dir().join(format!("cryptix-atomic-{label}-{}-{nanos}", std::process::id()))
+}
+
 fn format_bytes_for_log(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
@@ -2146,9 +2846,9 @@ fn format_bytes_for_log(bytes: u64) -> String {
     }
 }
 
-fn log_state_footprint(label: &str, footprint: AtomicTokenStateFootprint, state_file_bytes: Option<u64>) {
+fn log_state_footprint(label: &str, footprint: AtomicTokenStateFootprint, state_store_bytes: Option<u64>) {
     info!(
-        "[{IDENT}] Cryptix Atomic state footprint ({label}): assets={}, balances={}, nonces={}, anchor_counts={}, processed_ops={}, journals={}, checkpoints={}, event_checkpoints={}, retained_blocks={}, events={}, vaults={}, known_owner_addresses={}, owners={}, holder_assets={}, state_file={}",
+        "[{IDENT}] Cryptix Atomic state footprint ({label}): assets={}, balances={}, nonces={}, anchor_counts={}, processed_ops={}, journals={}, checkpoints={}, event_checkpoints={}, retained_blocks={}, events={}, vaults={}, known_owner_addresses={}, owners={}, holder_assets={}, state_store={}",
         footprint.assets,
         footprint.balances,
         footprint.nonces,
@@ -2163,7 +2863,7 @@ fn log_state_footprint(label: &str, footprint: AtomicTokenStateFootprint, state_
         footprint.known_owner_addresses,
         footprint.owners_with_balances,
         footprint.assets_with_holders,
-        state_file_bytes.map(format_bytes_for_log).unwrap_or_else(|| "n/a".to_string())
+        state_store_bytes.map(format_bytes_for_log).unwrap_or_else(|| "n/a".to_string())
     );
 }
 
@@ -2252,7 +2952,7 @@ fn validate_cryptographic_binding_self_test() -> AtomicTokenResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{AtomicTokenSnapshotState, BlockJournal, SNAPSHOT_SCHEMA_VERSION};
+    use crate::state::{BlockJournal, SNAPSHOT_SCHEMA_VERSION};
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -2265,8 +2965,21 @@ mod tests {
         dir
     }
 
-    fn minimal_snapshot(protocol_version: u16, network_id: &str) -> AtomicTokenSnapshot {
-        let at_block_hash = BlockHash::from_u64_word(1);
+    struct MinimalSnapshotFixture {
+        header: SnapshotFileHeaderV2,
+        replay_window: ReplayWindowTransferV2,
+    }
+
+    fn minimal_snapshot(protocol_version: u16, network_id: &str) -> MinimalSnapshotFixture {
+        minimal_snapshot_at(protocol_version, network_id, BlockHash::from_u64_word(1), 123)
+    }
+
+    fn minimal_snapshot_at(
+        protocol_version: u16,
+        network_id: &str,
+        at_block_hash: BlockHash,
+        at_daa_score: u64,
+    ) -> MinimalSnapshotFixture {
         let window_start_parent_block_hash = BlockHash::from_u64_word(0);
         let mut state = AtomicTokenState::new(protocol_version, network_id.to_string());
         let state_hash = state.compute_state_hash();
@@ -2274,58 +2987,42 @@ mod tests {
         state.event_sequence_by_block.insert(at_block_hash, 0);
         state.applied_chain_order.push(at_block_hash);
 
-        AtomicTokenSnapshot {
+        let header = SnapshotFileHeaderV2 {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             protocol_version,
             network_id: network_id.to_string(),
             at_block_hash,
-            at_daa_score: 123,
+            at_daa_score,
             state_hash_at_fp: state_hash,
             state_hash_at_window_start_parent: None,
             window_start_block_hash: at_block_hash,
             window_start_parent_block_hash,
             window_end_block_hash: at_block_hash,
-            state: AtomicTokenSnapshotState {
-                assets: state.assets,
-                balances: state.balances,
-                nonces: state.nonces,
-                anchor_counts: state.anchor_counts,
-                processed_ops: state.processed_ops,
-                state_hash_by_block: state.state_hash_by_block,
-                event_sequence_by_block: state.event_sequence_by_block,
-                applied_chain_order: state.applied_chain_order,
-                next_event_sequence: 0,
-                events: Vec::new(),
-            },
+            next_event_sequence: 0,
+            counts: AtomicStorageSnapshotCounts { state_hashes: 1, event_sequences: 1, chain_order: 1, ..Default::default() },
+        };
+        let replay_window = ReplayWindowTransferV2 {
+            protocol_version,
+            network_id: network_id.to_string(),
+            window_start_block_hash: hash_to_array(at_block_hash),
+            window_end_block_hash: hash_to_array(at_block_hash),
             journals_in_window: vec![(at_block_hash, BlockJournal::default())],
-        }
+        };
+        MinimalSnapshotFixture { header, replay_window }
     }
 
-    #[test]
-    fn load_state_from_path_clears_live_correct_on_restart() {
-        let dir = unique_temp_dir("load-state");
-        let path = dir.join("state.bin");
-        let mut state = AtomicTokenState::new(TOKEN_PROTOCOL_VERSION, "cryptix-simnet".to_string());
-        state.live_correct = true;
-        persist_state_to_path(&path, &state).expect("persist state");
-
-        let loaded =
-            load_state_from_path(&path, TOKEN_PROTOCOL_VERSION, "cryptix-simnet").expect("load state").expect("state present");
-        assert!(!loaded.live_correct);
-
-        let _ = fs::remove_dir_all(dir);
+    fn encode_snapshot_file(fixture: &MinimalSnapshotFixture) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let header = &fixture.header;
+        bincode::serialize_into(&mut bytes, header).expect("encode snapshot header");
+        bincode::serialize_into(&mut bytes, &(header.at_block_hash, header.state_hash_at_fp)).expect("encode state hash");
+        bincode::serialize_into(&mut bytes, &(header.at_block_hash, 0u64)).expect("encode event sequence");
+        bincode::serialize_into(&mut bytes, &(0u64, header.at_block_hash)).expect("encode chain order");
+        bytes
     }
 
-    #[test]
-    fn load_state_from_path_ignores_corrupt_state_file() {
-        let dir = unique_temp_dir("load-corrupt-state");
-        let path = dir.join("state.bin");
-        fs::write(&path, b"not a bincode atomic state").expect("write corrupt state");
-
-        let loaded = load_state_from_path(&path, TOKEN_PROTOCOL_VERSION, "cryptix-simnet").expect("load corrupt state");
-        assert!(loaded.is_none());
-
-        let _ = fs::remove_dir_all(dir);
+    fn encode_replay_window_transfer(replay_window: &ReplayWindowTransferV2) -> Vec<u8> {
+        bincode::serialize(replay_window).expect("encode replay")
     }
 
     #[test]
@@ -2333,9 +3030,9 @@ mod tests {
         let dir = unique_temp_dir("snapshot-catalog");
         let snapshot_path = dir.join("atomic-snapshot-1.bin");
         let snapshot = minimal_snapshot(TOKEN_PROTOCOL_VERSION, "cryptix-simnet");
-        let snapshot_bytes = bincode::serialize(&snapshot).expect("encode snapshot");
-        let replay_window_bytes = encode_replay_window_transfer(&snapshot).expect("encode replay");
-        let manifest = build_snapshot_manifest(&snapshot_path, &snapshot_bytes, &replay_window_bytes, &snapshot).expect("manifest");
+        let snapshot_bytes = encode_snapshot_file(&snapshot);
+        let replay_window_bytes = encode_replay_window_transfer(&snapshot.replay_window);
+        let manifest = build_snapshot_manifest(&snapshot_path, &snapshot_bytes, &replay_window_bytes, &snapshot.header).expect("manifest");
         let manifest_bytes = borsh::to_vec(&manifest).expect("encode manifest");
 
         fs::write(&snapshot_path, snapshot_bytes).expect("write snapshot");
@@ -2353,16 +3050,16 @@ mod tests {
         let dir = unique_temp_dir("snapshot-manifest-replay");
         let snapshot_path = dir.join("atomic-snapshot-1.bin");
         let snapshot = minimal_snapshot(TOKEN_PROTOCOL_VERSION, "cryptix-simnet");
-        let snapshot_bytes = bincode::serialize(&snapshot).expect("encode snapshot");
-        let replay_window_bytes = encode_replay_window_transfer(&snapshot).expect("encode replay");
-        let manifest = build_snapshot_manifest(&snapshot_path, &snapshot_bytes, &replay_window_bytes, &snapshot).expect("manifest");
+        let snapshot_bytes = encode_snapshot_file(&snapshot);
+        let replay_window_bytes = encode_replay_window_transfer(&snapshot.replay_window);
+        let manifest = build_snapshot_manifest(&snapshot_path, &snapshot_bytes, &replay_window_bytes, &snapshot.header).expect("manifest");
         let manifest_bytes = borsh::to_vec(&manifest).expect("encode manifest");
 
         fs::write(&snapshot_path, &snapshot_bytes).expect("write snapshot");
         fs::write(snapshot_replay_path(&snapshot_path), replay_window_bytes).expect("write replay");
         fs::write(snapshot_manifest_path(&snapshot_path), manifest_bytes).expect("write manifest");
 
-        validate_snapshot_manifest(&snapshot_path, &snapshot_bytes, TOKEN_PROTOCOL_VERSION, "cryptix-simnet")
+        validate_snapshot_manifest_and_decode(&snapshot_path, TOKEN_PROTOCOL_VERSION, "cryptix-simnet")
             .expect("manifest should validate against sidecar");
 
         let _ = fs::remove_dir_all(dir);
@@ -2373,26 +3070,20 @@ mod tests {
         let dir = unique_temp_dir("snapshot-manifest-replay-mismatch");
         let snapshot_path = dir.join("atomic-snapshot-1.bin");
         let snapshot = minimal_snapshot(TOKEN_PROTOCOL_VERSION, "cryptix-simnet");
-        let snapshot_bytes = bincode::serialize(&snapshot).expect("encode snapshot");
-        let mut replay_window = ReplayWindowTransferV1 {
-            protocol_version: snapshot.protocol_version,
-            network_id: snapshot.network_id.clone(),
-            window_start_block_hash: hash_to_array(snapshot.window_start_block_hash),
-            window_end_block_hash: hash_to_array(snapshot.window_end_block_hash),
-            journals_in_window: snapshot.journals_in_window.clone(),
-        };
+        let snapshot_bytes = encode_snapshot_file(&snapshot);
+        let mut replay_window = snapshot.replay_window.clone();
         replay_window.journals_in_window[0].1.added_processed_ops.push(BlockHash::from_u64_word(42));
-        let replay_window_bytes = bincode::serialize(&replay_window).expect("encode replay");
-        let manifest = build_snapshot_manifest(&snapshot_path, &snapshot_bytes, &replay_window_bytes, &snapshot).expect("manifest");
+        let replay_window_bytes = encode_replay_window_transfer(&replay_window);
+        let manifest = build_snapshot_manifest(&snapshot_path, &snapshot_bytes, &replay_window_bytes, &snapshot.header).expect("manifest");
         let manifest_bytes = borsh::to_vec(&manifest).expect("encode manifest");
 
         fs::write(&snapshot_path, &snapshot_bytes).expect("write snapshot");
         fs::write(snapshot_replay_path(&snapshot_path), replay_window_bytes).expect("write replay");
         fs::write(snapshot_manifest_path(&snapshot_path), manifest_bytes).expect("write manifest");
 
-        let err = validate_snapshot_manifest(&snapshot_path, &snapshot_bytes, TOKEN_PROTOCOL_VERSION, "cryptix-simnet")
+        let err = validate_snapshot_manifest_and_decode(&snapshot_path, TOKEN_PROTOCOL_VERSION, "cryptix-simnet")
             .expect_err("manifest sidecar semantics must be checked");
-        assert!(err.to_string().contains("replay window journals do not match decoded snapshot contents"));
+        assert!(err.to_string().contains("journal tx-result length mismatch"));
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -2408,16 +3099,13 @@ mod tests {
         let dir = unique_temp_dir("snapshot-prune");
         for i in 0..3u64 {
             let snapshot_path = dir.join(format!("atomic-snapshot-{i}.bin"));
-            let mut snapshot = minimal_snapshot(TOKEN_PROTOCOL_VERSION, "cryptix-simnet");
-            snapshot.at_daa_score = 100 + i;
-            snapshot.at_block_hash = BlockHash::from_u64_word(10_000 + i);
-            snapshot.window_start_block_hash = snapshot.at_block_hash;
-            snapshot.window_end_block_hash = snapshot.at_block_hash;
+            let snapshot =
+                minimal_snapshot_at(TOKEN_PROTOCOL_VERSION, "cryptix-simnet", BlockHash::from_u64_word(10_000 + i), 100 + i);
 
-            let snapshot_bytes = bincode::serialize(&snapshot).expect("encode snapshot");
-            let replay_window_bytes = encode_replay_window_transfer(&snapshot).expect("encode replay");
+            let snapshot_bytes = encode_snapshot_file(&snapshot);
+            let replay_window_bytes = encode_replay_window_transfer(&snapshot.replay_window);
             let manifest =
-                build_snapshot_manifest(&snapshot_path, &snapshot_bytes, &replay_window_bytes, &snapshot).expect("manifest");
+                build_snapshot_manifest(&snapshot_path, &snapshot_bytes, &replay_window_bytes, &snapshot.header).expect("manifest");
             let manifest_bytes = borsh::to_vec(&manifest).expect("encode manifest");
 
             fs::write(&snapshot_path, snapshot_bytes).expect("write snapshot");

@@ -60,8 +60,6 @@ impl EchoFlow {
             CryptixdMessagePayloadType::PruningPointProof,
             CryptixdMessagePayloadType::BlockWithTrustedDataV4,
             CryptixdMessagePayloadType::TrustedData,
-            CryptixdMessagePayloadType::TrustedAtomicStateChunk,
-            CryptixdMessagePayloadType::RequestNextPruningPointAtomicStateChunk,
             CryptixdMessagePayloadType::RequestIbdChainBlockLocator,
             CryptixdMessagePayloadType::IbdChainBlockLocator,
             CryptixdMessagePayloadType::RequestAntipast,

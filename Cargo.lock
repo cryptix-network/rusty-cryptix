@@ -1168,6 +1168,7 @@ dependencies = [
  "cryptix-utils",
  "hex",
  "log",
+ "rocksdb",
  "secp256k1",
  "serde",
  "thiserror 1.0.69",

@@ -24,6 +24,7 @@ cryptix-txscript.workspace = true
 cryptix-utils.workspace = true
 hex.workspace = true
 log.workspace = true
+rocksdb.workspace = true
 secp256k1.workspace = true
 serde.workspace = true
 thiserror.workspace = true

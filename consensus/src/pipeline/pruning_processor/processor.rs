@@ -8,7 +8,7 @@ use crate::{
     model::{
         services::reachability::{MTReachabilityService, ReachabilityService},
         stores::{
-            atomic_state::{AtomicConsensusState, AtomicStateStoreReader},
+            atomic_state::AtomicConsensusState,
             ghostdag::{CompactGhostdagData, GhostdagStoreReader},
             headers::HeaderStoreReader,
             past_pruning_points::PastPruningPointsStoreReader,
@@ -239,12 +239,12 @@ impl PruningProcessor {
         }
         let utxo_commitment = multiset.finalize();
         let payload_hf_active = header.daa_score >= self.config.params.payload_hf_activation_daa_score;
-        let atomic_state = match self.atomic_state_store.get(pruning_point) {
-            Ok(state) => state,
-            Err(StoreError::KeyNotFound(_)) if !payload_hf_active => Arc::new(AtomicConsensusState::default()),
+        let atomic_state_hash = match self.atomic_state_store.get_root_record(pruning_point) {
+            Ok(root) => root.state_hash,
+            Err(StoreError::KeyNotFound(_)) if !payload_hf_active => AtomicConsensusState::default().canonical_hash(),
             Err(err) => panic!("Updated pruning point atomic state is unavailable for sanity check: {err}"),
         };
-        let expected_commitment = atomic_state.header_commitment_for_state(utxo_commitment, payload_hf_active);
+        let expected_commitment = AtomicConsensusState::header_commitment(utxo_commitment, atomic_state_hash, payload_hf_active);
         assert_eq!(
             expected_commitment, header.utxo_commitment,
             "Updated pruning point state commitment does not match the header commitment"

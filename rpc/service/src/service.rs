@@ -479,23 +479,6 @@ impl RpcCoreService {
         RpcError::General(format!("{code}: {}", detail.as_ref()))
     }
 
-    async fn atomic_context(&self, view: &AtomicTokenReadView) -> RpcResult<RpcTokenContext> {
-        let consensus = self.consensus_manager.consensus();
-        let session = consensus.session().await;
-        let at_block_hash = view.at_block_hash;
-        let at_daa_score = session
-            .async_get_header(at_block_hash)
-            .await
-            .map_err(|err| RpcError::General(format!("failed reading token context header: {err}")))?
-            .daa_score;
-        Ok(RpcTokenContext {
-            at_block_hash,
-            at_daa_score,
-            state_hash: view.state_hash.as_slice().to_hex(),
-            is_degraded: view.is_degraded,
-        })
-    }
-
     async fn atomic_context_from_read_context(&self, context: &AtomicTokenReadContext) -> RpcResult<RpcTokenContext> {
         let consensus = self.consensus_manager.consensus();
         let session = consensus.session().await;
@@ -871,18 +854,6 @@ impl RpcCoreService {
         None
     }
 
-    fn token_asset_matches_query(asset: &TokenAsset, query: &str) -> bool {
-        if query.is_empty() {
-            return true;
-        }
-
-        let q = query.to_ascii_lowercase();
-        let symbol = Self::sanitize_token_display_text(&asset.symbol).to_ascii_lowercase();
-        let name = Self::sanitize_token_display_text(&asset.name).to_ascii_lowercase();
-        let asset_id = asset.asset_id.as_slice().to_hex();
-        symbol.contains(&q) || name.contains(&q) || asset_id.starts_with(&q)
-    }
-
     fn sanitize_token_display_text(bytes: &[u8]) -> String {
         let decoded = String::from_utf8_lossy(bytes);
         let mut out = String::with_capacity(decoded.len());
@@ -981,14 +952,6 @@ impl RpcCoreService {
     fn expected_nonce_for_op(view: &AtomicTokenReadView, owner_id: [u8; 32], op: &TokenOp) -> u64 {
         let key = nonce_key_for_op(owner_id, op);
         view.nonces.get(&key).copied().unwrap_or(1)
-    }
-
-    fn expected_owner_nonce(view: &AtomicTokenReadView, owner_id: [u8; 32]) -> u64 {
-        view.nonces.get(&NonceKey::owner(owner_id)).copied().unwrap_or(1)
-    }
-
-    fn expected_asset_nonce(view: &AtomicTokenReadView, owner_id: [u8; 32], asset_id: [u8; 32]) -> u64 {
-        view.nonces.get(&NonceKey::asset(owner_id, asset_id)).copied().unwrap_or(1)
     }
 
     fn simulate_token_noop_reason(
@@ -2460,25 +2423,28 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
     ) -> RpcResult<SimulateTokenOpResponse> {
         let SimulateTokenOpRequest { payload_hex, owner_id, at_block_hash } = request;
         let atomic = self.atomic_service()?;
-        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
-        Self::ensure_token_simulation_ready(&view)?;
         let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
+        let (base_context, owner_nonce) =
+            atomic.get_nonce_with_context(NonceKey::owner(owner_id), at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&base_context)?;
         let payload = Vec::<u8>::from_hex(&payload_hex).map_err(|err| RpcError::General(format!("invalid `payloadHex`: {err}")))?;
-        let (result, noop_reason, expected_next_nonce) = match parse_atomic_token_payload(&payload) {
-            None => ("ignored".to_string(), None, Self::expected_owner_nonce(&view, owner_id)),
-            Some(Err(noop_reason)) => ("noop".to_string(), Some(noop_reason as u32), Self::expected_owner_nonce(&view, owner_id)),
+        let (result, noop_reason, expected_next_nonce, response_context) = match parse_atomic_token_payload(&payload) {
+            None => ("ignored".to_string(), None, owner_nonce, base_context),
+            Some(Err(noop_reason)) => ("noop".to_string(), Some(noop_reason as u32), owner_nonce, base_context),
             Some(Ok(parsed)) => {
+                let view = atomic.get_simulation_view(owner_id, &parsed.op, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+                Self::ensure_token_simulation_ready(&view)?;
                 let expected_next_nonce = Self::expected_nonce_for_op(&view, owner_id, &parsed.op);
                 let noop_reason = self.simulate_token_noop_reason(&view, owner_id, &parsed).map(|reason| reason as u32);
                 if noop_reason.is_some() {
-                    ("noop".to_string(), noop_reason, expected_next_nonce)
+                    ("noop".to_string(), noop_reason, expected_next_nonce, view.context())
                 } else {
-                    ("state_only".to_string(), None, expected_next_nonce)
+                    ("state_only".to_string(), None, expected_next_nonce, view.context())
                 }
             }
         };
 
-        let context = self.atomic_context(&view).await?;
+        let context = self.atomic_context_from_read_context(&response_context).await?;
         Ok(SimulateTokenOpResponse { result, noop_reason, expected_next_nonce, context })
     }
 
@@ -2491,11 +2457,11 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let atomic = self.atomic_service()?;
         let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
         let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
-        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
-        Self::ensure_token_read_ready(&view)?;
-        let balance =
-            view.balances.get(&cryptix_atomicindex::state::BalanceKey { asset_id, owner_id }).copied().unwrap_or(0).to_string();
-        let context = self.atomic_context(&view).await?;
+        let (read_context, balance) =
+            atomic.get_balance_with_context(asset_id, owner_id, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+        let balance = balance.to_string();
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetTokenBalanceResponse { balance, context })
     }
 
@@ -2508,13 +2474,14 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let atomic = self.atomic_service()?;
         let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
         let asset_id = asset_id.as_deref().map(|asset_id| Self::parse_hex_32(asset_id, "assetId")).transpose()?;
-        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
-        Self::ensure_token_read_ready(&view)?;
-        let expected_next_nonce = match asset_id {
-            Some(asset_id) => Self::expected_asset_nonce(&view, owner_id, asset_id),
-            None => Self::expected_owner_nonce(&view, owner_id),
+        let key = match asset_id {
+            Some(asset_id) => NonceKey::asset(owner_id, asset_id),
+            None => NonceKey::owner(owner_id),
         };
-        let context = self.atomic_context(&view).await?;
+        let (read_context, expected_next_nonce) =
+            atomic.get_nonce_with_context(key, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetTokenNonceResponse { expected_next_nonce, context })
     }
 
@@ -2526,10 +2493,10 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let GetOwnerNonceRequest { owner_id, at_block_hash } = request;
         let atomic = self.atomic_service()?;
         let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
-        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
-        Self::ensure_token_read_ready(&view)?;
-        let expected_next_nonce = Self::expected_owner_nonce(&view, owner_id);
-        let context = self.atomic_context(&view).await?;
+        let (read_context, expected_next_nonce) =
+            atomic.get_nonce_with_context(NonceKey::owner(owner_id), at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetTokenNonceResponse { expected_next_nonce, context })
     }
 
@@ -2541,10 +2508,10 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let GetTokenAssetRequest { asset_id, at_block_hash } = request;
         let atomic = self.atomic_service()?;
         let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
-        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
-        Self::ensure_token_read_ready(&view)?;
-        let asset = view.assets.get(&asset_id).cloned().map(Self::map_token_asset);
-        let context = self.atomic_context(&view).await?;
+        let (read_context, asset) = atomic.get_asset_with_context(asset_id, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+        let asset = asset.map(Self::map_token_asset);
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetTokenAssetResponse { asset, context })
     }
 
@@ -2555,10 +2522,9 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
     ) -> RpcResult<GetTokenOpStatusResponse> {
         let GetTokenOpStatusRequest { txid, at_block_hash } = request;
         let atomic = self.atomic_service()?;
-        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
-        Self::ensure_token_read_ready(&view)?;
-        let context = self.atomic_context(&view).await?;
-        let status = view.processed_ops.get(&txid).cloned();
+        let (read_context, status) = atomic.get_op_status_with_context(txid, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(match status {
             Some(status) => Self::map_processed_op(status, context),
             None => GetTokenOpStatusResponse { accepting_block_hash: None, apply_status: None, noop_reason: None, context },
@@ -2572,9 +2538,9 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
     ) -> RpcResult<GetTokenStateHashResponse> {
         let GetTokenStateHashRequest { at_block_hash } = request;
         let atomic = self.atomic_service()?;
-        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
-        Self::ensure_token_read_ready(&view)?;
-        let context = self.atomic_context(&view).await?;
+        let read_context = atomic.get_read_context(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetTokenStateHashResponse { context })
     }
 
@@ -2588,16 +2554,17 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
         let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
         let min_daa_for_spend = min_daa_for_spend.unwrap_or(10);
-        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
-        match view.runtime_state {
+        let (read_context, balance) =
+            atomic.get_balance_with_context(asset_id, owner_id, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        match read_context.runtime_state {
             AtomicTokenRuntimeState::NotReady => return Err(RpcError::AtomicStateNotReady),
             AtomicTokenRuntimeState::Recovering => return Err(RpcError::AtomicStateRecovering),
             AtomicTokenRuntimeState::Healthy | AtomicTokenRuntimeState::Degraded => {}
         }
-        let balance = view.balances.get(&cryptix_atomicindex::state::BalanceKey { asset_id, owner_id }).copied().unwrap_or(0);
-        let anchor_count = view.anchor_counts.get(&owner_id).copied().unwrap_or(0);
-        let expected_next_nonce = Self::expected_asset_nonce(&view, owner_id, asset_id);
-        let context = self.atomic_context(&view).await?;
+        let (_, anchor_count) = atomic.get_anchor_count_with_context(owner_id, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        let (_, expected_next_nonce) =
+            atomic.get_nonce_with_context(NonceKey::asset(owner_id, asset_id), at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
 
         let (can_spend, reason) = if context.is_degraded {
             (false, Some("token_state_degraded".to_string()))
@@ -2629,15 +2596,15 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let GetTokenEventsRequest { after_sequence, limit, at_block_hash } = request;
         let atomic = self.atomic_service()?;
         let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_EVENTS_LIMIT_MAX);
-        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
-        Self::ensure_token_read_ready(&view)?;
+        let read_context = atomic.get_read_context(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
         let events = atomic
-            .get_events_since_capped(after_sequence, limit, view.event_sequence_cutoff)
+            .get_events_since_capped(after_sequence, limit, read_context.event_sequence_cutoff)
             .await
             .into_iter()
             .map(Self::map_token_event)
             .collect();
-        let context = self.atomic_context(&view).await?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetTokenEventsResponse { events, context })
     }
 
@@ -2650,24 +2617,12 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let atomic = self.atomic_service()?;
         let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_ASSETS_LIMIT_MAX);
         let offset = usize::try_from(offset).map_err(|e| RpcError::General(e.to_string()))?;
-        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
-        Self::ensure_token_read_ready(&view)?;
         let query = query.unwrap_or_default();
-
-        let mut assets: Vec<TokenAsset> =
-            view.assets.values().filter(|asset| Self::token_asset_matches_query(asset, &query)).cloned().collect();
-        assets.sort_by(|a, b| {
-            let a_symbol = String::from_utf8_lossy(&a.symbol);
-            let b_symbol = String::from_utf8_lossy(&b.symbol);
-            a_symbol
-                .cmp(&b_symbol)
-                .then_with(|| String::from_utf8_lossy(&a.name).cmp(&String::from_utf8_lossy(&b.name)))
-                .then_with(|| a.asset_id.cmp(&b.asset_id))
-        });
-
-        let total = assets.len() as u64;
-        let assets = assets.into_iter().skip(offset).take(limit).map(Self::map_token_asset).collect();
-        let context = self.atomic_context(&view).await?;
+        let (read_context, assets, total) =
+            atomic.get_assets_page(offset, limit, query, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+        let assets = assets.into_iter().map(Self::map_token_asset).collect();
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetTokenAssetsResponse { assets, total, context })
     }
 
@@ -2720,15 +2675,15 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
     ) -> RpcResult<GetTokenOwnerIdByAddressResponse> {
         let GetTokenOwnerIdByAddressRequest { address, at_block_hash } = request;
         let atomic = self.atomic_service()?;
-        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
-        Self::ensure_token_read_ready(&view)?;
+        let read_context = atomic.get_read_context(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
         let address = Address::try_from(address.as_str()).map_err(|e| RpcError::General(format!("invalid `address` string: {e}")))?;
         let script_public_key = pay_to_address_script(&address);
         let (owner_id, reason) = match Self::owner_id_from_script(&script_public_key) {
             Some(owner_id) => (Some(owner_id.as_slice().to_hex()), None),
             None => (None, Some("unsupported_script_class".to_string())),
         };
-        let context = self.atomic_context(&view).await?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetTokenOwnerIdByAddressResponse { owner_id, reason, context })
     }
 
@@ -2740,19 +2695,21 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let GetLiquidityPoolStateRequest { asset_id, at_block_hash } = request;
         let atomic = self.atomic_service()?;
         let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
-        let view =
-            atomic.get_read_view(at_block_hash).await.ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
-        Self::ensure_token_read_ready(&view)?;
+        let (read_context, asset) = atomic
+            .get_asset_with_context(asset_id, at_block_hash)
+            .await
+            .ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
+        Self::ensure_token_context_read_ready(&read_context)?;
 
         let prefix = self.config.prefix();
-        let pool = view.assets.get(&asset_id).and_then(|asset| {
+        let pool = asset.as_ref().and_then(|asset| {
             if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
                 return None;
             }
             asset.liquidity.as_ref().map(|liquidity| Self::map_liquidity_pool_state(asset, liquidity, prefix))
         });
 
-        let context = self.atomic_context(&view).await?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetLiquidityPoolStateResponse { pool, context })
     }
 
@@ -2764,11 +2721,13 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let GetLiquidityQuoteRequest { asset_id, side, exact_in_amount, at_block_hash } = request;
         let atomic = self.atomic_service()?;
         let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
-        let view =
-            atomic.get_read_view(at_block_hash).await.ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
-        Self::ensure_token_read_ready(&view)?;
+        let (read_context, asset) = atomic
+            .get_asset_with_context(asset_id, at_block_hash)
+            .await
+            .ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
+        Self::ensure_token_context_read_ready(&read_context)?;
 
-        let asset = view.assets.get(&asset_id).ok_or_else(|| RpcError::General("liquidity asset not found".to_string()))?;
+        let asset = asset.as_ref().ok_or_else(|| RpcError::General("liquidity asset not found".to_string()))?;
         if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
             return Err(RpcError::General("asset is not a liquidity asset".to_string()));
         }
@@ -2832,7 +2791,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             }
         };
 
-        let context = self.atomic_context(&view).await?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetLiquidityQuoteResponse {
             side,
             exact_in_amount: effective_exact_in_amount,
@@ -2851,11 +2810,13 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let GetLiquidityFeeStateRequest { asset_id, at_block_hash } = request;
         let atomic = self.atomic_service()?;
         let asset_id_bytes = Self::parse_hex_32(&asset_id, "assetId")?;
-        let view =
-            atomic.get_read_view(at_block_hash).await.ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
-        Self::ensure_token_read_ready(&view)?;
+        let (read_context, asset) = atomic
+            .get_asset_with_context(asset_id_bytes, at_block_hash)
+            .await
+            .ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
+        Self::ensure_token_context_read_ready(&read_context)?;
 
-        let asset = view.assets.get(&asset_id_bytes).ok_or_else(|| RpcError::General("liquidity asset not found".to_string()))?;
+        let asset = asset.as_ref().ok_or_else(|| RpcError::General("liquidity asset not found".to_string()))?;
         if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
             return Err(RpcError::General("asset is not a liquidity asset".to_string()));
         }
@@ -2864,7 +2825,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let prefix = self.config.prefix();
         let recipients: Vec<RpcLiquidityFeeRecipient> =
             pool.fee_recipients.iter().map(|recipient| Self::map_liquidity_fee_recipient(recipient, prefix)).collect();
-        let context = self.atomic_context(&view).await?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetLiquidityFeeStateResponse {
             asset_id,
             fee_bps: u32::from(pool.fee_bps),
@@ -2882,11 +2843,13 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let GetLiquidityClaimPreviewRequest { asset_id, recipient_address, at_block_hash } = request;
         let atomic = self.atomic_service()?;
         let asset_id_bytes = Self::parse_hex_32(&asset_id, "assetId")?;
-        let view =
-            atomic.get_read_view(at_block_hash).await.ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
-        Self::ensure_token_read_ready(&view)?;
+        let (read_context, asset) = atomic
+            .get_asset_with_context(asset_id_bytes, at_block_hash)
+            .await
+            .ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
+        Self::ensure_token_context_read_ready(&read_context)?;
 
-        let asset = view.assets.get(&asset_id_bytes).ok_or_else(|| RpcError::General("liquidity asset not found".to_string()))?;
+        let asset = asset.as_ref().ok_or_else(|| RpcError::General("liquidity asset not found".to_string()))?;
         if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
             return Err(RpcError::General("asset is not a liquidity asset".to_string()));
         }
@@ -2911,7 +2874,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             None => (None, 0u64, false, Some(format!("{CAT_ERR_PAYOUT_SCRIPT_CLASS_INVALID}: unsupported_script_class"))),
         };
 
-        let context = self.atomic_context(&view).await?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetLiquidityClaimPreviewResponse {
             recipient_address,
             owner_id,
@@ -2973,8 +2936,8 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             return Err(RpcError::UnavailableInSafeMode);
         }
         atomic.export_snapshot_to_file(&request.path).await.map_err(|err| RpcError::General(err.to_string()))?;
-        let view = atomic.get_read_view(None).await.ok_or(RpcError::StaleContext)?;
-        let context = self.atomic_context(&view).await?;
+        let read_context = atomic.get_read_context(None).await.ok_or(RpcError::StaleContext)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(ExportTokenSnapshotResponse { exported: true, context })
     }
 
@@ -2989,8 +2952,8 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             return Err(RpcError::UnavailableInSafeMode);
         }
         atomic.import_snapshot_from_file(&request.path).await.map_err(|err| RpcError::General(err.to_string()))?;
-        let view = atomic.get_read_view(None).await.ok_or(RpcError::StaleContext)?;
-        let context = self.atomic_context(&view).await?;
+        let read_context = atomic.get_read_context(None).await.ok_or(RpcError::StaleContext)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(ImportTokenSnapshotResponse { imported: true, context })
     }
 
@@ -3001,9 +2964,9 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
     ) -> RpcResult<GetTokenHealthResponse> {
         let GetTokenHealthRequest { at_block_hash } = request;
         let atomic = self.atomic_service()?;
-        let view = atomic.get_read_view(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        let read_context = atomic.get_read_context(at_block_hash).await.ok_or(RpcError::StaleContext)?;
         let health = atomic.get_health().await;
-        let context = self.atomic_context(&view).await?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(Self::map_health_response(health, context))
     }
 
@@ -3013,8 +2976,8 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         _request: GetScBootstrapSourcesRequest,
     ) -> RpcResult<GetScBootstrapSourcesResponse> {
         let atomic = self.atomic_service()?;
-        let view = atomic.get_read_view(None).await.ok_or(RpcError::StaleContext)?;
-        let context = self.atomic_context(&view).await?;
+        let read_context = atomic.get_read_context(None).await.ok_or(RpcError::StaleContext)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         let sources = atomic
             .get_sc_bootstrap_sources()
             .await
@@ -3078,8 +3041,8 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         _request: GetScSnapshotHeadRequest,
     ) -> RpcResult<GetScSnapshotHeadResponse> {
         let atomic = self.atomic_service()?;
-        let view = atomic.get_read_view(None).await.ok_or(RpcError::StaleContext)?;
-        let context = self.atomic_context(&view).await?;
+        let read_context = atomic.get_read_context(None).await.ok_or(RpcError::StaleContext)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
         let head =
             atomic.get_sc_snapshot_head().await.map_err(|err| RpcError::General(err.to_string()))?.map(Self::map_sc_bootstrap_source);
         Ok(GetScSnapshotHeadResponse { head, context })

@@ -1,0 +1,1459 @@
+use crate::{
+    error::{AtomicTokenError, AtomicTokenResult},
+    state::{AtomicTokenState, BalanceKey, BlockJournal, LiquidityHolderAddressState, NonceKey, ProcessedOp, TokenAsset, TokenEvent},
+};
+use blake2b_simd::Params as Blake2bParams;
+use cryptix_consensus_core::{tx::TransactionOutpoint, Hash as BlockHash};
+use rocksdb::{checkpoint::Checkpoint, Options, WriteBatch, DB};
+use serde::{de::DeserializeOwned, Serialize};
+use std::{collections::HashSet, path::{Path, PathBuf}};
+
+pub const ATOMIC_DB_SCHEMA_VERSION: u16 = 2;
+
+const META_SCHEMA_VERSION: &[u8] = b"meta/atomic_schema_version";
+const META_PROTOCOL_VERSION: &[u8] = b"meta/atomic_protocol_version";
+const META_CHAIN_ID: &[u8] = b"meta/atomic_chain_id";
+const META_GENESIS_HASH: &[u8] = b"meta/atomic_genesis_hash";
+const META_CURRENT_ROOT: &[u8] = b"meta/atomic_current_root";
+const META_CURRENT_HEIGHT: &[u8] = b"meta/atomic_current_height";
+const META_CURRENT_BLOCK_HASH: &[u8] = b"meta/atomic_current_block_hash";
+const META_DEGRADED: &[u8] = b"meta/atomic_degraded";
+const META_NEXT_EVENT_SEQUENCE: &[u8] = b"meta/atomic_next_event_sequence";
+
+const PREFIX_ASSET: &[u8] = b"asset/";
+const PREFIX_BALANCE: &[u8] = b"balance/";
+const PREFIX_NONCE: &[u8] = b"nonce/";
+const PREFIX_ANCHOR_COUNT: &[u8] = b"anchor/";
+const PREFIX_PROCESSED_OP: &[u8] = b"processed_op/";
+const PREFIX_JOURNAL: &[u8] = b"journal/";
+const PREFIX_STATE_HASH: &[u8] = b"root/";
+const PREFIX_EVENT_SEQUENCE: &[u8] = b"event_seq/";
+const PREFIX_CHAIN_ORDER: &[u8] = b"chain_order/";
+const PREFIX_EVENT: &[u8] = b"event/";
+const PREFIX_LEAF_HASH: &[u8] = b"leaf_hash/";
+const PREFIX_ROOT_BUCKET: &[u8] = b"root_bucket/";
+const PREFIX_OWNER_BALANCE: &[u8] = b"owner_balance/";
+const PREFIX_ASSET_HOLDER: &[u8] = b"asset_holder/";
+const PREFIX_LIQUIDITY_VAULT: &[u8] = b"liquidity_vault/";
+const PREFIX_KNOWN_OWNER_ADDRESS: &[u8] = b"known_owner_address/";
+
+const ATOMIC_ROOT_BUCKETS: usize = 4096;
+const ROOT_LEAF_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_V2_LEAF";
+const ROOT_BUCKET_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_V2_BUCKETED_ROOT";
+const LOGICAL_ASSET: u8 = 0x01;
+const LOGICAL_BALANCE: u8 = 0x02;
+const LOGICAL_NONCE: u8 = 0x03;
+const LOGICAL_ANCHOR_COUNT: u8 = 0x04;
+
+const STATE_PREFIXES: &[&[u8]] = &[
+    PREFIX_ASSET,
+    PREFIX_BALANCE,
+    PREFIX_NONCE,
+    PREFIX_ANCHOR_COUNT,
+    PREFIX_PROCESSED_OP,
+    PREFIX_JOURNAL,
+    PREFIX_STATE_HASH,
+    PREFIX_EVENT_SEQUENCE,
+    PREFIX_CHAIN_ORDER,
+    PREFIX_EVENT,
+    PREFIX_LEAF_HASH,
+    PREFIX_ROOT_BUCKET,
+    PREFIX_OWNER_BALANCE,
+    PREFIX_ASSET_HOLDER,
+    PREFIX_LIQUIDITY_VAULT,
+    PREFIX_KNOWN_OWNER_ADDRESS,
+];
+
+pub struct AtomicStorageV2 {
+    path: PathBuf,
+    db: DB,
+    protocol_version: u16,
+    network_id: String,
+    genesis_hash: BlockHash,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct AtomicStorageSnapshotCounts {
+    pub assets: u64,
+    pub balances: u64,
+    pub nonces: u64,
+    pub anchor_counts: u64,
+    pub processed_ops: u64,
+    pub state_hashes: u64,
+    pub event_sequences: u64,
+    pub chain_order: u64,
+    pub events: u64,
+}
+
+impl std::fmt::Debug for AtomicStorageV2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AtomicStorageV2")
+            .field("path", &self.path)
+            .field("protocol_version", &self.protocol_version)
+            .field("network_id", &self.network_id)
+            .field("genesis_hash", &self.genesis_hash)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AtomicStorageV2 {
+    pub fn open(
+        path: impl AsRef<Path>,
+        protocol_version: u16,
+        network_id: String,
+        genesis_hash: BlockHash,
+    ) -> AtomicTokenResult<Self> {
+        let path = path.as_ref().to_path_buf();
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        let db = DB::open(&options, &path)
+            .map_err(|err| AtomicTokenError::Processing(format!("failed opening Atomic DB schema v2: {err}")))?;
+        let store = Self { path, db, protocol_version, network_id, genesis_hash };
+        store.initialize_or_validate_meta()?;
+        Ok(store)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn approximate_size_bytes(&self) -> Option<u64> {
+        self.db
+            .property_int_value("rocksdb.estimate-live-data-size")
+            .ok()
+            .flatten()
+            .or_else(|| self.db.property_int_value("rocksdb.total-sst-files-size").ok().flatten())
+    }
+
+    pub fn checkpoint_to(&self, path: impl AsRef<Path>) -> AtomicTokenResult<()> {
+        let path = path.as_ref();
+        if path.exists() {
+            std::fs::remove_dir_all(path).map_err(|err| {
+                AtomicTokenError::Processing(format!("failed removing stale Atomic DB checkpoint `{}`: {err}", path.display()))
+            })?;
+        }
+        let checkpoint = Checkpoint::new(&self.db)
+            .map_err(|err| AtomicTokenError::Processing(format!("failed creating Atomic DB checkpoint handle: {err}")))?;
+        checkpoint
+            .create_checkpoint(path)
+            .map_err(|err| AtomicTokenError::Processing(format!("failed creating Atomic DB checkpoint `{}`: {err}", path.display())))
+    }
+
+    pub fn current_root(&self) -> AtomicTokenResult<Option<[u8; 32]>> {
+        self.get_typed(META_CURRENT_ROOT)
+    }
+
+    pub fn get_asset(&self, asset_id: &[u8; 32]) -> AtomicTokenResult<Option<TokenAsset>> {
+        self.get_typed(&asset_key(asset_id))
+    }
+
+    pub fn get_balance(&self, key: &BalanceKey) -> AtomicTokenResult<u128> {
+        Ok(self.get_typed(&balance_key(key))?.unwrap_or(0))
+    }
+
+    pub fn get_nonce(&self, key: &NonceKey) -> AtomicTokenResult<u64> {
+        Ok(self.get_typed(&nonce_key(key))?.unwrap_or(1))
+    }
+
+    pub fn get_anchor_count(&self, owner_id: &[u8; 32]) -> AtomicTokenResult<u64> {
+        Ok(self.get_typed(&anchor_count_key(owner_id))?.unwrap_or(0))
+    }
+
+    pub fn get_processed_op(&self, txid: &BlockHash) -> AtomicTokenResult<Option<ProcessedOp>> {
+        self.get_typed(&processed_op_key(txid))
+    }
+
+    pub fn get_liquidity_asset_by_vault_outpoint(&self, outpoint: &TransactionOutpoint) -> AtomicTokenResult<Option<[u8; 32]>> {
+        self.get_typed(&liquidity_vault_key(outpoint))
+    }
+
+    pub fn get_known_owner_address(&self, owner_id: &[u8; 32]) -> AtomicTokenResult<Option<LiquidityHolderAddressState>> {
+        self.get_typed(&known_owner_address_key(owner_id))
+    }
+
+    pub fn balances_by_owner(&self, owner_id: &[u8; 32]) -> AtomicTokenResult<Vec<([u8; 32], u128)>> {
+        let mut entries = Vec::new();
+        let prefix = owner_balance_prefix(owner_id);
+        self.read_prefix(&prefix, |suffix, value| {
+            let asset_id = decode_fixed_32(suffix, "owner balance asset id")?;
+            let amount: u128 = decode_value(value, "owner balance")?;
+            if amount > 0 {
+                entries.push((asset_id, amount));
+            }
+            Ok(())
+        })?;
+        Ok(entries)
+    }
+
+    pub fn holders_by_asset(&self, asset_id: &[u8; 32]) -> AtomicTokenResult<Vec<([u8; 32], u128)>> {
+        let mut entries = Vec::new();
+        let prefix = asset_holder_prefix(asset_id);
+        self.read_prefix(&prefix, |suffix, value| {
+            let owner_id = decode_fixed_32(suffix, "asset holder owner id")?;
+            let amount: u128 = decode_value(value, "asset holder")?;
+            if amount > 0 {
+                entries.push((owner_id, amount));
+            }
+            Ok(())
+        })?;
+        Ok(entries)
+    }
+
+    pub fn assets_page(&self, offset: usize, limit: usize, query: &str) -> AtomicTokenResult<(Vec<TokenAsset>, u64)> {
+        self.assets_page_excluding(offset, limit, query, &HashSet::new())
+    }
+
+    pub fn assets_page_excluding(
+        &self,
+        offset: usize,
+        limit: usize,
+        query: &str,
+        excluded_asset_ids: &HashSet<[u8; 32]>,
+    ) -> AtomicTokenResult<(Vec<TokenAsset>, u64)> {
+        let query = query.trim().to_ascii_lowercase();
+        let mut matched = 0u64;
+        let mut entries = Vec::with_capacity(limit.min(1024));
+        self.read_prefix(PREFIX_ASSET, |suffix, value| {
+            let asset_id = decode_fixed_32(suffix, "asset id")?;
+            if excluded_asset_ids.contains(&asset_id) {
+                return Ok(());
+            }
+            let asset: TokenAsset = decode_value(value, "asset")?;
+            if asset.asset_id != asset_id {
+                return Err(AtomicTokenError::Processing("Atomic DB asset key/id mismatch".to_string()));
+            }
+            if !asset_matches_query(&asset, &query) {
+                return Ok(());
+            }
+            if matched >= offset as u64 && entries.len() < limit {
+                entries.push(asset);
+            }
+            matched = matched.saturating_add(1);
+            Ok(())
+        })?;
+        Ok((entries, matched))
+    }
+
+    pub fn visit_assets_excluding<F>(
+        &self,
+        query: &str,
+        excluded_asset_ids: &HashSet<[u8; 32]>,
+        mut visitor: F,
+    ) -> AtomicTokenResult<()>
+    where
+        F: FnMut(TokenAsset) -> AtomicTokenResult<()>,
+    {
+        let query = query.trim().to_ascii_lowercase();
+        self.read_prefix(PREFIX_ASSET, |suffix, value| {
+            let asset_id = decode_fixed_32(suffix, "asset id")?;
+            if excluded_asset_ids.contains(&asset_id) {
+                return Ok(());
+            }
+            let asset: TokenAsset = decode_value(value, "asset")?;
+            if asset.asset_id != asset_id {
+                return Err(AtomicTokenError::Processing("Atomic DB asset key/id mismatch".to_string()));
+            }
+            if asset_matches_query(&asset, &query) {
+                visitor(asset)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn load_runtime_state(&self) -> AtomicTokenResult<Option<AtomicTokenState>> {
+        if self.get_raw(META_CURRENT_ROOT)?.is_none() {
+            return Ok(None);
+        }
+
+        let mut state = AtomicTokenState::new(self.protocol_version, self.network_id.clone());
+        state.degraded = self.get_typed(META_DEGRADED)?.unwrap_or(false);
+        state.live_correct = false;
+        state.next_event_sequence = self.get_typed(META_NEXT_EVENT_SEQUENCE)?.unwrap_or(0);
+        self.load_runtime_history(&mut state)?;
+        state.rebuild_event_id_index();
+        Ok(Some(state))
+    }
+
+    pub fn load_state(&self) -> AtomicTokenResult<Option<AtomicTokenState>> {
+        if self.get_raw(META_CURRENT_ROOT)?.is_none() {
+            return Ok(None);
+        }
+
+        let mut state = AtomicTokenState::new(self.protocol_version, self.network_id.clone());
+        state.degraded = self.get_typed(META_DEGRADED)?.unwrap_or(false);
+        state.live_correct = false;
+        state.next_event_sequence = self.get_typed(META_NEXT_EVENT_SEQUENCE)?.unwrap_or(0);
+
+        self.read_prefix(PREFIX_ASSET, |suffix, value| {
+            let asset_id = decode_fixed_32(suffix, "asset id")?;
+            let asset: TokenAsset = decode_value(value, "asset")?;
+            state.assets.insert(asset_id, asset);
+            Ok(())
+        })?;
+        self.read_prefix(PREFIX_BALANCE, |suffix, value| {
+            let key = decode_balance_key(suffix)?;
+            let amount: u128 = decode_value(value, "balance")?;
+            if amount > 0 {
+                state.balances.insert(key, amount);
+            }
+            Ok(())
+        })?;
+        self.read_prefix(PREFIX_NONCE, |suffix, value| {
+            let key = decode_nonce_key(suffix)?;
+            let nonce: u64 = decode_value(value, "nonce")?;
+            state.nonces.insert(key, nonce);
+            Ok(())
+        })?;
+        self.read_prefix(PREFIX_ANCHOR_COUNT, |suffix, value| {
+            let owner_id = decode_fixed_32(suffix, "anchor owner id")?;
+            let count: u64 = decode_value(value, "anchor count")?;
+            if count > 0 {
+                state.anchor_counts.insert(owner_id, count);
+            }
+            Ok(())
+        })?;
+        self.read_prefix(PREFIX_PROCESSED_OP, |suffix, value| {
+            let txid = decode_block_hash(suffix, "processed op txid")?;
+            let op: ProcessedOp = decode_value(value, "processed op")?;
+            state.processed_ops.insert(txid, op);
+            Ok(())
+        })?;
+        self.load_runtime_history(&mut state)?;
+
+        state.rebuild_event_id_index();
+        state.rebuild_runtime_caches();
+        Ok(Some(state))
+    }
+
+    pub fn snapshot_counts(&self) -> AtomicTokenResult<AtomicStorageSnapshotCounts> {
+        Ok(AtomicStorageSnapshotCounts {
+            assets: self.prefix_count(PREFIX_ASSET)?,
+            balances: self.prefix_count(PREFIX_BALANCE)?,
+            nonces: self.prefix_count(PREFIX_NONCE)?,
+            anchor_counts: self.prefix_count(PREFIX_ANCHOR_COUNT)?,
+            processed_ops: self.prefix_count(PREFIX_PROCESSED_OP)?,
+            state_hashes: self.prefix_count(PREFIX_STATE_HASH)?,
+            event_sequences: self.prefix_count(PREFIX_EVENT_SEQUENCE)?,
+            chain_order: self.prefix_count(PREFIX_CHAIN_ORDER)?,
+            events: self.prefix_count(PREFIX_EVENT)?,
+        })
+    }
+
+    pub fn visit_all_assets<F>(&self, mut visitor: F) -> AtomicTokenResult<()>
+    where
+        F: FnMut([u8; 32], TokenAsset) -> AtomicTokenResult<()>,
+    {
+        self.read_prefix(PREFIX_ASSET, |suffix, value| {
+            let asset_id = decode_fixed_32(suffix, "asset id")?;
+            let asset: TokenAsset = decode_value(value, "asset")?;
+            visitor(asset_id, asset)
+        })
+    }
+
+    pub fn visit_all_balances<F>(&self, mut visitor: F) -> AtomicTokenResult<()>
+    where
+        F: FnMut(BalanceKey, u128) -> AtomicTokenResult<()>,
+    {
+        self.read_prefix(PREFIX_BALANCE, |suffix, value| {
+            let key = decode_balance_key(suffix)?;
+            let amount: u128 = decode_value(value, "balance")?;
+            visitor(key, amount)
+        })
+    }
+
+    pub fn visit_all_nonces<F>(&self, mut visitor: F) -> AtomicTokenResult<()>
+    where
+        F: FnMut(NonceKey, u64) -> AtomicTokenResult<()>,
+    {
+        self.read_prefix(PREFIX_NONCE, |suffix, value| {
+            let key = decode_nonce_key(suffix)?;
+            let nonce: u64 = decode_value(value, "nonce")?;
+            visitor(key, nonce)
+        })
+    }
+
+    pub fn visit_all_anchor_counts<F>(&self, mut visitor: F) -> AtomicTokenResult<()>
+    where
+        F: FnMut([u8; 32], u64) -> AtomicTokenResult<()>,
+    {
+        self.read_prefix(PREFIX_ANCHOR_COUNT, |suffix, value| {
+            let owner_id = decode_fixed_32(suffix, "anchor owner id")?;
+            let count: u64 = decode_value(value, "anchor count")?;
+            visitor(owner_id, count)
+        })
+    }
+
+    pub fn visit_all_processed_ops<F>(&self, mut visitor: F) -> AtomicTokenResult<()>
+    where
+        F: FnMut(BlockHash, ProcessedOp) -> AtomicTokenResult<()>,
+    {
+        self.read_prefix(PREFIX_PROCESSED_OP, |suffix, value| {
+            let txid = decode_block_hash(suffix, "processed op txid")?;
+            let op: ProcessedOp = decode_value(value, "processed op")?;
+            visitor(txid, op)
+        })
+    }
+
+    pub fn visit_all_state_hashes<F>(&self, mut visitor: F) -> AtomicTokenResult<()>
+    where
+        F: FnMut(BlockHash, [u8; 32]) -> AtomicTokenResult<()>,
+    {
+        self.read_prefix(PREFIX_STATE_HASH, |suffix, value| {
+            let block_hash = decode_block_hash(suffix, "state hash block hash")?;
+            let state_hash: [u8; 32] = decode_value(value, "state hash")?;
+            visitor(block_hash, state_hash)
+        })
+    }
+
+    pub fn visit_all_event_sequences<F>(&self, mut visitor: F) -> AtomicTokenResult<()>
+    where
+        F: FnMut(BlockHash, u64) -> AtomicTokenResult<()>,
+    {
+        self.read_prefix(PREFIX_EVENT_SEQUENCE, |suffix, value| {
+            let block_hash = decode_block_hash(suffix, "event sequence block hash")?;
+            let sequence: u64 = decode_value(value, "event sequence")?;
+            visitor(block_hash, sequence)
+        })
+    }
+
+    pub fn visit_all_chain_order<F>(&self, mut visitor: F) -> AtomicTokenResult<()>
+    where
+        F: FnMut(u64, BlockHash) -> AtomicTokenResult<()>,
+    {
+        self.read_prefix(PREFIX_CHAIN_ORDER, |suffix, value| {
+            let index = decode_u64_suffix(suffix, "chain order index")?;
+            let block_hash: BlockHash = decode_value(value, "chain order block hash")?;
+            visitor(index, block_hash)
+        })
+    }
+
+    pub fn visit_all_events<F>(&self, mut visitor: F) -> AtomicTokenResult<()>
+    where
+        F: FnMut(TokenEvent) -> AtomicTokenResult<()>,
+    {
+        self.read_prefix(PREFIX_EVENT, |suffix, value| {
+            let _sequence = decode_event_key_suffix(suffix)?;
+            let event: TokenEvent = decode_value(value, "event")?;
+            visitor(event)
+        })
+    }
+
+    fn load_runtime_history(&self, state: &mut AtomicTokenState) -> AtomicTokenResult<()> {
+        self.read_prefix(PREFIX_JOURNAL, |suffix, value| {
+            let block_hash = decode_block_hash(suffix, "journal block hash")?;
+            let journal: BlockJournal = decode_value(value, "block journal")?;
+            state.block_journals.insert(block_hash, journal);
+            Ok(())
+        })?;
+        self.read_prefix(PREFIX_STATE_HASH, |suffix, value| {
+            let block_hash = decode_block_hash(suffix, "state hash block hash")?;
+            let state_hash: [u8; 32] = decode_value(value, "state hash")?;
+            state.state_hash_by_block.insert(block_hash, state_hash);
+            Ok(())
+        })?;
+        self.read_prefix(PREFIX_EVENT_SEQUENCE, |suffix, value| {
+            let block_hash = decode_block_hash(suffix, "event sequence block hash")?;
+            let sequence: u64 = decode_value(value, "event sequence")?;
+            state.event_sequence_by_block.insert(block_hash, sequence);
+            Ok(())
+        })?;
+        self.read_prefix(PREFIX_CHAIN_ORDER, |suffix, value| {
+            let _index = decode_u64_suffix(suffix, "chain order index")?;
+            let block_hash: BlockHash = decode_value(value, "chain order block hash")?;
+            state.applied_chain_order.push(block_hash);
+            Ok(())
+        })?;
+        self.read_prefix(PREFIX_EVENT, |suffix, value| {
+            let _sequence = decode_event_key_suffix(suffix)?;
+            let event: TokenEvent = decode_value(value, "event")?;
+            state.events.push(event);
+            Ok(())
+        })
+    }
+
+    pub fn persist_state(&self, state: &AtomicTokenState) -> AtomicTokenResult<()> {
+        let mut batch = WriteBatch::default();
+        for prefix in STATE_PREFIXES {
+            for key in self.keys_with_prefix(prefix)? {
+                batch.delete(key);
+            }
+        }
+
+        batch.put(META_SCHEMA_VERSION, encode_value(&ATOMIC_DB_SCHEMA_VERSION, "schema version")?);
+        batch.put(META_PROTOCOL_VERSION, encode_value(&self.protocol_version, "protocol version")?);
+        batch.put(META_CHAIN_ID, encode_value(&self.network_id, "chain id")?);
+        batch.put(META_GENESIS_HASH, encode_value(&self.genesis_hash.as_bytes(), "genesis hash")?);
+        let mut root_accumulator = RootAccumulator::default();
+        batch.put(META_CURRENT_ROOT, encode_value(&[0u8; 32], "current root")?);
+        batch.put(META_CURRENT_HEIGHT, encode_value(&(state.applied_chain_order.len() as u64), "current height")?);
+        if let Some(current_block_hash) = state.applied_chain_order.last() {
+            batch.put(META_CURRENT_BLOCK_HASH, encode_value(current_block_hash, "current block hash")?);
+        } else {
+            batch.delete(META_CURRENT_BLOCK_HASH);
+        }
+        batch.put(META_DEGRADED, encode_value(&state.degraded, "degraded flag")?);
+        batch.put(META_NEXT_EVENT_SEQUENCE, encode_value(&state.next_event_sequence, "next event sequence")?);
+
+        for (asset_id, asset) in state.assets.iter() {
+            let value = encode_value(asset, "asset")?;
+            batch.put(asset_key(asset_id), &value);
+            write_asset_secondary_indexes(&mut batch, asset)?;
+            root_accumulator.set(logical_asset_key(asset_id), Some(&value));
+        }
+        for (key, amount) in state.balances.iter() {
+            if *amount > 0 {
+                let value = encode_value(amount, "balance")?;
+                batch.put(balance_key(key), &value);
+                write_balance_secondary_indexes(&mut batch, key, *amount)?;
+                root_accumulator.set(logical_balance_key(key), Some(&value));
+            }
+        }
+        for (key, nonce) in state.nonces.iter() {
+            let value = encode_value(nonce, "nonce")?;
+            batch.put(nonce_key(key), &value);
+            root_accumulator.set(logical_nonce_key(key), Some(&value));
+        }
+        for (owner_id, count) in state.anchor_counts.iter() {
+            if *count > 0 {
+                let value = encode_value(count, "anchor count")?;
+                batch.put(anchor_count_key(owner_id), &value);
+                root_accumulator.set(logical_anchor_count_key(owner_id), Some(&value));
+            }
+        }
+        for (txid, op) in state.processed_ops.iter() {
+            let value = encode_value(op, "processed op")?;
+            batch.put(processed_op_key(txid), &value);
+        }
+        for (block_hash, journal) in state.block_journals.iter() {
+            batch.put(journal_key(block_hash), encode_value(journal, "block journal")?);
+        }
+        for (block_hash, state_hash) in state.state_hash_by_block.iter() {
+            batch.put(state_hash_key(block_hash), encode_value(state_hash, "state hash")?);
+        }
+        for (block_hash, sequence) in state.event_sequence_by_block.iter() {
+            batch.put(event_sequence_key(block_hash), encode_value(sequence, "event sequence")?);
+        }
+        for (index, block_hash) in state.applied_chain_order.iter().enumerate() {
+            batch.put(chain_order_key(index as u64), encode_value(block_hash, "chain order block hash")?);
+        }
+        for event in state.events.iter() {
+            batch.put(event_key(event), encode_value(event, "event")?);
+        }
+
+        let root = root_accumulator.write_to_batch(&mut batch)?;
+        batch.put(META_CURRENT_ROOT, encode_value(&root, "current root")?);
+
+        self.db
+            .write(batch)
+            .map_err(|err| AtomicTokenError::Processing(format!("failed committing Atomic DB schema v2 batch: {err}")))?;
+        Ok(())
+    }
+
+    pub fn apply_current_state_delta(
+        &self,
+        asset_changes: impl IntoIterator<Item = ([u8; 32], Option<TokenAsset>)>,
+        balance_changes: impl IntoIterator<Item = (BalanceKey, Option<u128>)>,
+        nonce_changes: impl IntoIterator<Item = (NonceKey, Option<u64>)>,
+        anchor_count_changes: impl IntoIterator<Item = ([u8; 32], Option<u64>)>,
+        processed_op_changes: impl IntoIterator<Item = (BlockHash, Option<ProcessedOp>)>,
+    ) -> AtomicTokenResult<[u8; 32]> {
+        let mut batch = WriteBatch::default();
+        let mut root_changes = Vec::new();
+        self.write_state_changes_to_batch(
+            &mut batch,
+            &mut root_changes,
+            asset_changes,
+            balance_changes,
+            nonce_changes,
+            anchor_count_changes,
+            processed_op_changes,
+        )?;
+
+        let root = self.apply_root_changes_to_batch(&mut batch, root_changes)?;
+        batch.put(META_CURRENT_ROOT, encode_value(&root, "current root")?);
+        self.db
+            .write(batch)
+            .map_err(|err| AtomicTokenError::Processing(format!("failed committing Atomic DB schema v2 delta: {err}")))?;
+        Ok(root)
+    }
+
+    pub fn commit_applied_block_delta(
+        &self,
+        asset_changes: Vec<([u8; 32], Option<TokenAsset>)>,
+        balance_changes: Vec<(BalanceKey, Option<u128>)>,
+        nonce_changes: Vec<(NonceKey, Option<u64>)>,
+        anchor_count_changes: Vec<([u8; 32], Option<u64>)>,
+        processed_op_changes: Vec<(BlockHash, Option<ProcessedOp>)>,
+        block_hash: BlockHash,
+        journal: &BlockJournal,
+        chain_index: u64,
+        event_sequence: u64,
+        new_events: &[TokenEvent],
+        degraded: bool,
+        next_event_sequence: u64,
+    ) -> AtomicTokenResult<[u8; 32]> {
+        let mut batch = WriteBatch::default();
+        let mut root_changes = Vec::new();
+        self.write_state_changes_to_batch(
+            &mut batch,
+            &mut root_changes,
+            asset_changes,
+            balance_changes,
+            nonce_changes,
+            anchor_count_changes,
+            processed_op_changes,
+        )?;
+        let root = self.apply_root_changes_to_batch(&mut batch, root_changes)?;
+
+        batch.put(journal_key(&block_hash), encode_value(journal, "block journal")?);
+        batch.put(state_hash_key(&block_hash), encode_value(&root, "state hash")?);
+        batch.put(event_sequence_key(&block_hash), encode_value(&event_sequence, "event sequence")?);
+        batch.put(chain_order_key(chain_index), encode_value(&block_hash, "chain order block hash")?);
+        for event in new_events {
+            batch.put(event_key(event), encode_value(event, "event")?);
+        }
+        self.write_current_meta_to_batch(
+            &mut batch,
+            Some(block_hash),
+            chain_index.saturating_add(1),
+            root,
+            degraded,
+            next_event_sequence,
+        )?;
+
+        self.db
+            .write(batch)
+            .map_err(|err| AtomicTokenError::Processing(format!("failed committing Atomic DB schema v2 applied block: {err}")))?;
+        Ok(root)
+    }
+
+    pub fn commit_rollback_delta(
+        &self,
+        asset_changes: Vec<([u8; 32], Option<TokenAsset>)>,
+        balance_changes: Vec<(BalanceKey, Option<u128>)>,
+        nonce_changes: Vec<(NonceKey, Option<u64>)>,
+        anchor_count_changes: Vec<([u8; 32], Option<u64>)>,
+        processed_op_changes: Vec<(BlockHash, Option<ProcessedOp>)>,
+        removed_block_hash: BlockHash,
+        current_block_hash: Option<BlockHash>,
+        chain_len: u64,
+        new_events: &[TokenEvent],
+        degraded: bool,
+        next_event_sequence: u64,
+    ) -> AtomicTokenResult<[u8; 32]> {
+        let mut batch = WriteBatch::default();
+        let mut root_changes = Vec::new();
+        self.write_state_changes_to_batch(
+            &mut batch,
+            &mut root_changes,
+            asset_changes,
+            balance_changes,
+            nonce_changes,
+            anchor_count_changes,
+            processed_op_changes,
+        )?;
+        let root = self.apply_root_changes_to_batch(&mut batch, root_changes)?;
+
+        batch.delete(journal_key(&removed_block_hash));
+        batch.delete(state_hash_key(&removed_block_hash));
+        batch.delete(event_sequence_key(&removed_block_hash));
+        batch.delete(chain_order_key(chain_len));
+        for event in new_events {
+            batch.put(event_key(event), encode_value(event, "event")?);
+        }
+        self.write_current_meta_to_batch(&mut batch, current_block_hash, chain_len, root, degraded, next_event_sequence)?;
+
+        self.db
+            .write(batch)
+            .map_err(|err| AtomicTokenError::Processing(format!("failed committing Atomic DB schema v2 rollback: {err}")))?;
+        Ok(root)
+    }
+
+    pub fn persist_runtime_flags(
+        &self,
+        current_block_hash: Option<BlockHash>,
+        chain_len: u64,
+        degraded: bool,
+        next_event_sequence: u64,
+    ) -> AtomicTokenResult<()> {
+        let root = self.current_root()?.unwrap_or([0u8; 32]);
+        let mut batch = WriteBatch::default();
+        self.write_current_meta_to_batch(&mut batch, current_block_hash, chain_len, root, degraded, next_event_sequence)?;
+        self.db
+            .write(batch)
+            .map_err(|err| AtomicTokenError::Processing(format!("failed committing Atomic DB schema v2 runtime flags: {err}")))?;
+        Ok(())
+    }
+
+    pub fn prune_history(
+        &self,
+        pruned_hashes: &[BlockHash],
+        retained_chain_order: &[BlockHash],
+        last_pruned_event_sequence: Option<u64>,
+    ) -> AtomicTokenResult<()> {
+        if pruned_hashes.is_empty() {
+            return Ok(());
+        }
+        let pruned = pruned_hashes.iter().copied().collect::<std::collections::HashSet<_>>();
+        let mut batch = WriteBatch::default();
+        for block_hash in pruned_hashes {
+            batch.delete(journal_key(block_hash));
+            batch.delete(state_hash_key(block_hash));
+            batch.delete(event_sequence_key(block_hash));
+        }
+        for key in self.keys_with_prefix(PREFIX_CHAIN_ORDER)? {
+            batch.delete(key);
+        }
+        for (index, block_hash) in retained_chain_order.iter().enumerate() {
+            batch.put(chain_order_key(index as u64), encode_value(block_hash, "chain order block hash")?);
+        }
+        if let Some(last_pruned_event_sequence) = last_pruned_event_sequence {
+            for key in self.keys_with_prefix(PREFIX_EVENT)? {
+                let sequence = decode_event_key_suffix(&key[PREFIX_EVENT.len()..])?;
+                if sequence <= last_pruned_event_sequence {
+                    batch.delete(key);
+                }
+            }
+        }
+        self.read_prefix(PREFIX_PROCESSED_OP, |suffix, value| {
+            let txid = decode_block_hash(suffix, "processed op txid")?;
+            let op: ProcessedOp = decode_value(value, "processed op")?;
+            if pruned.contains(&op.accepting_block_hash) {
+                batch.delete(processed_op_key(&txid));
+            }
+            Ok(())
+        })?;
+        let root = self.current_root()?.unwrap_or([0u8; 32]);
+        batch.put(META_CURRENT_ROOT, encode_value(&root, "current root")?);
+        batch.put(META_CURRENT_HEIGHT, encode_value(&(retained_chain_order.len() as u64), "current height")?);
+        self.db
+            .write(batch)
+            .map_err(|err| AtomicTokenError::Processing(format!("failed pruning Atomic DB schema v2 history: {err}")))?;
+        Ok(())
+    }
+
+    fn write_state_changes_to_batch(
+        &self,
+        batch: &mut WriteBatch,
+        root_changes: &mut Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        asset_changes: impl IntoIterator<Item = ([u8; 32], Option<TokenAsset>)>,
+        balance_changes: impl IntoIterator<Item = (BalanceKey, Option<u128>)>,
+        nonce_changes: impl IntoIterator<Item = (NonceKey, Option<u64>)>,
+        anchor_count_changes: impl IntoIterator<Item = ([u8; 32], Option<u64>)>,
+        processed_op_changes: impl IntoIterator<Item = (BlockHash, Option<ProcessedOp>)>,
+    ) -> AtomicTokenResult<()> {
+        for (asset_id, value) in asset_changes {
+            let logical_key = logical_asset_key(&asset_id);
+            if let Some(old_asset) = self.get_asset(&asset_id)? {
+                delete_asset_secondary_indexes(batch, &old_asset);
+            }
+            match value {
+                Some(asset) => {
+                    let encoded = encode_value(&asset, "asset")?;
+                    batch.put(asset_key(&asset_id), &encoded);
+                    write_asset_secondary_indexes(batch, &asset)?;
+                    root_changes.push((logical_key, Some(encoded)));
+                }
+                None => {
+                    batch.delete(asset_key(&asset_id));
+                    root_changes.push((logical_key, None));
+                }
+            }
+        }
+        for (key, value) in balance_changes {
+            let logical_key = logical_balance_key(&key);
+            match value.filter(|amount| *amount > 0) {
+                Some(amount) => {
+                    let encoded = encode_value(&amount, "balance")?;
+                    batch.put(balance_key(&key), &encoded);
+                    write_balance_secondary_indexes(batch, &key, amount)?;
+                    root_changes.push((logical_key, Some(encoded)));
+                }
+                None => {
+                    batch.delete(balance_key(&key));
+                    delete_balance_secondary_indexes(batch, &key);
+                    root_changes.push((logical_key, None));
+                }
+            }
+        }
+        for (key, value) in nonce_changes {
+            let logical_key = logical_nonce_key(&key);
+            match value {
+                Some(nonce) => {
+                    let encoded = encode_value(&nonce, "nonce")?;
+                    batch.put(nonce_key(&key), &encoded);
+                    root_changes.push((logical_key, Some(encoded)));
+                }
+                None => {
+                    batch.delete(nonce_key(&key));
+                    root_changes.push((logical_key, None));
+                }
+            }
+        }
+        for (owner_id, value) in anchor_count_changes {
+            let logical_key = logical_anchor_count_key(&owner_id);
+            match value.filter(|count| *count > 0) {
+                Some(count) => {
+                    let encoded = encode_value(&count, "anchor count")?;
+                    batch.put(anchor_count_key(&owner_id), &encoded);
+                    root_changes.push((logical_key, Some(encoded)));
+                }
+                None => {
+                    batch.delete(anchor_count_key(&owner_id));
+                    root_changes.push((logical_key, None));
+                }
+            }
+        }
+        for (txid, value) in processed_op_changes {
+            match value {
+                Some(op) => {
+                    let encoded = encode_value(&op, "processed op")?;
+                    batch.put(processed_op_key(&txid), &encoded);
+                }
+                None => {
+                    batch.delete(processed_op_key(&txid));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_current_meta_to_batch(
+        &self,
+        batch: &mut WriteBatch,
+        current_block_hash: Option<BlockHash>,
+        chain_len: u64,
+        root: [u8; 32],
+        degraded: bool,
+        next_event_sequence: u64,
+    ) -> AtomicTokenResult<()> {
+        batch.put(META_SCHEMA_VERSION, encode_value(&ATOMIC_DB_SCHEMA_VERSION, "schema version")?);
+        batch.put(META_PROTOCOL_VERSION, encode_value(&self.protocol_version, "protocol version")?);
+        batch.put(META_CHAIN_ID, encode_value(&self.network_id, "chain id")?);
+        batch.put(META_GENESIS_HASH, encode_value(&self.genesis_hash.as_bytes(), "genesis hash")?);
+        batch.put(META_CURRENT_ROOT, encode_value(&root, "current root")?);
+        batch.put(META_CURRENT_HEIGHT, encode_value(&chain_len, "current height")?);
+        if let Some(current_block_hash) = current_block_hash {
+            batch.put(META_CURRENT_BLOCK_HASH, encode_value(&current_block_hash, "current block hash")?);
+        } else {
+            batch.delete(META_CURRENT_BLOCK_HASH);
+        }
+        batch.put(META_DEGRADED, encode_value(&degraded, "degraded flag")?);
+        batch.put(META_NEXT_EVENT_SEQUENCE, encode_value(&next_event_sequence, "next event sequence")?);
+        Ok(())
+    }
+
+    fn initialize_or_validate_meta(&self) -> AtomicTokenResult<()> {
+        let Some(schema_version) = self.get_typed::<u16>(META_SCHEMA_VERSION)? else {
+            let mut batch = WriteBatch::default();
+            batch.put(META_SCHEMA_VERSION, encode_value(&ATOMIC_DB_SCHEMA_VERSION, "schema version")?);
+            batch.put(META_PROTOCOL_VERSION, encode_value(&self.protocol_version, "protocol version")?);
+            batch.put(META_CHAIN_ID, encode_value(&self.network_id, "chain id")?);
+            batch.put(META_GENESIS_HASH, encode_value(&self.genesis_hash.as_bytes(), "genesis hash")?);
+            self.db
+                .write(batch)
+                .map_err(|err| AtomicTokenError::Processing(format!("failed initializing Atomic DB schema v2 metadata: {err}")))?;
+            return Ok(());
+        };
+
+        if schema_version != ATOMIC_DB_SCHEMA_VERSION {
+            return Err(AtomicTokenError::Processing(format!(
+                "Atomic DB schema mismatch: expected `{ATOMIC_DB_SCHEMA_VERSION}`, got `{schema_version}`"
+            )));
+        }
+        let stored_protocol_version = self
+            .get_typed::<u16>(META_PROTOCOL_VERSION)?
+            .ok_or_else(|| AtomicTokenError::Processing("Atomic DB schema v2 is missing protocol version metadata".to_string()))?;
+        if stored_protocol_version != self.protocol_version {
+            return Err(AtomicTokenError::Processing(format!(
+                "Atomic DB protocol mismatch: expected `{}`, got `{stored_protocol_version}`",
+                self.protocol_version
+            )));
+        }
+        let stored_network_id = self
+            .get_typed::<String>(META_CHAIN_ID)?
+            .ok_or_else(|| AtomicTokenError::Processing("Atomic DB schema v2 is missing chain id metadata".to_string()))?;
+        if stored_network_id != self.network_id {
+            return Err(AtomicTokenError::Processing(format!(
+                "Atomic DB chain mismatch: expected `{}`, got `{stored_network_id}`",
+                self.network_id
+            )));
+        }
+        let stored_genesis_hash = self
+            .get_typed::<[u8; 32]>(META_GENESIS_HASH)?
+            .ok_or_else(|| AtomicTokenError::Processing("Atomic DB schema v2 is missing genesis hash metadata".to_string()))?;
+        if stored_genesis_hash != self.genesis_hash.as_bytes() {
+            return Err(AtomicTokenError::Processing(
+                "Atomic DB genesis hash mismatch; reset the Atomic data directory for this network".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn get_raw(&self, key: &[u8]) -> AtomicTokenResult<Option<Vec<u8>>> {
+        self.db.get(key).map_err(|err| AtomicTokenError::Processing(format!("failed reading Atomic DB schema v2: {err}")))
+    }
+
+    fn get_typed<T: DeserializeOwned>(&self, key: &[u8]) -> AtomicTokenResult<Option<T>> {
+        self.get_raw(key)?.map(|value| decode_value(&value, "metadata")).transpose()
+    }
+
+    fn read_prefix<F>(&self, prefix: &[u8], mut visitor: F) -> AtomicTokenResult<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> AtomicTokenResult<()>,
+    {
+        let iter = self.db.prefix_iterator(prefix);
+        for item in iter {
+            let (key, value) =
+                item.map_err(|err| AtomicTokenError::Processing(format!("failed iterating Atomic DB schema v2: {err}")))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            visitor(&key[prefix.len()..], &value)?;
+        }
+        Ok(())
+    }
+
+    fn prefix_count(&self, prefix: &[u8]) -> AtomicTokenResult<u64> {
+        let mut count = 0u64;
+        self.read_prefix(prefix, |_, _| {
+            count = count.saturating_add(1);
+            Ok(())
+        })?;
+        Ok(count)
+    }
+
+    fn keys_with_prefix(&self, prefix: &[u8]) -> AtomicTokenResult<Vec<Vec<u8>>> {
+        let mut keys = Vec::new();
+        self.read_prefix(prefix, |suffix, _| {
+            let mut key = Vec::with_capacity(prefix.len() + suffix.len());
+            key.extend_from_slice(prefix);
+            key.extend_from_slice(suffix);
+            keys.push(key);
+            Ok(())
+        })?;
+        Ok(keys)
+    }
+
+    fn apply_root_changes_to_batch(
+        &self,
+        batch: &mut WriteBatch,
+        changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> AtomicTokenResult<[u8; 32]> {
+        let mut buckets = self.load_root_buckets()?;
+        for (logical_key, value) in changes {
+            let leaf_key = leaf_hash_key(&logical_key);
+            let old_leaf = self.get_typed::<[u8; 32]>(&leaf_key)?.unwrap_or([0u8; 32]);
+            let new_leaf = value.as_ref().map(|encoded| root_leaf_hash(&logical_key, encoded)).unwrap_or([0u8; 32]);
+            if old_leaf == new_leaf {
+                continue;
+            }
+            let bucket_index = root_bucket_index(&logical_key);
+            xor_hash(&mut buckets[bucket_index], old_leaf);
+            xor_hash(&mut buckets[bucket_index], new_leaf);
+            if new_leaf == [0u8; 32] {
+                batch.delete(leaf_key);
+            } else {
+                batch.put(leaf_key, encode_value(&new_leaf, "root leaf hash")?);
+            }
+            batch.put(root_bucket_key(bucket_index as u16), encode_value(&buckets[bucket_index], "root bucket")?);
+        }
+        Ok(root_from_buckets(&buckets))
+    }
+
+    fn load_root_buckets(&self) -> AtomicTokenResult<[[u8; 32]; ATOMIC_ROOT_BUCKETS]> {
+        let mut buckets = [[0u8; 32]; ATOMIC_ROOT_BUCKETS];
+        self.read_prefix(PREFIX_ROOT_BUCKET, |suffix, value| {
+            let index = decode_u16_suffix(suffix, "root bucket index")? as usize;
+            if index >= ATOMIC_ROOT_BUCKETS {
+                return Err(AtomicTokenError::Processing(format!("Atomic DB root bucket index `{index}` is out of range")));
+            }
+            buckets[index] = decode_value(value, "root bucket")?;
+            Ok(())
+        })?;
+        Ok(buckets)
+    }
+}
+
+#[derive(Default)]
+struct RootAccumulator {
+    leaves: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl RootAccumulator {
+    fn set(&mut self, logical_key: Vec<u8>, value: Option<&[u8]>) {
+        if let Some(value) = value {
+            self.leaves.push((logical_key, value.to_vec()));
+        }
+    }
+
+    fn write_to_batch(self, batch: &mut WriteBatch) -> AtomicTokenResult<[u8; 32]> {
+        let mut buckets = [[0u8; 32]; ATOMIC_ROOT_BUCKETS];
+        for (logical_key, value) in self.leaves {
+            let leaf_hash = root_leaf_hash(&logical_key, &value);
+            let bucket_index = root_bucket_index(&logical_key);
+            xor_hash(&mut buckets[bucket_index], leaf_hash);
+            batch.put(leaf_hash_key(&logical_key), encode_value(&leaf_hash, "root leaf hash")?);
+        }
+        for (index, bucket) in buckets.iter().enumerate() {
+            if *bucket != [0u8; 32] {
+                batch.put(root_bucket_key(index as u16), encode_value(bucket, "root bucket")?);
+            }
+        }
+        Ok(root_from_buckets(&buckets))
+    }
+}
+
+fn encode_value<T: Serialize>(value: &T, label: &str) -> AtomicTokenResult<Vec<u8>> {
+    bincode::serialize(value).map_err(|err| AtomicTokenError::Processing(format!("failed encoding Atomic DB {label}: {err}")))
+}
+
+fn decode_value<T: DeserializeOwned>(value: &[u8], label: &str) -> AtomicTokenResult<T> {
+    bincode::deserialize(value).map_err(|err| AtomicTokenError::Processing(format!("failed decoding Atomic DB {label}: {err}")))
+}
+
+fn asset_matches_query(asset: &TokenAsset, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+
+    let symbol = String::from_utf8_lossy(&asset.symbol).to_ascii_lowercase();
+    let name = String::from_utf8_lossy(&asset.name).to_ascii_lowercase();
+    let asset_id = hex_lower(&asset.asset_id);
+    symbol.contains(query) || name.contains(query) || asset_id.starts_with(query)
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn prefixed_key(prefix: &[u8], suffix: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(prefix.len() + suffix.len());
+    key.extend_from_slice(prefix);
+    key.extend_from_slice(suffix);
+    key
+}
+
+fn asset_key(asset_id: &[u8; 32]) -> Vec<u8> {
+    prefixed_key(PREFIX_ASSET, asset_id)
+}
+
+fn balance_key(key: &BalanceKey) -> Vec<u8> {
+    let mut suffix = Vec::with_capacity(64);
+    suffix.extend_from_slice(&key.asset_id);
+    suffix.extend_from_slice(&key.owner_id);
+    prefixed_key(PREFIX_BALANCE, &suffix)
+}
+
+fn nonce_key(key: &NonceKey) -> Vec<u8> {
+    let mut suffix = Vec::with_capacity(65);
+    suffix.extend_from_slice(&key.owner_id);
+    suffix.push(key.scope_kind);
+    suffix.extend_from_slice(&key.scope_id);
+    prefixed_key(PREFIX_NONCE, &suffix)
+}
+
+fn anchor_count_key(owner_id: &[u8; 32]) -> Vec<u8> {
+    prefixed_key(PREFIX_ANCHOR_COUNT, owner_id)
+}
+
+fn processed_op_key(txid: &BlockHash) -> Vec<u8> {
+    prefixed_key(PREFIX_PROCESSED_OP, &txid.as_bytes())
+}
+
+fn journal_key(block_hash: &BlockHash) -> Vec<u8> {
+    prefixed_key(PREFIX_JOURNAL, &block_hash.as_bytes())
+}
+
+fn state_hash_key(block_hash: &BlockHash) -> Vec<u8> {
+    prefixed_key(PREFIX_STATE_HASH, &block_hash.as_bytes())
+}
+
+fn event_sequence_key(block_hash: &BlockHash) -> Vec<u8> {
+    prefixed_key(PREFIX_EVENT_SEQUENCE, &block_hash.as_bytes())
+}
+
+fn chain_order_key(index: u64) -> Vec<u8> {
+    prefixed_key(PREFIX_CHAIN_ORDER, &index.to_be_bytes())
+}
+
+fn event_key(event: &TokenEvent) -> Vec<u8> {
+    let mut suffix = Vec::with_capacity(40);
+    suffix.extend_from_slice(&event.sequence.to_be_bytes());
+    suffix.extend_from_slice(&event.event_id);
+    prefixed_key(PREFIX_EVENT, &suffix)
+}
+
+fn owner_balance_prefix(owner_id: &[u8; 32]) -> Vec<u8> {
+    prefixed_key(PREFIX_OWNER_BALANCE, owner_id)
+}
+
+fn owner_balance_key(key: &BalanceKey) -> Vec<u8> {
+    let mut suffix = Vec::with_capacity(64);
+    suffix.extend_from_slice(&key.owner_id);
+    suffix.extend_from_slice(&key.asset_id);
+    prefixed_key(PREFIX_OWNER_BALANCE, &suffix)
+}
+
+fn asset_holder_prefix(asset_id: &[u8; 32]) -> Vec<u8> {
+    prefixed_key(PREFIX_ASSET_HOLDER, asset_id)
+}
+
+fn asset_holder_key(key: &BalanceKey) -> Vec<u8> {
+    let mut suffix = Vec::with_capacity(64);
+    suffix.extend_from_slice(&key.asset_id);
+    suffix.extend_from_slice(&key.owner_id);
+    prefixed_key(PREFIX_ASSET_HOLDER, &suffix)
+}
+
+fn liquidity_vault_key(outpoint: &TransactionOutpoint) -> Vec<u8> {
+    let mut suffix = Vec::with_capacity(36);
+    suffix.extend_from_slice(&outpoint.transaction_id.as_bytes());
+    suffix.extend_from_slice(&outpoint.index.to_be_bytes());
+    prefixed_key(PREFIX_LIQUIDITY_VAULT, &suffix)
+}
+
+fn known_owner_address_key(owner_id: &[u8; 32]) -> Vec<u8> {
+    prefixed_key(PREFIX_KNOWN_OWNER_ADDRESS, owner_id)
+}
+
+fn write_balance_secondary_indexes(batch: &mut WriteBatch, key: &BalanceKey, amount: u128) -> AtomicTokenResult<()> {
+    batch.put(owner_balance_key(key), encode_value(&amount, "owner balance")?);
+    batch.put(asset_holder_key(key), encode_value(&amount, "asset holder")?);
+    Ok(())
+}
+
+fn delete_balance_secondary_indexes(batch: &mut WriteBatch, key: &BalanceKey) {
+    batch.delete(owner_balance_key(key));
+    batch.delete(asset_holder_key(key));
+}
+
+fn write_asset_secondary_indexes(batch: &mut WriteBatch, asset: &TokenAsset) -> AtomicTokenResult<()> {
+    let Some(pool) = asset.liquidity.as_ref() else {
+        return Ok(());
+    };
+    batch.put(liquidity_vault_key(&pool.vault_outpoint), encode_value(&asset.asset_id, "liquidity vault asset id")?);
+    for recipient in pool.fee_recipients.iter() {
+        let address = LiquidityHolderAddressState {
+            address_version: recipient.address_version,
+            address_payload: recipient.address_payload.clone(),
+        };
+        batch.put(known_owner_address_key(&recipient.owner_id), encode_value(&address, "known owner address")?);
+    }
+    for (owner_id, holder) in pool.holder_addresses.iter() {
+        batch.put(known_owner_address_key(owner_id), encode_value(holder, "known owner address")?);
+    }
+    Ok(())
+}
+
+fn delete_asset_secondary_indexes(batch: &mut WriteBatch, asset: &TokenAsset) {
+    if let Some(pool) = asset.liquidity.as_ref() {
+        batch.delete(liquidity_vault_key(&pool.vault_outpoint));
+    }
+}
+
+fn leaf_hash_key(logical_key: &[u8]) -> Vec<u8> {
+    prefixed_key(PREFIX_LEAF_HASH, logical_key)
+}
+
+fn root_bucket_key(index: u16) -> Vec<u8> {
+    prefixed_key(PREFIX_ROOT_BUCKET, &index.to_be_bytes())
+}
+
+fn logical_asset_key(asset_id: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(33);
+    key.push(LOGICAL_ASSET);
+    key.extend_from_slice(asset_id);
+    key
+}
+
+fn logical_balance_key(key: &BalanceKey) -> Vec<u8> {
+    let mut logical = Vec::with_capacity(65);
+    logical.push(LOGICAL_BALANCE);
+    logical.extend_from_slice(&key.asset_id);
+    logical.extend_from_slice(&key.owner_id);
+    logical
+}
+
+fn logical_nonce_key(key: &NonceKey) -> Vec<u8> {
+    let mut logical = Vec::with_capacity(66);
+    logical.push(LOGICAL_NONCE);
+    logical.extend_from_slice(&key.owner_id);
+    logical.push(key.scope_kind);
+    logical.extend_from_slice(&key.scope_id);
+    logical
+}
+
+fn logical_anchor_count_key(owner_id: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(33);
+    key.push(LOGICAL_ANCHOR_COUNT);
+    key.extend_from_slice(owner_id);
+    key
+}
+
+fn root_leaf_hash(logical_key: &[u8], value: &[u8]) -> [u8; 32] {
+    let mut hasher = Blake2bParams::new().hash_length(32).to_state();
+    hasher.update(ROOT_LEAF_DOMAIN);
+    hasher.update(&(logical_key.len() as u64).to_le_bytes());
+    hasher.update(logical_key);
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_bytes());
+    out
+}
+
+fn root_bucket_index(logical_key: &[u8]) -> usize {
+    let mut hasher = Blake2bParams::new().hash_length(32).to_state();
+    hasher.update(b"CRYPTIX_ATOMIC_V2_BUCKET_INDEX");
+    hasher.update(logical_key);
+    let digest = hasher.finalize();
+    let bytes = digest.as_bytes();
+    (((bytes[0] as usize) << 4) | ((bytes[1] as usize) >> 4)) & (ATOMIC_ROOT_BUCKETS - 1)
+}
+
+fn root_from_buckets(buckets: &[[u8; 32]; ATOMIC_ROOT_BUCKETS]) -> [u8; 32] {
+    let mut hasher = Blake2bParams::new().hash_length(32).to_state();
+    hasher.update(ROOT_BUCKET_DOMAIN);
+    hasher.update(&(ATOMIC_ROOT_BUCKETS as u64).to_le_bytes());
+    for bucket in buckets {
+        hasher.update(bucket);
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_bytes());
+    out
+}
+
+fn xor_hash(target: &mut [u8; 32], value: [u8; 32]) {
+    for (target, value) in target.iter_mut().zip(value) {
+        *target ^= value;
+    }
+}
+
+fn decode_fixed_32(suffix: &[u8], label: &str) -> AtomicTokenResult<[u8; 32]> {
+    if suffix.len() != 32 {
+        return Err(AtomicTokenError::Processing(format!(
+            "Atomic DB key decode failed for {label}: expected 32 bytes, got {}",
+            suffix.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(suffix);
+    Ok(out)
+}
+
+fn decode_block_hash(suffix: &[u8], label: &str) -> AtomicTokenResult<BlockHash> {
+    Ok(BlockHash::from_bytes(decode_fixed_32(suffix, label)?))
+}
+
+fn decode_balance_key(suffix: &[u8]) -> AtomicTokenResult<BalanceKey> {
+    if suffix.len() != 64 {
+        return Err(AtomicTokenError::Processing(format!(
+            "Atomic DB balance key decode failed: expected 64 bytes, got {}",
+            suffix.len()
+        )));
+    }
+    let mut asset_id = [0u8; 32];
+    let mut owner_id = [0u8; 32];
+    asset_id.copy_from_slice(&suffix[..32]);
+    owner_id.copy_from_slice(&suffix[32..64]);
+    Ok(BalanceKey { asset_id, owner_id })
+}
+
+fn decode_nonce_key(suffix: &[u8]) -> AtomicTokenResult<NonceKey> {
+    if suffix.len() != 65 {
+        return Err(AtomicTokenError::Processing(format!(
+            "Atomic DB nonce key decode failed: expected 65 bytes, got {}",
+            suffix.len()
+        )));
+    }
+    let mut owner_id = [0u8; 32];
+    let mut scope_id = [0u8; 32];
+    owner_id.copy_from_slice(&suffix[..32]);
+    scope_id.copy_from_slice(&suffix[33..65]);
+    Ok(NonceKey { owner_id, scope_kind: suffix[32], scope_id })
+}
+
+fn decode_u64_suffix(suffix: &[u8], label: &str) -> AtomicTokenResult<u64> {
+    if suffix.len() != 8 {
+        return Err(AtomicTokenError::Processing(format!(
+            "Atomic DB key decode failed for {label}: expected 8 bytes, got {}",
+            suffix.len()
+        )));
+    }
+    let mut out = [0u8; 8];
+    out.copy_from_slice(suffix);
+    Ok(u64::from_be_bytes(out))
+}
+
+fn decode_u16_suffix(suffix: &[u8], label: &str) -> AtomicTokenResult<u16> {
+    if suffix.len() != 2 {
+        return Err(AtomicTokenError::Processing(format!(
+            "Atomic DB key decode failed for {label}: expected 2 bytes, got {}",
+            suffix.len()
+        )));
+    }
+    let mut out = [0u8; 2];
+    out.copy_from_slice(suffix);
+    Ok(u16::from_be_bytes(out))
+}
+
+fn decode_event_key_suffix(suffix: &[u8]) -> AtomicTokenResult<u64> {
+    if suffix.len() != 40 {
+        return Err(AtomicTokenError::Processing(format!(
+            "Atomic DB event key decode failed: expected 40 bytes, got {}",
+            suffix.len()
+        )));
+    }
+    decode_u64_suffix(&suffix[..8], "event sequence")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AtomicStorageV2;
+    use crate::state::{AtomicTokenState, BalanceKey, NonceKey};
+    use cryptix_consensus_core::Hash as BlockHash;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("cryptix-atomic-{name}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn initializes_schema_v2_metadata_and_roundtrips_split_state() {
+        let dir = unique_temp_dir("roundtrip");
+        let genesis_hash = BlockHash::from_u64_word(42);
+        let store = AtomicStorageV2::open(&dir, 6, "cryptix-simnet".to_string(), genesis_hash).expect("open store");
+        assert!(store.load_state().expect("load empty").is_none());
+
+        let asset_id = [7u8; 32];
+        let owner_id = [9u8; 32];
+        let mut state = AtomicTokenState::new(6, "cryptix-simnet".to_string());
+        state.live_correct = true;
+        state.degraded = true;
+        state.balances.insert(BalanceKey { asset_id, owner_id }, 123);
+        state.nonces.insert(NonceKey::asset(owner_id, asset_id), 8);
+        state.anchor_counts.insert(owner_id, 1);
+        state.applied_chain_order.push(BlockHash::from_u64_word(99));
+        state.state_hash_by_block.insert(BlockHash::from_u64_word(99), state.compute_state_hash());
+
+        store.persist_state(&state).expect("persist state");
+        drop(store);
+
+        let store = AtomicStorageV2::open(&dir, 6, "cryptix-simnet".to_string(), genesis_hash).expect("reopen store");
+        let loaded = store.load_state().expect("load state").expect("state present");
+        assert!(loaded.degraded);
+        assert!(!loaded.live_correct);
+        assert_eq!(loaded.balances.get(&BalanceKey { asset_id, owner_id }), Some(&123));
+        assert_eq!(loaded.nonces.get(&NonceKey::asset(owner_id, asset_id)), Some(&8));
+        assert_eq!(loaded.anchor_counts.get(&owner_id), Some(&1));
+        assert_eq!(loaded.applied_chain_order, vec![BlockHash::from_u64_word(99)]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_wrong_chain_metadata() {
+        let dir = unique_temp_dir("wrong-chain");
+        let genesis_hash = BlockHash::from_u64_word(1);
+        let store = AtomicStorageV2::open(&dir, 6, "cryptix-simnet".to_string(), genesis_hash).expect("open store");
+        drop(store);
+
+        let err = match AtomicStorageV2::open(&dir, 6, "cryptix-mainnet".to_string(), genesis_hash) {
+            Ok(_) => panic!("network mismatch must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("Atomic DB chain mismatch"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn delta_updates_current_root_without_full_rewrite() {
+        let dir = unique_temp_dir("delta-root");
+        let genesis_hash = BlockHash::from_u64_word(7);
+        let store = AtomicStorageV2::open(&dir, 6, "cryptix-simnet".to_string(), genesis_hash).expect("open store");
+        let asset_id = [3u8; 32];
+        let owner_id = [4u8; 32];
+        let balance_key = BalanceKey { asset_id, owner_id };
+
+        let root_a = store
+            .apply_current_state_delta(
+                std::iter::empty(),
+                [(balance_key, Some(50u128))],
+                [(NonceKey::asset(owner_id, asset_id), Some(2u64))],
+                [(owner_id, Some(1u64))],
+                std::iter::empty(),
+            )
+            .expect("apply first delta");
+        assert_eq!(store.get_balance(&balance_key).expect("balance"), 50);
+        assert_eq!(store.current_root().expect("root"), Some(root_a));
+
+        let root_b = store
+            .apply_current_state_delta(
+                std::iter::empty(),
+                [(balance_key, Some(75u128))],
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+            )
+            .expect("apply second delta");
+        assert_ne!(root_a, root_b);
+        assert_eq!(store.get_balance(&balance_key).expect("balance"), 75);
+
+        let root_c = store
+            .apply_current_state_delta(
+                std::iter::empty(),
+                [(balance_key, None)],
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+            )
+            .expect("delete balance");
+        assert_ne!(root_b, root_c);
+        assert_eq!(store.get_balance(&balance_key).expect("balance"), 0);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn runtime_load_keeps_large_state_maps_on_disk() {
+        let dir = unique_temp_dir("runtime-load");
+        let genesis_hash = BlockHash::from_u64_word(8);
+        let store = AtomicStorageV2::open(&dir, 6, "cryptix-simnet".to_string(), genesis_hash).expect("open store");
+        let asset_id = [5u8; 32];
+        let owner_id = [6u8; 32];
+        let key = BalanceKey { asset_id, owner_id };
+        let block_hash = BlockHash::from_u64_word(100);
+        let mut state = AtomicTokenState::new(6, "cryptix-simnet".to_string());
+        state.balances.insert(key, 900);
+        state.applied_chain_order.push(block_hash);
+        state.state_hash_by_block.insert(block_hash, state.compute_state_hash());
+
+        store.persist_state(&state).expect("persist state");
+        drop(store);
+
+        let store = AtomicStorageV2::open(&dir, 6, "cryptix-simnet".to_string(), genesis_hash).expect("reopen store");
+        let runtime_state = store.load_runtime_state().expect("runtime load").expect("state present");
+        assert!(runtime_state.assets.is_empty());
+        assert!(runtime_state.balances.is_empty());
+        assert_eq!(runtime_state.applied_chain_order, vec![block_hash]);
+        assert_eq!(store.get_balance(&key).expect("balance point read"), 900);
+        assert_eq!(store.balances_by_owner(&owner_id).expect("owner index"), vec![(asset_id, 900)]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+}

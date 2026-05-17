@@ -1,7 +1,7 @@
 use crate::{
     flow_context::FlowContext,
     v5::{
-        ibd::{receive_trusted_atomic_state_chunks, HeadersChunkStream, TrustedEntryStream},
+        ibd::{HeadersChunkStream, TrustedEntryStream},
         Flow,
     },
 };
@@ -406,19 +406,7 @@ impl IbdFlow {
             return Ok(Some(inline_state));
         }
 
-        if pkg.has_chunked_atomic_state() {
-            let atomic_state = receive_trusted_atomic_state_chunks(
-                &self.router,
-                &mut self.incoming_route,
-                state_hash,
-                pkg.atomic_state_byte_length,
-                pkg.atomic_state_chunk_count,
-            )
-            .await?;
-            return Ok(Some(atomic_state));
-        }
-
-        Err(ProtocolError::Other("invalid pruning-point atomic state transfer metadata"))
+        Ok(Some(cryptix_consensus_core::pruning::PruningPointAtomicState { state_hash }))
     }
 
     async fn sync_headers(
