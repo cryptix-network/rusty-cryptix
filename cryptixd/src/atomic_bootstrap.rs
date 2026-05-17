@@ -1598,8 +1598,8 @@ fn select_snapshot_quorum(
         let support_key = (source.source_identity.clone(), snapshot_id);
         if let Some(existing) = unique_support.get_mut(&support_key) {
             let merged_kind = merge_source_kind(existing.kind, source.kind);
-            let replace_existing = (source.at_daa_score, source.at_block_hash.clone())
-                > (existing.at_daa_score, existing.at_block_hash.clone());
+            let replace_existing =
+                (source.at_daa_score, source.at_block_hash.clone()) > (existing.at_daa_score, existing.at_block_hash.clone());
             if replace_existing {
                 source.kind = merged_kind;
                 *existing = source;
@@ -2049,14 +2049,9 @@ mod tests {
 
     #[test]
     fn quorum_policy_peer_majority_min_sources_override_accepts_single_source() {
-        let decision = select_snapshot_quorum(
-            vec![evidence("peer-1", "snapshot-x", SourceKind::Configured, 220, "xxxx")],
-            true,
-            true,
-            1,
-            1,
-        )
-        .expect("explicit single-source peer quorum should allow private bootstrap testing");
+        let decision =
+            select_snapshot_quorum(vec![evidence("peer-1", "snapshot-x", SourceKind::Configured, 220, "xxxx")], true, true, 1, 1)
+                .expect("explicit single-source peer quorum should allow private bootstrap testing");
 
         assert_eq!(decision.snapshot_id, "snapshot-x");
         assert_eq!(decision.required_votes, 1);

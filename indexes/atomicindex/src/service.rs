@@ -6,7 +6,7 @@ use crate::{
         AtomicTokenStateFootprint, BalanceKey, LiquidityHolderAddressState, NonceKey, ProcessedOp, TokenAsset, TokenEvent,
         TokenHolderEntry, TokenOwnerBalanceEntry,
     },
-    storage_v2::{AtomicStorageSnapshotCounts, AtomicStorageV2},
+    storage_v2::{AtomicStorageSnapshotCounts, AtomicStorageV2, ATOMIC_REVALIDATION_VERSION},
     IDENT,
 };
 use async_channel::Receiver;
@@ -75,7 +75,6 @@ const SNAPSHOT_IMPORT_CHUNK_KEYS: usize = 4096;
 const BOOTSTRAP_STORE_MAX_SNAPSHOTS_PER_NETWORK: usize = 16;
 const ATOMIC_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const ATOMIC_LONG_OPERATION_LOG_INTERVAL: Duration = Duration::from_secs(5);
-const ATOMIC_REVALIDATION_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 struct SnapshotManifestV2 {
@@ -1348,16 +1347,20 @@ impl AtomicTokenService {
                 "startup state revalidation failed: canonical replay path has no retained prefix match".to_string(),
             ));
         }
-        if matching_prefix_len < expected_chain.len() {
+        let retained_path_diverged = matching_prefix_len < expected_chain.len();
+        if retained_path_diverged {
             let diverged_block = expected_chain[matching_prefix_len];
-            return Err(AtomicTokenError::Processing(format!(
-                "startup state revalidation failed: canonical replay path diverged before retained block `{diverged_block}`"
-            )));
+            warn!(
+                "[{IDENT}] Cryptix Atomic startup state revalidation retained path diverged before block {}; replaying current canonical path from last verified prefix",
+                diverged_block
+            );
         }
-        let replay_added = expected_chain.clone();
+        let replay_added = replay_chain.added.clone();
+        let replay_extends_loaded_chain = replay_added.len() != expected_chain.len();
         info!(
-            "[{IDENT}] Cryptix Atomic startup state revalidation canonical replay path resolved: {} retained block(s), sink={}",
+            "[{IDENT}] Cryptix Atomic startup state revalidation canonical replay path resolved: {} block(s), retained_prefix={} block(s), sink={}",
             replay_added.len(),
+            matching_prefix_len,
             sink
         );
 
@@ -1374,18 +1377,26 @@ impl AtomicTokenService {
         let auth_inputs = self.processor.collect_auth_inputs_for_added_blocks(&replay_added).await?;
 
         let temp_state_dir = unique_atomic_temp_dir("startup-revalidation");
-        self.processor.state_store.checkpoint_to(&temp_state_dir)?;
-        let temp_state_store =
-            Arc::new(AtomicStorageV2::open(&temp_state_dir, self.protocol_version, self.network_id.clone(), self.genesis_hash)?);
+        let temp_state_store = if first_replayable_index == 0 {
+            Arc::new(AtomicStorageV2::open(&temp_state_dir, self.protocol_version, self.network_id.clone(), self.genesis_hash)?)
+        } else {
+            self.processor.state_store.checkpoint_to(&temp_state_dir)?;
+            Arc::new(AtomicStorageV2::open(&temp_state_dir, self.protocol_version, self.network_id.clone(), self.genesis_hash)?)
+        };
         let mut staged_state = loaded_state.clone();
-        staged_state.attach_state_store(temp_state_store.clone());
-        staged_state.degraded = false;
-        staged_state.live_correct = false;
-        info!(
-            "[{IDENT}] Cryptix Atomic startup state revalidation rolling back retained replay window to parent of {}",
-            first_replayable_block_hash
-        );
-        staged_state.rollback_snapshot_window_to_parent_persisted(first_replayable_block_hash)?;
+        if first_replayable_index == 0 {
+            staged_state.reset_to_empty_replay_state(temp_state_store.clone());
+            info!("[{IDENT}] Cryptix Atomic startup state revalidation replay starts at retained root; using clean V2 replay store");
+        } else {
+            staged_state.attach_state_store(temp_state_store.clone());
+            staged_state.degraded = false;
+            staged_state.live_correct = false;
+            info!(
+                "[{IDENT}] Cryptix Atomic startup state revalidation rolling back retained replay window to parent of {}",
+                first_replayable_block_hash
+            );
+            staged_state.rollback_snapshot_window_to_parent_persisted(first_replayable_block_hash)?;
+        }
 
         let replay_notification =
             VirtualChainChangedNotification::new(Arc::new(replay_added.clone()), Arc::new(Vec::new()), Arc::new(acceptance_data));
@@ -1483,7 +1494,11 @@ impl AtomicTokenService {
         }
 
         let mut state = self.processor.state.lock().await;
-        if final_replayed_state_hash != final_expected_state_hash {
+        let active_state_needs_repair = loaded_state.degraded
+            || retained_path_diverged
+            || replay_extends_loaded_chain
+            || final_replayed_state_hash != final_expected_state_hash;
+        if active_state_needs_repair {
             staged_state.degraded = false;
             staged_state.live_correct = true;
             if let Some(pruned) = staged_state.prune_history_with_details(self.max_retained_blocks) {
@@ -1498,7 +1513,12 @@ impl AtomicTokenService {
             }
             let repaired_state = copy_snapshot_store_into_active(&temp_state_store, self.processor.state_store.clone(), staged_state)?;
             *state = repaired_state;
-            info!("[{IDENT}] Cryptix Atomic startup state revalidation repaired active V2 store from deterministic replay");
+            info!(
+                "[{IDENT}] Cryptix Atomic startup state revalidation repaired active V2 store from deterministic replay: diverged={}, extended={}, stale_final_hash={}",
+                retained_path_diverged,
+                replay_extends_loaded_chain,
+                final_replayed_state_hash != final_expected_state_hash
+            );
         }
         if !refreshed_retained_hashes.is_empty() {
             let refreshed_count = self.processor.state_store.replace_state_hashes(refreshed_retained_hashes.iter().copied())?;

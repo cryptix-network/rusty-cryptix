@@ -12,6 +12,7 @@ use std::{
 };
 
 pub const ATOMIC_DB_SCHEMA_VERSION: u16 = 2;
+pub const ATOMIC_REVALIDATION_VERSION: u16 = 2;
 
 const META_SCHEMA_VERSION: &[u8] = b"meta/atomic_schema_version";
 const META_PROTOCOL_VERSION: &[u8] = b"meta/atomic_protocol_version";
@@ -501,6 +502,7 @@ impl AtomicStorageV2 {
         }
         batch.put(META_DEGRADED, encode_value(&state.degraded, "degraded flag")?);
         batch.put(META_NEXT_EVENT_SEQUENCE, encode_value(&state.next_event_sequence, "next event sequence")?);
+        batch.put(META_REVALIDATION_VERSION, encode_value(&ATOMIC_REVALIDATION_VERSION, "revalidation version")?);
 
         for (asset_id, asset) in state.assets.iter() {
             let value = encode_value(asset, "asset")?;
@@ -517,9 +519,11 @@ impl AtomicStorageV2 {
             }
         }
         for (key, nonce) in state.nonces.iter() {
-            let value = encode_value(nonce, "nonce")?;
-            batch.put(nonce_key(key), &value);
-            root_accumulator.set(logical_nonce_key(key), Some(&value));
+            if *nonce != 1 {
+                let value = encode_value(nonce, "nonce")?;
+                batch.put(nonce_key(key), &value);
+                root_accumulator.set(logical_nonce_key(key), Some(&value));
+            }
         }
         for (owner_id, count) in state.anchor_counts.iter() {
             if *count > 0 {
@@ -927,6 +931,7 @@ impl AtomicStorageV2 {
         }
         batch.put(META_DEGRADED, encode_value(&degraded, "degraded flag")?);
         batch.put(META_NEXT_EVENT_SEQUENCE, encode_value(&next_event_sequence, "next event sequence")?);
+        batch.put(META_REVALIDATION_VERSION, encode_value(&ATOMIC_REVALIDATION_VERSION, "revalidation version")?);
         Ok(())
     }
 
@@ -1622,6 +1627,31 @@ mod tests {
         assert_eq!(runtime_state.applied_chain_order, vec![block_hash]);
         assert_eq!(store.get_balance(&key).expect("balance point read"), 900);
         assert_eq!(store.balances_by_owner(&owner_id).expect("owner index"), vec![(asset_id, 900)]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn persist_state_does_not_materialize_default_nonce() {
+        let dir = unique_temp_dir("default-nonce");
+        let genesis_hash = BlockHash::from_u64_word(11);
+        let store = AtomicStorageV2::open(&dir, 6, "cryptix-simnet".to_string(), genesis_hash).expect("open store");
+        let asset_id = [11u8; 32];
+        let owner_id = [12u8; 32];
+        let nonce_key = NonceKey::asset(owner_id, asset_id);
+        store.persist_state(&AtomicTokenState::new(6, "cryptix-simnet".to_string())).expect("persist empty state");
+        let empty_root = store.current_root().expect("empty root").expect("empty root present");
+
+        let mut state = AtomicTokenState::new(6, "cryptix-simnet".to_string());
+        state.nonces.insert(nonce_key, 1);
+
+        store.persist_state(&state).expect("persist state");
+
+        assert_eq!(store.get_nonce(&nonce_key).expect("nonce"), 1);
+        assert_eq!(store.current_root().expect("root"), Some(empty_root));
+        assert_eq!(store.prefix_count(super::PREFIX_NONCE).expect("nonce count"), 0);
+        let runtime_state = store.load_runtime_state().expect("load runtime").expect("state present");
+        assert!(runtime_state.nonces.is_empty());
 
         let _ = fs::remove_dir_all(dir);
     }

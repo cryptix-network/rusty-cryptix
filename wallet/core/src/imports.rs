@@ -9,9 +9,9 @@ pub use crate::account::{Account, AccountKind, DerivationCapableAccount};
 pub use crate::deterministic::*;
 pub use crate::encryption::{Encryptable, EncryptionKind};
 pub use crate::error::Error;
-pub use crate::events::{Events, SyncState};
 #[cfg(any(feature = "wasm32-sdk", feature = "wasm32-core"))]
 pub use crate::events::EventKind;
+pub use crate::events::{Events, SyncState};
 pub use crate::factory::{factories, Factory};
 pub use crate::metrics::{MetricsUpdate, MetricsUpdateKind};
 pub use crate::result::Result;

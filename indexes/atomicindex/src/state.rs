@@ -24,7 +24,7 @@ use cryptix_consensus_core::{
 };
 use cryptix_consensus_notify::notification::VirtualChainChangedNotification;
 use cryptix_consensusmanager::{ConsensusManager, ConsensusProxy};
-use cryptix_core::info;
+use cryptix_core::{info, warn};
 use cryptix_txscript::script_class::ScriptClass;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -765,6 +765,20 @@ impl AtomicTokenState {
         self.clear_storage_overlay();
     }
 
+    pub fn reset_to_empty_replay_state(&mut self, state_store: Arc<AtomicStorageV2>) {
+        self.attach_state_store(state_store);
+        self.clear_storage_overlay();
+        self.block_journals.clear();
+        self.state_hash_by_block.clear();
+        self.event_sequence_by_block.clear();
+        self.applied_chain_order.clear();
+        self.next_event_sequence = 0;
+        self.events.clear();
+        self.event_ids.clear();
+        self.degraded = false;
+        self.live_correct = false;
+    }
+
     fn storage_delta_for_applied_journal(&self, journal: &BlockJournal) -> StorageDelta {
         let mut delta = StorageDelta::default();
         for change in journal.changed_assets.iter() {
@@ -1468,16 +1482,25 @@ impl AtomicTokenState {
                         details,
                         journal,
                     ),
-                    Err(_noop_reason) => {
-                        // Accepted CAT ops that fail execution semantics indicate
-                        // consensus/index divergence. Fail closed.
-                        self.mark_degraded();
+                    Err(noop_reason) => {
+                        let replay_integrity_failure = is_replay_integrity_failure(noop_reason);
+                        if replay_integrity_failure {
+                            warn!(
+                                "[{IDENT}] accepted CAT transaction failed Atomic replay integrity; marking degraded: txid={}, accepting_block={}, op={:?}, nonce={}, reason={:?}",
+                                tx.id(),
+                                accepting_block_hash,
+                                parsed.header.op,
+                                parsed.header.nonce,
+                                noop_reason
+                            );
+                            self.mark_degraded();
+                        }
                         let details = self.build_event_details(tx, &parsed, auth_inputs);
                         self.insert_processed(
                             tx.id(),
                             accepting_block_hash,
                             ApplyStatus::Noop,
-                            NoopReason::InternalMalformedAcceptance,
+                            if replay_integrity_failure { NoopReason::InternalMalformedAcceptance } else { noop_reason },
                             tx_ref.source_block_hash,
                             ordinal,
                             details,
@@ -1486,9 +1509,15 @@ impl AtomicTokenState {
                     }
                 }
             }
-            Err(_noop_reason) => {
+            Err(noop_reason) => {
                 // Accepted CAT payload parse failures are consensus/index divergence.
                 // We preserve journal continuity but force degraded runtime state.
+                warn!(
+                    "[{IDENT}] accepted CAT transaction failed Atomic payload parsing; marking degraded: txid={}, accepting_block={}, reason={:?}",
+                    tx.id(),
+                    accepting_block_hash,
+                    noop_reason
+                );
                 self.mark_degraded();
                 self.insert_processed(
                     tx.id(),
@@ -1528,7 +1557,7 @@ impl AtomicTokenState {
         if parsed.header.nonce != expected_nonce {
             return Err(NoopReason::BadNonce);
         }
-        let next_nonce = expected_nonce.checked_add(1).ok_or(NoopReason::BadNonce)?;
+        let next_nonce = expected_nonce.checked_add(1).ok_or(NoopReason::InternalMalformedAcceptance)?;
         if !spent_vault_inputs.is_empty() {
             match &parsed.op {
                 TokenOp::BuyLiquidityExactIn(_) | TokenOp::SellLiquidityExactIn(_) | TokenOp::ClaimLiquidityFees(_) => {}
@@ -3995,6 +4024,10 @@ fn map_liquidity_math_error(err: LiquidityMathError) -> NoopReason {
     }
 }
 
+fn is_replay_integrity_failure(reason: NoopReason) -> bool {
+    matches!(reason, NoopReason::BadAuthInput | NoopReason::InternalMalformedAcceptance)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4275,6 +4308,30 @@ mod tests {
         let processed = state.processed_ops.get(&txid).expect("overflowing tx should be recorded as noop");
         assert_eq!(processed.apply_status, ApplyStatus::Noop);
         assert_eq!(processed.noop_reason, NoopReason::InternalMalformedAcceptance);
+    }
+
+    #[test]
+    fn stale_nonce_cat_op_is_noop_without_degrading_indexer() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let owner_script = test_script(9);
+        let owner_id = owner_id(&state, &owner_script);
+        let outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(3234), 0);
+        state.nonces.insert(NonceKey::owner(owner_id), 2);
+
+        let payload = payload_create_asset(0, 1, 8, owner_id, b"Stale", b"STL", b"");
+        let tx = token_tx(outpoint, owner_script.clone(), payload);
+        let txid = tx.id();
+        let mut auth_inputs = HashMap::new();
+        auth_inputs.insert(outpoint, UtxoEntry::new(1000, owner_script, 0, false));
+
+        apply_block(&mut state, BlockHash::from_u64_word(6321), vec![tx_ref(tx, BlockHash::from_u64_word(6000), 0, 0)], &auth_inputs);
+
+        assert!(!state.degraded, "stale nonce is a deterministic CAT noop, not an indexer integrity failure");
+        assert!(!state.assets.contains_key(&hash_bytes(txid)));
+        assert_eq!(state.get_owner_nonce(owner_id), 2);
+        let processed = state.processed_ops.get(&txid).expect("stale tx should be recorded as noop");
+        assert_eq!(processed.apply_status, ApplyStatus::Noop);
+        assert_eq!(processed.noop_reason, NoopReason::BadNonce);
     }
 
     #[test]
