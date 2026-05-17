@@ -2868,13 +2868,7 @@ impl AtomicTokenState {
     ) -> Option<AtomicTokenReadContext> {
         let state_hash = self.state_hash_by_block.get(&at_block_hash).copied()?;
         let event_sequence_cutoff = self.event_sequence_by_block.get(&at_block_hash).copied().unwrap_or(self.next_event_sequence);
-        Some(AtomicTokenReadContext {
-            at_block_hash,
-            state_hash,
-            is_degraded: self.degraded,
-            runtime_state,
-            event_sequence_cutoff,
-        })
+        Some(AtomicTokenReadContext { at_block_hash, state_hash, is_degraded: self.degraded, runtime_state, event_sequence_cutoff })
     }
 
     fn retained_index(&self, at_block_hash: BlockHash) -> Option<usize> {
@@ -3002,11 +2996,8 @@ impl AtomicTokenState {
         if self.assets.is_empty() && self.deleted_assets.is_empty() {
             if let Some(store) = self.state_store.as_ref() {
                 let excluded = changed_assets.keys().copied().collect::<HashSet<_>>();
-                let mut override_assets = changed_assets
-                    .into_values()
-                    .flatten()
-                    .filter(|asset| asset_matches_query(asset, query))
-                    .collect::<Vec<_>>();
+                let mut override_assets =
+                    changed_assets.into_values().flatten().filter(|asset| asset_matches_query(asset, query)).collect::<Vec<_>>();
                 override_assets.sort_by(|a, b| a.asset_id.cmp(&b.asset_id));
 
                 let mut total = 0u64;
@@ -3021,8 +3012,7 @@ impl AtomicTokenState {
 
                 store
                     .visit_assets_excluding(query, &excluded, |base_asset| {
-                        while override_index < override_assets.len()
-                            && override_assets[override_index].asset_id < base_asset.asset_id
+                        while override_index < override_assets.len() && override_assets[override_index].asset_id < base_asset.asset_id
                         {
                             emit_asset(override_assets[override_index].clone());
                             override_index += 1;
@@ -3040,12 +3030,8 @@ impl AtomicTokenState {
         }
 
         let mut view = self.materialize_view_at_block(at_block_hash)?;
-        let mut assets = view
-            .assets
-            .drain()
-            .map(|(_, asset)| asset)
-            .filter(|asset| asset_matches_query(asset, query))
-            .collect::<Vec<_>>();
+        let mut assets =
+            view.assets.drain().map(|(_, asset)| asset).filter(|asset| asset_matches_query(asset, query)).collect::<Vec<_>>();
         assets.sort_by(|a, b| a.asset_id.cmp(&b.asset_id));
         let total = assets.len() as u64;
         let page = assets.into_iter().skip(offset).take(limit).collect();
@@ -3457,7 +3443,9 @@ impl AtomicTokenState {
                 AtomicTokenError::Processing(format!("snapshot export failed: missing state hash checkpoint for block `{block_hash}`"))
             })?;
             let event_sequence = self.event_sequence_by_block.get(&block_hash).copied().ok_or_else(|| {
-                AtomicTokenError::Processing(format!("snapshot export failed: missing event sequence checkpoint for block `{block_hash}`"))
+                AtomicTokenError::Processing(format!(
+                    "snapshot export failed: missing event sequence checkpoint for block `{block_hash}`"
+                ))
             })?;
             state_hash_by_block.insert(block_hash, state_hash);
             event_sequence_by_block.insert(block_hash, event_sequence);
@@ -3473,7 +3461,9 @@ impl AtomicTokenState {
 
         for block_hash in self.applied_chain_order[target_index + 1..].iter().rev().copied().collect::<Vec<_>>() {
             self.rollback_block_internal(block_hash, false).map_err(|_| {
-                AtomicTokenError::Processing(format!("snapshot export failed: missing journal while rolling back block `{block_hash}`"))
+                AtomicTokenError::Processing(format!(
+                    "snapshot export failed: missing journal while rolling back block `{block_hash}`"
+                ))
             })?;
         }
 
@@ -3979,7 +3969,6 @@ impl AtomicTokenState {
             }
         }
     }
-
 }
 
 fn map_liquidity_math_error(err: LiquidityMathError) -> NoopReason {

@@ -6,7 +6,10 @@ use blake2b_simd::Params as Blake2bParams;
 use cryptix_consensus_core::{tx::TransactionOutpoint, Hash as BlockHash};
 use rocksdb::{checkpoint::Checkpoint, Options, WriteBatch, DB};
 use serde::{de::DeserializeOwned, Serialize};
-use std::{collections::HashSet, path::{Path, PathBuf}};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 pub const ATOMIC_DB_SCHEMA_VERSION: u16 = 2;
 
@@ -683,6 +686,22 @@ impl AtomicStorageV2 {
             .write(batch)
             .map_err(|err| AtomicTokenError::Processing(format!("failed committing Atomic DB schema v2 runtime flags: {err}")))?;
         Ok(())
+    }
+
+    pub fn replace_state_hashes(&self, state_hashes: impl IntoIterator<Item = (BlockHash, [u8; 32])>) -> AtomicTokenResult<usize> {
+        let mut batch = WriteBatch::default();
+        let mut count = 0usize;
+        for (block_hash, state_hash) in state_hashes {
+            batch.put(state_hash_key(&block_hash), encode_value(&state_hash, "state hash")?);
+            count = count.saturating_add(1);
+        }
+        if count == 0 {
+            return Ok(0);
+        }
+        self.db
+            .write(batch)
+            .map_err(|err| AtomicTokenError::Processing(format!("failed refreshing Atomic DB schema v2 state hashes: {err}")))?;
+        Ok(count)
     }
 
     pub fn prune_history(

@@ -31,12 +31,8 @@ use crate::{
     model::{
         services::reachability::MTReachabilityService,
         stores::{
-            ghostdag::DbGhostdagStore,
-            headers::HeaderStoreReader,
-            pruning::PruningStoreReader,
-            reachability::DbReachabilityStore,
-            virtual_state::VirtualStores,
-            DB,
+            ghostdag::DbGhostdagStore, headers::HeaderStoreReader, pruning::PruningStoreReader, reachability::DbReachabilityStore,
+            virtual_state::VirtualStores, DB,
         },
     },
     params::Params,

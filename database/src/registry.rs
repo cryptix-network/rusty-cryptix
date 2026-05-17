@@ -41,6 +41,7 @@ pub enum DatabaseStorePrefixes {
     // ---- Decomposed reachability stores ----
     ReachabilityTreeChildren = 30,
     ReachabilityFutureCoveringSet = 31,
+    AtomicStateV2 = 32,
 
     // ---- Metadata ----
     MultiConsensusMetadata = 124,

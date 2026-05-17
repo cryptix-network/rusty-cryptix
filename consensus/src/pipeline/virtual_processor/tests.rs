@@ -804,6 +804,57 @@ fn balance_of(atomic: &crate::model::stores::atomic_state::AtomicConsensusState,
 }
 
 #[tokio::test]
+async fn payload_hf_activation_switches_live_without_restart() {
+    let activation_daa = 8;
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.coinbase_maturity = 0;
+            p.payload_hf_activation_daa_score = activation_daa;
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    for _ in 0..3 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    assert!(ctx.consensus.get_virtual_daa_score() < activation_daa);
+    let (funding_outpoint, funding_entry) = find_virtual_utxo_by_script(&ctx, &owner_script);
+    let tx_fee = 10_000u64;
+    let create_tx = payload_tx(
+        vec![TransactionInput::new(funding_outpoint, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(funding_entry.amount - tx_fee, owner_script.clone())],
+        payload_create_asset_with_mint(0, 1, owner_id, b"LiveHF", b"LHF", 100, owner_id),
+    );
+    let asset_id = create_tx.id().as_bytes();
+
+    let mut pre_hf = MutableTransaction::from_tx(create_tx.clone());
+    ctx.consensus
+        .validate_mempool_transaction(&mut pre_hf, &TransactionValidationArgs::default())
+        .expect_err("payload transaction must be rejected before the HF DAA");
+
+    while ctx.consensus.get_virtual_daa_score() < activation_daa {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+
+    let mut post_hf = MutableTransaction::from_tx(create_tx.clone());
+    ctx.consensus
+        .validate_mempool_transaction(&mut post_hf, &TransactionValidationArgs::default())
+        .expect("same running node must accept payload transaction after the HF DAA");
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let create_template = ctx.build_block_template_with_transactions(vec![create_tx], 200, ctx.simulated_time);
+    ctx.validate_and_insert_block(create_template.block.to_immutable()).await;
+
+    let atomic = ctx.consensus.virtual_atomic_state();
+    assert!(atomic.assets.contains_key(&asset_id));
+    assert_eq!(balance_of(&atomic, asset_id, owner_id), 100);
+}
+
+#[tokio::test]
 async fn atomic_same_owner_different_assets_can_advance_in_same_block() {
     let mut ctx = liquidity_test_context();
     let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());

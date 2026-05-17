@@ -486,23 +486,21 @@ impl VirtualStateProcessor {
 
             let mut needs_recompute = true;
             match self.utxo_diffs_store.get(current) {
-                Ok(mergeset_diff) => {
-                    match self.atomic_state_store.get_delta(current) {
-                        Ok(delta) => {
-                            if let Err(err) = atomic_state.apply_delta_forward(delta.as_ref()) {
-                                warn!("block `{current}` has cached UTXO diff but invalid atomic delta ({err}); recomputing");
-                            } else {
-                                diff.with_diff_in_place(mergeset_diff.deref()).unwrap();
-                                diff_point = current;
-                                needs_recompute = false;
-                            }
+                Ok(mergeset_diff) => match self.atomic_state_store.get_delta(current) {
+                    Ok(delta) => {
+                        if let Err(err) = atomic_state.apply_delta_forward(delta.as_ref()) {
+                            warn!("block `{current}` has cached UTXO diff but invalid atomic delta ({err}); recomputing");
+                        } else {
+                            diff.with_diff_in_place(mergeset_diff.deref()).unwrap();
+                            diff_point = current;
+                            needs_recompute = false;
                         }
-                        Err(StoreError::KeyNotFound(_)) => {
-                            warn!("block `{current}` has cached UTXO diff but no atomic delta; recomputing block UTXO/atomic state");
-                        }
-                        Err(err) => panic!("unexpected error {err}"),
                     }
-                }
+                    Err(StoreError::KeyNotFound(_)) => {
+                        warn!("block `{current}` has cached UTXO diff but no atomic delta; recomputing block UTXO/atomic state");
+                    }
+                    Err(err) => panic!("unexpected error {err}"),
+                },
                 Err(StoreError::KeyNotFound(_)) => {}
                 Err(err) => panic!("unexpected error {err}"),
             }

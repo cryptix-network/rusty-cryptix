@@ -1,6 +1,6 @@
 use blake2b_simd::Params as Blake2bParams;
-use cryptix_consensus_core::ChainPath;
 use cryptix_consensus_core::BlockHasher;
+use cryptix_consensus_core::ChainPath;
 use cryptix_consensus_core::{constants::MAX_SOMPI, tx::TransactionOutpoint};
 use cryptix_database::prelude::CachePolicy;
 use cryptix_database::prelude::DbKey;
@@ -515,7 +515,9 @@ impl AtomicConsensusState {
     }
 
     pub fn root_accumulator(&self) -> AtomicConsensusRootAccumulator {
-        if self.current_store.is_some() || self.next_nonces.is_empty() && self.assets.is_empty() && self.balances.is_empty() && self.anchor_counts.is_empty() {
+        if self.current_store.is_some()
+            || self.next_nonces.is_empty() && self.assets.is_empty() && self.balances.is_empty() && self.anchor_counts.is_empty()
+        {
             self.root_accumulator
         } else {
             AtomicConsensusRootAccumulator::from_state_maps(self)
@@ -524,6 +526,14 @@ impl AtomicConsensusState {
 
     pub fn as_virtual_root_state(&self) -> Self {
         Self::root_only(self.root_accumulator())
+    }
+
+    fn has_in_memory_values(&self) -> bool {
+        !self.next_nonces.is_empty()
+            || !self.assets.is_empty()
+            || !self.balances.is_empty()
+            || !self.anchor_counts.is_empty()
+            || !self.liquidity_vault_outpoints.is_empty()
     }
 
     pub fn attach_current_store(mut self, store: Arc<DbAtomicStateStore>) -> Self {
@@ -565,9 +575,7 @@ impl AtomicConsensusState {
         self.current_store
             .as_ref()
             .map(|store| {
-                store
-                    .read_current_nonce(key)
-                    .unwrap_or_else(|err| panic!("failed reading current Atomic nonce from DB: {err}"))
+                store.read_current_nonce(key).unwrap_or_else(|err| panic!("failed reading current Atomic nonce from DB: {err}"))
             })
             .flatten()
     }
@@ -576,9 +584,7 @@ impl AtomicConsensusState {
         self.current_store
             .as_ref()
             .map(|store| {
-                store
-                    .read_current_asset(asset_id)
-                    .unwrap_or_else(|err| panic!("failed reading current Atomic asset from DB: {err}"))
+                store.read_current_asset(asset_id).unwrap_or_else(|err| panic!("failed reading current Atomic asset from DB: {err}"))
             })
             .flatten()
     }
@@ -587,9 +593,7 @@ impl AtomicConsensusState {
         self.current_store
             .as_ref()
             .map(|store| {
-                store
-                    .read_current_balance(key)
-                    .unwrap_or_else(|err| panic!("failed reading current Atomic balance from DB: {err}"))
+                store.read_current_balance(key).unwrap_or_else(|err| panic!("failed reading current Atomic balance from DB: {err}"))
             })
             .flatten()
     }
@@ -699,9 +703,10 @@ impl AtomicConsensusState {
         };
 
         if matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
-            let pool = asset.liquidity.as_ref().ok_or_else(|| {
-                format!("liquidity state missing for asset `{}`", faster_hex::hex_string(&asset_id))
-            })?;
+            let pool = asset
+                .liquidity
+                .as_ref()
+                .ok_or_else(|| format!("liquidity state missing for asset `{}`", faster_hex::hex_string(&asset_id)))?;
             self.deleted_vault_outpoints.remove(&pool.vault_outpoint);
             if let Some(previous_asset_id) = self.liquidity_vault_outpoints.insert(pool.vault_outpoint, asset_id) {
                 if previous_asset_id != asset_id {
@@ -884,9 +889,9 @@ impl AtomicConsensusState {
 
     pub fn liquidity_asset_by_vault_outpoint(&self, outpoint: TransactionOutpoint) -> Result<Option<[u8; 32]>, String> {
         if let Some(asset_id) = self.liquidity_vault_outpoints.get(&outpoint).copied() {
-            let asset = self.cloned_asset(&asset_id).ok_or_else(|| {
-                format!("liquidity vault index references missing asset `{}`", faster_hex::hex_string(&asset_id))
-            })?;
+            let asset = self
+                .cloned_asset(&asset_id)
+                .ok_or_else(|| format!("liquidity vault index references missing asset `{}`", faster_hex::hex_string(&asset_id)))?;
             let pool = asset.liquidity.as_ref().ok_or_else(|| {
                 format!("liquidity vault index references asset `{}` without liquidity state", faster_hex::hex_string(&asset_id))
             })?;
@@ -900,9 +905,9 @@ impl AtomicConsensusState {
             return Ok(None);
         }
         if let Some(asset_id) = self.store_vault_asset(outpoint) {
-            let asset = self.cloned_asset(&asset_id).ok_or_else(|| {
-                format!("liquidity vault index references missing asset `{}`", faster_hex::hex_string(&asset_id))
-            })?;
+            let asset = self
+                .cloned_asset(&asset_id)
+                .ok_or_else(|| format!("liquidity vault index references missing asset `{}`", faster_hex::hex_string(&asset_id)))?;
             let pool = asset.liquidity.as_ref().ok_or_else(|| {
                 format!("liquidity vault index references asset `{}` without liquidity state", faster_hex::hex_string(&asset_id))
             })?;
@@ -1498,6 +1503,14 @@ impl DbAtomicStateStore {
                 faster_hex::hex_string(&expected.hash()),
                 faster_hex::hex_string(&actual.hash())
             ),
+            Ok(None) if state.has_in_memory_values() => {
+                let mut batch = WriteBatch::default();
+                self.write_current_overlay_batch(&mut batch, state)
+                    .unwrap_or_else(|err| panic!("failed migrating legacy in-memory Atomic consensus state into V2 current store: {err}"));
+                self.db
+                    .write(batch)
+                    .unwrap_or_else(|err| panic!("failed committing migrated Atomic consensus V2 current store: {err}"));
+            }
             Ok(None) if expected == AtomicConsensusRootAccumulator::default() => {}
             Ok(None) => panic!(
                 "Atomic consensus current-state KV store is missing while virtual root is {}; reset the datadir or import an Atomic V2 snapshot",
@@ -1553,11 +1566,7 @@ impl DbAtomicStateStore {
         self.write_current_root_batch(batch, new_virtual_atomic_state.root_accumulator())
     }
 
-    pub fn write_current_overlay_batch(
-        &self,
-        batch: &mut WriteBatch,
-        state: &AtomicConsensusState,
-    ) -> Result<(), StoreError> {
+    pub fn write_current_overlay_batch(&self, batch: &mut WriteBatch, state: &AtomicConsensusState) -> Result<(), StoreError> {
         for key in state.deleted_nonces.iter() {
             write_current_value::<u64, _>(batch, ATOMIC_STATE_CURRENT_NONCE_SUBPREFIX, encode_nonce_key(key), None)?;
         }
@@ -1779,7 +1788,12 @@ fn write_current_asset_change(
 ) -> Result<(), StoreError> {
     if let Some(old_asset) = old_value {
         if let Some(pool) = old_asset.liquidity.as_ref() {
-            write_current_value::<[u8; 32], _>(batch, ATOMIC_STATE_CURRENT_VAULT_SUBPREFIX, encode_outpoint_key(pool.vault_outpoint), None)?;
+            write_current_value::<[u8; 32], _>(
+                batch,
+                ATOMIC_STATE_CURRENT_VAULT_SUBPREFIX,
+                encode_outpoint_key(pool.vault_outpoint),
+                None,
+            )?;
         }
     }
     write_current_value(batch, ATOMIC_STATE_CURRENT_ASSET_SUBPREFIX, asset_id, new_value.cloned())?;
@@ -1799,7 +1813,7 @@ fn write_current_asset_change(
 }
 
 fn atomic_state_subprefix(tag: u8) -> Vec<u8> {
-    let mut prefix: Vec<u8> = DatabaseStorePrefixes::AtomicState.into();
+    let mut prefix: Vec<u8> = DatabaseStorePrefixes::AtomicStateV2.into();
     prefix.push(tag);
     prefix
 }
@@ -2199,11 +2213,7 @@ mod tests {
         let block_hash = hash(0x44);
         let state_hash = [0x55; 32];
         let delta = Arc::new(AtomicConsensusStateDelta {
-            nonce_changes: vec![AtomicNonceChange {
-                key: AtomicNonceKey::owner(owner(0x56)),
-                old_value: None,
-                new_value: Some(2),
-            }],
+            nonce_changes: vec![AtomicNonceChange { key: AtomicNonceKey::owner(owner(0x56)), old_value: None, new_value: Some(2) }],
             asset_changes: Vec::new(),
             balance_changes: Vec::new(),
             anchor_count_changes: Vec::new(),

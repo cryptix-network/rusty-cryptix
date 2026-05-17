@@ -1,11 +1,11 @@
 use crate::{
     error::{AtomicTokenError, AtomicTokenResult},
+    payload::TokenOp,
     state::{
         AtomicTokenHealth, AtomicTokenReadContext, AtomicTokenReadView, AtomicTokenRuntimeState, AtomicTokenState,
         AtomicTokenStateFootprint, BalanceKey, LiquidityHolderAddressState, NonceKey, ProcessedOp, TokenAsset, TokenEvent,
         TokenHolderEntry, TokenOwnerBalanceEntry,
     },
-    payload::TokenOp,
     storage_v2::{AtomicStorageSnapshotCounts, AtomicStorageV2},
     IDENT,
 };
@@ -32,8 +32,7 @@ use cryptix_consensus_notify::{
 };
 use cryptix_consensusmanager::ConsensusManager;
 use cryptix_core::{
-    debug,
-    info,
+    debug, info,
     task::service::{AsyncService, AsyncServiceFuture},
     trace, warn,
 };
@@ -1130,12 +1129,8 @@ impl AtomicTokenService {
 
         let temp_state_dir = unique_atomic_temp_dir("startup-revalidation");
         self.processor.state_store.checkpoint_to(&temp_state_dir)?;
-        let temp_state_store = Arc::new(AtomicStorageV2::open(
-            &temp_state_dir,
-            self.protocol_version,
-            self.network_id.clone(),
-            self.genesis_hash,
-        )?);
+        let temp_state_store =
+            Arc::new(AtomicStorageV2::open(&temp_state_dir, self.protocol_version, self.network_id.clone(), self.genesis_hash)?);
         let mut staged_state = loaded_state.clone();
         staged_state.attach_state_store(temp_state_store);
         staged_state.degraded = false;
@@ -1181,6 +1176,7 @@ impl AtomicTokenService {
                 "startup state revalidation failed: replay did not reproduce retained block `{final_replayed_block_hash}`"
             ))
         })?;
+        let mut refreshed_retained_hashes = Vec::new();
         if final_replayed_state_hash != final_expected_state_hash {
             return Err(AtomicTokenError::Processing(format!(
                 "startup state revalidation failed: retained state hash mismatch at final retained block `{final_replayed_block_hash}`"
@@ -1215,12 +1211,23 @@ impl AtomicTokenService {
                 }
             }
             if let Some((block_hash, stored_hash, replayed_hash)) = first_stale_checkpoint {
-                return Err(AtomicTokenError::Processing(format!(
-                    "startup state revalidation failed: retained state hash mismatch at block `{block_hash}` ({} stale checkpoint(s), stored={}, replayed={})",
+                warn!(
+                    "[{IDENT}] Cryptix Atomic startup state revalidation found {} stale retained checkpoint hash(es); final retained checkpoint {} matched deterministic replay, so refreshing checkpoint cache. first_mismatch={}, stored={}, replayed={}",
                     stale_checkpoint_count,
+                    final_replayed_block_hash,
+                    block_hash,
                     short_hex_for_log(&stored_hash),
                     short_hex_for_log(&replayed_hash)
-                )));
+                );
+                refreshed_retained_hashes.reserve(matching_prefix_len);
+                for block_hash in expected_chain.iter().take(matching_prefix_len).copied() {
+                    let replayed_state_hash = staged_state.get_state_hash_at_block(block_hash).ok_or_else(|| {
+                        AtomicTokenError::Processing(format!(
+                            "startup state revalidation failed: replay did not reproduce retained block `{block_hash}`"
+                        ))
+                    })?;
+                    refreshed_retained_hashes.push((block_hash, replayed_state_hash));
+                }
             } else {
                 info!(
                     "[{IDENT}] Cryptix Atomic startup state revalidation verified {} retained state hash checkpoint(s)",
@@ -1235,6 +1242,16 @@ impl AtomicTokenService {
         drop(staged_state);
 
         let mut state = self.processor.state.lock().await;
+        if !refreshed_retained_hashes.is_empty() {
+            let refreshed_count = self.processor.state_store.replace_state_hashes(refreshed_retained_hashes.iter().copied())?;
+            for (block_hash, state_hash) in refreshed_retained_hashes {
+                state.state_hash_by_block.insert(block_hash, state_hash);
+            }
+            info!(
+                "[{IDENT}] Cryptix Atomic startup state revalidation refreshed {} retained checkpoint hash(es) from deterministic replay",
+                refreshed_count
+            );
+        }
         if let Some(pruned) = state.prune_history_with_details(self.max_retained_blocks) {
             self.processor.state_store.prune_history(
                 &pruned.pruned_hashes,
@@ -1513,12 +1530,8 @@ impl AtomicTokenService {
 
         let temp_state_dir = unique_atomic_temp_dir("snapshot-export");
         self.processor.state_store.checkpoint_to(&temp_state_dir)?;
-        let temp_state_store = Arc::new(AtomicStorageV2::open(
-            &temp_state_dir,
-            self.protocol_version,
-            self.network_id.clone(),
-            self.genesis_hash,
-        )?);
+        let temp_state_store =
+            Arc::new(AtomicStorageV2::open(&temp_state_dir, self.protocol_version, self.network_id.clone(), self.genesis_hash)?);
         let mut state = temp_state_store.load_runtime_state()?.ok_or_else(|| {
             AtomicTokenError::Processing("snapshot export failed: no persisted Atomic V2 state is available".to_string())
         })?;
@@ -1530,16 +1543,13 @@ impl AtomicTokenService {
         })?;
         let start_index = anchor_index.saturating_sub(self.replay_overlap.saturating_sub(1));
         let window_blocks = state.applied_chain_order[start_index..=anchor_index].to_vec();
-        let window_start_block_hash = *window_blocks.first().ok_or_else(|| {
-            AtomicTokenError::Processing("snapshot export failed: empty replay window".to_string())
-        })?;
+        let window_start_block_hash = *window_blocks
+            .first()
+            .ok_or_else(|| AtomicTokenError::Processing("snapshot export failed: empty replay window".to_string()))?;
         let window_start_parent_block_hash =
             if start_index > 0 { state.applied_chain_order[start_index - 1] } else { self.genesis_hash };
-        let state_hash_at_window_start_parent = if start_index > 0 {
-            state.state_hash_by_block.get(&window_start_parent_block_hash).copied()
-        } else {
-            None
-        };
+        let state_hash_at_window_start_parent =
+            if start_index > 0 { state.state_hash_by_block.get(&window_start_parent_block_hash).copied() } else { None };
         let state_hash_at_fp = state.compute_state_hash();
         let mut journals_in_window = Vec::with_capacity(window_blocks.len());
         for block_hash in window_blocks.iter().copied() {
@@ -1935,11 +1945,7 @@ fn verify_chunk_hash(chunk_data: &[u8], expected_hashes: &[[u8; 32]], chunk_inde
     Ok(())
 }
 
-fn write_snapshot_file_from_store(
-    path: &Path,
-    header: &SnapshotFileHeaderV2,
-    store: &AtomicStorageV2,
-) -> AtomicTokenResult<()> {
+fn write_snapshot_file_from_store(path: &Path, header: &SnapshotFileHeaderV2, store: &AtomicStorageV2) -> AtomicTokenResult<()> {
     let file = File::create(path)
         .map_err(|e| AtomicTokenError::Processing(format!("snapshot write failed: create `{}`: {e}", path.display())))?;
     let mut writer = BufWriter::new(file);
@@ -1981,9 +1987,7 @@ fn write_snapshot_file_from_store(
         bincode::serialize_into(&mut writer, &(txid, op))
             .map_err(|e| AtomicTokenError::Processing(format!("snapshot processed-op encode failed: {e}")))
     })?;
-    writer
-        .flush()
-        .map_err(|e| AtomicTokenError::Processing(format!("snapshot write failed: flush `{}`: {e}", path.display())))?;
+    writer.flush().map_err(|e| AtomicTokenError::Processing(format!("snapshot write failed: flush `{}`: {e}", path.display())))?;
     Ok(())
 }
 
@@ -2101,11 +2105,7 @@ struct SnapshotStateImportChunk {
 
 impl SnapshotStateImportChunk {
     fn len(&self) -> usize {
-        self.assets.len()
-            + self.balances.len()
-            + self.nonces.len()
-            + self.anchor_counts.len()
-            + self.processed_ops.len()
+        self.assets.len() + self.balances.len() + self.nonces.len() + self.anchor_counts.len() + self.processed_ops.len()
     }
 
     fn flush_if_full(&mut self, store: &AtomicStorageV2) -> AtomicTokenResult<()> {
@@ -2145,10 +2145,7 @@ impl Drop for RemoveDirOnDrop {
     }
 }
 
-fn read_snapshot_record<T: serde::de::DeserializeOwned>(
-    reader: &mut BufReader<File>,
-    label: &str,
-) -> AtomicTokenResult<T> {
+fn read_snapshot_record<T: serde::de::DeserializeOwned>(reader: &mut BufReader<File>, label: &str) -> AtomicTokenResult<T> {
     bincode::deserialize_from(reader)
         .map_err(|e| AtomicTokenError::Processing(format!("snapshot import failed: {label} decode failed: {e}")))
 }
@@ -2208,9 +2205,7 @@ fn validate_snapshot_runtime_header(
         ));
     }
     if state.applied_chain_order.last().copied() != Some(header.at_block_hash) {
-        return Err(AtomicTokenError::Processing(
-            "snapshot import failed: applied_chain_order must end at at_block_hash".to_string(),
-        ));
+        return Err(AtomicTokenError::Processing("snapshot import failed: applied_chain_order must end at at_block_hash".to_string()));
     }
     let expected_len = state.applied_chain_order.len();
     let unique_blocks: HashSet<BlockHash> = state.applied_chain_order.iter().copied().collect();
@@ -2239,9 +2234,7 @@ fn validate_snapshot_runtime_header(
         ));
     }
     if state.events.iter().any(|event| event.sequence > header.next_event_sequence) {
-        return Err(AtomicTokenError::Processing(
-            "snapshot import failed: event sequence exceeds next_event_sequence".to_string(),
-        ));
+        return Err(AtomicTokenError::Processing("snapshot import failed: event sequence exceeds next_event_sequence".to_string()));
     }
     let window_start_index =
         state.applied_chain_order.iter().position(|hash| *hash == header.window_start_block_hash).ok_or_else(|| {
@@ -2400,13 +2393,11 @@ fn import_snapshot_file_into_store(
         .stream_position()
         .map_err(|e| AtomicTokenError::Processing(format!("snapshot import failed: decode position check failed: {e}")))?;
     if decoded_pos != snapshot_size {
-        return Err(AtomicTokenError::Processing(
-            "snapshot import failed: trailing bytes after snapshot payload".to_string(),
-        ));
+        return Err(AtomicTokenError::Processing("snapshot import failed: trailing bytes after snapshot payload".to_string()));
     }
-    let imported_root = store.current_root()?.ok_or_else(|| {
-        AtomicTokenError::Processing("snapshot import failed: imported V2 store has no current root".to_string())
-    })?;
+    let imported_root = store
+        .current_root()?
+        .ok_or_else(|| AtomicTokenError::Processing("snapshot import failed: imported V2 store has no current root".to_string()))?;
     if imported_root != header.state_hash_at_fp {
         return Err(AtomicTokenError::Processing("snapshot import failed: state hash mismatch at snapshot at_block_hash".to_string()));
     }
@@ -2446,9 +2437,9 @@ fn copy_snapshot_store_into_active(
     target: Arc<AtomicStorageV2>,
     mut state: AtomicTokenState,
 ) -> AtomicTokenResult<AtomicTokenState> {
-    let expected_root = source.current_root()?.ok_or_else(|| {
-        AtomicTokenError::Processing("snapshot import failed: staged V2 store has no current root".to_string())
-    })?;
+    let expected_root = source
+        .current_root()?
+        .ok_or_else(|| AtomicTokenError::Processing("snapshot import failed: staged V2 store has no current root".to_string()))?;
     state.clear_persistent_state_overlay();
     target.persist_state(&state)?;
     let copied_root = copy_all_persistent_state_keys(source, &target)?;
@@ -2583,9 +2574,7 @@ fn validate_snapshot_manifest_and_decode(
         .seek(SeekFrom::Current(0))
         .map_err(|e| AtomicTokenError::Processing(format!("snapshot replay decode position check failed: {e}")))?;
     if replay_decoded_pos != manifest.replay_window_size {
-        return Err(AtomicTokenError::Processing(
-            "snapshot import failed: trailing bytes after replay window payload".to_string(),
-        ));
+        return Err(AtomicTokenError::Processing("snapshot import failed: trailing bytes after replay window payload".to_string()));
     }
     if replay_window.protocol_version != header.protocol_version
         || replay_window.network_id != header.network_id
@@ -2691,11 +2680,8 @@ fn list_snapshot_catalog(snapshot_store_dir: &Path) -> AtomicTokenResult<Vec<Sna
 }
 
 fn cached_snapshot_parent_checkpoint_matches_current_state(entry: &SnapshotCatalogEntry, state: &AtomicTokenState) -> bool {
-    let expected_parent_hash = state
-        .state_hash_by_block
-        .get(&BlockHash::from_bytes(entry.manifest.window_start_parent_block_hash))
-        .copied()
-        .or_else(|| {
+    let expected_parent_hash =
+        state.state_hash_by_block.get(&BlockHash::from_bytes(entry.manifest.window_start_parent_block_hash)).copied().or_else(|| {
             state
                 .materialize_context_at_block(
                     BlockHash::from_bytes(entry.manifest.window_start_parent_block_hash),
@@ -3032,7 +3018,8 @@ mod tests {
         let snapshot = minimal_snapshot(TOKEN_PROTOCOL_VERSION, "cryptix-simnet");
         let snapshot_bytes = encode_snapshot_file(&snapshot);
         let replay_window_bytes = encode_replay_window_transfer(&snapshot.replay_window);
-        let manifest = build_snapshot_manifest(&snapshot_path, &snapshot_bytes, &replay_window_bytes, &snapshot.header).expect("manifest");
+        let manifest =
+            build_snapshot_manifest(&snapshot_path, &snapshot_bytes, &replay_window_bytes, &snapshot.header).expect("manifest");
         let manifest_bytes = borsh::to_vec(&manifest).expect("encode manifest");
 
         fs::write(&snapshot_path, snapshot_bytes).expect("write snapshot");
@@ -3052,7 +3039,8 @@ mod tests {
         let snapshot = minimal_snapshot(TOKEN_PROTOCOL_VERSION, "cryptix-simnet");
         let snapshot_bytes = encode_snapshot_file(&snapshot);
         let replay_window_bytes = encode_replay_window_transfer(&snapshot.replay_window);
-        let manifest = build_snapshot_manifest(&snapshot_path, &snapshot_bytes, &replay_window_bytes, &snapshot.header).expect("manifest");
+        let manifest =
+            build_snapshot_manifest(&snapshot_path, &snapshot_bytes, &replay_window_bytes, &snapshot.header).expect("manifest");
         let manifest_bytes = borsh::to_vec(&manifest).expect("encode manifest");
 
         fs::write(&snapshot_path, &snapshot_bytes).expect("write snapshot");
@@ -3074,7 +3062,8 @@ mod tests {
         let mut replay_window = snapshot.replay_window.clone();
         replay_window.journals_in_window[0].1.added_processed_ops.push(BlockHash::from_u64_word(42));
         let replay_window_bytes = encode_replay_window_transfer(&replay_window);
-        let manifest = build_snapshot_manifest(&snapshot_path, &snapshot_bytes, &replay_window_bytes, &snapshot.header).expect("manifest");
+        let manifest =
+            build_snapshot_manifest(&snapshot_path, &snapshot_bytes, &replay_window_bytes, &snapshot.header).expect("manifest");
         let manifest_bytes = borsh::to_vec(&manifest).expect("encode manifest");
 
         fs::write(&snapshot_path, &snapshot_bytes).expect("write snapshot");
