@@ -28,6 +28,7 @@ pub(crate) struct ConsensusMock {
     transactions: RwLock<HashMap<TransactionId, Arc<Transaction>>>,
     statuses: RwLock<HashMap<TransactionId, TxResult<()>>>,
     single_validation_statuses: RwLock<HashMap<TransactionId, TxResult<()>>>,
+    transient_statuses: RwLock<HashMap<TransactionId, TxResult<()>>>,
     utxos: RwLock<UtxoCollection>,
     virtual_daa_score: RwLock<u64>,
 }
@@ -38,6 +39,7 @@ impl ConsensusMock {
             transactions: RwLock::new(HashMap::default()),
             statuses: RwLock::new(HashMap::default()),
             single_validation_statuses: RwLock::new(HashMap::default()),
+            transient_statuses: RwLock::new(HashMap::default()),
             utxos: RwLock::new(HashMap::default()),
             virtual_daa_score: RwLock::new(0),
         }
@@ -51,8 +53,16 @@ impl ConsensusMock {
         self.single_validation_statuses.write().insert(transaction_id, status);
     }
 
+    pub(crate) fn set_transient_status(&self, transaction_id: TransactionId, status: TxResult<()>) {
+        self.transient_statuses.write().insert(transaction_id, status);
+    }
+
     pub(crate) fn set_virtual_daa_score(&self, virtual_daa_score: u64) {
         *self.virtual_daa_score.write() = virtual_daa_score;
+    }
+
+    pub(crate) fn add_utxo(&self, outpoint: TransactionOutpoint, entry: UtxoEntry) {
+        self.utxos.write().insert(outpoint, entry);
     }
 
     pub(crate) fn add_transaction(&self, transaction: Transaction, block_daa_score: u64) {
@@ -96,6 +106,11 @@ impl ConsensusMock {
         if let Some(status) = self.statuses.read().get(&mutable_tx.id()) {
             if status.is_err() {
                 return status.clone();
+            }
+        }
+        if let Some(status) = self.transient_statuses.write().remove(&mutable_tx.id()) {
+            if status.is_err() {
+                return status;
             }
         }
         let utxos = self.utxos.read();

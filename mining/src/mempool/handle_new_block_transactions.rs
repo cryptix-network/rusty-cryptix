@@ -1,5 +1,5 @@
 use crate::mempool::{
-    atomic_slots::{atomic_mempool_domains_from_payload, atomic_mempool_liquidity_pool_slot},
+    atomic_slots::atomic_mempool_liquidity_pool_slot,
     errors::RuleResult,
     model::{
         pool::Pool,
@@ -81,16 +81,6 @@ impl Mempool {
     }
 
     fn remove_accepted_atomic_conflicts(&mut self, transaction: &Transaction) -> RuleResult<()> {
-        let domains = atomic_mempool_domains_from_payload(transaction)?;
-        for conflicting_transaction_id in self.transaction_pool.atomic_domain_conflict_owners(&domains) {
-            self.remove_transaction(
-                &conflicting_transaction_id,
-                true,
-                TxRemovalReason::DoubleSpend,
-                format!(" atomic domain favouring {}", transaction.id()).as_str(),
-            )?;
-        }
-
         let Some(slot) = atomic_mempool_liquidity_pool_slot(transaction)? else {
             return Ok(());
         };

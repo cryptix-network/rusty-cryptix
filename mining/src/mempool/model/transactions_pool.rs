@@ -1,7 +1,7 @@
 use crate::{
     feerate::{FeerateEstimator, FeerateEstimatorArgs},
     mempool::{
-        atomic_slots::{atomic_mempool_domains, atomic_mempool_slots, is_cat_transaction, AtomicMempoolDomain, AtomicMempoolSlot},
+        atomic_slots::{atomic_mempool_slots, is_cat_transaction, AtomicMempoolSlot},
         config::Config,
         errors::{RuleError, RuleResult},
         model::{
@@ -121,11 +121,7 @@ impl TransactionsPool {
         assert!(transaction.mtx.is_fully_populated(), "transaction {id} to be added in the transactions pool is not fully populated");
 
         let atomic_slots = atomic_mempool_slots(&transaction.mtx)?;
-        for slot in atomic_slots.iter() {
-            if let Some(existing_id) = self.atomic_slot_owners.get(slot) {
-                return Err(RuleError::RejectAtomicSlotConflict(id, *existing_id, slot.to_string()));
-            }
-        }
+        self.check_atomic_slot_conflicts_for_slots(id, &atomic_slots)?;
 
         // Create the bijective parent/chained relations.
         // This concerns only the parents of the added transaction.
@@ -227,14 +223,18 @@ impl TransactionsPool {
         self.atomic_slot_owners.get(slot)
     }
 
-    pub(crate) fn atomic_domain_conflict_owners(&self, domains: &[AtomicMempoolDomain]) -> Vec<TransactionId> {
-        let mut owners = Vec::new();
-        for (transaction_id, slots) in self.atomic_slots_by_tx.iter() {
-            if atomic_domains_conflict(domains, &atomic_domains_from_slots(slots)) {
-                owners.push(*transaction_id);
+    pub(crate) fn check_atomic_slot_conflicts(&self, transaction: &MutableTransaction) -> RuleResult<()> {
+        let slots = atomic_mempool_slots(transaction)?;
+        self.check_atomic_slot_conflicts_for_slots(transaction.id(), &slots)
+    }
+
+    fn check_atomic_slot_conflicts_for_slots(&self, transaction_id: TransactionId, slots: &[AtomicMempoolSlot]) -> RuleResult<()> {
+        for slot in slots {
+            if let Some(existing_id) = self.atomic_slot_owners.get(slot) {
+                return Err(RuleError::RejectAtomicSlotConflict(transaction_id, *existing_id, slot.to_string()));
             }
         }
-        owners
+        Ok(())
     }
 
     pub(crate) fn ready_transaction_count(&self) -> usize {
@@ -275,15 +275,17 @@ impl TransactionsPool {
         self.limit_transaction_count_by(transaction, transaction_size, |_| Ok(true))
     }
 
-    pub(crate) fn limit_transaction_count_without_atomic_domain_eviction(
+    pub(crate) fn limit_transaction_count_preserving_atomic_slot_order(
         &self,
         transaction: &MutableTransaction,
         transaction_size: usize,
     ) -> RuleResult<Vec<TransactionId>> {
-        let incoming_domains = atomic_mempool_domains(transaction)?;
+        let incoming_slots = atomic_mempool_slots(transaction)?;
         self.limit_transaction_count_by(transaction, transaction_size, |tx| {
-            let existing_domains = atomic_mempool_domains(&tx.mtx)?;
-            Ok(!atomic_domains_conflict(&incoming_domains, &existing_domains))
+            let existing_slots = atomic_mempool_slots(&tx.mtx)?;
+            // Do not make room by removing a first-seen same/earlier Atomic slot that the incoming CAT
+            // transaction either conflicts with directly or may have validated against as pending context.
+            Ok(!atomic_slots_block_capacity_eviction(&incoming_slots, &existing_slots))
         })
     }
 
@@ -413,21 +415,31 @@ impl TransactionsPool {
 type IterTxId<'a> = Iter<'a, TransactionId>;
 type KeysTxId<'a> = Keys<'a, TransactionId, MempoolTransaction>;
 
-fn atomic_domains_conflict(left: &[AtomicMempoolDomain], right: &[AtomicMempoolDomain]) -> bool {
-    left.iter().any(|left_domain| right.iter().any(|right_domain| left_domain == right_domain))
+fn atomic_slots_block_capacity_eviction(incoming: &[AtomicMempoolSlot], existing: &[AtomicMempoolSlot]) -> bool {
+    incoming
+        .iter()
+        .any(|incoming_slot| existing.iter().any(|existing_slot| atomic_slot_blocks_capacity_eviction(incoming_slot, existing_slot)))
 }
 
-fn atomic_domains_from_slots(slots: &[AtomicMempoolSlot]) -> Vec<AtomicMempoolDomain> {
-    slots
-        .iter()
-        .map(|slot| match *slot {
-            AtomicMempoolSlot::Nonce { owner_id, scope_kind, scope_id, .. } => match scope_kind {
-                crate::mempool::atomic_slots::ATOMIC_NONCE_SCOPE_ASSET => AtomicMempoolDomain::Asset(scope_id),
-                _ => AtomicMempoolDomain::Owner(owner_id),
+fn atomic_slot_blocks_capacity_eviction(incoming: &AtomicMempoolSlot, existing: &AtomicMempoolSlot) -> bool {
+    match (incoming, existing) {
+        (
+            AtomicMempoolSlot::Nonce {
+                owner_id: incoming_owner,
+                scope_kind: incoming_scope_kind,
+                scope_id: incoming_scope_id,
+                nonce: incoming_nonce,
             },
-            AtomicMempoolSlot::LiquidityPool { asset_id, .. } => AtomicMempoolDomain::LiquidityPool(asset_id),
-        })
-        .collect()
+            AtomicMempoolSlot::Nonce { owner_id, scope_kind, scope_id, nonce },
+        ) => {
+            owner_id == incoming_owner && scope_kind == incoming_scope_kind && scope_id == incoming_scope_id && nonce <= incoming_nonce
+        }
+        (
+            AtomicMempoolSlot::LiquidityPool { asset_id: incoming_asset_id, pool_nonce: incoming_pool_nonce },
+            AtomicMempoolSlot::LiquidityPool { asset_id, pool_nonce },
+        ) => asset_id == incoming_asset_id && pool_nonce <= incoming_pool_nonce,
+        _ => false,
+    }
 }
 
 impl<'a> TopologicalIndex<'a, KeysTxId<'a>, IterTxId<'a>, TransactionId> for TransactionsPool {

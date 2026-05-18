@@ -398,6 +398,32 @@ impl MiningManager {
         (transaction, validation_result)
     }
 
+    fn recover_transactions_with_pending_atomic_context(
+        &self,
+        consensus: &dyn ConsensusApi,
+        transactions: &mut [MutableTransaction],
+        validation_results: &mut [Result<(), RuleError>],
+        args: &TransactionValidationBatchArgs,
+    ) {
+        if !validation_results.iter().any(Self::is_atomic_pending_context_recoverable_violation) {
+            return;
+        }
+
+        let mut context_transactions = self.mempool.read().get_all_transactions(TransactionQuery::TransactionsOnly).0;
+        let incoming_offset = context_transactions.len();
+        context_transactions.extend(transactions.iter().cloned());
+
+        let context_results = validate_mempool_transactions_in_parallel(consensus, &mut context_transactions, args);
+        for (idx, (context_transaction, context_result)) in
+            context_transactions.into_iter().skip(incoming_offset).zip(context_results.into_iter().skip(incoming_offset)).enumerate()
+        {
+            if Self::is_atomic_pending_context_recoverable_violation(&validation_results[idx]) {
+                transactions[idx] = context_transaction;
+                validation_results[idx] = context_result;
+            }
+        }
+    }
+
     fn validate_and_insert_unorphaned_transactions(
         &self,
         consensus: &dyn ConsensusApi,
@@ -430,6 +456,7 @@ impl MiningManager {
                 lower_bound = upper_bound;
             }
             assert_eq!(transactions.len(), validation_results.len(), "every transaction should have a matching validation result");
+            self.recover_transactions_with_pending_atomic_context(consensus, &mut transactions, &mut validation_results, &args);
 
             // write lock on mempool
             let mut mempool = self.mempool.write();
@@ -542,6 +569,7 @@ impl MiningManager {
             lower_bound = upper_bound;
         }
         assert_eq!(transactions.len(), validation_results.len(), "every transaction should have a matching validation result");
+        self.recover_transactions_with_pending_atomic_context(consensus, &mut transactions, &mut validation_results, &args);
 
         // write lock on mempool
         // Here again, transactions failing post validation are logged and dropped

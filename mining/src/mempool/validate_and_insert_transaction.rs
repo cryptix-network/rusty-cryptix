@@ -76,6 +76,10 @@ impl Mempool {
         // Check double spends and try to remove them if the RBF policy requires it
         let removed_transaction = self.execute_replace_by_fee(&transaction, rbf_policy)?;
 
+        // Reject exact Atomic slot conflicts before capacity eviction so a same-nonce submission cannot
+        // evict unrelated pending descendants and then fail on insertion.
+        self.transaction_pool.check_atomic_slot_conflicts(&transaction)?;
+
         //
         // Note: there exists a case below where `limit_transaction_count` returns an error signaling that
         //       this tx should be rejected due to mempool size limits (rather than evicting others). However,
@@ -87,7 +91,7 @@ impl Mempool {
         // Before adding the transaction, check if there is room in the pool
         let transaction_size = transaction.mempool_estimated_bytes();
         let txs_to_remove = if is_cat_transaction(transaction.tx.as_ref()) {
-            self.transaction_pool.limit_transaction_count_without_atomic_domain_eviction(&transaction, transaction_size)?
+            self.transaction_pool.limit_transaction_count_preserving_atomic_slot_order(&transaction, transaction_size)?
         } else {
             self.transaction_pool.limit_transaction_count(&transaction, transaction_size)?
         };

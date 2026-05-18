@@ -23,13 +23,6 @@ pub(crate) enum AtomicMempoolSlot {
     LiquidityPool { asset_id: [u8; 32], pool_nonce: u64 },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum AtomicMempoolDomain {
-    Owner([u8; 32]),
-    Asset([u8; 32]),
-    LiquidityPool([u8; 32]),
-}
-
 impl Display for AtomicMempoolSlot {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -93,38 +86,6 @@ pub(crate) fn atomic_mempool_slots(transaction: &MutableTransaction) -> RuleResu
         slots.push(AtomicMempoolSlot::LiquidityPool { asset_id, pool_nonce });
     }
     Ok(slots)
-}
-
-pub(crate) fn atomic_mempool_domains(transaction: &MutableTransaction) -> RuleResult<Vec<AtomicMempoolDomain>> {
-    Ok(atomic_mempool_slots(transaction)?
-        .into_iter()
-        .map(|slot| match slot {
-            AtomicMempoolSlot::Nonce { owner_id, scope_kind, scope_id, .. } => match scope_kind {
-                ATOMIC_NONCE_SCOPE_ASSET => AtomicMempoolDomain::Asset(scope_id),
-                _ => AtomicMempoolDomain::Owner(owner_id),
-            },
-            AtomicMempoolSlot::LiquidityPool { asset_id, .. } => AtomicMempoolDomain::LiquidityPool(asset_id),
-        })
-        .collect())
-}
-
-pub(crate) fn atomic_mempool_domains_from_payload(transaction: &Transaction) -> RuleResult<Vec<AtomicMempoolDomain>> {
-    if !is_cat_transaction(transaction) {
-        return Ok(vec![]);
-    }
-
-    let Some(parsed) = parse_atomic_mempool_payload(transaction.payload.as_slice())? else {
-        return Ok(vec![]);
-    };
-
-    let mut domains = vec![];
-    if let ParsedAtomicNonceScope::Asset(asset_id) = parsed.nonce_scope {
-        domains.push(AtomicMempoolDomain::Asset(asset_id));
-    }
-    if let Some((asset_id, _)) = parsed.pool_slot {
-        domains.push(AtomicMempoolDomain::LiquidityPool(asset_id));
-    }
-    Ok(domains)
 }
 
 pub(crate) fn atomic_mempool_liquidity_pool_slot(transaction: &Transaction) -> RuleResult<Option<AtomicMempoolSlot>> {

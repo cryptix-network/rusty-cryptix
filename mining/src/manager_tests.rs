@@ -232,6 +232,52 @@ mod tests {
     }
 
     #[test]
+    fn test_atomic_nonce_p2p_batch_can_use_pending_mempool_context() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+
+        let first_transaction = create_transaction_with_utxo_entry(0, 0);
+        let second_transaction = create_transaction_with_utxo_entry(1, 0);
+
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                first_transaction.clone(),
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("first transaction should enter the mempool");
+
+        consensus.set_transient_status(
+            second_transaction.id(),
+            Err(TxRuleError::InvalidAtomicPayload(
+                "nonce baseline violation for owner `00` scope `asset` `11`: expected `1`, got `2`".to_string(),
+            )),
+        );
+        consensus.add_utxo(
+            second_transaction.tx.inputs[0].previous_outpoint,
+            second_transaction.entries[0].as_ref().expect("test transaction entry is populated").clone(),
+        );
+
+        let results = mining_manager.validate_and_insert_transaction_batch(
+            consensus.as_ref(),
+            vec![second_transaction.tx.as_ref().clone()],
+            Priority::Low,
+            Orphan::Allowed,
+            RbfPolicy::Allowed,
+        );
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok(), "P2P batch future CAT nonce should validate against pending mempool context");
+
+        let (transactions_from_pool, _) = mining_manager.get_all_transactions(TransactionQuery::TransactionsOnly);
+        assert!(transactions_from_pool.iter().any(|tx| tx.id() == first_transaction.id()));
+        assert!(transactions_from_pool.iter().any(|tx| tx.id() == second_transaction.id()));
+    }
+
+    #[test]
     fn test_atomic_liquidity_vault_submit_can_use_pending_mempool_context() {
         let consensus = Arc::new(ConsensusMock::new());
         let counters = Arc::new(MiningCounters::default());
@@ -313,6 +359,41 @@ mod tests {
             }
             other => panic!("expected duplicate owner nonce slot rejection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_atomic_duplicate_nonce_does_not_evict_pending_future_nonce_when_full() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.maximum_transaction_count = 2;
+        config.minimum_relay_transaction_fee = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x12; 32];
+
+        let first = create_cat_payload_transaction_with_utxo_entry(0, 10_000, cat_transfer_payload(1, asset_id));
+        let future = create_cat_payload_transaction_with_utxo_entry(1, 20_000, cat_transfer_payload(2, asset_id));
+        let duplicate_first = create_cat_payload_transaction_with_utxo_entry(2, 500_000, cat_transfer_payload(1, asset_id));
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), first.clone()).unwrap();
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), future.clone()).unwrap();
+
+        let result =
+            into_mempool_result(validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), duplicate_first.clone()));
+
+        match result {
+            Err(RuleError::RejectAtomicSlotConflict(rejected_id, existing_id, slot)) => {
+                assert_eq!(duplicate_first.id(), rejected_id);
+                assert_eq!(first.id(), existing_id);
+                assert!(slot.contains("nonce:asset"), "unexpected slot: {slot}");
+            }
+            other => panic!("expected duplicate owner nonce slot rejection, got {other:?}"),
+        }
+        assert!(
+            mining_manager.get_transaction(&future.id(), TransactionQuery::All).is_some(),
+            "duplicate same-nonce CAT must not evict an already pending future nonce"
+        );
+        assert_transaction_count(&mining_manager, 2, "duplicate same-nonce rejection");
     }
 
     #[test]
@@ -398,16 +479,16 @@ mod tests {
     }
 
     #[test]
-    fn test_atomic_mempool_removes_accepted_same_asset_domain_conflict() {
+    fn test_atomic_mempool_keeps_future_same_asset_nonce_after_accepted_predecessor() {
         let consensus = Arc::new(ConsensusMock::new());
         let counters = Arc::new(MiningCounters::default());
         let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
         let asset_id = [0x4c; 32];
         let other_asset_id = [0x4d; 32];
-        let local_same_asset = create_cat_payload_transaction_with_utxo_entry(
+        let local_future_same_asset = create_cat_payload_transaction_with_utxo_entry(
             0,
             DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
-            cat_transfer_payload(1, asset_id),
+            cat_transfer_payload(2, asset_id),
         );
         let local_other_asset = create_cat_payload_transaction_with_utxo_entry(
             1,
@@ -417,19 +498,19 @@ mod tests {
         let accepted_from_peer = create_cat_payload_transaction_with_utxo_entry(
             2,
             DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
-            cat_transfer_payload(2, asset_id),
+            cat_transfer_payload(1, asset_id),
         );
 
-        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), local_same_asset.clone()).unwrap();
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), local_future_same_asset.clone()).unwrap();
         validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), local_other_asset.clone()).unwrap();
 
         let block_transactions = build_block_transactions(std::iter::once(accepted_from_peer.tx.as_ref()));
         let result = mining_manager.handle_new_block_transactions(consensus.as_ref(), 2, &block_transactions);
-        assert!(result.is_ok(), "handling a block with an accepted same-asset conflict should succeed but returned {result:?}");
+        assert!(result.is_ok(), "handling a block with an accepted same-asset predecessor should succeed but returned {result:?}");
 
         assert!(
-            mining_manager.get_transaction(&local_same_asset.id(), TransactionQuery::All).is_none(),
-            "local same-asset CAT transaction should be removed after another node accepted that asset domain"
+            mining_manager.get_transaction(&local_future_same_asset.id(), TransactionQuery::All).is_some(),
+            "future same-asset CAT nonce should stay in the mempool after its predecessor is accepted"
         );
         assert!(
             mining_manager.get_transaction(&local_other_asset.id(), TransactionQuery::All).is_some(),
@@ -513,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn test_atomic_mempool_count_limit_rejects_same_domain_cat_without_eviction() {
+    fn test_atomic_mempool_count_limit_preserves_pending_nonce_chain() {
         let consensus = Arc::new(ConsensusMock::new());
         let counters = Arc::new(MiningCounters::default());
         let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
@@ -547,7 +628,7 @@ mod tests {
         assert_eq!(
             Err(RuleError::RejectMempoolIsFull),
             high_result,
-            "even a higher-feerate same-asset CAT transaction must not use mempool-capacity eviction"
+            "even a higher-feerate future CAT nonce must not evict the earlier pending nonce chain it depends on"
         );
         assert_transaction_count(&mining_manager, 2, "high-fee CAT rejection");
         assert!(mining_manager.get_transaction(&first.id(), TransactionQuery::All).is_some());
@@ -556,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn test_atomic_same_domain_low_fee_blocker_expires_then_new_cat_enters() {
+    fn test_atomic_pending_nonce_chain_blocker_expires_then_new_cat_enters() {
         let consensus = Arc::new(ConsensusMock::new());
         let counters = Arc::new(MiningCounters::default());
         let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
@@ -575,7 +656,7 @@ mod tests {
 
         let blocked_result =
             into_mempool_result(validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), fresh_trade.clone()));
-        assert_eq!(Err(RuleError::RejectMempoolIsFull), blocked_result, "same-domain CAT must not bypass first-seen ordering by fee");
+        assert_eq!(Err(RuleError::RejectMempoolIsFull), blocked_result, "future CAT nonce must not evict its pending predecessor");
         assert!(mining_manager.get_transaction(&blocker.id(), TransactionQuery::All).is_some());
 
         consensus.set_virtual_daa_score(6);
@@ -621,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn test_atomic_mempool_count_limit_can_evict_different_domain_cat() {
+    fn test_atomic_mempool_count_limit_can_evict_different_asset_cat() {
         let consensus = Arc::new(ConsensusMock::new());
         let counters = Arc::new(MiningCounters::default());
         let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
@@ -641,7 +722,7 @@ mod tests {
         assert_transaction_count(&mining_manager, 1, "incoming different-asset CAT admission");
         assert!(
             mining_manager.get_transaction(&existing_cat.id(), TransactionQuery::All).is_none(),
-            "incoming CAT may evict a lower-feerate CAT from another asset domain"
+            "incoming CAT may evict a lower-feerate CAT from another asset"
         );
         assert!(
             mining_manager.get_transaction(&incoming_cat.id(), TransactionQuery::All).is_some(),
