@@ -1,7 +1,7 @@
 use crate::{
     feerate::{FeerateEstimator, FeerateEstimatorArgs},
     mempool::{
-        atomic_slots::{atomic_mempool_slots, AtomicMempoolSlot},
+        atomic_slots::{atomic_mempool_domains, atomic_mempool_slots, is_cat_transaction, AtomicMempoolDomain, AtomicMempoolSlot},
         config::Config,
         errors::{RuleError, RuleResult},
         model::{
@@ -19,7 +19,7 @@ use cryptix_consensus_core::{
     block::TemplateTransactionSelector,
     tx::{MutableTransaction, TransactionId, TransactionOutpoint},
 };
-use cryptix_core::{debug, time::unix_now, trace};
+use cryptix_core::{debug, trace};
 use std::{
     collections::{hash_map::Keys, hash_set::Iter, HashMap},
     iter::once,
@@ -76,9 +76,6 @@ pub(crate) struct TransactionsPool {
 
     last_expire_scan_daa_score: u64,
 
-    /// last expire scan time in milliseconds
-    last_expire_scan_time: u64,
-
     /// Sum of estimated size for all transactions currently held in `all_transactions`
     estimated_size: usize,
 
@@ -97,7 +94,6 @@ impl TransactionsPool {
             atomic_slots_by_tx: HashMap::new(),
             ready_transactions: Default::default(),
             last_expire_scan_daa_score: 0,
-            last_expire_scan_time: unix_now(),
             utxo_set: MempoolUtxoSet::new(),
             estimated_size: 0,
         }
@@ -223,8 +219,22 @@ impl TransactionsPool {
         }
     }
 
+    pub(crate) fn all_atomic_transaction_ids(&self) -> Vec<TransactionId> {
+        self.all_transactions.values().filter_map(|tx| is_cat_transaction(tx.mtx.tx.as_ref()).then_some(tx.id())).collect()
+    }
+
     pub(crate) fn atomic_slot_owner(&self, slot: &AtomicMempoolSlot) -> Option<&TransactionId> {
         self.atomic_slot_owners.get(slot)
+    }
+
+    pub(crate) fn atomic_domain_conflict_owners(&self, domains: &[AtomicMempoolDomain]) -> Vec<TransactionId> {
+        let mut owners = Vec::new();
+        for (transaction_id, slots) in self.atomic_slots_by_tx.iter() {
+            if atomic_domains_conflict(domains, &atomic_domains_from_slots(slots)) {
+                owners.push(*transaction_id);
+            }
+        }
+        owners
     }
 
     pub(crate) fn ready_transaction_count(&self) -> usize {
@@ -262,6 +272,30 @@ impl TransactionsPool {
         transaction: &MutableTransaction,
         transaction_size: usize,
     ) -> RuleResult<Vec<TransactionId>> {
+        self.limit_transaction_count_by(transaction, transaction_size, |_| Ok(true))
+    }
+
+    pub(crate) fn limit_transaction_count_without_atomic_domain_eviction(
+        &self,
+        transaction: &MutableTransaction,
+        transaction_size: usize,
+    ) -> RuleResult<Vec<TransactionId>> {
+        let incoming_domains = atomic_mempool_domains(transaction)?;
+        self.limit_transaction_count_by(transaction, transaction_size, |tx| {
+            let existing_domains = atomic_mempool_domains(&tx.mtx)?;
+            Ok(!atomic_domains_conflict(&incoming_domains, &existing_domains))
+        })
+    }
+
+    fn limit_transaction_count_by<F>(
+        &self,
+        transaction: &MutableTransaction,
+        transaction_size: usize,
+        can_remove: F,
+    ) -> RuleResult<Vec<TransactionId>>
+    where
+        F: Fn(&MempoolTransaction) -> RuleResult<bool>,
+    {
         // No eviction needed -- return
         if self.len() < self.config.maximum_transaction_count
             && self.estimated_size + transaction_size <= self.config.mempool_size_limit
@@ -273,12 +307,11 @@ impl TransactionsPool {
         let feerate_threshold = transaction.calculated_feerate().unwrap();
         let mut txs_to_remove = Vec::with_capacity(1); // Normally we expect a single removal
         let mut selection_overall_size = 0;
-        for tx in self
-            .ready_transactions
-            .ascending_iter()
-            .map(|tx| self.all_transactions.get(&tx.id()).unwrap())
-            .filter(|mtx| mtx.priority == Priority::Low)
-        {
+        for tx in self.ready_transactions.ascending_iter().map(|tx| self.all_transactions.get(&tx.id()).unwrap()) {
+            if tx.priority != Priority::Low || !can_remove(tx)? {
+                continue;
+            }
+
             // TODO (optimization): inline the `has_parent_in_set` check within the redeemer traversal and exit early if possible
             let redeemers = self.get_redeemer_ids_in_pool(&tx.id()).into_iter().chain(once(tx.id())).collect::<TransactionIdSet>();
             if transaction.has_parent_in_set(&redeemers) {
@@ -351,24 +384,23 @@ impl TransactionsPool {
     }
 
     pub(crate) fn collect_expired_low_priority_transactions(&mut self, virtual_daa_score: u64) -> Vec<TransactionId> {
-        let now = unix_now();
-        if virtual_daa_score < self.last_expire_scan_daa_score + self.config.transaction_expire_scan_interval_daa_score
-            || now < self.last_expire_scan_time + self.config.transaction_expire_scan_interval_milliseconds
-        {
+        if virtual_daa_score < self.last_expire_scan_daa_score + self.config.transaction_expire_scan_interval_daa_score {
             return vec![];
         }
 
         self.last_expire_scan_daa_score = virtual_daa_score;
-        self.last_expire_scan_time = now;
 
         // Never expire high priority transactions
         // Remove all transactions whose added_at_daa_score is older then transaction_expire_interval_daa_score
         self.all_transactions
             .values()
             .filter_map(|x| {
-                if (x.priority == Priority::Low)
-                    && virtual_daa_score > x.added_at_daa_score + self.config.transaction_expire_interval_daa_score
-                {
+                let expire_interval = if is_cat_transaction(x.mtx.tx.as_ref()) {
+                    self.config.atomic_transaction_expire_interval_daa_score
+                } else {
+                    self.config.transaction_expire_interval_daa_score
+                };
+                if x.priority == Priority::Low && virtual_daa_score > x.added_at_daa_score + expire_interval {
                     Some(x.id())
                 } else {
                     None
@@ -380,6 +412,23 @@ impl TransactionsPool {
 
 type IterTxId<'a> = Iter<'a, TransactionId>;
 type KeysTxId<'a> = Keys<'a, TransactionId, MempoolTransaction>;
+
+fn atomic_domains_conflict(left: &[AtomicMempoolDomain], right: &[AtomicMempoolDomain]) -> bool {
+    left.iter().any(|left_domain| right.iter().any(|right_domain| left_domain == right_domain))
+}
+
+fn atomic_domains_from_slots(slots: &[AtomicMempoolSlot]) -> Vec<AtomicMempoolDomain> {
+    slots
+        .iter()
+        .map(|slot| match *slot {
+            AtomicMempoolSlot::Nonce { owner_id, scope_kind, scope_id, .. } => match scope_kind {
+                crate::mempool::atomic_slots::ATOMIC_NONCE_SCOPE_ASSET => AtomicMempoolDomain::Asset(scope_id),
+                _ => AtomicMempoolDomain::Owner(owner_id),
+            },
+            AtomicMempoolSlot::LiquidityPool { asset_id, .. } => AtomicMempoolDomain::LiquidityPool(asset_id),
+        })
+        .collect()
+}
 
 impl<'a> TopologicalIndex<'a, KeysTxId<'a>, IterTxId<'a>, TransactionId> for TransactionsPool {
     fn topology_nodes(&'a self) -> KeysTxId<'a> {

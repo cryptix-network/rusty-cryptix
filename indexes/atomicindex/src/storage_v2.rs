@@ -43,6 +43,7 @@ const PREFIX_LIQUIDITY_VAULT: &[u8] = b"liquidity_vault/";
 const PREFIX_KNOWN_OWNER_ADDRESS: &[u8] = b"known_owner_address/";
 
 const ATOMIC_ROOT_BUCKETS: usize = 4096;
+const RAW_STATE_COPY_CHUNK_KEYS: usize = 4096;
 const ROOT_LEAF_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_V2_LEAF";
 const ROOT_BUCKET_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_V2_BUCKETED_ROOT";
 const LOGICAL_ASSET: u8 = 0x01;
@@ -61,6 +62,20 @@ const STATE_PREFIXES: &[&[u8]] = &[
     PREFIX_EVENT_SEQUENCE,
     PREFIX_CHAIN_ORDER,
     PREFIX_EVENT,
+    PREFIX_LEAF_HASH,
+    PREFIX_ROOT_BUCKET,
+    PREFIX_OWNER_BALANCE,
+    PREFIX_ASSET_HOLDER,
+    PREFIX_LIQUIDITY_VAULT,
+    PREFIX_KNOWN_OWNER_ADDRESS,
+];
+
+const CURRENT_STATE_COPY_PREFIXES: &[&[u8]] = &[
+    PREFIX_ASSET,
+    PREFIX_BALANCE,
+    PREFIX_NONCE,
+    PREFIX_ANCHOR_COUNT,
+    PREFIX_PROCESSED_OP,
     PREFIX_LEAF_HASH,
     PREFIX_ROOT_BUCKET,
     PREFIX_OWNER_BALANCE,
@@ -586,6 +601,63 @@ impl AtomicStorageV2 {
         self.db
             .write(batch)
             .map_err(|err| AtomicTokenError::Processing(format!("failed committing Atomic DB schema v2 delta: {err}")))?;
+        Ok(root)
+    }
+
+    pub fn replace_current_state_from(&self, source: &AtomicStorageV2, state: &AtomicTokenState) -> AtomicTokenResult<[u8; 32]> {
+        let root = source
+            .current_root()?
+            .ok_or_else(|| AtomicTokenError::Processing("Atomic DB copy failed: source V2 store has no current root".to_string()))?;
+
+        let mut batch = WriteBatch::default();
+        let mut pending = 0usize;
+        for prefix in CURRENT_STATE_COPY_PREFIXES {
+            for key in self.keys_with_prefix(prefix)? {
+                batch.delete(key);
+                pending = pending.saturating_add(1);
+                if pending >= RAW_STATE_COPY_CHUNK_KEYS {
+                    self.db
+                        .write(batch)
+                        .map_err(|err| AtomicTokenError::Processing(format!("failed clearing Atomic DB current-state keys: {err}")))?;
+                    batch = WriteBatch::default();
+                    pending = 0;
+                }
+            }
+        }
+        if pending > 0 {
+            self.db
+                .write(batch)
+                .map_err(|err| AtomicTokenError::Processing(format!("failed clearing Atomic DB current-state keys: {err}")))?;
+        }
+
+        let mut batch = WriteBatch::default();
+        let mut pending = 0usize;
+        for prefix in CURRENT_STATE_COPY_PREFIXES {
+            source.read_prefix(prefix, |suffix, value| {
+                batch.put(prefixed_key(prefix, suffix), value);
+                pending = pending.saturating_add(1);
+                if pending >= RAW_STATE_COPY_CHUNK_KEYS {
+                    let to_write = std::mem::take(&mut batch);
+                    self.db
+                        .write(to_write)
+                        .map_err(|err| AtomicTokenError::Processing(format!("failed copying Atomic DB current-state keys: {err}")))?;
+                    pending = 0;
+                }
+                Ok(())
+            })?;
+        }
+        self.write_current_meta_to_batch(
+            &mut batch,
+            state.applied_chain_order.last().copied(),
+            state.applied_chain_order.len() as u64,
+            root,
+            state.degraded,
+            state.next_event_sequence,
+        )?;
+        self.db
+            .write(batch)
+            .map_err(|err| AtomicTokenError::Processing(format!("failed copying Atomic DB current-state keys: {err}")))?;
+
         Ok(root)
     }
 
@@ -1601,6 +1673,52 @@ mod tests {
         assert_eq!(store.get_balance(&balance_key).expect("balance"), 0);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn replace_current_state_from_preserves_source_root_and_runtime_history() {
+        let source_dir = unique_temp_dir("replace-current-source");
+        let target_dir = unique_temp_dir("replace-current-target");
+        let genesis_hash = BlockHash::from_u64_word(17);
+        let source = AtomicStorageV2::open(&source_dir, 6, "cryptix-simnet".to_string(), genesis_hash).expect("open source");
+        let target = AtomicStorageV2::open(&target_dir, 6, "cryptix-simnet".to_string(), genesis_hash).expect("open target");
+
+        let asset_id = [17u8; 32];
+        let owner_id = [18u8; 32];
+        let key = BalanceKey { asset_id, owner_id };
+        let block_hash = BlockHash::from_u64_word(1700);
+        let mut source_state = AtomicTokenState::new(6, "cryptix-simnet".to_string());
+        source_state.balances.insert(key, 55);
+        source_state.nonces.insert(NonceKey::asset(owner_id, asset_id), 3);
+        source_state.anchor_counts.insert(owner_id, 2);
+        source_state.applied_chain_order.push(block_hash);
+        source_state.state_hash_by_block.insert(block_hash, source_state.compute_state_hash());
+        source_state.next_event_sequence = 7;
+        source.persist_state(&source_state).expect("persist source");
+        let source_root = source.current_root().expect("source root").expect("root present");
+
+        let stale_key = BalanceKey { asset_id: [99u8; 32], owner_id: [98u8; 32] };
+        let mut stale_target_state = AtomicTokenState::new(6, "cryptix-simnet".to_string());
+        stale_target_state.balances.insert(stale_key, 123);
+        target.persist_state(&stale_target_state).expect("persist stale target");
+
+        let mut runtime_history = source_state.clone();
+        runtime_history.clear_persistent_state_overlay();
+        target.persist_state(&runtime_history).expect("persist runtime history");
+        let copied_root = target.replace_current_state_from(&source, &runtime_history).expect("copy current state");
+
+        assert_eq!(copied_root, source_root);
+        assert_eq!(target.current_root().expect("target root"), Some(source_root));
+        assert_eq!(target.get_balance(&key).expect("copied balance"), 55);
+        assert_eq!(target.get_balance(&stale_key).expect("stale balance removed"), 0);
+        assert_eq!(target.get_nonce(&NonceKey::asset(owner_id, asset_id)).expect("copied nonce"), 3);
+        let runtime = target.load_runtime_state().expect("runtime load").expect("runtime present");
+        assert_eq!(runtime.applied_chain_order, vec![block_hash]);
+        assert_eq!(runtime.next_event_sequence, 7);
+        assert!(runtime.balances.is_empty());
+
+        let _ = fs::remove_dir_all(source_dir);
+        let _ = fs::remove_dir_all(target_dir);
     }
 
     #[test]

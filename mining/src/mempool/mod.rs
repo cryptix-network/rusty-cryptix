@@ -44,8 +44,9 @@ pub(crate) mod validate_and_insert_transaction;
 /// - Transactions submitted to the mempool by a RPC call have **high priority**.
 ///   They are owned by the node, they never expire in the mempool and the node
 ///   rebroadcasts them once in a while.
-/// - Transactions received through P2P have **low-priority**. They expire after
-///   60 seconds and are removed if not inserted in a block for mining.
+/// - Transactions received through P2P have **low-priority**. They expire by
+///   DAA score if not inserted in a block for mining. CAT transactions use a
+///   shorter DAA-based expiry so stale token intents do not linger.
 pub(crate) struct Mempool {
     config: Arc<Config>,
     transaction_pool: TransactionsPool,
@@ -138,6 +139,10 @@ impl Mempool {
     pub(crate) fn all_transaction_ids_with_priority(&self, priority: Priority) -> Vec<TransactionId> {
         let _sw = Stopwatch::<15>::with_threshold("all_transaction_ids_with_priority op");
         self.transaction_pool.all_transaction_ids_with_priority(priority)
+    }
+
+    pub(crate) fn all_atomic_transaction_ids(&self) -> Vec<TransactionId> {
+        self.transaction_pool.all_atomic_transaction_ids()
     }
 
     pub(crate) fn update_revalidated_transaction(&mut self, transaction: MutableTransaction) -> bool {

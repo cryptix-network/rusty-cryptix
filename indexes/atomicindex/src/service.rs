@@ -2815,34 +2815,6 @@ fn import_snapshot_file_into_store(
     Ok(state)
 }
 
-fn copy_all_persistent_state_keys(source: &AtomicStorageV2, target: &AtomicStorageV2) -> AtomicTokenResult<[u8; 32]> {
-    let mut chunk = SnapshotStateImportChunk::default();
-    source.visit_all_assets(|asset_id, asset| {
-        chunk.assets.push((asset_id, Some(asset)));
-        chunk.flush_if_full(target)
-    })?;
-    source.visit_all_balances(|key, amount| {
-        chunk.balances.push((key, (amount > 0).then_some(amount)));
-        chunk.flush_if_full(target)
-    })?;
-    source.visit_all_nonces(|key, nonce| {
-        chunk.nonces.push((key, (nonce != 1).then_some(nonce)));
-        chunk.flush_if_full(target)
-    })?;
-    source.visit_all_anchor_counts(|owner_id, count| {
-        chunk.anchor_counts.push((owner_id, (count > 0).then_some(count)));
-        chunk.flush_if_full(target)
-    })?;
-    source.visit_all_processed_ops(|txid, op| {
-        chunk.processed_ops.push((txid, Some(op)));
-        chunk.flush_if_full(target)
-    })?;
-    chunk.flush(target)?;
-    target
-        .current_root()?
-        .ok_or_else(|| AtomicTokenError::Processing("Atomic DB copy failed: target V2 store has no current root".to_string()))
-}
-
 fn copy_snapshot_store_into_active(
     source: &AtomicStorageV2,
     target: Arc<AtomicStorageV2>,
@@ -2853,7 +2825,7 @@ fn copy_snapshot_store_into_active(
         .ok_or_else(|| AtomicTokenError::Processing("snapshot import failed: staged V2 store has no current root".to_string()))?;
     state.clear_persistent_state_overlay();
     target.persist_state(&state)?;
-    let copied_root = copy_all_persistent_state_keys(source, &target)?;
+    let copied_root = target.replace_current_state_from(source, &state)?;
     if copied_root != expected_root {
         return Err(AtomicTokenError::Processing(
             "snapshot import failed: active V2 store root mismatch after snapshot swap".to_string(),

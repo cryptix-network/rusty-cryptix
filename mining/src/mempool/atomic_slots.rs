@@ -14,13 +14,20 @@ const CAT_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
 const OWNER_AUTH_SCHEME_PUBKEY: u8 = 0;
 const OWNER_AUTH_SCHEME_PUBKEY_ECDSA: u8 = 1;
 const OWNER_AUTH_SCHEME_SCRIPT_HASH: u8 = 2;
-const ATOMIC_NONCE_SCOPE_OWNER: u8 = 0;
-const ATOMIC_NONCE_SCOPE_ASSET: u8 = 1;
+pub(crate) const ATOMIC_NONCE_SCOPE_OWNER: u8 = 0;
+pub(crate) const ATOMIC_NONCE_SCOPE_ASSET: u8 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AtomicMempoolSlot {
     Nonce { owner_id: [u8; 32], scope_kind: u8, scope_id: [u8; 32], nonce: u64 },
     LiquidityPool { asset_id: [u8; 32], pool_nonce: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AtomicMempoolDomain {
+    Owner([u8; 32]),
+    Asset([u8; 32]),
+    LiquidityPool([u8; 32]),
 }
 
 impl Display for AtomicMempoolSlot {
@@ -86,6 +93,38 @@ pub(crate) fn atomic_mempool_slots(transaction: &MutableTransaction) -> RuleResu
         slots.push(AtomicMempoolSlot::LiquidityPool { asset_id, pool_nonce });
     }
     Ok(slots)
+}
+
+pub(crate) fn atomic_mempool_domains(transaction: &MutableTransaction) -> RuleResult<Vec<AtomicMempoolDomain>> {
+    Ok(atomic_mempool_slots(transaction)?
+        .into_iter()
+        .map(|slot| match slot {
+            AtomicMempoolSlot::Nonce { owner_id, scope_kind, scope_id, .. } => match scope_kind {
+                ATOMIC_NONCE_SCOPE_ASSET => AtomicMempoolDomain::Asset(scope_id),
+                _ => AtomicMempoolDomain::Owner(owner_id),
+            },
+            AtomicMempoolSlot::LiquidityPool { asset_id, .. } => AtomicMempoolDomain::LiquidityPool(asset_id),
+        })
+        .collect())
+}
+
+pub(crate) fn atomic_mempool_domains_from_payload(transaction: &Transaction) -> RuleResult<Vec<AtomicMempoolDomain>> {
+    if !is_cat_transaction(transaction) {
+        return Ok(vec![]);
+    }
+
+    let Some(parsed) = parse_atomic_mempool_payload(transaction.payload.as_slice())? else {
+        return Ok(vec![]);
+    };
+
+    let mut domains = vec![];
+    if let ParsedAtomicNonceScope::Asset(asset_id) = parsed.nonce_scope {
+        domains.push(AtomicMempoolDomain::Asset(asset_id));
+    }
+    if let Some((asset_id, _)) = parsed.pool_slot {
+        domains.push(AtomicMempoolDomain::LiquidityPool(asset_id));
+    }
+    Ok(domains)
 }
 
 pub(crate) fn atomic_mempool_liquidity_pool_slot(transaction: &Transaction) -> RuleResult<Option<AtomicMempoolSlot>> {

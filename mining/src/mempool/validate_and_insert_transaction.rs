@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::mempool::{
+    atomic_slots::is_cat_transaction,
     errors::{RuleError, RuleResult},
     model::{
         pool::Pool,
@@ -85,7 +86,11 @@ impl Mempool {
 
         // Before adding the transaction, check if there is room in the pool
         let transaction_size = transaction.mempool_estimated_bytes();
-        let txs_to_remove = self.transaction_pool.limit_transaction_count(&transaction, transaction_size)?;
+        let txs_to_remove = if is_cat_transaction(transaction.tx.as_ref()) {
+            self.transaction_pool.limit_transaction_count_without_atomic_domain_eviction(&transaction, transaction_size)?
+        } else {
+            self.transaction_pool.limit_transaction_count(&transaction, transaction_size)?
+        };
         if !txs_to_remove.is_empty() {
             let transaction_pool_len_before = self.transaction_pool.len();
             for x in txs_to_remove.iter() {

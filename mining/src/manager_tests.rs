@@ -398,6 +398,258 @@ mod tests {
     }
 
     #[test]
+    fn test_atomic_mempool_removes_accepted_same_asset_domain_conflict() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let asset_id = [0x4c; 32];
+        let other_asset_id = [0x4d; 32];
+        let local_same_asset = create_cat_payload_transaction_with_utxo_entry(
+            0,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_transfer_payload(1, asset_id),
+        );
+        let local_other_asset = create_cat_payload_transaction_with_utxo_entry(
+            1,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_transfer_payload(1, other_asset_id),
+        );
+        let accepted_from_peer = create_cat_payload_transaction_with_utxo_entry(
+            2,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_transfer_payload(2, asset_id),
+        );
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), local_same_asset.clone()).unwrap();
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), local_other_asset.clone()).unwrap();
+
+        let block_transactions = build_block_transactions(std::iter::once(accepted_from_peer.tx.as_ref()));
+        let result = mining_manager.handle_new_block_transactions(consensus.as_ref(), 2, &block_transactions);
+        assert!(result.is_ok(), "handling a block with an accepted same-asset conflict should succeed but returned {result:?}");
+
+        assert!(
+            mining_manager.get_transaction(&local_same_asset.id(), TransactionQuery::All).is_none(),
+            "local same-asset CAT transaction should be removed after another node accepted that asset domain"
+        );
+        assert!(
+            mining_manager.get_transaction(&local_other_asset.id(), TransactionQuery::All).is_some(),
+            "local other-asset CAT transaction should stay in the mempool"
+        );
+    }
+
+    #[test]
+    fn test_atomic_low_priority_stale_tx_revalidation_evicts_invalid_payload() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let asset_id = [0x45; 32];
+        let stale_transaction = create_cat_payload_transaction_with_utxo_entry(
+            0,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_transfer_payload(1, asset_id),
+        );
+
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                stale_transaction.clone(),
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("low-priority CAT transaction should enter the mempool");
+
+        consensus.set_status(stale_transaction.id(), Err(TxRuleError::InvalidAtomicPayload("stale liquidity nonce".to_string())));
+
+        let (tx, mut rx) = unbounded_channel();
+        mining_manager.revalidate_high_priority_transactions(consensus.as_ref(), tx);
+
+        assert_eq!(
+            Err(TryRecvError::Disconnected),
+            rx.try_recv(),
+            "low-priority CAT revalidation must not rebroadcast a valid-id chunk"
+        );
+        assert!(
+            mining_manager.get_transaction(&stale_transaction.id(), TransactionQuery::All).is_none(),
+            "stale low-priority CAT transaction should be evicted by periodic revalidation"
+        );
+    }
+
+    #[test]
+    fn test_atomic_low_priority_tx_expires_faster_than_standard_tx() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.transaction_expire_interval_daa_score = 1_000;
+        config.atomic_transaction_expire_interval_daa_score = 5;
+        config.transaction_expire_scan_interval_daa_score = 0;
+        config.transaction_expire_scan_interval_milliseconds = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x4a; 32];
+
+        let standard_transaction = create_transaction_with_utxo_entry(0, 0);
+        let atomic_transaction = create_cat_payload_transaction_with_utxo_entry(
+            1,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_transfer_payload(1, asset_id),
+        );
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), standard_transaction.clone()).unwrap();
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), atomic_transaction.clone()).unwrap();
+        assert_transaction_count(&mining_manager, 2, "before Atomic expiry");
+
+        consensus.set_virtual_daa_score(6);
+        mining_manager.expire_low_priority_transactions(consensus.as_ref());
+
+        assert_transaction_count(&mining_manager, 1, "after Atomic expiry");
+        assert!(
+            mining_manager.get_transaction(&standard_transaction.id(), TransactionQuery::All).is_some(),
+            "standard low-priority transaction should keep the normal expiry window"
+        );
+        assert!(
+            mining_manager.get_transaction(&atomic_transaction.id(), TransactionQuery::All).is_none(),
+            "low-priority CAT transaction should use the shorter Atomic expiry window"
+        );
+    }
+
+    #[test]
+    fn test_atomic_mempool_count_limit_rejects_same_domain_cat_without_eviction() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.maximum_transaction_count = 2;
+        config.minimum_relay_transaction_fee = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x46; 32];
+
+        let first = create_cat_payload_transaction_with_utxo_entry(0, 10_000, cat_transfer_payload(1, asset_id));
+        let second = create_cat_payload_transaction_with_utxo_entry(1, 20_000, cat_transfer_payload(2, asset_id));
+        let low_fee = create_cat_payload_transaction_with_utxo_entry(2, 1, cat_transfer_payload(3, asset_id));
+        let high_fee = create_cat_payload_transaction_with_utxo_entry(3, 500_000, cat_transfer_payload(4, asset_id));
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), first.clone()).unwrap();
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), second.clone()).unwrap();
+        assert_transaction_count(&mining_manager, 2, "filled CAT mempool");
+
+        let low_result =
+            into_mempool_result(validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), low_fee.clone()));
+        assert_eq!(
+            Err(RuleError::RejectMempoolIsFull),
+            low_result,
+            "a lower-feerate CAT transaction should not displace the full mempool"
+        );
+        assert_transaction_count(&mining_manager, 2, "low-fee CAT rejection");
+        assert!(mining_manager.get_transaction(&first.id(), TransactionQuery::All).is_some());
+        assert!(mining_manager.get_transaction(&second.id(), TransactionQuery::All).is_some());
+
+        let high_result =
+            into_mempool_result(validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), high_fee.clone()));
+        assert_eq!(
+            Err(RuleError::RejectMempoolIsFull),
+            high_result,
+            "even a higher-feerate same-asset CAT transaction must not use mempool-capacity eviction"
+        );
+        assert_transaction_count(&mining_manager, 2, "high-fee CAT rejection");
+        assert!(mining_manager.get_transaction(&first.id(), TransactionQuery::All).is_some());
+        assert!(mining_manager.get_transaction(&second.id(), TransactionQuery::All).is_some());
+        assert!(mining_manager.get_transaction(&high_fee.id(), TransactionQuery::All).is_none());
+    }
+
+    #[test]
+    fn test_atomic_same_domain_low_fee_blocker_expires_then_new_cat_enters() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.maximum_transaction_count = 1;
+        config.minimum_relay_transaction_fee = 0;
+        config.atomic_transaction_expire_interval_daa_score = 5;
+        config.transaction_expire_scan_interval_daa_score = 0;
+        config.transaction_expire_scan_interval_milliseconds = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x4b; 32];
+
+        let blocker = create_cat_payload_transaction_with_utxo_entry(0, 1, cat_transfer_payload(1, asset_id));
+        let fresh_trade = create_cat_payload_transaction_with_utxo_entry(1, 500_000, cat_transfer_payload(2, asset_id));
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), blocker.clone()).unwrap();
+
+        let blocked_result =
+            into_mempool_result(validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), fresh_trade.clone()));
+        assert_eq!(Err(RuleError::RejectMempoolIsFull), blocked_result, "same-domain CAT must not bypass first-seen ordering by fee");
+        assert!(mining_manager.get_transaction(&blocker.id(), TransactionQuery::All).is_some());
+
+        consensus.set_virtual_daa_score(6);
+        mining_manager.expire_low_priority_transactions(consensus.as_ref());
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), fresh_trade.clone()).unwrap();
+
+        assert!(mining_manager.get_transaction(&blocker.id(), TransactionQuery::All).is_none());
+        assert!(mining_manager.get_transaction(&fresh_trade.id(), TransactionQuery::All).is_some());
+    }
+
+    #[test]
+    fn test_atomic_mempool_count_limit_can_evict_non_atomic_transaction() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.maximum_transaction_count = 2;
+        config.minimum_relay_transaction_fee = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x47; 32];
+
+        let normal = create_transaction_with_utxo_entry(0, 0);
+        let existing_cat = create_cat_payload_transaction_with_utxo_entry(1, 20_000, cat_transfer_payload(1, asset_id));
+        let incoming_cat = create_cat_payload_transaction_with_utxo_entry(2, 500_000, cat_transfer_payload(2, asset_id));
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), normal.clone()).unwrap();
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), existing_cat.clone()).unwrap();
+        assert_transaction_count(&mining_manager, 2, "filled mixed mempool");
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), incoming_cat.clone()).unwrap();
+        assert_transaction_count(&mining_manager, 2, "incoming CAT admission after non-CAT eviction");
+        assert!(
+            mining_manager.get_transaction(&normal.id(), TransactionQuery::All).is_none(),
+            "incoming CAT may evict a normal low-priority transaction when the mempool is full"
+        );
+        assert!(
+            mining_manager.get_transaction(&existing_cat.id(), TransactionQuery::All).is_some(),
+            "incoming CAT must not evict an existing CAT transaction"
+        );
+        assert!(
+            mining_manager.get_transaction(&incoming_cat.id(), TransactionQuery::All).is_some(),
+            "incoming CAT should be admitted after evicting only a normal transaction"
+        );
+    }
+
+    #[test]
+    fn test_atomic_mempool_count_limit_can_evict_different_domain_cat() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.maximum_transaction_count = 1;
+        config.minimum_relay_transaction_fee = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+
+        let existing_asset = [0x48; 32];
+        let incoming_asset = [0x49; 32];
+        let existing_cat = create_cat_payload_transaction_with_utxo_entry(0, 10_000, cat_transfer_payload(1, existing_asset));
+        let incoming_cat = create_cat_payload_transaction_with_utxo_entry(1, 500_000, cat_transfer_payload(1, incoming_asset));
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), existing_cat.clone()).unwrap();
+        assert_transaction_count(&mining_manager, 1, "filled CAT mempool");
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), incoming_cat.clone()).unwrap();
+        assert_transaction_count(&mining_manager, 1, "incoming different-asset CAT admission");
+        assert!(
+            mining_manager.get_transaction(&existing_cat.id(), TransactionQuery::All).is_none(),
+            "incoming CAT may evict a lower-feerate CAT from another asset domain"
+        );
+        assert!(
+            mining_manager.get_transaction(&incoming_cat.id(), TransactionQuery::All).is_some(),
+            "incoming different-asset CAT should be admitted"
+        );
+    }
+
+    #[test]
     fn test_atomic_rbf_rejects_incoming_cat_replacement() {
         let consensus = Arc::new(ConsensusMock::new());
         let counters = Arc::new(MiningCounters::default());

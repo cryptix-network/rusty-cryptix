@@ -33,7 +33,7 @@ use cryptix_core::{debug, error, info, time::Stopwatch, warn};
 use cryptix_mining_errors::{manager::MiningManagerError, mempool::RuleError};
 use itertools::Itertools;
 use parking_lot::RwLock;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use tokio::sync::mpsc::UnboundedSender;
 
 pub struct MiningManager {
@@ -707,16 +707,33 @@ impl MiningManager {
         const TRANSACTION_CHUNK_SIZE: usize = 1000;
 
         // read lock on mempool
-        // Prepare a vector with clones of high priority transactions found in the mempool
+        // Prepare a vector with clones of high priority transactions and CAT transactions found in the mempool.
+        // High priority transactions are rebroadcast after successful revalidation; low-priority CAT transactions
+        // are only revalidated so stale Atomic payloads do not accumulate until normal expiry.
         let mempool = self.mempool.read();
-        let transaction_ids = mempool.all_transaction_ids_with_priority(Priority::High);
+        let high_priority_ids = mempool.all_transaction_ids_with_priority(Priority::High);
+        let mut high_priority_set: HashSet<_> = high_priority_ids.iter().copied().collect();
+        let mut transaction_ids = high_priority_ids.clone();
+        let mut atomic_low_priority_count = 0usize;
+        for transaction_id in mempool.all_atomic_transaction_ids() {
+            if high_priority_set.insert(transaction_id) {
+                transaction_ids.push(transaction_id);
+                atomic_low_priority_count += 1;
+            }
+        }
         if transaction_ids.is_empty() {
-            debug!("<> Revalidating high priority transactions found no transactions");
+            debug!("<> Revalidating high priority/CAT transactions found no transactions");
             return;
         } else {
-            debug!("<> Revalidating {} high priority transactions...", transaction_ids.len());
+            debug!(
+                "<> Revalidating {} high priority/CAT transactions ({} high priority, {} low-priority CAT)...",
+                transaction_ids.len(),
+                high_priority_ids.len(),
+                atomic_low_priority_count
+            );
         }
         drop(mempool);
+        let high_priority_set: HashSet<_> = high_priority_ids.into_iter().collect();
         // read lock on mempool by transaction chunks
         let mut transactions = Vec::with_capacity(transaction_ids.len());
         for chunk in &transaction_ids.iter().chunks(TRANSACTION_CHUNK_SIZE) {
@@ -796,7 +813,9 @@ impl MiningManager {
                             // high-priority transactions, we might wrongfully return as valid the id of a removed transaction.
                             // However, as only consequence, said transaction would then be advertised to registered peers and not be
                             // provided upon request.
-                            valid_ids.push(transaction_id);
+                            if high_priority_set.contains(&transaction_id) {
+                                valid_ids.push(transaction_id);
+                            }
                             valid += 1;
                         } else {
                             other += 1;
@@ -857,11 +876,11 @@ impl MiningManager {
         }
         match accepted + missing_outpoint + invalid {
             0 => {
-                info!("Revalidated {} high priority transactions", valid);
+                info!("Revalidated {} high priority/CAT transactions", valid);
             }
             _ => {
                 info!(
-                    "Revalidated {} and removed {} high priority transactions (removals: {} accepted, {} missing outpoint, {} invalid)",
+                    "Revalidated {} and removed {} high priority/CAT transactions (removals: {} accepted, {} missing outpoint, {} invalid)",
                     valid,
                     accepted + missing_outpoint + invalid,
                     accepted,

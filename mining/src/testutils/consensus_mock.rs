@@ -29,6 +29,7 @@ pub(crate) struct ConsensusMock {
     statuses: RwLock<HashMap<TransactionId, TxResult<()>>>,
     single_validation_statuses: RwLock<HashMap<TransactionId, TxResult<()>>>,
     utxos: RwLock<UtxoCollection>,
+    virtual_daa_score: RwLock<u64>,
 }
 
 impl ConsensusMock {
@@ -38,6 +39,7 @@ impl ConsensusMock {
             statuses: RwLock::new(HashMap::default()),
             single_validation_statuses: RwLock::new(HashMap::default()),
             utxos: RwLock::new(HashMap::default()),
+            virtual_daa_score: RwLock::new(0),
         }
     }
 
@@ -47,6 +49,10 @@ impl ConsensusMock {
 
     pub(crate) fn set_single_validation_status(&self, transaction_id: TransactionId, status: TxResult<()>) {
         self.single_validation_statuses.write().insert(transaction_id, status);
+    }
+
+    pub(crate) fn set_virtual_daa_score(&self, virtual_daa_score: u64) {
+        *self.virtual_daa_score.write() = virtual_daa_score;
     }
 
     pub(crate) fn add_transaction(&self, transaction: Transaction, block_daa_score: u64) {
@@ -185,7 +191,7 @@ impl ConsensusApi for ConsensusMock {
     }
 
     fn get_virtual_daa_score(&self) -> u64 {
-        0
+        *self.virtual_daa_score.read()
     }
 
     fn get_virtual_state_approx_id(&self) -> VirtualStateApproxId {
