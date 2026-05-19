@@ -73,8 +73,11 @@ pub const MAX_BOOTSTRAP_SNAPSHOT_FILE_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub const MAX_BOOTSTRAP_REPLAY_WINDOW_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const SNAPSHOT_IMPORT_CHUNK_KEYS: usize = 4096;
 const BOOTSTRAP_STORE_MAX_SNAPSHOTS_PER_NETWORK: usize = 16;
+const ATOMIC_TEMP_DIR_MAX_AGE: Duration = Duration::from_secs(3600);
 const ATOMIC_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const ATOMIC_LONG_OPERATION_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const DEGRADED_READ_WARN_INTERVAL: Duration = Duration::from_secs(10);
+const P2P_AUDIT_RENDEZVOUS_DAA_LAG: u64 = 60;
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 struct SnapshotManifestV2 {
@@ -198,6 +201,7 @@ struct AtomicTokenProcessor {
 struct AtomicProgressLogState {
     last_log: Option<Instant>,
     last_runtime_state: Option<AtomicTokenRuntimeState>,
+    last_degraded_read_log: Option<Instant>,
 }
 
 impl AtomicTokenProcessor {
@@ -211,7 +215,7 @@ impl AtomicTokenProcessor {
             consensus_manager,
             max_retained_blocks,
             operation_lock: Default::default(),
-            bootstrap_in_progress: AtomicBool::new(false),
+            bootstrap_in_progress: AtomicBool::new(true),
             processed_chain_blocks: AtomicU64::new(0),
             progress_log: Default::default(),
             state_progress_notify: Notify::new(),
@@ -338,15 +342,12 @@ impl AtomicTokenProcessor {
                         trace!("[{IDENT}] Cryptix Atomic pruning removed processed op guard entries");
                     }
                 }
-                let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
-                let mut health = state.get_health();
-                health.bootstrap_in_progress = bootstrap_in_progress;
-                health.runtime_state = state.runtime_state(bootstrap_in_progress);
                 let retained_blocks = state.applied_chain_order.len();
                 let footprint = state.footprint();
                 let state_store_bytes = self.state_store.approximate_size_bytes();
                 drop(state);
 
+                let health = self.health().await;
                 self.maybe_log_progress(added_count, removed_count, retained_blocks, health, footprint, state_store_bytes);
                 self.notify_state_progress();
                 Ok(())
@@ -404,23 +405,17 @@ impl AtomicTokenProcessor {
         self.state.lock().await.get_state_hash()
     }
 
-    async fn health(&self) -> AtomicTokenHealth {
+    async fn local_health(&self) -> AtomicTokenHealth {
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
-        let (mut health, last_applied) = {
-            let state = self.state.lock().await;
-            let mut health = state.get_health();
-            health.bootstrap_in_progress = bootstrap_in_progress;
-            health.runtime_state = state.runtime_state(bootstrap_in_progress);
-            (health, state.applied_chain_order.last().copied())
-        };
-        if matches!(health.runtime_state, AtomicTokenRuntimeState::Healthy) {
-            let sink = self.consensus_sink().await;
-            if last_applied != Some(sink) {
-                health.runtime_state = AtomicTokenRuntimeState::Recovering;
-                health.live_correct = false;
-            }
-        }
+        let state = self.state.lock().await;
+        let mut health = state.get_health();
+        health.bootstrap_in_progress = bootstrap_in_progress;
+        health.runtime_state = state.runtime_state(bootstrap_in_progress);
         health
+    }
+
+    async fn health(&self) -> AtomicTokenHealth {
+        self.local_health().await
     }
 
     async fn consensus_sink(&self) -> BlockHash {
@@ -457,10 +452,24 @@ impl AtomicTokenProcessor {
             {
                 let last_applied_for_log = last_applied.map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string());
                 if matches!(runtime_state, AtomicTokenRuntimeState::Degraded) {
-                    warn!(
-                        "[{IDENT}] refusing latest Atomic read while indexer is degraded: last_applied={}, target_sink={}, current_sink={}",
-                        last_applied_for_log, target_sink, current_sink
-                    );
+                    let should_log = {
+                        let now = Instant::now();
+                        let mut progress_log = self.progress_log.lock().expect("Atomic progress log mutex poisoned");
+                        let should_log = progress_log
+                            .last_degraded_read_log
+                            .map(|last| now.duration_since(last) >= DEGRADED_READ_WARN_INTERVAL)
+                            .unwrap_or(true);
+                        if should_log {
+                            progress_log.last_degraded_read_log = Some(now);
+                        }
+                        should_log
+                    };
+                    if should_log {
+                        warn!(
+                            "[{IDENT}] refusing latest Atomic read while indexer is degraded: last_applied={}, target_sink={}, current_sink={}",
+                            last_applied_for_log, target_sink, current_sink
+                        );
+                    }
                 } else {
                     debug!(
                         "[{IDENT}] latest Atomic read unavailable while indexer is initializing: last_applied={}, target_sink={}, current_sink={}",
@@ -1050,8 +1059,38 @@ impl AtomicTokenService {
         self.processor.health().await
     }
 
+    pub async fn get_local_health(&self) -> AtomicTokenHealth {
+        self.processor.local_health().await
+    }
+
     pub async fn get_state_hash_at_block(&self, at_block_hash: BlockHash) -> Option<[u8; 32]> {
         self.processor.state.lock().await.get_state_hash_at_block(at_block_hash)
+    }
+
+    pub async fn get_p2p_audit_context(&self) -> AtomicTokenResult<Option<(AtomicTokenReadContext, u64)>> {
+        let (anchor_hash, anchor_daa_score) = self.current_p2p_audit_anchor().await?;
+        Ok(self.p2p_audit_context_from_retained_checkpoint(anchor_hash).await?.map(|context| (context, anchor_daa_score)))
+    }
+
+    pub async fn get_p2p_audit_state_hash_at_block(&self, at_block_hash: BlockHash) -> Option<[u8; 32]> {
+        self.p2p_audit_context_from_retained_checkpoint(at_block_hash).await.ok().flatten().map(|context| context.state_hash)
+    }
+
+    async fn p2p_audit_context_from_retained_checkpoint(
+        &self,
+        at_block_hash: BlockHash,
+    ) -> AtomicTokenResult<Option<AtomicTokenReadContext>> {
+        if self.processor.bootstrap_in_progress.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        if self.processor.state_store.revalidation_version()? != Some(ATOMIC_REVALIDATION_VERSION) {
+            return Ok(None);
+        }
+        let state = self.processor.state.lock().await;
+        if state.degraded || !state.live_correct || !state.has_verified_state() {
+            return Ok(None);
+        }
+        Ok(state.materialize_context_at_block(at_block_hash, state.runtime_state(false)))
     }
 
     pub async fn mark_degraded_and_persist(&self, reason: &str) -> AtomicTokenResult<()> {
@@ -1173,7 +1212,32 @@ impl AtomicTokenService {
                 return Ok(false);
             }
         }
-        self.revalidate_loaded_state_once_per_process().await
+        self.revalidate_loaded_state_once_per_process(false).await
+    }
+
+    pub async fn revalidate_retained_state_for_audit_once(&self) -> AtomicTokenResult<bool> {
+        if self.processor.bootstrap_in_progress.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        self.revalidate_loaded_state_once_per_process(true).await
+    }
+
+    pub async fn repair_from_local_selected_chain_once(&self) -> AtomicTokenResult<bool> {
+        if self.processor.bootstrap_in_progress.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let has_verified_state = { self.processor.state.lock().await.has_verified_state() };
+        if has_verified_state {
+            self.revalidate_retained_state_once().await
+        } else {
+            self.backfill_empty_state_from_local_selected_chain().await
+        }
+    }
+
+    fn prune_stale_state_hash_checkpoints(&self, state: &mut AtomicTokenState) -> AtomicTokenResult<usize> {
+        let retained_hashes = state.applied_chain_order.iter().copied().collect::<HashSet<_>>();
+        state.state_hash_by_block.retain(|block_hash, _| retained_hashes.contains(block_hash));
+        self.processor.state_store.prune_state_hashes_except(&retained_hashes)
     }
 
     async fn accept_persisted_state_fast_path(&self) -> AtomicTokenResult<bool> {
@@ -1189,9 +1253,7 @@ impl AtomicTokenService {
         if state.degraded || !state.has_verified_state() {
             return Ok(false);
         }
-        if state.state_hash_by_block.len() != state.applied_chain_order.len()
-            || state.applied_chain_order.iter().any(|block_hash| !state.state_hash_by_block.contains_key(block_hash))
-        {
+        if state.applied_chain_order.iter().any(|block_hash| !state.state_hash_by_block.contains_key(block_hash)) {
             return Ok(false);
         }
         let Some(last_applied) = state.applied_chain_order.last().copied() else {
@@ -1205,6 +1267,14 @@ impl AtomicTokenService {
         }
 
         state.live_correct = true;
+        let pruned_state_hashes = if state.state_hash_by_block.len() > state.applied_chain_order.len() {
+            self.prune_stale_state_hash_checkpoints(&mut state)?
+        } else {
+            0
+        };
+        if pruned_state_hashes > 0 {
+            info!("[{IDENT}] Cryptix Atomic startup fast path pruned {} stale retained state hash checkpoint(s)", pruned_state_hashes);
+        }
         info!("[{IDENT}] Cryptix Atomic startup state revalidation skipped: persisted V2 root matches retained tip {}", last_applied);
         drop(state);
         self.processor.notify_state_progress();
@@ -1279,8 +1349,9 @@ impl AtomicTokenService {
         self.processor.indexed_liquidity_holders(asset_id, requested_at_block_hash, self.genesis_hash).await
     }
 
-    async fn revalidate_loaded_state(&self) -> AtomicTokenResult<bool> {
+    async fn revalidate_loaded_state(&self, force_healthy_revalidation: bool) -> AtomicTokenResult<bool> {
         let _operation_guard = self.processor.operation_lock.lock().await;
+        let _bootstrap_progress_guard = BootstrapProgressGuard::new(&self.processor.bootstrap_in_progress);
         if self.retained_revalidation_failed.load(Ordering::SeqCst) {
             return Err(AtomicTokenError::Processing(
                 "retained-chain revalidation already failed in this process; remote snapshot bootstrap is required".to_string(),
@@ -1290,6 +1361,10 @@ impl AtomicTokenService {
         let loaded_state = {
             let state = self.processor.state.lock().await;
             if !state.has_verified_state() {
+                return Ok(false);
+            }
+            if !force_healthy_revalidation && !state.degraded && state.live_correct {
+                info!("[{IDENT}] Cryptix Atomic startup state revalidation skipped: local state became healthy");
                 return Ok(false);
             }
             info!(
@@ -1376,7 +1451,8 @@ impl AtomicTokenService {
         info!("[{IDENT}] Cryptix Atomic startup state revalidation loaded acceptance data for {} block(s)", acceptance_data.len());
         let auth_inputs = self.processor.collect_auth_inputs_for_added_blocks(&replay_added).await?;
 
-        let temp_state_dir = unique_atomic_temp_dir("startup-revalidation");
+        let temp_state_dir = unique_atomic_temp_dir(&self.atomic_data_dir, "startup-revalidation")?;
+        let _temp_state_cleanup = RemoveDirOnDrop::new(temp_state_dir.clone());
         let temp_state_store = if first_replayable_index == 0 {
             Arc::new(AtomicStorageV2::open(&temp_state_dir, self.protocol_version, self.network_id.clone(), self.genesis_hash)?)
         } else {
@@ -1521,6 +1597,10 @@ impl AtomicTokenService {
             );
         }
         if !refreshed_retained_hashes.is_empty() {
+            let retained_hashes = state.applied_chain_order.iter().copied().collect::<HashSet<_>>();
+            refreshed_retained_hashes.retain(|(block_hash, _)| retained_hashes.contains(block_hash));
+        }
+        if !refreshed_retained_hashes.is_empty() {
             let refreshed_count = self.processor.state_store.replace_state_hashes(refreshed_retained_hashes.iter().copied())?;
             for (block_hash, state_hash) in refreshed_retained_hashes {
                 state.state_hash_by_block.insert(block_hash, state_hash);
@@ -1540,6 +1620,14 @@ impl AtomicTokenService {
                 info!("[{IDENT}] Cryptix Atomic pruned processed-op guard entries after startup state revalidation");
             }
         }
+        let pruned_state_hashes = if state.state_hash_by_block.len() > state.applied_chain_order.len() {
+            self.prune_stale_state_hash_checkpoints(&mut state)?
+        } else {
+            0
+        };
+        if pruned_state_hashes > 0 {
+            info!("[{IDENT}] Cryptix Atomic startup state revalidation pruned {} stale state hash checkpoint(s)", pruned_state_hashes);
+        }
         state.degraded = false;
         state.live_correct = true;
 
@@ -1552,18 +1640,17 @@ impl AtomicTokenService {
         self.processor.state_store.persist_revalidation_version(ATOMIC_REVALIDATION_VERSION)?;
         drop(state);
         self.processor.notify_state_progress();
-        let _ = std::fs::remove_dir_all(temp_state_dir);
         Ok(true)
     }
 
-    async fn revalidate_loaded_state_once_per_process(&self) -> AtomicTokenResult<bool> {
+    async fn revalidate_loaded_state_once_per_process(&self, force_healthy_revalidation: bool) -> AtomicTokenResult<bool> {
         if self.retained_revalidation_failed.load(Ordering::SeqCst) {
             return Err(AtomicTokenError::Processing(
                 "retained-chain revalidation already failed in this process; remote snapshot bootstrap is required".to_string(),
             ));
         }
 
-        match self.revalidate_loaded_state().await {
+        match self.revalidate_loaded_state(force_healthy_revalidation).await {
             Ok(true) => {
                 self.retained_revalidation_failed.store(false, Ordering::SeqCst);
                 Ok(true)
@@ -1649,13 +1736,11 @@ impl AtomicTokenService {
 
         if result.as_ref().copied().unwrap_or(false) {
             let state = self.processor.state.lock().await;
-            let mut health = state.get_health();
-            health.bootstrap_in_progress = false;
-            health.runtime_state = state.runtime_state(false);
             let retained_blocks = state.applied_chain_order.len();
             let footprint = state.footprint();
             let state_store_bytes = self.processor.state_store.approximate_size_bytes();
             drop(state);
+            let health = self.processor.health().await;
             self.processor.maybe_log_progress(
                 notification.added_chain_block_hashes.len(),
                 0,
@@ -1726,6 +1811,26 @@ impl AtomicTokenService {
         Ok((fp, fp_header.daa_score))
     }
 
+    async fn current_p2p_audit_anchor(&self) -> AtomicTokenResult<(BlockHash, u64)> {
+        let (mut anchor_hash, fp_daa_score) = self.current_snapshot_anchor().await?;
+        let target_daa_score = fp_daa_score.saturating_sub(P2P_AUDIT_RENDEZVOUS_DAA_LAG);
+
+        let consensus = self.processor.consensus_manager.consensus();
+        let session = consensus.session().await;
+        let mut anchor_header = session.async_get_header(anchor_hash).await?;
+        while anchor_header.daa_score > target_daa_score && anchor_hash != self.genesis_hash {
+            let ghostdag = session.async_get_ghostdag_data(anchor_hash).await?;
+            let selected_parent = ghostdag.selected_parent;
+            if selected_parent == anchor_hash {
+                break;
+            }
+            anchor_hash = selected_parent;
+            anchor_header = session.async_get_header(anchor_hash).await?;
+        }
+
+        Ok((anchor_hash, anchor_header.daa_score))
+    }
+
     fn prune_bootstrap_snapshot_store(&self) -> AtomicTokenResult<()> {
         prune_snapshot_catalog_entries(
             &self.snapshot_store_dir,
@@ -1735,8 +1840,7 @@ impl AtomicTokenService {
         )
     }
 
-    async fn ensure_current_bootstrap_snapshot(&self) -> AtomicTokenResult<()> {
-        let _refresh_guard = self.snapshot_refresh_lock.lock().await;
+    async fn refresh_current_bootstrap_snapshot(&self) -> AtomicTokenResult<()> {
         let (anchor_hash, _anchor_daa_score) = self.current_snapshot_anchor().await?;
         let anchor_hash_bytes = hash_to_array(anchor_hash);
         let already_present = {
@@ -1761,14 +1865,12 @@ impl AtomicTokenService {
         Ok(())
     }
 
-    pub async fn get_sc_bootstrap_sources(&self) -> AtomicTokenResult<Vec<ScBootstrapSource>> {
-        self.ensure_bootstrap_serving_ready().await?;
+    async fn ensure_current_bootstrap_snapshot(&self) -> AtomicTokenResult<()> {
+        let _refresh_guard = self.snapshot_refresh_lock.lock().await;
+        self.refresh_current_bootstrap_snapshot().await
+    }
 
-        let refresh_error = self.ensure_current_bootstrap_snapshot().await.err();
-        if let Some(err) = &refresh_error {
-            trace!("[{IDENT}] skipping bootstrap snapshot refresh: {err}");
-        }
-
+    fn bootstrap_sources_from_catalog(&self) -> AtomicTokenResult<Vec<ScBootstrapSource>> {
         let mut sources = list_snapshot_catalog(&self.snapshot_store_dir)?
             .into_iter()
             .filter(|entry| entry.manifest.protocol_version == self.protocol_version && entry.manifest.network_id == self.network_id)
@@ -1784,6 +1886,23 @@ impl AtomicTokenService {
                 window_end_block_hash: BlockHash::from_bytes(entry.manifest.window_end_block_hash),
             })
             .collect::<Vec<_>>();
+        sources.sort_by(|a, b| b.at_daa_score.cmp(&a.at_daa_score).then(b.at_block_hash.as_bytes().cmp(&a.at_block_hash.as_bytes())));
+        Ok(sources)
+    }
+
+    pub async fn get_sc_bootstrap_sources(&self) -> AtomicTokenResult<Vec<ScBootstrapSource>> {
+        self.ensure_bootstrap_serving_ready().await?;
+
+        let mut sources = self.bootstrap_sources_from_catalog()?;
+        let refresh_error = if sources.is_empty() {
+            let refresh_error = self.ensure_current_bootstrap_snapshot().await.err();
+            if refresh_error.is_none() {
+                sources = self.bootstrap_sources_from_catalog()?;
+            }
+            refresh_error
+        } else {
+            None
+        };
         if sources.is_empty() {
             if let Some(err) = refresh_error {
                 let err = err.to_string();
@@ -1794,7 +1913,6 @@ impl AtomicTokenService {
                 }
             }
         }
-        sources.sort_by(|a, b| b.at_daa_score.cmp(&a.at_daa_score).then(b.at_block_hash.as_bytes().cmp(&a.at_block_hash.as_bytes())));
         Ok(sources)
     }
 
@@ -1901,7 +2019,8 @@ impl AtomicTokenService {
         let _operation_guard = self.processor.operation_lock.lock().await;
         let (anchor_hash, anchor_daa_score) = self.current_snapshot_anchor().await?;
 
-        let temp_state_dir = unique_atomic_temp_dir("snapshot-export");
+        let temp_state_dir = unique_atomic_temp_dir(&self.atomic_data_dir, "snapshot-export")?;
+        let _temp_state_cleanup = RemoveDirOnDrop::new(temp_state_dir.clone());
         self.processor.state_store.checkpoint_to(&temp_state_dir)?;
         let temp_state_store =
             Arc::new(AtomicStorageV2::open(&temp_state_dir, self.protocol_version, self.network_id.clone(), self.genesis_hash)?);
@@ -1981,7 +2100,6 @@ impl AtomicTokenService {
         }
         drop(state);
         drop(temp_state_store);
-        let _ = std::fs::remove_dir_all(temp_state_dir);
         let _ = self.prune_bootstrap_snapshot_store();
         Ok(())
     }
@@ -2067,7 +2185,7 @@ impl AtomicTokenService {
             }
 
             // Stage snapshot import and deterministic replay off-line, then swap into live state only if fully verified.
-            let temp_state_dir = unique_atomic_temp_dir("snapshot-import");
+            let temp_state_dir = unique_atomic_temp_dir(&self.atomic_data_dir, "snapshot-import")?;
             let _temp_state_cleanup = RemoveDirOnDrop::new(temp_state_dir.clone());
             let temp_state_store = Arc::new(AtomicStorageV2::open(
                 &temp_state_dir,
@@ -2181,6 +2299,7 @@ impl AsyncService for AtomicTokenService {
                 info!(
                     "[{IDENT}] Cryptix Atomic startup state is degraded; deferring retained-chain revalidation to bootstrap worker so remote snapshot repair can be tried first"
                 );
+                self.processor.set_bootstrap_in_progress(false);
             } else {
                 self.processor.set_bootstrap_in_progress(true);
                 let mut local_state_ready = false;
@@ -2189,7 +2308,7 @@ impl AsyncService for AtomicTokenService {
                         local_state_ready = true;
                     }
                     Ok(false) => {
-                        match self.revalidate_loaded_state_once_per_process().await {
+                        match self.revalidate_loaded_state_once_per_process(false).await {
                             Ok(true) => {
                                 info!("[{IDENT}] Cryptix Atomic startup state revalidation completed successfully");
                                 local_state_ready = true;
@@ -2544,6 +2663,24 @@ struct RemoveDirOnDrop {
     path: PathBuf,
 }
 
+struct BootstrapProgressGuard<'a> {
+    flag: &'a AtomicBool,
+    previous: bool,
+}
+
+impl<'a> BootstrapProgressGuard<'a> {
+    fn new(flag: &'a AtomicBool) -> Self {
+        let previous = flag.swap(true, Ordering::SeqCst);
+        Self { flag, previous }
+    }
+}
+
+impl Drop for BootstrapProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(self.previous, Ordering::SeqCst);
+    }
+}
+
 impl RemoveDirOnDrop {
     fn new(path: PathBuf) -> Self {
         Self { path }
@@ -2552,7 +2689,11 @@ impl RemoveDirOnDrop {
 
 impl Drop for RemoveDirOnDrop {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        match std::fs::remove_dir_all(&self.path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => warn!("[{IDENT}] failed removing Atomic temp directory `{}`: {err}", self.path.display()),
+        }
     }
 }
 
@@ -3194,9 +3335,42 @@ fn short_hex_for_log(data: &[u8]) -> String {
     format!("{}...{}", hex_encode(&data[..4]), hex_encode(&data[data.len() - 4..]))
 }
 
-fn unique_atomic_temp_dir(label: &str) -> PathBuf {
+fn unique_atomic_temp_dir(atomic_data_dir: &Path, label: &str) -> AtomicTokenResult<PathBuf> {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_nanos()).unwrap_or(0);
-    std::env::temp_dir().join(format!("cryptix-atomic-{label}-{}-{nanos}", std::process::id()))
+    let temp_root = atomic_data_dir.join("tmp");
+    std::fs::create_dir_all(&temp_root).map_err(|err| {
+        AtomicTokenError::Processing(format!("failed creating Atomic temp directory `{}`: {err}", temp_root.display()))
+    })?;
+    prune_stale_atomic_temp_dirs(&temp_root);
+    Ok(temp_root.join(format!("cryptix-atomic-{label}-{}-{nanos}", std::process::id())))
+}
+
+fn prune_stale_atomic_temp_dirs(temp_root: &Path) {
+    let Ok(entries) = std::fs::read_dir(temp_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("cryptix-atomic-") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age >= ATOMIC_TEMP_DIR_MAX_AGE);
+        if stale {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => info!("[{IDENT}] removed stale Atomic temp directory `{}`", path.display()),
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => trace!("[{IDENT}] failed removing stale Atomic temp directory `{}`: {err}", path.display()),
+            }
+        }
+    }
 }
 
 fn format_bytes_for_log(bytes: u64) -> String {

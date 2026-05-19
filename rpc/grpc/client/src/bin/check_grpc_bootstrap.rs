@@ -37,6 +37,18 @@ async fn run(endpoint: String) -> Result<(), Box<dyn std::error::Error>> {
         server.server_version, server.network_id, server.is_synced, server.has_utxo_index
     );
 
+    match client.get_block_dag_info().await {
+        Ok(info) => {
+            println!(
+                "block_dag_info: blocks={}, headers={}, sink={}, virtual_daa_score={}",
+                info.block_count, info.header_count, info.sink, info.virtual_daa_score
+            );
+        }
+        Err(err) => {
+            println!("block_dag_info_error: {err}");
+        }
+    }
+
     match client.get_token_health().await {
         Ok(h) => {
             println!(

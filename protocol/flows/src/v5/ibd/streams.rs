@@ -22,6 +22,15 @@ use std::sync::Arc;
 use tokio::time::timeout;
 
 pub const IBD_BATCH_SIZE: usize = 99;
+pub const TRUSTED_ATOMIC_STATE_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+pub const MAX_IMPORTED_ATOMIC_STATE_BYTES: u64 = 128 << 30;
+
+pub fn trusted_atomic_state_chunk_count(byte_length: u64) -> u64 {
+    if byte_length == 0 {
+        return 0;
+    }
+    ((byte_length - 1) / TRUSTED_ATOMIC_STATE_CHUNK_SIZE as u64) + 1
+}
 
 pub struct TrustedEntryStream<'a, 'b> {
     router: &'a Router,

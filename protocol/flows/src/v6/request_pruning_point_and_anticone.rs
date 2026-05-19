@@ -9,7 +9,7 @@ use cryptix_p2p_lib::{
     dequeue, dequeue_with_request_id, make_response,
     pb::{
         self, cryptixd_message::Payload, BlockWithTrustedDataV4Message, DoneBlocksWithTrustedDataMessage, PruningPointsMessage,
-        TrustedDataMessage,
+        TrustedAtomicStateChunkMessage, TrustedDataMessage,
     },
     IncomingRoute, Router,
 };
@@ -17,7 +17,11 @@ use itertools::Itertools;
 use log::debug;
 use std::sync::Arc;
 
-use crate::{flow_context::FlowContext, flow_trait::Flow, v5::ibd::IBD_BATCH_SIZE};
+use crate::{
+    flow_context::FlowContext,
+    flow_trait::Flow,
+    v5::ibd::{trusted_atomic_state_chunk_count, IBD_BATCH_SIZE, TRUSTED_ATOMIC_STATE_CHUNK_SIZE},
+};
 
 pub struct PruningPointAndItsAnticoneRequestsFlow {
     ctx: FlowContext,
@@ -74,11 +78,20 @@ impl PruningPointAndItsAnticoneRequestsFlow {
                 }
                 None
             };
-            let (atomic_consensus_state_hash, atomic_consensus_state_byte_length, atomic_consensus_state_chunk_count) =
-                match atomic_state {
-                    Some(state) => (state.state_hash.to_vec(), 0, 0),
-                    None => (Vec::new(), 0, 0),
-                };
+            let (
+                atomic_consensus_state_hash,
+                atomic_state_bytes,
+                atomic_consensus_state_byte_length,
+                atomic_consensus_state_chunk_count,
+            ) = match atomic_state {
+                Some(state) => {
+                    let state_bytes = state.state_bytes.clone().unwrap_or_default();
+                    let byte_length = state_bytes.len() as u64;
+                    let chunk_count = trusted_atomic_state_chunk_count(byte_length);
+                    (state.state_hash.to_vec(), state_bytes, byte_length, chunk_count)
+                }
+                None => (Vec::new(), Vec::new(), 0, 0),
+            };
             self.router
                 .enqueue(make_response!(
                     Payload::TrustedData,
@@ -86,13 +99,17 @@ impl PruningPointAndItsAnticoneRequestsFlow {
                         daa_window: daa_window.iter().map(|daa_block| daa_block.into()).collect_vec(),
                         ghostdag_data: ghostdag_data.iter().map(|gd| gd.into()).collect_vec(),
                         atomic_consensus_state: Vec::new(),
-                        atomic_consensus_state_hash,
+                        atomic_consensus_state_hash: atomic_consensus_state_hash.clone(),
                         atomic_consensus_state_byte_length,
                         atomic_consensus_state_chunk_count,
                     },
                     request_id
                 ))
                 .await?;
+
+            if !atomic_state_bytes.is_empty() {
+                self.send_trusted_atomic_state_chunks(&atomic_consensus_state_hash, &atomic_state_bytes, request_id).await?;
+            }
 
             let daa_window_hash_to_index =
                 BlockHashMap::from_iter(daa_window.iter().enumerate().map(|(i, trusted_header)| (trusted_header.header.hash, i)));
@@ -138,5 +155,37 @@ impl PruningPointAndItsAnticoneRequestsFlow {
                 .await?;
             debug!("Finished sending pruning point anticone")
         }
+    }
+
+    async fn send_trusted_atomic_state_chunks(
+        &mut self,
+        state_hash: &[u8],
+        state_bytes: &[u8],
+        request_id: u32,
+    ) -> Result<(), ProtocolError> {
+        let total_bytes = state_bytes.len() as u64;
+        let total_chunks = trusted_atomic_state_chunk_count(total_bytes);
+        for (chunk_index, chunk) in state_bytes.chunks(TRUSTED_ATOMIC_STATE_CHUNK_SIZE).enumerate() {
+            self.router
+                .enqueue(make_response!(
+                    Payload::TrustedAtomicStateChunk,
+                    TrustedAtomicStateChunkMessage {
+                        state_hash: state_hash.to_vec(),
+                        chunk_index: chunk_index as u64,
+                        total_chunks,
+                        total_bytes,
+                        chunk: chunk.to_vec(),
+                    },
+                    request_id
+                ))
+                .await?;
+
+            let downloaded_chunks = chunk_index as u64 + 1;
+            if downloaded_chunks % IBD_BATCH_SIZE as u64 == 0 && downloaded_chunks < total_chunks {
+                dequeue!(self.incoming_route, Payload::RequestNextPruningPointAtomicStateChunk)?;
+            }
+        }
+        debug!("Finished sending pruning point Atomic state in {} chunk(s)", total_chunks);
+        Ok(())
     }
 }

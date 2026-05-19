@@ -12,7 +12,7 @@ use std::{
 };
 
 pub const ATOMIC_DB_SCHEMA_VERSION: u16 = 2;
-pub const ATOMIC_REVALIDATION_VERSION: u16 = 2;
+pub const ATOMIC_REVALIDATION_VERSION: u16 = 7;
 
 const META_SCHEMA_VERSION: &[u8] = b"meta/atomic_schema_version";
 const META_PROTOCOL_VERSION: &[u8] = b"meta/atomic_protocol_version";
@@ -124,8 +124,13 @@ impl AtomicStorageV2 {
         genesis_hash: BlockHash,
     ) -> AtomicTokenResult<Self> {
         let path = path.as_ref().to_path_buf();
+        let _ = remove_archived_wal_dir(&path);
         let mut options = Options::default();
         options.create_if_missing(true);
+        options.set_keep_log_file_num(8);
+        options.set_max_total_wal_size(64 * 1024 * 1024);
+        options.set_wal_ttl_seconds(0);
+        options.set_wal_size_limit_mb(0);
         let db = DB::open(&options, &path)
             .map_err(|err| AtomicTokenError::Processing(format!("failed opening Atomic DB schema v2: {err}")))?;
         let store = Self { path, db, protocol_version, network_id, genesis_hash };
@@ -523,28 +528,28 @@ impl AtomicStorageV2 {
             let value = encode_value(asset, "asset")?;
             batch.put(asset_key(asset_id), &value);
             write_asset_secondary_indexes(&mut batch, asset)?;
-            root_accumulator.set(logical_asset_key(asset_id), Some(&value));
+            root_accumulator.set(logical_asset_key(asset_id), Some(root_value_for_asset(asset)));
         }
         for (key, amount) in state.balances.iter() {
             if *amount > 0 {
                 let value = encode_value(amount, "balance")?;
                 batch.put(balance_key(key), &value);
                 write_balance_secondary_indexes(&mut batch, key, *amount)?;
-                root_accumulator.set(logical_balance_key(key), Some(&value));
+                root_accumulator.set(logical_balance_key(key), Some(root_value_for_u128(*amount)));
             }
         }
         for (key, nonce) in state.nonces.iter() {
             if *nonce != 1 {
                 let value = encode_value(nonce, "nonce")?;
                 batch.put(nonce_key(key), &value);
-                root_accumulator.set(logical_nonce_key(key), Some(&value));
+                root_accumulator.set(logical_nonce_key(key), Some(root_value_for_u64(*nonce)));
             }
         }
         for (owner_id, count) in state.anchor_counts.iter() {
             if *count > 0 {
                 let value = encode_value(count, "anchor count")?;
                 batch.put(anchor_count_key(owner_id), &value);
-                root_accumulator.set(logical_anchor_count_key(owner_id), Some(&value));
+                root_accumulator.set(logical_anchor_count_key(owner_id), Some(root_value_for_u64(*count)));
             }
         }
         for (txid, op) in state.processed_ops.iter() {
@@ -785,6 +790,25 @@ impl AtomicStorageV2 {
         Ok(count)
     }
 
+    pub fn prune_state_hashes_except(&self, retained_hashes: &HashSet<BlockHash>) -> AtomicTokenResult<usize> {
+        let mut batch = WriteBatch::default();
+        let mut count = 0usize;
+        for key in self.keys_with_prefix(PREFIX_STATE_HASH)? {
+            let block_hash = decode_block_hash(&key[PREFIX_STATE_HASH.len()..], "state hash block hash")?;
+            if !retained_hashes.contains(&block_hash) {
+                batch.delete(key);
+                count = count.saturating_add(1);
+            }
+        }
+        if count == 0 {
+            return Ok(0);
+        }
+        self.db
+            .write(batch)
+            .map_err(|err| AtomicTokenError::Processing(format!("failed pruning stale Atomic DB schema v2 state hashes: {err}")))?;
+        Ok(count)
+    }
+
     pub fn persist_revalidation_version(&self, version: u16) -> AtomicTokenResult<()> {
         let mut batch = WriteBatch::default();
         batch.put(META_REVALIDATION_VERSION, encode_value(&version, "revalidation version")?);
@@ -876,7 +900,7 @@ impl AtomicStorageV2 {
                     let encoded = encode_value(&asset, "asset")?;
                     batch.put(asset_key(asset_id), &encoded);
                     write_asset_secondary_indexes(batch, &asset)?;
-                    root_changes.push((logical_key, Some(encoded)));
+                    root_changes.push((logical_key, Some(root_value_for_asset(asset))));
                 }
                 None => {
                     batch.delete(asset_key(asset_id));
@@ -892,7 +916,7 @@ impl AtomicStorageV2 {
                     let encoded = encode_value(&amount, "balance")?;
                     batch.put(balance_key(&key), &encoded);
                     write_balance_secondary_indexes(batch, &key, amount)?;
-                    root_changes.push((logical_key, Some(encoded)));
+                    root_changes.push((logical_key, Some(root_value_for_u128(amount))));
                 }
                 None => {
                     batch.delete(balance_key(&key));
@@ -907,7 +931,7 @@ impl AtomicStorageV2 {
                 Some(nonce) => {
                     let encoded = encode_value(&nonce, "nonce")?;
                     batch.put(nonce_key(&key), &encoded);
-                    root_changes.push((logical_key, Some(encoded)));
+                    root_changes.push((logical_key, Some(root_value_for_u64(nonce))));
                 }
                 None => {
                     batch.delete(nonce_key(&key));
@@ -921,7 +945,7 @@ impl AtomicStorageV2 {
                 Some(count) => {
                     let encoded = encode_value(&count, "anchor count")?;
                     batch.put(anchor_count_key(&owner_id), &encoded);
-                    root_changes.push((logical_key, Some(encoded)));
+                    root_changes.push((logical_key, Some(root_value_for_u64(count))));
                 }
                 None => {
                     batch.delete(anchor_count_key(&owner_id));
@@ -1003,7 +1027,6 @@ impl AtomicStorageV2 {
         }
         batch.put(META_DEGRADED, encode_value(&degraded, "degraded flag")?);
         batch.put(META_NEXT_EVENT_SEQUENCE, encode_value(&next_event_sequence, "next event sequence")?);
-        batch.put(META_REVALIDATION_VERSION, encode_value(&ATOMIC_REVALIDATION_VERSION, "revalidation version")?);
         Ok(())
     }
 
@@ -1145,9 +1168,9 @@ struct RootAccumulator {
 }
 
 impl RootAccumulator {
-    fn set(&mut self, logical_key: Vec<u8>, value: Option<&[u8]>) {
+    fn set(&mut self, logical_key: Vec<u8>, value: Option<Vec<u8>>) {
         if let Some(value) = value {
-            self.leaves.push((logical_key, value.to_vec()));
+            self.leaves.push((logical_key, value));
         }
     }
 
@@ -1393,6 +1416,159 @@ fn logical_anchor_count_key(owner_id: &[u8; 32]) -> Vec<u8> {
     key
 }
 
+pub(crate) fn compute_state_root_from_parts(
+    assets: &HashMap<[u8; 32], TokenAsset>,
+    balances: &HashMap<BalanceKey, u128>,
+    nonces: &HashMap<NonceKey, u64>,
+    anchor_counts: &HashMap<[u8; 32], u64>,
+) -> [u8; 32] {
+    let mut buckets = [[0u8; 32]; ATOMIC_ROOT_BUCKETS];
+
+    let mut asset_ids = assets.keys().copied().collect::<Vec<_>>();
+    asset_ids.sort_unstable();
+    for asset_id in asset_ids {
+        if let Some(asset) = assets.get(&asset_id) {
+            apply_root_leaf(&mut buckets, &logical_asset_key(&asset_id), &root_value_for_asset(asset));
+        }
+    }
+
+    let mut balance_keys = balances.keys().copied().collect::<Vec<_>>();
+    balance_keys.sort_unstable();
+    for key in balance_keys {
+        if let Some(amount) = balances.get(&key).copied().filter(|amount| *amount > 0) {
+            apply_root_leaf(&mut buckets, &logical_balance_key(&key), &root_value_for_u128(amount));
+        }
+    }
+
+    let mut nonce_keys = nonces.keys().copied().collect::<Vec<_>>();
+    nonce_keys.sort_unstable();
+    for key in nonce_keys {
+        if let Some(nonce) = nonces.get(&key).copied().filter(|nonce| *nonce != 1) {
+            apply_root_leaf(&mut buckets, &logical_nonce_key(&key), &root_value_for_u64(nonce));
+        }
+    }
+
+    let mut anchor_count_owners = anchor_counts.keys().copied().collect::<Vec<_>>();
+    anchor_count_owners.sort_unstable();
+    for owner_id in anchor_count_owners {
+        if let Some(count) = anchor_counts.get(&owner_id).copied().filter(|count| *count > 0) {
+            apply_root_leaf(&mut buckets, &logical_anchor_count_key(&owner_id), &root_value_for_u64(count));
+        }
+    }
+
+    root_from_buckets(&buckets)
+}
+
+fn apply_root_leaf(buckets: &mut [[u8; 32]; ATOMIC_ROOT_BUCKETS], logical_key: &[u8], value: &[u8]) {
+    let leaf_hash = root_leaf_hash(logical_key, value);
+    let bucket_index = root_bucket_index(logical_key);
+    xor_hash(&mut buckets[bucket_index], leaf_hash);
+}
+
+fn root_value_for_u64(value: u64) -> Vec<u8> {
+    value.to_le_bytes().to_vec()
+}
+
+fn root_value_for_u128(value: u128) -> Vec<u8> {
+    value.to_le_bytes().to_vec()
+}
+
+fn token_asset_class_tag(asset_class: &crate::state::TokenAssetClass) -> u8 {
+    match asset_class {
+        crate::state::TokenAssetClass::Standard => 0,
+        crate::state::TokenAssetClass::Liquidity => 1,
+    }
+}
+
+fn push_root_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+fn push_root_option_hash(out: &mut Vec<u8>, value: &Option<BlockHash>) {
+    match value {
+        Some(hash) => {
+            out.push(1);
+            out.extend_from_slice(&hash.as_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn push_root_option_u64(out: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn root_value_for_asset(asset: &TokenAsset) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256 + asset.name.len() + asset.symbol.len() + asset.metadata.len() + asset.platform_tag.len());
+    out.extend_from_slice(b"CAT_ASSET_ROOT_V1");
+    out.extend_from_slice(&asset.asset_id);
+    out.extend_from_slice(&asset.creator_owner_id);
+    out.push(token_asset_class_tag(&asset.asset_class));
+    out.push(asset.token_version);
+    out.extend_from_slice(&asset.mint_authority_owner_id);
+    out.push(asset.decimals);
+    out.push(asset.supply_mode as u8);
+    out.extend_from_slice(&asset.max_supply.to_le_bytes());
+    out.extend_from_slice(&asset.total_supply.to_le_bytes());
+    push_root_bytes(&mut out, &asset.name);
+    push_root_bytes(&mut out, &asset.symbol);
+    push_root_bytes(&mut out, &asset.metadata);
+    push_root_bytes(&mut out, &asset.platform_tag);
+    push_root_option_hash(&mut out, &asset.created_block_hash);
+    push_root_option_u64(&mut out, asset.created_daa_score);
+    push_root_option_u64(&mut out, asset.created_at);
+
+    match asset.liquidity.as_ref() {
+        Some(pool) => {
+            out.push(1);
+            out.extend_from_slice(&pool.pool_nonce.to_le_bytes());
+            out.push(pool.curve_version);
+            out.push(pool.curve_mode);
+            out.extend_from_slice(&pool.individual_virtual_cpay_reserves_sompi.to_le_bytes());
+            out.extend_from_slice(&pool.individual_virtual_token_multiplier_bps.to_le_bytes());
+            out.extend_from_slice(&pool.real_cpay_reserves_sompi.to_le_bytes());
+            out.extend_from_slice(&pool.real_token_reserves.to_le_bytes());
+            out.extend_from_slice(&pool.virtual_cpay_reserves_sompi.to_le_bytes());
+            out.extend_from_slice(&pool.virtual_token_reserves.to_le_bytes());
+            out.extend_from_slice(&pool.unclaimed_fee_total_sompi.to_le_bytes());
+            out.extend_from_slice(&pool.fee_bps.to_le_bytes());
+            out.extend_from_slice(&(pool.fee_recipients.len() as u64).to_le_bytes());
+            for recipient in pool.fee_recipients.iter() {
+                out.extend_from_slice(&recipient.owner_id);
+                out.push(recipient.address_version);
+                push_root_bytes(&mut out, &recipient.address_payload);
+                out.extend_from_slice(&recipient.unclaimed_sompi.to_le_bytes());
+            }
+            out.extend_from_slice(&pool.vault_outpoint.transaction_id.as_bytes());
+            out.extend_from_slice(&pool.vault_outpoint.index.to_le_bytes());
+            out.extend_from_slice(&pool.vault_value_sompi.to_le_bytes());
+            out.extend_from_slice(&pool.unlock_target_sompi.to_le_bytes());
+            out.push(u8::from(pool.unlocked));
+
+            let mut holder_ids = pool.holder_addresses.keys().copied().collect::<Vec<_>>();
+            holder_ids.sort_unstable();
+            out.extend_from_slice(&(holder_ids.len() as u64).to_le_bytes());
+            for holder_id in holder_ids {
+                if let Some(holder) = pool.holder_addresses.get(&holder_id) {
+                    out.extend_from_slice(&holder_id);
+                    out.push(holder.address_version);
+                    push_root_bytes(&mut out, &holder.address_payload);
+                }
+            }
+        }
+        None => out.push(0),
+    }
+
+    out
+}
+
 fn root_leaf_hash(logical_key: &[u8], value: &[u8]) -> [u8; 32] {
     let mut hasher = Blake2bParams::new().hash_length(32).to_state();
     hasher.update(ROOT_LEAF_DOMAIN);
@@ -1432,6 +1608,14 @@ fn xor_hash(target: &mut [u8; 32], value: [u8; 32]) {
     for (target, value) in target.iter_mut().zip(value) {
         *target ^= value;
     }
+}
+
+fn remove_archived_wal_dir(path: &Path) -> std::io::Result<()> {
+    let archive_dir = path.join("archive");
+    if archive_dir.exists() {
+        std::fs::remove_dir_all(archive_dir)?;
+    }
+    Ok(())
 }
 
 fn decode_fixed_32(suffix: &[u8], label: &str) -> AtomicTokenResult<[u8; 32]> {

@@ -60,6 +60,10 @@ message CryptixdMessage {
     BlockProducerClaimV1Message blockProducerClaimV1 = 62;
     TrustedAtomicStateChunkMessage trustedAtomicStateChunk = 63;
     RequestNextPruningPointAtomicStateChunkMessage requestNextPruningPointAtomicStateChunk = 64;
+    RequestConsensusAtomicStateHashMessage requestConsensusAtomicStateHash = 65;
+    ConsensusAtomicStateHashMessage consensusAtomicStateHash = 66;
+    RequestAtomicTokenStateHashMessage requestAtomicTokenStateHash = 67;
+    AtomicTokenStateHashMessage atomicTokenStateHash = 68;
   }
 }
 

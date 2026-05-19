@@ -58,8 +58,8 @@ pub enum ProtocolError {
     #[error("outgoing route capacity has been reached (peer: {0})")]
     OutgoingRouteCapacityReached(String),
 
-    #[error("no flow has been registered for message type {0:?}")]
-    NoRouteForMessageType(CryptixdMessagePayloadType),
+    #[error("no flow has been registered for message type {0:?} (response_id={1}, request_id={2})")]
+    NoRouteForMessageType(CryptixdMessagePayloadType, u32, u32),
 
     #[error("peer {0} already exists")]
     PeerAlreadyExists(PeerKey),

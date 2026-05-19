@@ -5,7 +5,9 @@ use self::{
     ibd::IbdFlow,
     ping::{ReceivePingsFlow, SendPingsFlow},
     request_antipast::HandleAntipastRequests,
+    request_atomic_token_state_hash::RequestAtomicTokenStateHashFlow,
     request_block_locator::RequestBlockLocatorFlow,
+    request_consensus_atomic_state_hash::RequestConsensusAtomicStateHashFlow,
     request_headers::RequestHeadersFlow,
     request_ibd_blocks::HandleIbdBlockRequests,
     request_ibd_chain_block_locator::RequestIbdChainBlockLocatorFlow,
@@ -28,7 +30,9 @@ pub(crate) mod hfa;
 pub(crate) mod ibd;
 pub(crate) mod ping;
 pub(crate) mod request_antipast;
+pub(crate) mod request_atomic_token_state_hash;
 pub(crate) mod request_block_locator;
+pub(crate) mod request_consensus_atomic_state_hash;
 pub(crate) mod request_headers;
 pub(crate) mod request_ibd_blocks;
 pub(crate) mod request_ibd_chain_block_locator;
@@ -56,6 +60,7 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, hfa_capable: bool, strong
                 CryptixdMessagePayloadType::IbdChainBlockLocator,
                 CryptixdMessagePayloadType::IbdBlock,
                 CryptixdMessagePayloadType::TrustedData,
+                CryptixdMessagePayloadType::TrustedAtomicStateChunk,
                 CryptixdMessagePayloadType::PruningPoints,
                 CryptixdMessagePayloadType::PruningPointProof,
                 CryptixdMessagePayloadType::UnexpectedPruningPoint,
@@ -100,6 +105,16 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, hfa_capable: bool, strong
             router.clone(),
             router.subscribe(vec![CryptixdMessagePayloadType::RequestPruningPointProof]),
         )),
+        Box::new(RequestConsensusAtomicStateHashFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe(vec![CryptixdMessagePayloadType::RequestConsensusAtomicStateHash]),
+        )),
+        Box::new(RequestAtomicTokenStateHashFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe(vec![CryptixdMessagePayloadType::RequestAtomicTokenStateHash]),
+        )),
         Box::new(RequestIbdChainBlockLocatorFlow::new(
             ctx.clone(),
             router.clone(),
@@ -111,6 +126,7 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, hfa_capable: bool, strong
             router.subscribe(vec![
                 CryptixdMessagePayloadType::RequestPruningPointAndItsAnticone,
                 CryptixdMessagePayloadType::RequestNextPruningPointAndItsAnticoneBlocks,
+                CryptixdMessagePayloadType::RequestNextPruningPointAtomicStateChunk,
             ]),
         )),
         Box::new(RequestPruningPointUtxoSetFlow::new(

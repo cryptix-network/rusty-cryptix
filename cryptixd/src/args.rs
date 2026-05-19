@@ -381,13 +381,13 @@ pub fn cli() -> Command {
                 .action(ArgAction::Append)
                 .require_equals(true)
                 .value_parser(clap::value_parser!(ContextualNetAddress))
-                .help("Add a Cryptix Atomic bootstrap gRPC peer endpoint override for snapshot discovery/fetch."),
+                .help("Add an optional Cryptix Atomic bootstrap gRPC endpoint for snapshot discovery/fetch. Normal P2P sync and local Atomic replay do not require this."),
         )
         .arg(
             Arg::new("atomic-bootstrap-allow-peer-fallback")
                 .long("atomic-bootstrap-allow-peer-fallback")
                 .action(ArgAction::SetTrue)
-                .help("Enable peer-only Atomic bootstrap fallback when no seed source is reachable or DNS seeds are disabled (mainnet safety override; disabled by default)."),
+                .help("Enable peer-only Atomic quorum fallback when no seed source is reachable or seeded P2P discovery is disabled (mainnet safety override; disabled by default)."),
         )
         .arg(
             Arg::new("atomic-bootstrap-peer-quorum-min-sources")
@@ -396,7 +396,7 @@ pub fn cli() -> Command {
                 .value_name("N")
                 .require_equals(true)
                 .value_parser(clap::value_parser!(usize))
-                .help("Override the minimum independent non-seed sources required for Atomic bootstrap quorum. On mainnet this applies to seed-confirmed quorum as >=1 seed + >=N non-seed sources and to peer-only fallback. Values below 3 are intended for private/testing networks."),
+                .help("Override the minimum independent non-seed/P2P sources required for Atomic quorum. On mainnet this applies to seed-confirmed quorum as >=1 seed + >=N peers and to peer-only fallback as >=N peers with majority. Values below 3 are intended for private/testing networks."),
         )
         .arg(
             Arg::new("max-tracked-addresses")

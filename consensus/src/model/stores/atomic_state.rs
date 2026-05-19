@@ -27,6 +27,8 @@ const ATOMIC_STATE_CURRENT_BALANCE_SUBPREFIX: u8 = b'b';
 const ATOMIC_STATE_CURRENT_ANCHOR_SUBPREFIX: u8 = b'c';
 const ATOMIC_STATE_CURRENT_VAULT_SUBPREFIX: u8 = b'v';
 const ATOMIC_STATE_CURRENT_ROOT_KEY: &[u8] = b"current-root";
+const ATOMIC_CONSENSUS_STATE_MAGIC: &[u8] = b"CATCSG02";
+const ATOMIC_CONSENSUS_STATE_ROOT_ONLY_TAG: &[u8] = b"ROOT";
 const ATOMIC_CONSENSUS_ROOT_ACCUMULATOR_VERSION: u8 = 2;
 const ATOMIC_ROOT_NAMESPACE_NONCE: u8 = b'n';
 const ATOMIC_ROOT_NAMESPACE_ASSET: u8 = b'a';
@@ -522,6 +524,121 @@ impl AtomicConsensusState {
         } else {
             AtomicConsensusRootAccumulator::from_state_maps(self)
         }
+    }
+
+    pub fn root_only_canonical_bytes(state_hash: [u8; 32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(ATOMIC_CONSENSUS_STATE_MAGIC.len() + ATOMIC_CONSENSUS_STATE_ROOT_ONLY_TAG.len() + 32);
+        out.extend_from_slice(ATOMIC_CONSENSUS_STATE_MAGIC);
+        out.extend_from_slice(ATOMIC_CONSENSUS_STATE_ROOT_ONLY_TAG);
+        out.extend_from_slice(&state_hash);
+        out
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(ATOMIC_CONSENSUS_STATE_MAGIC);
+
+        let mut nonce_keys = self.next_nonces.keys().copied().collect::<Vec<_>>();
+        nonce_keys.sort();
+        write_len(&mut out, nonce_keys.len());
+        for key in nonce_keys {
+            out.extend_from_slice(&key.owner_id);
+            out.push(key.scope_kind);
+            out.extend_from_slice(&key.scope_id);
+            write_u64(&mut out, self.next_nonces[&key]);
+        }
+
+        let mut asset_ids = self.assets.keys().copied().collect::<Vec<_>>();
+        asset_ids.sort();
+        write_len(&mut out, asset_ids.len());
+        for asset_id in asset_ids {
+            out.extend_from_slice(&asset_id);
+            write_atomic_asset(&mut out, &self.assets[&asset_id]);
+        }
+
+        let mut balance_keys = self.balances.keys().copied().collect::<Vec<_>>();
+        balance_keys.sort();
+        write_len(&mut out, balance_keys.len());
+        for key in balance_keys {
+            out.extend_from_slice(&key.asset_id);
+            out.extend_from_slice(&key.owner_id);
+            write_u128(&mut out, self.balances[&key]);
+        }
+
+        let mut anchor_owner_ids = self.anchor_counts.keys().copied().collect::<Vec<_>>();
+        anchor_owner_ids.sort();
+        write_len(&mut out, anchor_owner_ids.len());
+        for owner_id in anchor_owner_ids {
+            out.extend_from_slice(&owner_id);
+            write_u64(&mut out, self.anchor_counts[&owner_id]);
+        }
+
+        out
+    }
+
+    pub fn canonical_hash_from_canonical_bytes(bytes: &[u8]) -> Result<[u8; 32], String> {
+        if let Some(state_hash) = decode_root_only_canonical_bytes(bytes)? {
+            return Ok(state_hash);
+        }
+        Ok(Self::try_from_canonical_bytes(bytes)?.canonical_hash())
+    }
+
+    pub fn try_from_canonical_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if decode_root_only_canonical_bytes(bytes)?.is_some() {
+            return Err("root-only Atomic consensus state cannot be imported as a full state".to_string());
+        }
+
+        let mut reader = AtomicStateReader::new(bytes);
+        reader.read_exact_magic(ATOMIC_CONSENSUS_STATE_MAGIC)?;
+        let mut state = Self::default();
+
+        let nonce_count = reader.read_len()?;
+        for _ in 0..nonce_count {
+            let owner_id = reader.read_hash32()?;
+            let scope_kind = reader.read_u8()?;
+            let scope_id = reader.read_hash32()?;
+            let key = AtomicNonceKey { owner_id, scope_kind, scope_id };
+            key.validate()?;
+            let value = reader.read_u64()?;
+            if state.next_nonces.insert(key, value).is_some() {
+                return Err("duplicate atomic nonce key".to_string());
+            }
+        }
+
+        let asset_count = reader.read_len()?;
+        for _ in 0..asset_count {
+            let asset_id = reader.read_hash32()?;
+            let asset = reader.read_atomic_asset()?;
+            if state.assets.insert(asset_id, asset).is_some() {
+                return Err("duplicate atomic asset id".to_string());
+            }
+        }
+
+        let balance_count = reader.read_len()?;
+        for _ in 0..balance_count {
+            let asset_id = reader.read_hash32()?;
+            let owner_id = reader.read_hash32()?;
+            let key = AtomicBalanceKey { asset_id, owner_id };
+            let value = reader.read_u128()?;
+            if state.balances.insert(key, value).is_some() {
+                return Err("duplicate atomic balance key".to_string());
+            }
+        }
+
+        let anchor_count = reader.read_len()?;
+        for _ in 0..anchor_count {
+            let owner_id = reader.read_hash32()?;
+            let value = reader.read_u64()?;
+            if state.anchor_counts.insert(owner_id, value).is_some() {
+                return Err("duplicate atomic anchor owner id".to_string());
+            }
+        }
+
+        reader.finish()?;
+        state.rebuild_liquidity_vault_outpoint_index();
+        state.validate_normalized()?;
+        state.root_accumulator = AtomicConsensusRootAccumulator::from_state_maps(&state);
+        Ok(state)
     }
 
     pub fn as_virtual_root_state(&self) -> Self {
@@ -1630,14 +1747,13 @@ impl DbAtomicStateStore {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub fn materialize_current_state_for_tests(&self, root_state: &AtomicConsensusState) -> AtomicConsensusState {
+    pub fn materialize_current_state(&self, root_state: &AtomicConsensusState) -> Result<AtomicConsensusState, StoreError> {
         let mut state = AtomicConsensusState::default();
         state.root_accumulator = root_state.root_accumulator();
 
-        for (raw_key, value) in self.current_iterator_for_tests::<u64>(ATOMIC_STATE_CURRENT_NONCE_SUBPREFIX) {
+        for (raw_key, value) in self.current_iterator::<u64>(ATOMIC_STATE_CURRENT_NONCE_SUBPREFIX)? {
             if raw_key.len() != 65 {
-                panic!("invalid current Atomic nonce key length {}", raw_key.len());
+                return Err(StoreError::DataInconsistency(format!("invalid current Atomic nonce key length {}", raw_key.len())));
             }
             let mut owner_id = [0u8; 32];
             owner_id.copy_from_slice(&raw_key[..32]);
@@ -1646,17 +1762,17 @@ impl DbAtomicStateStore {
             scope_id.copy_from_slice(&raw_key[33..65]);
             state.next_nonces.insert(AtomicNonceKey { owner_id, scope_kind, scope_id }, value);
         }
-        for (raw_key, value) in self.current_iterator_for_tests::<AtomicAssetState>(ATOMIC_STATE_CURRENT_ASSET_SUBPREFIX) {
+        for (raw_key, value) in self.current_iterator::<AtomicAssetState>(ATOMIC_STATE_CURRENT_ASSET_SUBPREFIX)? {
             if raw_key.len() != 32 {
-                panic!("invalid current Atomic asset key length {}", raw_key.len());
+                return Err(StoreError::DataInconsistency(format!("invalid current Atomic asset key length {}", raw_key.len())));
             }
             let mut asset_id = [0u8; 32];
             asset_id.copy_from_slice(&raw_key);
             state.assets.insert(asset_id, value);
         }
-        for (raw_key, value) in self.current_iterator_for_tests::<u128>(ATOMIC_STATE_CURRENT_BALANCE_SUBPREFIX) {
+        for (raw_key, value) in self.current_iterator::<u128>(ATOMIC_STATE_CURRENT_BALANCE_SUBPREFIX)? {
             if raw_key.len() != 64 {
-                panic!("invalid current Atomic balance key length {}", raw_key.len());
+                return Err(StoreError::DataInconsistency(format!("invalid current Atomic balance key length {}", raw_key.len())));
             }
             let mut asset_id = [0u8; 32];
             asset_id.copy_from_slice(&raw_key[..32]);
@@ -1664,21 +1780,31 @@ impl DbAtomicStateStore {
             owner_id.copy_from_slice(&raw_key[32..64]);
             state.balances.insert(AtomicBalanceKey { asset_id, owner_id }, value);
         }
-        for (raw_key, value) in self.current_iterator_for_tests::<u64>(ATOMIC_STATE_CURRENT_ANCHOR_SUBPREFIX) {
+        for (raw_key, value) in self.current_iterator::<u64>(ATOMIC_STATE_CURRENT_ANCHOR_SUBPREFIX)? {
             if raw_key.len() != 32 {
-                panic!("invalid current Atomic anchor-count key length {}", raw_key.len());
+                return Err(StoreError::DataInconsistency(format!(
+                    "invalid current Atomic anchor-count key length {}",
+                    raw_key.len()
+                )));
             }
             let mut owner_id = [0u8; 32];
             owner_id.copy_from_slice(&raw_key);
             state.anchor_counts.insert(owner_id, value);
         }
         state.rebuild_liquidity_vault_outpoint_index();
-        assert_eq!(
-            state.canonical_hash(),
-            root_state.canonical_hash(),
-            "materialized current Atomic test state does not match virtual root"
-        );
-        state
+        if state.canonical_hash() != root_state.canonical_hash() {
+            return Err(StoreError::DataInconsistency(format!(
+                "materialized current Atomic state root mismatch: expected {}, got {}",
+                faster_hex::hex_string(&root_state.canonical_hash()),
+                faster_hex::hex_string(&state.canonical_hash())
+            )));
+        }
+        Ok(state)
+    }
+
+    #[cfg(test)]
+    pub fn materialize_current_state_for_tests(&self, root_state: &AtomicConsensusState) -> AtomicConsensusState {
+        self.materialize_current_state(root_state).expect("materialize current Atomic test state")
     }
 
     #[cfg(test)]
@@ -1697,23 +1823,20 @@ impl DbAtomicStateStore {
         self.db.write(batch).expect("clear current Atomic store");
     }
 
-    #[cfg(test)]
-    fn current_iterator_for_tests<T>(&self, tag: u8) -> Vec<(Vec<u8>, T)>
+    fn current_iterator<T>(&self, tag: u8) -> Result<Vec<(Vec<u8>, T)>, StoreError>
     where
         T: DeserializeOwned,
     {
         let prefix = atomic_state_subprefix(tag);
-        self.db
-            .prefix_iterator(&prefix)
-            .filter_map(|item| {
-                let (key, value) = item.expect("current Atomic iterator should be valid");
-                if !key.starts_with(&prefix) {
-                    return None;
-                }
-                let data = bincode::deserialize(value.as_ref()).expect("current Atomic value should deserialize");
-                Some((key[prefix.len()..].to_vec(), data))
-            })
-            .collect()
+        let mut out = Vec::new();
+        for item in self.db.prefix_iterator(&prefix) {
+            let (key, value) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            out.push((key[prefix.len()..].to_vec(), bincode::deserialize(value.as_ref())?));
+        }
+        Ok(out)
     }
 
     fn apply_current_delta_batch(
@@ -1865,6 +1988,276 @@ fn write_current_asset_change(
         }
     }
     Ok(())
+}
+
+fn decode_root_only_canonical_bytes(bytes: &[u8]) -> Result<Option<[u8; 32]>, String> {
+    if bytes.len() != ATOMIC_CONSENSUS_STATE_MAGIC.len() + ATOMIC_CONSENSUS_STATE_ROOT_ONLY_TAG.len() + 32 {
+        return Ok(None);
+    }
+    if !bytes.starts_with(ATOMIC_CONSENSUS_STATE_MAGIC) {
+        return Err("invalid atomic consensus state magic".to_string());
+    }
+    let tag_start = ATOMIC_CONSENSUS_STATE_MAGIC.len();
+    let tag_end = tag_start + ATOMIC_CONSENSUS_STATE_ROOT_ONLY_TAG.len();
+    if &bytes[tag_start..tag_end] != ATOMIC_CONSENSUS_STATE_ROOT_ONLY_TAG {
+        return Ok(None);
+    }
+    let mut state_hash = [0u8; 32];
+    state_hash.copy_from_slice(&bytes[tag_end..]);
+    Ok(Some(state_hash))
+}
+
+fn write_len(out: &mut Vec<u8>, len: usize) {
+    write_u64(out, len as u64);
+}
+
+fn write_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_u128(out: &mut Vec<u8>, value: u128) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_atomic_asset(out: &mut Vec<u8>, asset: &AtomicAssetState) {
+    out.push(match asset.asset_class {
+        AtomicAssetClass::Standard => 0,
+        AtomicAssetClass::Liquidity => 1,
+    });
+    out.push(asset.token_version);
+    out.extend_from_slice(&asset.mint_authority_owner_id);
+    out.push(match asset.supply_mode {
+        AtomicSupplyMode::Uncapped => 0,
+        AtomicSupplyMode::Capped => 1,
+    });
+    write_u128(out, asset.max_supply);
+    write_u128(out, asset.total_supply);
+    write_len(out, asset.platform_tag.len());
+    out.extend_from_slice(&asset.platform_tag);
+    match asset.liquidity.as_ref() {
+        Some(pool) => {
+            out.push(1);
+            write_liquidity_pool(out, pool);
+        }
+        None => out.push(0),
+    }
+}
+
+fn write_liquidity_pool(out: &mut Vec<u8>, pool: &AtomicLiquidityPoolState) {
+    write_u64(out, pool.pool_nonce);
+    out.push(pool.curve_version);
+    out.push(pool.curve_mode);
+    write_u64(out, pool.individual_virtual_cpay_reserves_sompi);
+    write_u16(out, pool.individual_virtual_token_multiplier_bps);
+    write_u64(out, pool.real_cpay_reserves_sompi);
+    write_u128(out, pool.real_token_reserves);
+    write_u64(out, pool.virtual_cpay_reserves_sompi);
+    write_u128(out, pool.virtual_token_reserves);
+    write_u64(out, pool.unclaimed_fee_total_sompi);
+    write_u16(out, pool.fee_bps);
+    write_len(out, pool.fee_recipients.len());
+    for recipient in &pool.fee_recipients {
+        out.extend_from_slice(&recipient.owner_id);
+        out.push(recipient.address_version);
+        write_len(out, recipient.address_payload.len());
+        out.extend_from_slice(&recipient.address_payload);
+        write_u64(out, recipient.unclaimed_sompi);
+    }
+    out.extend_from_slice(&pool.vault_outpoint.transaction_id.as_bytes());
+    write_u32(out, pool.vault_outpoint.index);
+    write_u64(out, pool.vault_value_sompi);
+    write_u64(out, pool.unlock_target_sompi);
+    out.push(u8::from(pool.unlocked));
+}
+
+struct AtomicStateReader<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> AtomicStateReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, cursor: 0 }
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], String> {
+        let end = self.cursor.checked_add(len).ok_or_else(|| "truncated atomic consensus state".to_string())?;
+        if end > self.bytes.len() {
+            return Err("truncated atomic consensus state".to_string());
+        }
+        let out = &self.bytes[self.cursor..end];
+        self.cursor = end;
+        Ok(out)
+    }
+
+    fn read_exact_magic(&mut self, magic: &[u8]) -> Result<(), String> {
+        let actual = self.read_bytes(magic.len())?;
+        if actual == magic {
+            Ok(())
+        } else {
+            Err("invalid atomic consensus state magic".to_string())
+        }
+    }
+
+    fn read_hash32(&mut self) -> Result<[u8; 32], String> {
+        let bytes = self.read_bytes(32)?;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(bytes);
+        Ok(out)
+    }
+
+    fn read_u8(&mut self) -> Result<u8, String> {
+        Ok(self.read_bytes(1)?[0])
+    }
+
+    fn read_u16(&mut self) -> Result<u16, String> {
+        let mut bytes = [0u8; 2];
+        bytes.copy_from_slice(self.read_bytes(2)?);
+        Ok(u16::from_le_bytes(bytes))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, String> {
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(self.read_bytes(4)?);
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, String> {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(self.read_bytes(8)?);
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn read_u128(&mut self) -> Result<u128, String> {
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(self.read_bytes(16)?);
+        Ok(u128::from_le_bytes(bytes))
+    }
+
+    fn read_len(&mut self) -> Result<u64, String> {
+        self.read_u64()
+    }
+
+    fn read_len_usize(&mut self, context: &str) -> Result<usize, String> {
+        let len = self.read_len()?;
+        usize::try_from(len).map_err(|_| format!("{context} length `{len}` exceeds platform limit"))
+    }
+
+    fn read_atomic_asset(&mut self) -> Result<AtomicAssetState, String> {
+        let asset_class = match self.read_u8()? {
+            0 => AtomicAssetClass::Standard,
+            1 => AtomicAssetClass::Liquidity,
+            raw => return Err(format!("invalid atomic asset class `{raw}`")),
+        };
+        let token_version = self.read_u8()?;
+        validate_token_version(token_version)?;
+        let mint_authority_owner_id = self.read_hash32()?;
+        let supply_mode = match self.read_u8()? {
+            0 => AtomicSupplyMode::Uncapped,
+            1 => AtomicSupplyMode::Capped,
+            raw => return Err(format!("invalid atomic supply mode `{raw}`")),
+        };
+        let max_supply = self.read_u128()?;
+        let total_supply = self.read_u128()?;
+        let platform_tag_len = self.read_len_usize("atomic platform tag")?;
+        if platform_tag_len > MAX_ATOMIC_PLATFORM_TAG_LEN {
+            return Err(format!("atomic platform tag length `{platform_tag_len}` exceeds max"));
+        }
+        let platform_tag = self.read_bytes(platform_tag_len)?.to_vec();
+        std::str::from_utf8(&platform_tag).map_err(|_| "atomic platform tag must be valid utf-8".to_string())?;
+        let liquidity = match self.read_u8()? {
+            0 => None,
+            1 => Some(self.read_liquidity_pool()?),
+            raw => return Err(format!("invalid atomic liquidity presence flag `{raw}`")),
+        };
+        Ok(AtomicAssetState {
+            asset_class,
+            token_version,
+            mint_authority_owner_id,
+            supply_mode,
+            max_supply,
+            total_supply,
+            platform_tag,
+            liquidity,
+        })
+    }
+
+    fn read_liquidity_pool(&mut self) -> Result<AtomicLiquidityPoolState, String> {
+        let pool_nonce = self.read_u64()?;
+        let curve_version = self.read_u8()?;
+        validate_liquidity_curve_version(curve_version)?;
+        let curve_mode = self.read_u8()?;
+        validate_liquidity_curve_mode(curve_mode)?;
+        let individual_virtual_cpay_reserves_sompi = self.read_u64()?;
+        let individual_virtual_token_multiplier_bps = self.read_u16()?;
+        validate_liquidity_curve_parameters(
+            curve_mode,
+            individual_virtual_cpay_reserves_sompi,
+            individual_virtual_token_multiplier_bps,
+        )?;
+        let real_cpay_reserves_sompi = self.read_u64()?;
+        let real_token_reserves = self.read_u128()?;
+        let virtual_cpay_reserves_sompi = self.read_u64()?;
+        let virtual_token_reserves = self.read_u128()?;
+        let unclaimed_fee_total_sompi = self.read_u64()?;
+        let fee_bps = self.read_u16()?;
+        let recipient_count = self.read_len_usize("atomic liquidity recipient")?;
+        if recipient_count > MAX_ATOMIC_LIQUIDITY_FEE_RECIPIENTS {
+            return Err(format!("atomic liquidity recipient count `{recipient_count}` exceeds max"));
+        }
+        let mut fee_recipients = Vec::with_capacity(recipient_count);
+        for _ in 0..recipient_count {
+            let owner_id = self.read_hash32()?;
+            let address_version = self.read_u8()?;
+            let address_payload_len = self.read_len_usize("atomic liquidity recipient address payload")?;
+            let address_payload = self.read_bytes(address_payload_len)?.to_vec();
+            let unclaimed_sompi = self.read_u64()?;
+            fee_recipients.push(AtomicLiquidityFeeRecipientState { owner_id, address_version, address_payload, unclaimed_sompi });
+        }
+        let transaction_id = Hash::from_bytes(self.read_hash32()?);
+        let index = self.read_u32()?;
+        let vault_value_sompi = self.read_u64()?;
+        let unlock_target_sompi = self.read_u64()?;
+        let unlocked = match self.read_u8()? {
+            0 => false,
+            1 => true,
+            raw => return Err(format!("invalid atomic liquidity unlocked flag `{raw}`")),
+        };
+        Ok(AtomicLiquidityPoolState {
+            pool_nonce,
+            curve_version,
+            curve_mode,
+            individual_virtual_cpay_reserves_sompi,
+            individual_virtual_token_multiplier_bps,
+            real_cpay_reserves_sompi,
+            real_token_reserves,
+            virtual_cpay_reserves_sompi,
+            virtual_token_reserves,
+            unclaimed_fee_total_sompi,
+            fee_bps,
+            fee_recipients,
+            vault_outpoint: TransactionOutpoint::new(transaction_id, index),
+            vault_value_sompi,
+            unlock_target_sompi,
+            unlocked,
+        })
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        if self.cursor == self.bytes.len() {
+            Ok(())
+        } else {
+            Err("unexpected trailing bytes in atomic consensus state".to_string())
+        }
+    }
 }
 
 fn atomic_state_subprefix(tag: u8) -> Vec<u8> {

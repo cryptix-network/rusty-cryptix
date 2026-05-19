@@ -11,10 +11,12 @@ pub type PruningPointsList = Vec<Arc<Header>>;
 
 #[derive(Clone, Debug)]
 pub struct PruningPointAtomicState {
-    /// Atomic state root at the pruning point. The full token state is intentionally not carried
-    /// inside pruning trusted data; post-HF nodes must obtain the state through Atomic snapshot
-    /// bootstrap and verify it against this root.
+    /// Atomic state root at the pruning point.
     pub state_hash: [u8; 32],
+
+    /// Optional canonical full Atomic state bytes carried by the node sync protocol.
+    /// When absent, the receiver only has a root and can use local replay or legacy root-only fallback.
+    pub state_bytes: Option<Vec<u8>>,
 }
 
 pub struct PruningPointTrustedData {
@@ -27,7 +29,6 @@ pub struct PruningPointTrustedData {
     /// Union of GHOSTDAG data required to verify blocks in the future of the pruning point
     pub ghostdag_blocks: Vec<TrustedGhostdagData>,
 
-    /// Atomic root at the pruning point. Full token state is synchronized separately by the
-    /// Atomic snapshot/bootstrap protocol so pruning proofs cannot balloon with token state size.
+    /// Atomic root/full state at the pruning point, synchronized through the normal node sync protocol.
     pub atomic_state: Option<PruningPointAtomicState>,
 }

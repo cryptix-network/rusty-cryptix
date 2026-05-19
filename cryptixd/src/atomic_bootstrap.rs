@@ -3,7 +3,7 @@ use blake2b_simd::Params as Blake2bParams;
 use borsh::BorshDeserialize;
 use cryptix_atomicindex::{
     service::{AtomicTokenService, MAX_BOOTSTRAP_REPLAY_WINDOW_SIZE_BYTES, MAX_BOOTSTRAP_SNAPSHOT_FILE_SIZE_BYTES},
-    state::AtomicTokenRuntimeState,
+    state::{AtomicTokenHealth, AtomicTokenRuntimeState},
 };
 use cryptix_consensus_core::Hash as BlockHash;
 use cryptix_core::{
@@ -13,6 +13,11 @@ use cryptix_core::{
 };
 use cryptix_grpc_client::GrpcClient;
 use cryptix_p2p_flows::flow_context::{AtomicStateQuorumVerifier, FlowContext};
+use cryptix_p2p_lib::{
+    make_request,
+    pb::{cryptixd_message::Payload, RequestAtomicTokenStateHashMessage, RequestConsensusAtomicStateHashMessage},
+    Router,
+};
 use cryptix_rpc_core::{
     api::rpc::RpcApi,
     model::message::{
@@ -20,11 +25,12 @@ use cryptix_rpc_core::{
     },
 };
 use cryptix_utils::triggers::SingleTrigger;
+use futures_util::future::join_all;
 use hex::{decode as hex_decode, encode as hex_encode};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io::Write,
-    net::{SocketAddr, ToSocketAddrs},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -38,7 +44,10 @@ const SERVICE_IDENT: &str = "atomic-bootstrap-service";
 const SNAPSHOT_MANIFEST_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_SNAPSHOT_MANIFEST_V2";
 const SNAPSHOT_ID_DOMAIN: &[u8] = b"CAT_SNAPSHOT_ID_V2";
 const MAX_REMOTE_SOURCES: usize = 64;
+const P2P_AUDIT_MIN_SAMPLE_SOURCES: usize = 4;
+const P2P_AUDIT_MAX_SAMPLE_SOURCES: usize = 12;
 const RPC_CALL_TIMEOUT: Duration = Duration::from_secs(15);
+const P2P_ATOMIC_STATE_HASH_TIMEOUT: Duration = Duration::from_secs(15);
 const SOURCE_FAILURE_THRESHOLD: u32 = 3;
 const SOURCE_RETRY_COOLDOWN: Duration = Duration::from_secs(300);
 pub(crate) const ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES: usize = 1;
@@ -119,6 +128,11 @@ struct SnapshotQuorumDecision {
     snapshot_id: String,
     required_votes: usize,
     policy_description: String,
+}
+
+struct P2pAuditPeerCandidate {
+    router: Arc<Router>,
+    source_identity: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -225,21 +239,16 @@ impl AtomicBootstrapService {
     fn no_sources_reason(&self) -> String {
         if !self.configured_rpc_peers.is_empty() {
             return format!(
-                "no compatible bootstrap sources found ({} configured --atomic-bootstrap-peer source(s) did not serve a compatible live-correct Atomic snapshot; check RPC port, peer Atomic health, and snapshot freshness)",
+                "no compatible bootstrap sources found (P2P quorum/local replay unavailable and {} optional --atomic-bootstrap-peer RPC source(s) did not serve a compatible live-correct Atomic snapshot; check peer Atomic health and snapshot freshness)",
                 self.configured_rpc_peers.len()
             );
         }
-        if self.disable_dns_seed_sources {
-            if self.flow_context.config.net.is_mainnet() && !self.allow_peer_majority_fallback_override {
-                "no compatible bootstrap sources found (DNS seed bootstrap disabled by --nodnsseed; mainnet peer-only fallback is disabled unless --atomic-bootstrap-allow-peer-fallback is explicitly set)".to_string()
-            } else {
-                format!(
-                    "no compatible bootstrap sources found (DNS seed bootstrap disabled by --nodnsseed; add manual peers and/or at least {} independent --atomic-bootstrap-peer source(s) for peer-only quorum)",
-                    self.peer_majority_min_sources
-                )
-            }
+        if self.disable_dns_seed_sources && self.flow_context.config.net.is_mainnet() && !self.allow_peer_majority_fallback_override {
+            "no optional --atomic-bootstrap-peer RPC snapshot source configured; mainnet peer-only Atomic fallback is disabled unless --atomic-bootstrap-allow-peer-fallback is explicitly set".to_string()
+        } else if self.disable_dns_seed_sources {
+            "no optional --atomic-bootstrap-peer RPC snapshot source configured; local replay and P2P pruning-point Atomic state sync remain authoritative".to_string()
         } else {
-            "no compatible bootstrap sources found".to_string()
+            "no optional --atomic-bootstrap-peer RPC snapshot source configured; DNS seeds are only used for P2P discovery, not hidden RPC snapshot downloads".to_string()
         }
     }
 
@@ -266,6 +275,11 @@ impl AtomicBootstrapService {
     async fn collect_compatible_sources(&self, protocol_version: u32, network_id: &str) -> Vec<SourceClient> {
         let mut sources: Vec<SourceClient> = Vec::new();
         let candidates = self.candidate_endpoints();
+        if candidates.is_empty() {
+            trace!("[atomic-bootstrap:rpc] optional RPC snapshot bootstrap disabled: no --atomic-bootstrap-peer configured");
+            return sources;
+        }
+        trace!("[atomic-bootstrap:rpc] collecting Atomic snapshot sources from {} configured RPC endpoint(s)", candidates.len());
 
         for candidate in candidates.into_iter().take(MAX_REMOTE_SOURCES) {
             if self.is_source_blocked(&candidate.endpoint).await {
@@ -408,6 +422,13 @@ impl AtomicBootstrapService {
         block_hash: BlockHash,
         expected_state_hash: [u8; 32],
     ) -> Result<(), String> {
+        let p2p_result = self.verify_consensus_atomic_state_hash_p2p_quorum(block_hash, expected_state_hash).await;
+        match p2p_result {
+            Ok(()) => return Ok(()),
+            Err(err) if self.configured_rpc_peers.is_empty() => return Err(err),
+            Err(err) => trace!("[atomic-bootstrap] P2P Atomic state hash quorum unavailable; trying optional RPC sources: {err}"),
+        }
+
         let protocol_version = self.atomic_token_service.protocol_version() as u32;
         let network_id = self.atomic_token_service.network_id().to_string();
         let expected_state_hash_hex = hex_encode(expected_state_hash);
@@ -493,6 +514,471 @@ impl AtomicBootstrapService {
             decision.policy_description
         );
         Ok(())
+    }
+
+    async fn verify_consensus_atomic_state_hash_p2p_quorum(
+        &self,
+        block_hash: BlockHash,
+        expected_state_hash: [u8; 32],
+    ) -> Result<(), String> {
+        let consensus = self.flow_context.consensus();
+        let session = consensus.session().await;
+        let anchor_daa_score = session
+            .async_get_header(block_hash)
+            .await
+            .map_err(|err| format!("local header unavailable for P2P Atomic state hash quorum `{block_hash}`: {err}"))?
+            .daa_score;
+        let decision = self.select_p2p_atomic_state_hash_quorum(block_hash, anchor_daa_score).await?;
+        let expected_state_hash_hex = hex_encode(expected_state_hash);
+        if decision.snapshot_id != expected_state_hash_hex {
+            return Err(format!(
+                "P2P atomic consensus state hash quorum selected `{}`, expected `{}` for `{}` using {}",
+                decision.snapshot_id, expected_state_hash_hex, block_hash, decision.policy_description
+            ));
+        }
+
+        info!(
+            "[atomic-bootstrap:p2p] verified Atomic state hash {} for {} using {}",
+            expected_state_hash_hex, block_hash, decision.policy_description
+        );
+        Ok(())
+    }
+
+    async fn select_p2p_atomic_state_hash_quorum(
+        &self,
+        block_hash: BlockHash,
+        anchor_daa_score: u64,
+    ) -> Result<SnapshotQuorumDecision, String> {
+        let min_sources = self.p2p_atomic_quorum_min_sources()?;
+        let sample_limit = Self::p2p_audit_sample_limit(min_sources);
+        let evidence = self.collect_p2p_atomic_state_hash_evidence(block_hash, anchor_daa_score, sample_limit).await;
+        if evidence.is_empty() {
+            return Err(format!("no active P2P peer reported consensus atomic state for `{block_hash}` at daa {anchor_daa_score}"));
+        }
+
+        select_snapshot_quorum(evidence, true, false, min_sources, min_sources).map_err(|err| {
+            format!("P2P atomic consensus state hash quorum unavailable for `{block_hash}` at daa {anchor_daa_score}: {err}")
+        })
+    }
+
+    async fn select_p2p_atomic_token_state_hash_quorum(
+        &self,
+        block_hash: BlockHash,
+        anchor_daa_score: u64,
+    ) -> Result<SnapshotQuorumDecision, String> {
+        let min_sources = self.p2p_atomic_quorum_min_sources()?;
+        let sample_limit = Self::p2p_audit_sample_limit(min_sources);
+        let evidence = self.collect_p2p_atomic_token_state_hash_evidence(block_hash, anchor_daa_score, sample_limit).await;
+        if evidence.is_empty() {
+            return Err(format!("no healthy P2P peer reported Atomic token state for `{block_hash}` at daa {anchor_daa_score}"));
+        }
+
+        select_snapshot_quorum(evidence, true, false, min_sources, min_sources).map_err(|err| {
+            format!("P2P Atomic token state hash quorum unavailable for `{block_hash}` at daa {anchor_daa_score}: {err}")
+        })
+    }
+
+    fn p2p_atomic_quorum_min_sources(&self) -> Result<usize, String> {
+        if self.disable_dns_seed_sources && !self.allow_peer_majority_fallback_override {
+            return Err("P2P peer-only Atomic quorum disabled by policy: --nodnsseed requires --atomic-bootstrap-allow-peer-fallback"
+                .to_string());
+        }
+
+        Ok(if self.disable_dns_seed_sources {
+            self.peer_majority_min_sources.max(1)
+        } else {
+            self.seed_confirmed_min_non_seed_sources.max(1)
+        })
+    }
+
+    fn p2p_audit_sample_limit(min_sources: usize) -> usize {
+        min_sources
+            .saturating_mul(2)
+            .saturating_add(1)
+            .max(P2P_AUDIT_MIN_SAMPLE_SOURCES)
+            .min(P2P_AUDIT_MAX_SAMPLE_SOURCES)
+            .max(min_sources)
+            .min(MAX_REMOTE_SOURCES)
+    }
+
+    fn select_p2p_audit_peer_sample(&self, block_hash: BlockHash, sample_limit: usize) -> (usize, usize, Vec<P2pAuditPeerCandidate>) {
+        let routers = self.flow_context.active_peer_routers();
+        let active_peer_count = routers.len();
+        let mut candidates = Vec::new();
+
+        for router in routers.into_iter().take(MAX_REMOTE_SOURCES) {
+            let properties = router.properties();
+            if !properties.atomic_enabled {
+                continue;
+            }
+
+            let source_identity = properties.unified_node_id.map(hex_encode).unwrap_or_else(|| router.key().to_string());
+            let score = p2p_audit_sample_score(block_hash, &source_identity);
+            candidates.push((score, P2pAuditPeerCandidate { router, source_identity }));
+        }
+
+        let atomic_peer_count = candidates.len();
+        candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.source_identity.cmp(&b.1.source_identity)));
+        let sample = candidates.into_iter().take(sample_limit).map(|(_, candidate)| candidate).collect();
+        (active_peer_count, atomic_peer_count, sample)
+    }
+
+    async fn collect_p2p_atomic_state_hash_evidence(
+        &self,
+        block_hash: BlockHash,
+        anchor_daa_score: u64,
+        sample_limit: usize,
+    ) -> Vec<SnapshotSupportEvidence> {
+        let (active_peer_count, atomic_peer_count, peer_sample) = self.select_p2p_audit_peer_sample(block_hash, sample_limit);
+        let mut tasks = Vec::new();
+
+        for candidate in peer_sample {
+            let router = candidate.router;
+            let source_identity = candidate.source_identity;
+            tasks.push(async move {
+                let router_label = router.to_string();
+                let result = self.request_p2p_atomic_state_hash(router.clone(), block_hash, anchor_daa_score).await;
+                (router_label, source_identity, result)
+            });
+        }
+
+        let mut evidence = Vec::new();
+        for (router_label, source_identity, result) in join_all(tasks).await {
+            match result {
+                Ok(Some(state_hash)) => evidence.push(SnapshotSupportEvidence {
+                    source_identity,
+                    snapshot_id: hex_encode(state_hash),
+                    kind: SourceKind::Peer,
+                    at_daa_score: anchor_daa_score,
+                    at_block_hash: block_hash.to_string(),
+                }),
+                Ok(None) => {
+                    trace!("[atomic-bootstrap:p2p] peer {} has no consensus Atomic state for {}", router_label, block_hash);
+                }
+                Err(err) => {
+                    info!("[atomic-bootstrap:p2p] peer {} consensus Atomic state hash request failed: {}", router_label, err);
+                }
+            }
+        }
+
+        if evidence.is_empty() {
+            trace!(
+                "[atomic-bootstrap:p2p] Atomic state hash evidence for {}: 0 responding Atomic peer(s), {} active peer(s), {} Atomic-capable peer(s)",
+                block_hash,
+                active_peer_count,
+                atomic_peer_count
+            );
+        } else {
+            trace!(
+                "[atomic-bootstrap:p2p] Atomic state hash evidence for {}: {} responding Atomic peer(s), {} active peer(s), {} Atomic-capable peer(s)",
+                block_hash,
+                evidence.len(),
+                active_peer_count,
+                atomic_peer_count
+            );
+        }
+        evidence
+    }
+
+    async fn collect_p2p_atomic_token_state_hash_evidence(
+        &self,
+        block_hash: BlockHash,
+        anchor_daa_score: u64,
+        sample_limit: usize,
+    ) -> Vec<SnapshotSupportEvidence> {
+        let (active_peer_count, atomic_peer_count, peer_sample) = self.select_p2p_audit_peer_sample(block_hash, sample_limit);
+        let mut tasks = Vec::new();
+
+        for candidate in peer_sample {
+            let router = candidate.router;
+            let source_identity = candidate.source_identity;
+            tasks.push(async move {
+                let router_label = router.to_string();
+                let result = self.request_p2p_atomic_token_state_hash(router.clone(), block_hash, anchor_daa_score).await;
+                (router_label, source_identity, result)
+            });
+        }
+
+        let mut evidence = Vec::new();
+        for (router_label, source_identity, result) in join_all(tasks).await {
+            match result {
+                Ok(Some(state_hash)) => evidence.push(SnapshotSupportEvidence {
+                    source_identity,
+                    snapshot_id: hex_encode(state_hash),
+                    kind: SourceKind::Peer,
+                    at_daa_score: anchor_daa_score,
+                    at_block_hash: block_hash.to_string(),
+                }),
+                Ok(None) => {
+                    trace!("[atomic-bootstrap:p2p] peer {} has no healthy Atomic token state for {}", router_label, block_hash);
+                }
+                Err(err) => {
+                    info!("[atomic-bootstrap:p2p] peer {} Atomic token state hash request failed: {}", router_label, err);
+                }
+            }
+        }
+
+        if evidence.is_empty() {
+            trace!(
+                "[atomic-bootstrap:p2p] Atomic token state hash evidence for {}: 0 responding healthy Atomic peer(s), {} active peer(s), {} Atomic-capable peer(s)",
+                block_hash,
+                active_peer_count,
+                atomic_peer_count
+            );
+        } else {
+            trace!(
+                "[atomic-bootstrap:p2p] Atomic token state hash evidence for {}: {} responding healthy Atomic peer(s), {} active peer(s), {} Atomic-capable peer(s)",
+                block_hash,
+                evidence.len(),
+                active_peer_count,
+                atomic_peer_count
+            );
+        }
+        evidence
+    }
+
+    async fn request_p2p_atomic_state_hash(
+        &self,
+        router: Arc<Router>,
+        block_hash: BlockHash,
+        anchor_daa_score: u64,
+    ) -> Result<Option<[u8; 32]>, String> {
+        let mut route = router.subscribe_response_only();
+        let route_id = route.id();
+        let result = async {
+            router
+                .enqueue(make_request!(
+                    Payload::RequestConsensusAtomicStateHash,
+                    RequestConsensusAtomicStateHashMessage { block_hash: Some(block_hash.into()), anchor_daa_score },
+                    route_id
+                ))
+                .await
+                .map_err(|err| format!("send failed: {err}"))?;
+
+            let message = timeout(P2P_ATOMIC_STATE_HASH_TIMEOUT, route.recv())
+                .await
+                .map_err(|_| format!("timed out after {}s", P2P_ATOMIC_STATE_HASH_TIMEOUT.as_secs()))?
+                .ok_or_else(|| "response route closed".to_string())?;
+
+            let Some(Payload::ConsensusAtomicStateHash(response)) = message.payload else {
+                return Err("unexpected P2P response while waiting for ConsensusAtomicStateHash".to_string());
+            };
+
+            let Some(response_block_hash) = response.block_hash else {
+                return Err("ConsensusAtomicStateHash response missing block hash".to_string());
+            };
+            let response_block_hash: BlockHash = response_block_hash.try_into().map_err(|err| format!("invalid block hash: {err}"))?;
+            if response_block_hash != block_hash {
+                return Err(format!("response block hash mismatch: expected `{block_hash}`, got `{response_block_hash}`"));
+            }
+            if response.anchor_daa_score != anchor_daa_score {
+                return Err(format!(
+                    "response DAA mismatch for `{block_hash}`: expected {}, got {}",
+                    anchor_daa_score, response.anchor_daa_score
+                ));
+            }
+            if !response.has_state {
+                return Ok(None);
+            }
+            if response.state_hash.len() != 32 {
+                return Err(format!("invalid state hash length: {}", response.state_hash.len()));
+            }
+            let mut state_hash = [0u8; 32];
+            state_hash.copy_from_slice(&response.state_hash);
+            Ok(Some(state_hash))
+        }
+        .await;
+        router.unsubscribe_route_id(route_id);
+        result
+    }
+
+    async fn request_p2p_atomic_token_state_hash(
+        &self,
+        router: Arc<Router>,
+        block_hash: BlockHash,
+        anchor_daa_score: u64,
+    ) -> Result<Option<[u8; 32]>, String> {
+        let mut route = router.subscribe_response_only();
+        let route_id = route.id();
+        let result = async {
+            router
+                .enqueue(make_request!(
+                    Payload::RequestAtomicTokenStateHash,
+                    RequestAtomicTokenStateHashMessage { block_hash: Some(block_hash.into()), anchor_daa_score },
+                    route_id
+                ))
+                .await
+                .map_err(|err| format!("send failed: {err}"))?;
+
+            let message = timeout(P2P_ATOMIC_STATE_HASH_TIMEOUT, route.recv())
+                .await
+                .map_err(|_| format!("timed out after {}s", P2P_ATOMIC_STATE_HASH_TIMEOUT.as_secs()))?
+                .ok_or_else(|| "response route closed".to_string())?;
+
+            let Some(Payload::AtomicTokenStateHash(response)) = message.payload else {
+                return Err("unexpected P2P response while waiting for AtomicTokenStateHash".to_string());
+            };
+
+            let Some(response_block_hash) = response.block_hash else {
+                return Err("AtomicTokenStateHash response missing block hash".to_string());
+            };
+            let response_block_hash: BlockHash = response_block_hash.try_into().map_err(|err| format!("invalid block hash: {err}"))?;
+            if response_block_hash != block_hash {
+                return Err(format!("response block hash mismatch: expected `{block_hash}`, got `{response_block_hash}`"));
+            }
+            if response.anchor_daa_score != anchor_daa_score {
+                return Err(format!(
+                    "response DAA mismatch for `{block_hash}`: expected {}, got {}",
+                    anchor_daa_score, response.anchor_daa_score
+                ));
+            }
+            if !response.has_state {
+                return Ok(None);
+            }
+            if response.state_hash.len() != 32 {
+                return Err(format!("invalid state hash length: {}", response.state_hash.len()));
+            }
+            let mut state_hash = [0u8; 32];
+            state_hash.copy_from_slice(&response.state_hash);
+            Ok(Some(state_hash))
+        }
+        .await;
+        router.unsubscribe_route_id(route_id);
+        result
+    }
+
+    async fn audit_healthy_state_with_p2p(&self, health: &AtomicTokenHealth) -> Result<bool, String> {
+        if health.runtime_state != AtomicTokenRuntimeState::Healthy || health.is_degraded || health.bootstrap_in_progress {
+            info!(
+                "[atomic-bootstrap:p2p] healthy-state audit deferred: local_runtime={}, degraded={}, bootstrap_in_progress={}",
+                health.runtime_state.as_str(),
+                health.is_degraded,
+                health.bootstrap_in_progress
+            );
+            return Ok(false);
+        }
+
+        let active_peer_count = self.flow_context.active_peer_routers().len();
+        if active_peer_count == 0 {
+            info!("[atomic-bootstrap:p2p] healthy-state audit skipped: no active P2P peers");
+            return Ok(false);
+        }
+
+        let (context, anchor_daa_score) = match self.atomic_token_service.get_p2p_audit_context().await {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                info!(
+                    "[atomic-bootstrap:p2p] healthy-state audit deferred: no finality-stable retained/revalidated Atomic checkpoint is available right now"
+                );
+                return Ok(false);
+            }
+            Err(err) => {
+                info!("[atomic-bootstrap:p2p] healthy-state audit skipped: stable audit anchor unavailable: {err}");
+                return Ok(false);
+            }
+        };
+        let anchor_hash = context.at_block_hash;
+        let local_state_hash = context.state_hash;
+        let decision = match self.select_p2p_atomic_token_state_hash_quorum(anchor_hash, anchor_daa_score).await {
+            Ok(decision) => decision,
+            Err(err) => {
+                trace!(
+                    "[atomic-bootstrap:p2p] healthy-state audit skipped at DAA-rendezvous block {} (daa={}): {}",
+                    anchor_hash,
+                    anchor_daa_score,
+                    err
+                );
+                return self.audit_healthy_consensus_state_with_p2p(anchor_hash, anchor_daa_score).await;
+            }
+        };
+
+        let local_state_hash_hex = hex_encode(local_state_hash);
+        if decision.snapshot_id == local_state_hash_hex {
+            info!(
+                "[atomic-bootstrap:p2p] healthy-state audit passed at DAA-rendezvous block {} (daa={}): local state hash {} confirmed by {}; runtime={}, active peer(s)={}",
+                anchor_hash,
+                anchor_daa_score,
+                local_state_hash_hex,
+                decision.policy_description,
+                health.runtime_state.as_str(),
+                active_peer_count
+            );
+            return Ok(true);
+        }
+
+        let reason = format!(
+            "P2P healthy-state audit mismatch at DAA-rendezvous block {} (daa={}): local state hash {} differs from quorum state hash {} using {}",
+            anchor_hash, anchor_daa_score, local_state_hash_hex, decision.snapshot_id, decision.policy_description
+        );
+        warn!("[atomic-bootstrap:p2p] {reason}");
+
+        match self.atomic_token_service.revalidate_retained_state_for_audit_once().await {
+            Ok(true) => {
+                info!("[atomic-bootstrap:p2p] local retained-chain repair completed after P2P audit mismatch");
+                return Ok(false);
+            }
+            Ok(false) => {
+                warn!(
+                    "[atomic-bootstrap:p2p] local retained-chain audit revalidation found no local repair to apply; keeping local state live and retrying peer audit later"
+                );
+                return Ok(false);
+            }
+            Err(err) => {
+                warn!("[atomic-bootstrap:p2p] local retained-chain repair failed after P2P audit mismatch: {err}");
+            }
+        }
+
+        self.atomic_token_service
+            .mark_degraded_and_persist(&reason)
+            .await
+            .map_err(|err| format!("{reason}; failed marking Atomic degraded: {err}"))?;
+        Err(reason)
+    }
+
+    async fn audit_healthy_consensus_state_with_p2p(&self, anchor_hash: BlockHash, anchor_daa_score: u64) -> Result<bool, String> {
+        let consensus = self.flow_context.consensus();
+        let session = consensus.session().await;
+        let Some(local_consensus_state_hash) = session
+            .async_get_atomic_state_hash(anchor_hash)
+            .await
+            .map_err(|err| format!("local consensus Atomic state hash unavailable for `{anchor_hash}`: {err}"))?
+        else {
+            info!(
+                "[atomic-bootstrap:p2p] consensus-state audit skipped at DAA-rendezvous block {} (daa={}): local consensus has no Atomic state hash",
+                anchor_hash, anchor_daa_score
+            );
+            return Ok(false);
+        };
+
+        let decision = match self.select_p2p_atomic_state_hash_quorum(anchor_hash, anchor_daa_score).await {
+            Ok(decision) => decision,
+            Err(err) => {
+                info!(
+                    "[atomic-bootstrap:p2p] consensus-state audit skipped at DAA-rendezvous block {} (daa={}): {}",
+                    anchor_hash, anchor_daa_score, err
+                );
+                return Ok(false);
+            }
+        };
+
+        let local_consensus_state_hash_hex = hex_encode(local_consensus_state_hash);
+        if decision.snapshot_id == local_consensus_state_hash_hex {
+            info!(
+                "[atomic-bootstrap:p2p] consensus-state audit passed at DAA-rendezvous block {} (daa={}): local consensus state hash {} confirmed by {}",
+                anchor_hash, anchor_daa_score, local_consensus_state_hash_hex, decision.policy_description
+            );
+            return Ok(true);
+        }
+
+        let reason = format!(
+            "P2P consensus-state audit mismatch at DAA-rendezvous block {} (daa={}): local consensus state hash {} differs from quorum state hash {} using {}",
+            anchor_hash, anchor_daa_score, local_consensus_state_hash_hex, decision.snapshot_id, decision.policy_description
+        );
+        warn!("[atomic-bootstrap:p2p] {reason}");
+        warn!(
+            "[atomic-bootstrap:p2p] consensus-state mismatch does not degrade the Atomic indexer directly; normal P2P consensus/IBD remains authoritative"
+        );
+        Ok(false)
     }
 
     async fn audit_healthy_state_with_sources(
@@ -702,21 +1188,83 @@ impl AtomicBootstrapService {
     }
 
     async fn try_bootstrap_once_inner(&self) -> Result<bool, String> {
-        let health = self.atomic_token_service.get_health().await;
-        let healthy_state = health.runtime_state == AtomicTokenRuntimeState::Healthy;
-        let should_audit_healthy_state = if healthy_state { self.should_run_health_audit().await } else { false };
-        if healthy_state && !should_audit_healthy_state {
-            return Ok(false);
-        }
+        let effective_health = self.atomic_token_service.get_health().await;
+        let health = self.atomic_token_service.get_local_health().await;
         if health.runtime_state == AtomicTokenRuntimeState::NotReady && !self.flow_context.is_payload_hf_active() {
             trace!("[atomic-bootstrap] bootstrap deferred until payload hardfork is active locally");
             return Ok(false);
         }
+        if health.bootstrap_in_progress {
+            trace!("[atomic-bootstrap:p2p] local Atomic replay/import already in progress; skipping optional snapshot bootstrap");
+            return Ok(false);
+        }
         if self.flow_context.is_ibd_running() {
             info!(
-                "[atomic-bootstrap] bootstrap deferred while IBD is running; waiting for a stable local replay path before importing Atomic snapshot"
+                "[atomic-bootstrap:p2p] bootstrap deferred while P2P IBD is running; Atomic state will be recovered through pruning-point state sync/local replay"
             );
             return Ok(false);
+        }
+        let should_audit_healthy_state = if !health.is_degraded
+            && health.runtime_state == AtomicTokenRuntimeState::Healthy
+            && health.last_applied_block.is_some()
+        {
+            if !self.should_run_health_audit().await {
+                return Ok(false);
+            }
+            true
+        } else {
+            false
+        };
+
+        if should_audit_healthy_state {
+            match self.audit_healthy_state_with_p2p(&health).await {
+                Ok(true) => return Ok(false),
+                Ok(false) => {}
+                Err(err) if self.configured_rpc_peers.is_empty() => return Err(err),
+                Err(err) => {
+                    warn!(
+                        "[atomic-bootstrap:p2p] healthy-state audit failed; trying optional RPC snapshot audit before repair decision: {err}"
+                    );
+                }
+            }
+        }
+
+        if effective_health.runtime_state == AtomicTokenRuntimeState::Recovering
+            && health.runtime_state != AtomicTokenRuntimeState::Healthy
+            && !health.is_degraded
+            && self.configured_rpc_peers.is_empty()
+        {
+            info!(
+                "[atomic-bootstrap:p2p] Atomic state is recovering; healthy-state P2P audit deferred until local replay reaches a stable healthy state"
+            );
+            return Ok(false);
+        }
+        if effective_health.runtime_state == AtomicTokenRuntimeState::Recovering
+            && health.runtime_state == AtomicTokenRuntimeState::Healthy
+            && !health.is_degraded
+            && self.configured_rpc_peers.is_empty()
+        {
+            trace!(
+                "[atomic-bootstrap:p2p] Atomic state is locally healthy but still catching up to consensus sink; snapshot bootstrap not needed"
+            );
+            return Ok(false);
+        }
+
+        let mut local_repair_error = None;
+        if health.runtime_state == AtomicTokenRuntimeState::NotReady {
+            match self.atomic_token_service.repair_from_local_selected_chain_once().await {
+                Ok(true) => {
+                    info!(
+                        "[atomic-bootstrap] Atomic state repaired by local selected-chain replay/backfill; remote snapshot bootstrap not needed"
+                    );
+                    return Ok(true);
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    trace!("[atomic-bootstrap] local selected-chain Atomic repair is not available yet: {err}");
+                    local_repair_error = Some(err.to_string());
+                }
+            }
         }
 
         let protocol_version = self.atomic_token_service.protocol_version() as u32;
@@ -754,6 +1302,10 @@ impl AtomicBootstrapService {
 
         if sources.is_empty() {
             let mut reason = self.no_sources_reason();
+            if let Some(local_err) = local_repair_error {
+                reason.push_str("; local selected-chain replay/backfill also failed: ");
+                reason.push_str(&local_err);
+            }
             if let Some(local_err) = retained_revalidation_error {
                 reason.push_str("; local retained-chain revalidation also failed: ");
                 reason.push_str(&local_err);
@@ -768,6 +1320,20 @@ impl AtomicBootstrapService {
             {
                 info!(
                     "[atomic-bootstrap] Atomic state is not ready yet; waiting for local block replay/IBD or a compatible snapshot source ({reason})"
+                );
+                return Ok(false);
+            }
+            if health.runtime_state == AtomicTokenRuntimeState::NotReady && !health.is_degraded && self.configured_rpc_peers.is_empty()
+            {
+                trace!(
+                    "[atomic-bootstrap] optional RPC snapshot bootstrap skipped while Atomic state is not ready yet; waiting for local replay or P2P pruning-point Atomic state sync ({reason})"
+                );
+                return Ok(false);
+            }
+            if !health.is_degraded && self.configured_rpc_peers.is_empty() {
+                trace!(
+                    "[atomic-bootstrap] optional RPC snapshot bootstrap skipped while Atomic state is {}; local replay/P2P sync remains authoritative ({reason})",
+                    health.runtime_state.as_str()
                 );
                 return Ok(false);
             }
@@ -840,29 +1406,6 @@ impl AtomicBootstrapService {
             let socket = SocketAddr::new(address.ip.into(), address.port);
             let endpoint = format!("grpc://{socket}");
             push_candidate_endpoint(&mut endpoints, &mut by_endpoint, endpoint, None, SourceKind::Configured);
-        }
-
-        let default_rpc_port = self.flow_context.config.default_rpc_port();
-        if !self.disable_dns_seed_sources {
-            for &dns_seed in self.flow_context.config.dns_seeders {
-                for endpoint in resolve_seed_endpoints(dns_seed, default_rpc_port) {
-                    push_candidate_endpoint(&mut endpoints, &mut by_endpoint, endpoint, None, SourceKind::Seed);
-                }
-            }
-        }
-
-        for peer in self.flow_context.hub().active_peers() {
-            let socket = SocketAddr::new(peer.net_address().ip(), default_rpc_port);
-            let endpoint = format!("grpc://{socket}");
-            push_candidate_endpoint(&mut endpoints, &mut by_endpoint, endpoint, peer.properties().unified_node_id, SourceKind::Peer);
-        }
-
-        // Include all known verified addresses.
-        let address_manager = self.flow_context.address_manager.lock();
-        for address in address_manager.iterate_verified_addresses() {
-            let socket = SocketAddr::new(address.ip.into(), default_rpc_port);
-            let endpoint = format!("grpc://{socket}");
-            push_candidate_endpoint(&mut endpoints, &mut by_endpoint, endpoint, None, SourceKind::Peer);
         }
 
         endpoints
@@ -1442,6 +1985,10 @@ impl AtomicStateQuorumVerifier for AtomicBootstrapService {
         self.verify_consensus_atomic_state_hash_quorum(block_hash, state_hash).await
     }
 
+    async fn local_atomic_token_state_hash_for_peer(&self, block_hash: BlockHash) -> Result<Option<[u8; 32]>, String> {
+        Ok(self.atomic_token_service.get_p2p_audit_state_hash_at_block(block_hash).await)
+    }
+
     async fn repair_atomic_index_once(&self) -> Result<bool, String> {
         self.try_bootstrap_once().await
     }
@@ -1464,7 +2011,7 @@ impl AsyncService for AtomicBootstrapService {
                     _ = ticker.tick() => {
                         match self.try_bootstrap_once().await {
                             Ok(true) => {
-                                info!("[atomic-bootstrap] snapshot bootstrap completed successfully");
+                                info!("[atomic-bootstrap] Atomic bootstrap/repair completed successfully");
                             }
                             Ok(false) => {}
                             Err(err) => {
@@ -1487,25 +2034,6 @@ impl AsyncService for AtomicBootstrapService {
     }
 }
 
-fn resolve_seed_endpoints(seed_host: &str, port: u16) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::<SocketAddr>::new();
-    let lookup = format!("{seed_host}:{port}");
-    if let Ok(resolved) = lookup.to_socket_addrs() {
-        for socket in resolved {
-            if seen.insert(socket) {
-                out.push(format!("grpc://{socket}"));
-            }
-        }
-    }
-
-    if out.is_empty() {
-        out.push(format!("grpc://{seed_host}:{port}"));
-    }
-
-    out
-}
-
 fn merge_source_kind(existing: SourceKind, incoming: SourceKind) -> SourceKind {
     if matches!(existing, SourceKind::Seed) || matches!(incoming, SourceKind::Seed) {
         SourceKind::Seed
@@ -1514,6 +2042,17 @@ fn merge_source_kind(existing: SourceKind, incoming: SourceKind) -> SourceKind {
     } else {
         SourceKind::Peer
     }
+}
+
+fn p2p_audit_sample_score(block_hash: BlockHash, source_identity: &str) -> [u8; 32] {
+    let mut hasher = Blake2bParams::new().hash_length(32).to_state();
+    hasher.update(b"CRYPTIX_ATOMIC_P2P_AUDIT_SAMPLE_V1");
+    hasher.update(&block_hash.as_bytes());
+    hasher.update(source_identity.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_bytes());
+    out
 }
 
 fn push_candidate_endpoint(

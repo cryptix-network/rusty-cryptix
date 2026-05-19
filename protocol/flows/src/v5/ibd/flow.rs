@@ -22,7 +22,8 @@ use cryptix_p2p_lib::{
     dequeue_with_timeout, make_message,
     pb::{
         cryptixd_message::Payload, RequestAntipastMessage, RequestHeadersMessage, RequestIbdBlocksMessage,
-        RequestPruningPointAndItsAnticoneMessage, RequestPruningPointProofMessage, RequestPruningPointUtxoSetMessage,
+        RequestNextPruningPointAtomicStateChunkMessage, RequestPruningPointAndItsAnticoneMessage, RequestPruningPointProofMessage,
+        RequestPruningPointUtxoSetMessage,
     },
     IncomingRoute, Router,
 };
@@ -34,7 +35,10 @@ use std::{
 };
 use tokio::time::sleep;
 
-use super::{progress::ProgressReporter, HeadersChunk, PruningPointUtxosetChunkStream, IBD_BATCH_SIZE};
+use super::{
+    progress::ProgressReporter, trusted_atomic_state_chunk_count, HeadersChunk, PruningPointUtxosetChunkStream, IBD_BATCH_SIZE,
+    MAX_IMPORTED_ATOMIC_STATE_BYTES, TRUSTED_ATOMIC_STATE_CHUNK_SIZE,
+};
 
 /// Flow for managing IBD - Initial Block Download
 pub struct IbdFlow {
@@ -383,8 +387,14 @@ impl IbdFlow {
         proof_pruning_point_daa_score: u64,
     ) -> Result<Option<cryptix_consensus_core::pruning::PruningPointAtomicState>, ProtocolError> {
         if proof_pruning_point_daa_score < self.ctx.config.params.payload_hf_activation_daa_score {
-            if pkg.atomic_state_hash.is_some() {
+            if pkg.atomic_state_hash.is_some() || pkg.atomic_state_byte_length != 0 || pkg.atomic_state_chunk_count != 0 {
                 debug!("Ignoring pre-HF pruning-point atomic state; consensus reconstructs it from the imported UTXO set");
+            }
+            if let Some(state_hash) = pkg.atomic_state_hash {
+                if pkg.atomic_state_byte_length != 0 || pkg.atomic_state_chunk_count != 0 {
+                    self.drain_trusted_atomic_state_chunks(state_hash, pkg.atomic_state_byte_length, pkg.atomic_state_chunk_count)
+                        .await?;
+                }
             }
             pkg.atomic_state.take();
             return Ok(None);
@@ -394,10 +404,12 @@ impl IbdFlow {
             return Err(ProtocolError::Other("post-HF pruning-point trusted data is missing atomic consensus state hash"));
         };
 
-        self.ctx
-            .verify_consensus_atomic_state_hash_quorum(proof_pruning_point, state_hash)
-            .await
-            .map_err(|err| ProtocolError::OtherOwned(format!("pruning-point atomic state quorum verification failed: {err}")))?;
+        if let Err(err) = self.ctx.verify_consensus_atomic_state_hash_quorum(proof_pruning_point, state_hash).await {
+            warn!(
+                "P2P pruning-point atomic root quorum check unavailable for {} from peer {}; continuing with trusted-data root and validating it against the pruning-point commitment ({})",
+                proof_pruning_point, self.router, err
+            );
+        }
 
         if let Some(inline_state) = pkg.atomic_state.take() {
             if inline_state.state_hash != state_hash {
@@ -406,7 +418,141 @@ impl IbdFlow {
             return Ok(Some(inline_state));
         }
 
-        Ok(Some(cryptix_consensus_core::pruning::PruningPointAtomicState { state_hash }))
+        if pkg.atomic_state_byte_length != 0 || pkg.atomic_state_chunk_count != 0 {
+            let state_bytes = self
+                .receive_trusted_atomic_state_chunks(state_hash, pkg.atomic_state_byte_length, pkg.atomic_state_chunk_count)
+                .await?;
+            return Ok(Some(cryptix_consensus_core::pruning::PruningPointAtomicState { state_hash, state_bytes: Some(state_bytes) }));
+        }
+
+        Ok(Some(cryptix_consensus_core::pruning::PruningPointAtomicState { state_hash, state_bytes: None }))
+    }
+
+    async fn receive_trusted_atomic_state_chunks(
+        &mut self,
+        state_hash: [u8; 32],
+        total_bytes: u64,
+        total_chunks: u64,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        self.validate_trusted_atomic_state_metadata(total_bytes, total_chunks)?;
+
+        let initial_capacity = (total_bytes as usize).min(TRUSTED_ATOMIC_STATE_CHUNK_SIZE);
+        let mut state_bytes = Vec::with_capacity(initial_capacity);
+        for expected_chunk_index in 0..total_chunks {
+            let msg = dequeue_with_timeout!(
+                self.incoming_route,
+                Payload::TrustedAtomicStateChunk,
+                cryptix_p2p_lib::common::DEFAULT_TIMEOUT
+            )?;
+            self.validate_trusted_atomic_state_chunk(
+                &msg,
+                state_hash,
+                expected_chunk_index,
+                total_chunks,
+                total_bytes,
+                state_bytes.len() as u64,
+            )?;
+            state_bytes.extend_from_slice(&msg.chunk);
+
+            let downloaded_chunks = expected_chunk_index + 1;
+            if downloaded_chunks % IBD_BATCH_SIZE as u64 == 0 && downloaded_chunks < total_chunks {
+                info!("Downloaded {} pruning point Atomic state chunks from {}", downloaded_chunks, self.router);
+                self.router
+                    .enqueue(make_message!(
+                        Payload::RequestNextPruningPointAtomicStateChunk,
+                        RequestNextPruningPointAtomicStateChunkMessage {}
+                    ))
+                    .await?;
+            }
+        }
+
+        if state_bytes.len() as u64 != total_bytes {
+            return Err(ProtocolError::Other("pruning point Atomic state size mismatch"));
+        }
+        info!("Finished receiving pruning point Atomic state from {}: {} bytes in {} chunks", self.router, total_bytes, total_chunks);
+        Ok(state_bytes)
+    }
+
+    async fn drain_trusted_atomic_state_chunks(
+        &mut self,
+        state_hash: [u8; 32],
+        total_bytes: u64,
+        total_chunks: u64,
+    ) -> Result<(), ProtocolError> {
+        self.validate_trusted_atomic_state_metadata(total_bytes, total_chunks)?;
+
+        let mut downloaded_bytes = 0u64;
+        for expected_chunk_index in 0..total_chunks {
+            let msg = dequeue_with_timeout!(
+                self.incoming_route,
+                Payload::TrustedAtomicStateChunk,
+                cryptix_p2p_lib::common::DEFAULT_TIMEOUT
+            )?;
+            self.validate_trusted_atomic_state_chunk(
+                &msg,
+                state_hash,
+                expected_chunk_index,
+                total_chunks,
+                total_bytes,
+                downloaded_bytes,
+            )?;
+            downloaded_bytes = downloaded_bytes.saturating_add(msg.chunk.len() as u64);
+
+            let downloaded_chunks = expected_chunk_index + 1;
+            if downloaded_chunks % IBD_BATCH_SIZE as u64 == 0 && downloaded_chunks < total_chunks {
+                self.router
+                    .enqueue(make_message!(
+                        Payload::RequestNextPruningPointAtomicStateChunk,
+                        RequestNextPruningPointAtomicStateChunkMessage {}
+                    ))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_trusted_atomic_state_metadata(&self, total_bytes: u64, total_chunks: u64) -> Result<(), ProtocolError> {
+        if total_bytes == 0 || total_chunks == 0 {
+            return Err(ProtocolError::Other("invalid pruning point Atomic state chunk metadata"));
+        }
+        if total_bytes > MAX_IMPORTED_ATOMIC_STATE_BYTES {
+            return Err(ProtocolError::Other("pruning point Atomic state exceeds maximum import size"));
+        }
+        let expected_chunks = trusted_atomic_state_chunk_count(total_bytes);
+        if total_chunks != expected_chunks {
+            return Err(ProtocolError::Other("invalid pruning point Atomic state chunk count"));
+        }
+        Ok(())
+    }
+
+    fn validate_trusted_atomic_state_chunk(
+        &self,
+        chunk: &cryptix_p2p_lib::pb::TrustedAtomicStateChunkMessage,
+        state_hash: [u8; 32],
+        expected_chunk_index: u64,
+        total_chunks: u64,
+        total_bytes: u64,
+        downloaded_bytes: u64,
+    ) -> Result<(), ProtocolError> {
+        if chunk.state_hash.as_slice() != &state_hash[..] {
+            return Err(ProtocolError::Other("pruning point Atomic state chunk hash mismatch"));
+        }
+        if chunk.chunk_index != expected_chunk_index {
+            return Err(ProtocolError::Other("unexpected pruning point Atomic state chunk index"));
+        }
+        if chunk.total_chunks != total_chunks || chunk.total_bytes != total_bytes {
+            return Err(ProtocolError::Other("pruning point Atomic state chunk metadata mismatch"));
+        }
+        if chunk.chunk.is_empty() || chunk.chunk.len() > TRUSTED_ATOMIC_STATE_CHUNK_SIZE {
+            return Err(ProtocolError::Other("invalid pruning point Atomic state chunk size"));
+        }
+        let remaining =
+            total_bytes.checked_sub(downloaded_bytes).ok_or(ProtocolError::Other("pruning point Atomic state chunk overflow"))?;
+        let expected_len = remaining.min(TRUSTED_ATOMIC_STATE_CHUNK_SIZE as u64) as usize;
+        if chunk.chunk.len() != expected_len {
+            return Err(ProtocolError::Other("unexpected pruning point Atomic state chunk length"));
+        }
+        Ok(())
     }
 
     async fn sync_headers(

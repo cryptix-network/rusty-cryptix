@@ -21,13 +21,7 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     let url = Some("ws://127.0.0.1:19301");
-    let client = CryptixRpcClient::new(
-        WrpcEncoding::Borsh,
-        url,
-        None,
-        Some(NetworkId::new(NetworkType::Mainnet)),
-        None,
-    )?;
+    let client = CryptixRpcClient::new(WrpcEncoding::Borsh, url, None, Some(NetworkId::new(NetworkType::Mainnet)), None)?;
 
     let options = ConnectOptions {
         block_async_connect: true,

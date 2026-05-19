@@ -148,8 +148,26 @@ impl TryFrom<protowire::TrustedDataMessage> for TrustedDataPackage {
             (true, false, 0, 0) => Ok(Self::new(
                 daa_window,
                 ghostdag_data,
-                Some(PruningPointAtomicState { state_hash: msg.atomic_consensus_state_hash.as_slice().try_into()? }),
+                Some(PruningPointAtomicState {
+                    state_hash: msg.atomic_consensus_state_hash.as_slice().try_into()?,
+                    state_bytes: None,
+                }),
             )),
+            (false, false, 0, 0) => Ok(Self::new(
+                daa_window,
+                ghostdag_data,
+                Some(PruningPointAtomicState {
+                    state_hash: msg.atomic_consensus_state_hash.as_slice().try_into()?,
+                    state_bytes: Some(msg.atomic_consensus_state),
+                }),
+            )),
+            (true, false, byte_length, chunk_count) if byte_length > 0 && chunk_count > 0 => {
+                let mut package = Self::new(daa_window, ghostdag_data, None);
+                package.atomic_state_hash = Some(msg.atomic_consensus_state_hash.as_slice().try_into()?);
+                package.atomic_state_byte_length = byte_length;
+                package.atomic_state_chunk_count = chunk_count;
+                Ok(package)
+            }
             _ => Err(ConversionError::General),
         }
     }
@@ -308,30 +326,40 @@ mod tests {
     }
 
     #[test]
-    fn trusted_data_message_rejects_legacy_inline_atomic_state() {
+    fn trusted_data_message_accepts_inline_atomic_state() {
+        let state_hash = [7u8; 32];
+        let state_bytes = vec![1, 2, 3];
         let msg = protowire::TrustedDataMessage {
             daa_window: Vec::new(),
             ghostdag_data: Vec::new(),
-            atomic_consensus_state: vec![1, 2, 3],
-            atomic_consensus_state_hash: vec![7u8; 32],
+            atomic_consensus_state: state_bytes.clone(),
+            atomic_consensus_state_hash: state_hash.to_vec(),
             atomic_consensus_state_byte_length: 0,
             atomic_consensus_state_chunk_count: 0,
         };
 
-        assert!(TrustedDataPackage::try_from(msg).is_err());
+        let package = TrustedDataPackage::try_from(msg).expect("inline state should convert");
+        let state = package.atomic_state.expect("inline state should be present");
+        assert_eq!(state.state_hash, state_hash);
+        assert_eq!(state.state_bytes, Some(state_bytes));
     }
 
     #[test]
-    fn trusted_data_message_rejects_legacy_chunked_atomic_state() {
+    fn trusted_data_message_accepts_chunked_atomic_state_metadata() {
+        let state_hash = [7u8; 32];
         let msg = protowire::TrustedDataMessage {
             daa_window: Vec::new(),
             ghostdag_data: Vec::new(),
             atomic_consensus_state: Vec::new(),
-            atomic_consensus_state_hash: vec![7u8; 32],
+            atomic_consensus_state_hash: state_hash.to_vec(),
             atomic_consensus_state_byte_length: 5,
             atomic_consensus_state_chunk_count: 1,
         };
 
-        assert!(TrustedDataPackage::try_from(msg).is_err());
+        let package = TrustedDataPackage::try_from(msg).expect("chunked metadata should convert");
+        assert!(package.atomic_state.is_none());
+        assert_eq!(package.atomic_state_hash, Some(state_hash));
+        assert_eq!(package.atomic_state_byte_length, 5);
+        assert_eq!(package.atomic_state_chunk_count, 1);
     }
 }

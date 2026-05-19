@@ -40,7 +40,7 @@ use crate::{
     model::{
         services::reachability::{MTReachabilityService, ReachabilityService},
         stores::{
-            atomic_state::DbAtomicStateStore,
+            atomic_state::{AtomicConsensusState, DbAtomicStateStore},
             depth::DbDepthStore,
             ghostdag::{DbGhostdagStore, GhostdagData, GhostdagStore, GhostdagStoreReader},
             headers::{DbHeadersStore, HeaderStore, HeaderStoreReader},
@@ -49,7 +49,7 @@ use crate::{
             pruning::{DbPruningStore, PruningStoreReader},
             reachability::{DbReachabilityStore, ReachabilityStoreReader, StagingReachabilityStore},
             relations::{DbRelationsStore, RelationsStoreReader, StagingRelationsStore},
-            selected_chain::{DbSelectedChainStore, SelectedChainStore},
+            selected_chain::{DbSelectedChainStore, SelectedChainStore, SelectedChainStoreReader},
             tips::DbTipsStore,
             virtual_state::{VirtualState, VirtualStateStore, VirtualStateStoreReader, VirtualStores},
             DB,
@@ -909,7 +909,19 @@ impl PruningProofManager {
         }
 
         let atomic_state = match self.atomic_state_store.get_root_record(pruning_point) {
-            Ok(root) => Some(PruningPointAtomicState { state_hash: root.state_hash }),
+            Ok(root) => {
+                let state_bytes = match self.materialize_selected_chain_atomic_state(pruning_point, root.state_hash) {
+                    Ok(Some(state)) => Some(state.canonical_bytes()),
+                    Ok(None) => None,
+                    Err(err) => {
+                        warn!(
+                            "failed materializing full pruning-point atomic state for `{pruning_point}` while building trusted data: {err}"
+                        );
+                        None
+                    }
+                };
+                Some(PruningPointAtomicState { state_hash: root.state_hash, state_bytes })
+            }
             Err(StoreError::KeyNotFound(_)) => None,
             Err(err) => {
                 warn!("failed reading pruning-point atomic root for `{pruning_point}` while building trusted data: {err}");
@@ -923,6 +935,60 @@ impl PruningProofManager {
             ghostdag_blocks: ghostdag_blocks.into_iter().map(|(hash, ghostdag)| TrustedGhostdagData { hash, ghostdag }).collect_vec(),
             atomic_state,
         }
+    }
+
+    fn materialize_selected_chain_atomic_state(
+        &self,
+        target_hash: Hash,
+        expected_state_hash: [u8; 32],
+    ) -> Result<Option<AtomicConsensusState>, String> {
+        let virtual_state = self.virtual_stores.read().state.get().map_err(|err| format!("virtual state unavailable: {err}"))?;
+        let mut state = self
+            .atomic_state_store
+            .materialize_current_state(&virtual_state.atomic_state)
+            .map_err(|err| format!("current Atomic state unavailable: {err}"))?;
+        state
+            .apply_delta_rollback(&virtual_state.atomic_diff)
+            .map_err(|err| format!("failed rolling back virtual Atomic diff: {err}"))?;
+
+        let selected_chain_read = self.selected_chain_store.read();
+        let (tip_index, _) = selected_chain_read.get_tip().map_err(|err| format!("selected-chain tip unavailable: {err}"))?;
+        let mut target_index = None;
+        for index in 0..=tip_index {
+            let hash =
+                selected_chain_read.get_by_index(index).map_err(|err| format!("selected-chain index `{index}` unavailable: {err}"))?;
+            if hash == target_hash {
+                target_index = Some(index);
+                break;
+            }
+        }
+        let Some(target_index) = target_index else {
+            return Ok(None);
+        };
+
+        for index in ((target_index + 1)..=tip_index).rev() {
+            let block_hash =
+                selected_chain_read.get_by_index(index).map_err(|err| format!("selected-chain index `{index}` unavailable: {err}"))?;
+            let delta = self
+                .atomic_state_store
+                .get_delta(block_hash)
+                .map_err(|err| format!("Atomic delta for selected-chain block `{block_hash}` unavailable: {err}"))?;
+            state
+                .apply_delta_rollback(delta.as_ref())
+                .map_err(|err| format!("failed rolling back Atomic delta for selected-chain block `{block_hash}`: {err}"))?;
+        }
+        drop(selected_chain_read);
+
+        let actual_state_hash = state.canonical_hash();
+        if actual_state_hash != expected_state_hash {
+            return Err(format!(
+                "materialized pruning-point Atomic root mismatch for `{target_hash}`: expected {}, got {}",
+                faster_hex::hex_string(&expected_state_hash),
+                faster_hex::hex_string(&actual_state_hash)
+            ));
+        }
+
+        Ok(Some(state))
     }
 
     pub fn get_pruning_point_proof(&self) -> Arc<PruningPointProof> {

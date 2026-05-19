@@ -77,7 +77,11 @@ use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use uuid::Uuid;
 
 /// The P2P protocol version. Currently the only one supported.
-const PROTOCOL_VERSION: u32 = 9;
+const PROTOCOL_VERSION: u32 = 13;
+const PRE_CANONICAL_ATOMIC_TOKEN_ORDER_PROTOCOL_VERSION: u32 = 12;
+const PRE_EXPLICIT_ATOMIC_REVALIDATION_PROTOCOL_VERSION: u32 = 11;
+const PRE_RETAINED_CHECKPOINT_P2P_AUDIT_PROTOCOL_VERSION: u32 = 10;
+const PRE_ATOMIC_P2P_AUDIT_PROTOCOL_VERSION: u32 = 9;
 const PRE_HARD_FORK_PROTOCOL_VERSION: u32 = 8;
 const LEGACY_PROTOCOL_VERSION: u32 = 7;
 const OLDER_LEGACY_PROTOCOL_VERSION: u32 = 6;
@@ -96,6 +100,10 @@ fn is_transport_payload_hf_active(params: &Params, virtual_daa_score: u64) -> bo
 #[async_trait]
 pub trait AtomicStateQuorumVerifier: Send + Sync {
     async fn verify_consensus_atomic_state_hash(&self, block_hash: Hash, state_hash: [u8; 32]) -> Result<(), String>;
+
+    async fn local_atomic_token_state_hash_for_peer(&self, _block_hash: Hash) -> Result<Option<[u8; 32]>, String> {
+        Ok(None)
+    }
 
     async fn repair_atomic_index_once(&self) -> Result<bool, String> {
         Ok(false)
@@ -700,6 +708,14 @@ impl FlowContext {
         }
     }
 
+    pub async fn local_atomic_token_state_hash_for_peer(&self, block_hash: Hash) -> Result<Option<[u8; 32]>, String> {
+        let verifier = self.atomic_state_quorum_verifier.read().clone();
+        match verifier {
+            Some(verifier) => verifier.local_atomic_token_state_hash_for_peer(block_hash).await,
+            None => Ok(None),
+        }
+    }
+
     pub async fn repair_atomic_index_once(&self) -> Result<bool, String> {
         let verifier = self.atomic_state_quorum_verifier.read().clone();
         match verifier {
@@ -809,6 +825,10 @@ impl FlowContext {
 
     pub fn hub(&self) -> &Hub {
         &self.hub
+    }
+
+    pub fn active_peer_routers(&self) -> Vec<Arc<Router>> {
+        self.hub.active_routers()
     }
 
     fn unrestricted_peer_keys(&self) -> Vec<PeerKey> {
@@ -1491,6 +1511,22 @@ impl ConnectionInitializer for FlowContext {
                 (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), PROTOCOL_VERSION)
             }
             // Pre-HF compatibility lines.
+            PRE_CANONICAL_ATOMIC_TOKEN_ORDER_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_CANONICAL_ATOMIC_TOKEN_ORDER_PROTOCOL_VERSION,
+            ),
+            PRE_EXPLICIT_ATOMIC_REVALIDATION_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_EXPLICIT_ATOMIC_REVALIDATION_PROTOCOL_VERSION,
+            ),
+            PRE_RETAINED_CHECKPOINT_P2P_AUDIT_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_RETAINED_CHECKPOINT_P2P_AUDIT_PROTOCOL_VERSION,
+            ),
+            PRE_ATOMIC_P2P_AUDIT_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_ATOMIC_P2P_AUDIT_PROTOCOL_VERSION,
+            ),
             PRE_HARD_FORK_PROTOCOL_VERSION if !enforce_hardfork_core => {
                 (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), PRE_HARD_FORK_PROTOCOL_VERSION)
             }

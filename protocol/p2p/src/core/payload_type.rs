@@ -54,6 +54,10 @@ pub enum CryptixdMessagePayloadType {
     BlockProducerClaimV1,
     TrustedAtomicStateChunk,
     RequestNextPruningPointAtomicStateChunk,
+    RequestConsensusAtomicStateHash,
+    ConsensusAtomicStateHash,
+    RequestAtomicTokenStateHash,
+    AtomicTokenStateHash,
 }
 
 impl From<&CryptixdMessagePayload> for CryptixdMessagePayloadType {
@@ -120,6 +124,10 @@ impl From<&CryptixdMessagePayload> for CryptixdMessagePayloadType {
             CryptixdMessagePayload::RequestNextPruningPointAtomicStateChunk(_) => {
                 CryptixdMessagePayloadType::RequestNextPruningPointAtomicStateChunk
             }
+            CryptixdMessagePayload::RequestConsensusAtomicStateHash(_) => CryptixdMessagePayloadType::RequestConsensusAtomicStateHash,
+            CryptixdMessagePayload::ConsensusAtomicStateHash(_) => CryptixdMessagePayloadType::ConsensusAtomicStateHash,
+            CryptixdMessagePayload::RequestAtomicTokenStateHash(_) => CryptixdMessagePayloadType::RequestAtomicTokenStateHash,
+            CryptixdMessagePayload::AtomicTokenStateHash(_) => CryptixdMessagePayloadType::AtomicTokenStateHash,
         }
     }
 }

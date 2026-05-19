@@ -1633,10 +1633,46 @@ impl VirtualStateProcessor {
                     imported_state_commitment,
                 ));
             }
-            return Err(PruningImportError::AtomicStateStoreError(
-                "post-HF pruning import carries only the Atomic root; import an Atomic V2 snapshot for the pruning point before using the UTXO set"
-                    .to_string(),
-            ));
+
+            match self.atomic_state_store.read_current_root() {
+                Ok(Some(current_root)) if AtomicConsensusState::root_only(current_root).canonical_hash() == root.state_hash => self
+                    .atomic_state_store
+                    .materialize_current_state(&AtomicConsensusState::root_only(current_root))
+                    .map_err(|err| {
+                        PruningImportError::AtomicStateStoreError(format!(
+                            "failed materializing imported post-HF pruning-point Atomic state for `{new_pruning_point}`: {err}"
+                        ))
+                    })?,
+                Ok(_) => {
+                    let pruning_utxoset_read = self.pruning_utxoset_stores.read();
+                    let reconstructed = Self::atomic_anchor_state_from_utxo_iterator(
+                        pruning_utxoset_read.utxo_set.iterator(),
+                        "post-HF pruning-point UTXO set",
+                    )
+                    .map_err(|err| {
+                        PruningImportError::AtomicStateStoreError(format!(
+                            "failed reconstructing post-HF pruning-point Atomic state from P2P UTXO set for `{new_pruning_point}`: {err}"
+                        ))
+                    })?;
+                    drop(pruning_utxoset_read);
+
+                    let reconstructed_hash = reconstructed.canonical_hash();
+                    if reconstructed_hash != root.state_hash {
+                        return Err(PruningImportError::AtomicStateStoreError(format!(
+                            "post-HF pruning-point Atomic root cannot be reconstructed from P2P UTXO anchors alone for `{new_pruning_point}`; expected {}, rebuilt {}. A full Atomic state is required over the node sync protocol.",
+                            faster_hex::hex_string(&root.state_hash),
+                            faster_hex::hex_string(&reconstructed_hash)
+                        )));
+                    }
+
+                    reconstructed
+                }
+                Err(err) => {
+                    return Err(PruningImportError::AtomicStateStoreError(format!(
+                        "failed reading imported post-HF pruning-point Atomic state root for `{new_pruning_point}`: {err}"
+                    )))
+                }
+            }
         } else {
             self.reconstruct_pre_hf_pruning_point_atomic_state(new_pruning_point)?
         };
@@ -2271,6 +2307,24 @@ impl VirtualStateProcessor {
         imported_atomic_state: PruningPointAtomicState,
     ) -> PruningImportResult<()> {
         let expected_hash = imported_atomic_state.state_hash;
+        let full_state = match imported_atomic_state.state_bytes.as_deref() {
+            Some(bytes) => {
+                let actual_hash = AtomicConsensusState::canonical_hash_from_canonical_bytes(bytes).map_err(|err| {
+                    PruningImportError::AtomicStateStoreError(format!(
+                        "invalid pruning-point Atomic state bytes for `{new_pruning_point}`: {err}"
+                    ))
+                })?;
+                if actual_hash != expected_hash {
+                    return Err(PruningImportError::AtomicStateStoreError(format!(
+                        "full pruning-point Atomic state root mismatch for `{new_pruning_point}`: expected {}, got {}",
+                        faster_hex::hex_string(&expected_hash),
+                        faster_hex::hex_string(&actual_hash)
+                    )));
+                }
+                AtomicConsensusState::try_from_canonical_bytes(bytes).ok()
+            }
+            None => None,
+        };
         match self.atomic_state_store.get_root_record(new_pruning_point) {
             Ok(existing_root) => {
                 if existing_root.state_hash != expected_hash {
@@ -2278,7 +2332,6 @@ impl VirtualStateProcessor {
                         "existing pruning-point atomic root for `{new_pruning_point}` differs from imported root"
                     )));
                 }
-                Ok(())
             }
             Err(StoreError::KeyNotFound(_)) => {
                 let mut batch = WriteBatch::default();
@@ -2291,12 +2344,29 @@ impl VirtualStateProcessor {
                     PruningImportError::AtomicStateStoreError(format!(
                         "failed committing pruning-point atomic root for `{new_pruning_point}`: {err}"
                     ))
-                })
+                })?;
             }
-            Err(err) => Err(PruningImportError::AtomicStateStoreError(format!(
-                "failed reading pruning-point atomic root for `{new_pruning_point}`: {err}"
-            ))),
+            Err(err) => {
+                return Err(PruningImportError::AtomicStateStoreError(format!(
+                    "failed reading pruning-point atomic root for `{new_pruning_point}`: {err}"
+                )))
+            }
         }
+
+        if let Some(full_state) = full_state {
+            let mut batch = WriteBatch::default();
+            self.atomic_state_store.replace_current_overlay_batch(&mut batch, &full_state).map_err(|err| {
+                PruningImportError::AtomicStateStoreError(format!(
+                    "failed writing full pruning-point Atomic state for `{new_pruning_point}`: {err}"
+                ))
+            })?;
+            self.db.write(batch).map_err(|err| {
+                PruningImportError::AtomicStateStoreError(format!(
+                    "failed committing full pruning-point Atomic state for `{new_pruning_point}`: {err}"
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     pub fn get_atomic_state_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {

@@ -12,7 +12,7 @@ use crate::{
         CreateLiquidityAssetOp, EventType, LiquidityRecipientAddress, MintOp, NoopReason, ParsedTokenPayload, SellLiquidityExactInOp,
         SupplyMode, TokenOp, TokenOpCode, CURRENT_LIQUIDITY_CURVE_VERSION, CURRENT_TOKEN_VERSION,
     },
-    storage_v2::AtomicStorageV2,
+    storage_v2::{compute_state_root_from_parts, AtomicStorageV2},
     IDENT,
 };
 use blake2b_simd::Params as Blake2bParams;
@@ -37,13 +37,8 @@ const CAT_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
 const OWNER_AUTH_SCHEME_PUBKEY: u8 = 0;
 const OWNER_AUTH_SCHEME_PUBKEY_ECDSA: u8 = 1;
 const OWNER_AUTH_SCHEME_SCRIPT_HASH: u8 = 2;
-const CAT_STATE_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_STATE_V2";
 const LONG_ATOMIC_REPLAY_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
-const SECTION_ASSETS: u8 = 0xA1;
-const SECTION_BALANCES: u8 = 0xB1;
-const SECTION_NONCES: u8 = 0xC1;
-const SECTION_ANCHOR_COUNTS: u8 = 0xD1;
 const CAT_EVENT_DOMAIN: &[u8] = b"CAT_EVT_V2";
 const CAT_EVENT_INSTANCE_DOMAIN: &[u8] = b"CAT_EVT_INSTANCE_V2";
 pub const SNAPSHOT_SCHEMA_VERSION: u16 = 2;
@@ -489,12 +484,12 @@ struct NormalizedAcceptance {
 }
 
 fn normalize_acceptance_refs(_accepting_block_hash: BlockHash, refs: Vec<CanonicalTxRef>) -> AtomicTokenResult<NormalizedAcceptance> {
-    let mut seen_semantics: HashMap<BlockHash, (BlockHash, u32, u32)> = HashMap::new();
+    let mut seen_semantics: HashMap<BlockHash, (BlockHash, u32)> = HashMap::new();
     let mut unique_refs = Vec::with_capacity(refs.len());
     let mut conflicting_txids = HashSet::new();
 
     for tx_ref in refs {
-        let semantics = (tx_ref.source_block_hash, tx_ref.tx_index, tx_ref.acceptance_entry_position);
+        let semantics = (tx_ref.source_block_hash, tx_ref.tx_index);
         if let Some(previous) = seen_semantics.get(&tx_ref.txid).copied() {
             if previous != semantics {
                 conflicting_txids.insert(tx_ref.txid);
@@ -507,8 +502,9 @@ fn normalize_acceptance_refs(_accepting_block_hash: BlockHash, refs: Vec<Canonic
     }
 
     unique_refs.sort_by(|a, b| {
-        a.acceptance_entry_position
-            .cmp(&b.acceptance_entry_position)
+        a.source_block_hash
+            .as_bytes()
+            .cmp(&b.source_block_hash.as_bytes())
             .then(a.tx_index.cmp(&b.tx_index))
             .then(a.txid.as_bytes().cmp(&b.txid.as_bytes()))
     });
@@ -2895,6 +2891,7 @@ impl AtomicTokenState {
         at_block_hash: BlockHash,
         runtime_state: AtomicTokenRuntimeState,
     ) -> Option<AtomicTokenReadContext> {
+        self.retained_index(at_block_hash)?;
         let state_hash = self.state_hash_by_block.get(&at_block_hash).copied()?;
         let event_sequence_cutoff = self.event_sequence_by_block.get(&at_block_hash).copied().unwrap_or(self.next_event_sequence);
         Some(AtomicTokenReadContext { at_block_hash, state_hash, is_degraded: self.degraded, runtime_state, event_sequence_cutoff })
@@ -3880,138 +3877,7 @@ impl AtomicTokenState {
             }
         }
 
-        let network_id_bytes = self.network_id.as_bytes();
-        let network_len = u16::try_from(network_id_bytes.len()).unwrap_or(0);
-
-        let mut hasher = Blake2bParams::new().hash_length(32).to_state();
-        hasher.update(CAT_STATE_DOMAIN);
-        hasher.update(&self.protocol_version.to_le_bytes());
-        hasher.update(&network_len.to_le_bytes());
-        hasher.update(network_id_bytes);
-
-        self.hash_assets_section(&mut hasher);
-        self.hash_balances_section(&mut hasher);
-        self.hash_nonces_section(&mut hasher);
-        self.hash_anchor_counts_section(&mut hasher);
-        let digest = hasher.finalize();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(digest.as_bytes());
-        out
-    }
-
-    fn hash_assets_section(&self, hasher: &mut blake2b_simd::State) {
-        hasher.update(&[SECTION_ASSETS]);
-
-        let mut asset_ids: Vec<[u8; 32]> = self.assets.keys().copied().collect();
-        asset_ids.sort_unstable();
-        hasher.update(&(asset_ids.len() as u32).to_le_bytes());
-
-        for asset_id in asset_ids {
-            if let Some(asset) = self.assets.get(&asset_id) {
-                hasher.update(&asset.asset_id);
-                hasher.update(&asset.creator_owner_id);
-                hasher.update(&[asset.asset_class as u8]);
-                hasher.update(&[asset.token_version]);
-                hasher.update(&asset.mint_authority_owner_id);
-                hasher.update(&[asset.decimals]);
-                hasher.update(&[asset.supply_mode as u8]);
-                hasher.update(&asset.max_supply.to_le_bytes());
-                hasher.update(&asset.total_supply.to_le_bytes());
-                hasher.update(&[asset.name.len() as u8]);
-                hasher.update(&asset.name);
-                hasher.update(&[asset.symbol.len() as u8]);
-                hasher.update(&asset.symbol);
-                hasher.update(&(asset.metadata.len() as u16).to_le_bytes());
-                hasher.update(&asset.metadata);
-                hasher.update(&[asset.platform_tag.len() as u8]);
-                hasher.update(&asset.platform_tag);
-                if let Some(pool) = asset.liquidity.as_ref() {
-                    hasher.update(&[1u8]);
-                    hasher.update(&pool.pool_nonce.to_le_bytes());
-                    hasher.update(&[pool.curve_version]);
-                    hasher.update(&[pool.curve_mode]);
-                    hasher.update(&pool.individual_virtual_cpay_reserves_sompi.to_le_bytes());
-                    hasher.update(&pool.individual_virtual_token_multiplier_bps.to_le_bytes());
-                    hasher.update(&pool.real_cpay_reserves_sompi.to_le_bytes());
-                    hasher.update(&pool.real_token_reserves.to_le_bytes());
-                    hasher.update(&pool.virtual_cpay_reserves_sompi.to_le_bytes());
-                    hasher.update(&pool.virtual_token_reserves.to_le_bytes());
-                    hasher.update(&pool.unclaimed_fee_total_sompi.to_le_bytes());
-                    hasher.update(&pool.fee_bps.to_le_bytes());
-                    hasher.update(&(pool.fee_recipients.len() as u8).to_le_bytes());
-                    for recipient in pool.fee_recipients.iter() {
-                        hasher.update(&recipient.owner_id);
-                        hasher.update(&[recipient.address_version]);
-                        hasher.update(&[recipient.address_payload.len() as u8]);
-                        hasher.update(&recipient.address_payload);
-                        hasher.update(&recipient.unclaimed_sompi.to_le_bytes());
-                    }
-                    let mut holder_ids: Vec<[u8; 32]> = pool.holder_addresses.keys().copied().collect();
-                    holder_ids.sort_unstable();
-                    hasher.update(&(holder_ids.len() as u32).to_le_bytes());
-                    for holder_id in holder_ids {
-                        if let Some(holder_address) = pool.holder_addresses.get(&holder_id) {
-                            hasher.update(&holder_id);
-                            hasher.update(&[holder_address.address_version]);
-                            hasher.update(&[holder_address.address_payload.len() as u8]);
-                            hasher.update(&holder_address.address_payload);
-                        }
-                    }
-                    hasher.update(&pool.vault_outpoint.transaction_id.as_bytes());
-                    hasher.update(&pool.vault_outpoint.index.to_le_bytes());
-                    hasher.update(&pool.vault_value_sompi.to_le_bytes());
-                    hasher.update(&pool.unlock_target_sompi.to_le_bytes());
-                    hasher.update(&[u8::from(pool.unlocked)]);
-                } else {
-                    hasher.update(&[0u8]);
-                }
-            }
-        }
-    }
-
-    fn hash_balances_section(&self, hasher: &mut blake2b_simd::State) {
-        hasher.update(&[SECTION_BALANCES]);
-        let mut keys: Vec<BalanceKey> = self.balances.keys().copied().collect();
-        keys.sort_unstable();
-        hasher.update(&(keys.len() as u32).to_le_bytes());
-
-        for key in keys {
-            if let Some(amount) = self.balances.get(&key) {
-                hasher.update(&key.asset_id);
-                hasher.update(&key.owner_id);
-                hasher.update(&amount.to_le_bytes());
-            }
-        }
-    }
-
-    fn hash_nonces_section(&self, hasher: &mut blake2b_simd::State) {
-        hasher.update(&[SECTION_NONCES]);
-        let mut keys: Vec<NonceKey> = self.nonces.keys().copied().collect();
-        keys.sort_unstable();
-        hasher.update(&(keys.len() as u32).to_le_bytes());
-
-        for key in keys {
-            if let Some(nonce) = self.nonces.get(&key) {
-                hasher.update(&key.owner_id);
-                hasher.update(&[key.scope_kind]);
-                hasher.update(&key.scope_id);
-                hasher.update(&nonce.to_le_bytes());
-            }
-        }
-    }
-
-    fn hash_anchor_counts_section(&self, hasher: &mut blake2b_simd::State) {
-        hasher.update(&[SECTION_ANCHOR_COUNTS]);
-        let mut owners: Vec<[u8; 32]> = self.anchor_counts.keys().copied().collect();
-        owners.sort_unstable();
-        hasher.update(&(owners.len() as u32).to_le_bytes());
-
-        for owner in owners {
-            if let Some(anchor_count) = self.anchor_counts.get(&owner) {
-                hasher.update(&owner);
-                hasher.update(&anchor_count.to_le_bytes());
-            }
-        }
+        compute_state_root_from_parts(&self.assets, &self.balances, &self.nonces, &self.anchor_counts)
     }
 }
 
@@ -5410,6 +5276,27 @@ mod tests {
         assert_eq!(normalized.refs[0].txid, b.txid);
         assert_eq!(normalized.refs[1].txid, c.txid);
         assert_eq!(normalized.refs[2].txid, a.txid);
+    }
+
+    #[test]
+    fn conformance_acceptance_normalization_ignores_local_mergeset_position() {
+        let script = test_script(17);
+        let outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(556), 0);
+
+        let tx_a = token_tx(outpoint, script.clone(), payload_burn(0, 1, [4u8; 32], 1));
+        let tx_b = token_tx(outpoint, script, payload_burn(0, 1, [5u8; 32], 1));
+
+        let a_late = tx_ref(tx_a.clone(), BlockHash::from_u64_word(10), 0, 99);
+        let a_early = tx_ref(tx_a, BlockHash::from_u64_word(10), 0, 1);
+        let b = tx_ref(tx_b, BlockHash::from_u64_word(2), 0, 50);
+
+        let normalized = normalize_acceptance_refs(BlockHash::from_u64_word(999), vec![a_late.clone(), b.clone(), a_early])
+            .expect("normalization should succeed");
+
+        assert!(normalized.conflicting_txids.is_empty());
+        assert_eq!(normalized.refs.len(), 2);
+        assert_eq!(normalized.refs[0].txid, b.txid);
+        assert_eq!(normalized.refs[1].txid, a_late.txid);
     }
 
     #[test]

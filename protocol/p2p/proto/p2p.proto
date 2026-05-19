@@ -333,6 +333,30 @@ message TrustedAtomicStateChunkMessage {
 message RequestNextPruningPointAtomicStateChunkMessage {
 }
 
+message RequestConsensusAtomicStateHashMessage {
+  Hash blockHash = 1;
+  uint64 anchorDaaScore = 2;
+}
+
+message ConsensusAtomicStateHashMessage {
+  Hash blockHash = 1;
+  bytes stateHash = 2;
+  bool hasState = 3;
+  uint64 anchorDaaScore = 4;
+}
+
+message RequestAtomicTokenStateHashMessage {
+  Hash blockHash = 1;
+  uint64 anchorDaaScore = 2;
+}
+
+message AtomicTokenStateHashMessage {
+  Hash blockHash = 1;
+  bytes stateHash = 2;
+  bool hasState = 3;
+  uint64 anchorDaaScore = 4;
+}
+
 message RequestFastIntentsMessage {
   repeated Hash intentIds = 1;
 }

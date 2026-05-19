@@ -177,6 +177,11 @@ impl Hub {
         self.peers.read().values().map(|r| r.as_ref().into()).collect()
     }
 
+    /// Returns active peer routers for request/response helpers.
+    pub fn active_routers(&self) -> Vec<Arc<Router>> {
+        self.peers.read().values().cloned().collect()
+    }
+
     /// Returns the number of currently active peers
     pub fn active_peers_len(&self) -> usize {
         self.peers.read().len()
