@@ -1588,11 +1588,8 @@ pub(crate) fn debug_state_root_report_from_parts(
         ));
     }
 
-    let mut owners = anchor_counts
-        .keys()
-        .copied()
-        .filter(|owner_id| anchor_counts.get(owner_id).copied().unwrap_or(0) > 0)
-        .collect::<Vec<_>>();
+    let mut owners =
+        anchor_counts.keys().copied().filter(|owner_id| anchor_counts.get(owner_id).copied().unwrap_or(0) > 0).collect::<Vec<_>>();
     owners.sort_unstable();
     for (index, owner_id) in owners.iter().copied().enumerate() {
         if index >= max_entries {

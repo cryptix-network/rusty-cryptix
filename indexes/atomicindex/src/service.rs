@@ -1115,11 +1115,13 @@ impl AtomicTokenService {
         };
         let checkpoint_hash = state.state_hash_by_block.get(&at_block_hash).copied();
         let Some(view) = state.materialize_view_at_block(at_block_hash) else {
-            info!("[{IDENT}] Atomic token index debug at {} unavailable: block is not retained in local Atomic history", at_block_hash);
+            info!(
+                "[{IDENT}] Atomic token index debug at {} unavailable: block is not retained in local Atomic history",
+                at_block_hash
+            );
             return Ok(());
         };
-        let report =
-            debug_state_root_report_from_parts(&view.assets, &view.balances, &view.nonces, &view.anchor_counts, 32);
+        let report = debug_state_root_report_from_parts(&view.assets, &view.balances, &view.nonces, &view.anchor_counts, 4);
         info!(
             "[{IDENT}] local Atomic token index debug at DAA-rendezvous block {}: checkpoint_hash={}, recomputed_view_hash={}\n{}",
             at_block_hash,
