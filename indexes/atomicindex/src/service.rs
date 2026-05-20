@@ -6,7 +6,7 @@ use crate::{
         AtomicTokenStateFootprint, BalanceKey, LiquidityHolderAddressState, NonceKey, ProcessedOp, TokenAsset, TokenEvent,
         TokenHolderEntry, TokenOwnerBalanceEntry,
     },
-    storage_v2::{AtomicStorageSnapshotCounts, AtomicStorageV2, ATOMIC_REVALIDATION_VERSION},
+    storage_v2::{debug_state_root_report_from_parts, AtomicStorageSnapshotCounts, AtomicStorageV2, ATOMIC_REVALIDATION_VERSION},
     IDENT,
 };
 use async_channel::Receiver;
@@ -201,7 +201,14 @@ struct AtomicTokenProcessor {
 struct AtomicProgressLogState {
     last_log: Option<Instant>,
     last_runtime_state: Option<AtomicTokenRuntimeState>,
+    last_logged_daa_score: Option<u64>,
     last_degraded_read_log: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AtomicCatchupEstimate {
+    last_applied_daa_score: u64,
+    sink_daa_score: u64,
 }
 
 impl AtomicTokenProcessor {
@@ -348,7 +355,16 @@ impl AtomicTokenProcessor {
                 drop(state);
 
                 let health = self.health().await;
-                self.maybe_log_progress(added_count, removed_count, retained_blocks, health, footprint, state_store_bytes);
+                let catchup_estimate = self.catchup_estimate(&health).await;
+                self.maybe_log_progress(
+                    added_count,
+                    removed_count,
+                    retained_blocks,
+                    health,
+                    footprint,
+                    state_store_bytes,
+                    catchup_estimate,
+                );
                 self.notify_state_progress();
                 Ok(())
             }
@@ -364,6 +380,7 @@ impl AtomicTokenProcessor {
         health: AtomicTokenHealth,
         footprint: AtomicTokenStateFootprint,
         state_store_bytes: Option<u64>,
+        catchup_estimate: Option<AtomicCatchupEstimate>,
     ) {
         if added_count == 0 && removed_count == 0 {
             return;
@@ -380,11 +397,15 @@ impl AtomicTokenProcessor {
             return;
         }
 
+        let previous_log = progress_log.last_log;
+        let previous_daa_score = progress_log.last_logged_daa_score;
         progress_log.last_log = Some(now);
         progress_log.last_runtime_state = Some(health.runtime_state);
+        progress_log.last_logged_daa_score = catchup_estimate.map(|estimate| estimate.last_applied_daa_score);
         let last_applied = health.last_applied_block.map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string());
+        let catchup_suffix = format_catchup_estimate_for_log(catchup_estimate, previous_log, previous_daa_score, now);
         info!(
-            "[{IDENT}] Cryptix Atomic indexed chain progress: +{}/-{} blocks ({} processed since startup, {} retained), runtime={}, live_correct={}, last_applied={}, event_seq={}, state_hash={}, events={}, journals={}, checkpoints={}, state_store={}",
+            "[{IDENT}] Cryptix Atomic indexed chain progress: +{}/-{} blocks ({} processed since startup, {} retained), runtime={}, live_correct={}, last_applied={}, event_seq={}, state_hash={}, events={}, journals={}, checkpoints={}, state_store={}{}",
             added_count,
             removed_count,
             total_processed,
@@ -398,7 +419,18 @@ impl AtomicTokenProcessor {
             footprint.block_journals,
             footprint.state_hash_checkpoints,
             state_store_bytes.map(format_bytes_for_log).unwrap_or_else(|| "n/a".to_string()),
+            catchup_suffix,
         );
+    }
+
+    async fn catchup_estimate(&self, health: &AtomicTokenHealth) -> Option<AtomicCatchupEstimate> {
+        let last_applied = health.last_applied_block?;
+        let consensus = self.consensus_manager.consensus();
+        let session = consensus.session().await;
+        let sink = session.async_get_sink().await;
+        let last_applied_header = session.async_get_header(last_applied).await.ok()?;
+        let sink_header = session.async_get_header(sink).await.ok()?;
+        Some(AtomicCatchupEstimate { last_applied_daa_score: last_applied_header.daa_score, sink_daa_score: sink_header.daa_score })
     }
 
     async fn state_hash(&self) -> [u8; 32] {
@@ -1076,6 +1108,28 @@ impl AtomicTokenService {
         self.p2p_audit_context_from_retained_checkpoint(at_block_hash).await.ok().flatten().map(|context| context.state_hash)
     }
 
+    pub async fn log_p2p_audit_debug_at_block(&self, at_block_hash: BlockHash) -> AtomicTokenResult<()> {
+        let Some(state) = self.processor.state_store.load_state()? else {
+            info!("[{IDENT}] Atomic token index debug at {} unavailable: V2 state is empty", at_block_hash);
+            return Ok(());
+        };
+        let checkpoint_hash = state.state_hash_by_block.get(&at_block_hash).copied();
+        let Some(view) = state.materialize_view_at_block(at_block_hash) else {
+            info!("[{IDENT}] Atomic token index debug at {} unavailable: block is not retained in local Atomic history", at_block_hash);
+            return Ok(());
+        };
+        let report =
+            debug_state_root_report_from_parts(&view.assets, &view.balances, &view.nonces, &view.anchor_counts, 32);
+        info!(
+            "[{IDENT}] local Atomic token index debug at DAA-rendezvous block {}: checkpoint_hash={}, recomputed_view_hash={}\n{}",
+            at_block_hash,
+            checkpoint_hash.map(|hash| short_hex_for_log(&hash)).unwrap_or_else(|| "<missing>".to_string()),
+            short_hex_for_log(&view.state_hash),
+            report
+        );
+        Ok(())
+    }
+
     async fn p2p_audit_context_from_retained_checkpoint(
         &self,
         at_block_hash: BlockHash,
@@ -1253,6 +1307,9 @@ impl AtomicTokenService {
         if state.degraded || !state.has_verified_state() {
             return Ok(false);
         }
+        if !state.assets_missing_permanent_metadata().is_empty() {
+            return Ok(false);
+        }
         if state.applied_chain_order.iter().any(|block_hash| !state.state_hash_by_block.contains_key(block_hash)) {
             return Ok(false);
         }
@@ -1357,13 +1414,14 @@ impl AtomicTokenService {
                 "retained-chain revalidation already failed in this process; remote snapshot bootstrap is required".to_string(),
             ));
         }
+        let revalidation_version_is_current = self.processor.state_store.revalidation_version()? == Some(ATOMIC_REVALIDATION_VERSION);
 
         let loaded_state = {
             let state = self.processor.state.lock().await;
             if !state.has_verified_state() {
                 return Ok(false);
             }
-            if !force_healthy_revalidation && !state.degraded && state.live_correct {
+            if !force_healthy_revalidation && !state.degraded && state.live_correct && revalidation_version_is_current {
                 info!("[{IDENT}] Cryptix Atomic startup state revalidation skipped: local state became healthy");
                 return Ok(false);
             }
@@ -1397,6 +1455,170 @@ impl AtomicTokenService {
         let session = consensus.session().await;
         let sink = session.async_get_sink().await;
         let first_replayable_parent = session.async_get_ghostdag_data(first_replayable_block_hash).await?.selected_parent;
+        let empty_replay_base_is_valid = if first_replayable_index != 0 {
+            false
+        } else if first_replayable_block_hash == self.genesis_hash {
+            true
+        } else {
+            let parent_header = session.async_get_header(first_replayable_parent).await?;
+            parent_header.daa_score < self.payload_hf_activation_daa_score
+        };
+        if first_replayable_index == 0 && !empty_replay_base_is_valid {
+            let parent_header = session.async_get_header(first_replayable_parent).await?;
+            info!(
+                "[{IDENT}] Cryptix Atomic retained-chain revalidation cannot use empty replay base: retained replay window starts after Atomic activation (first_replayable={}, parent_daa={}, activation_daa={}); refreshing checkpoint hashes from current V2 store rollback",
+                first_replayable_block_hash,
+                parent_header.daa_score,
+                self.payload_hf_activation_daa_score
+            );
+
+            let temp_state_dir = unique_atomic_temp_dir(&self.atomic_data_dir, "checkpoint-refresh")?;
+            let _temp_state_cleanup = RemoveDirOnDrop::new(temp_state_dir.clone());
+            let (checkpoint_state, expected_chain, expected_hashes) = {
+                let state = self.processor.state.lock().await;
+                let checkpoint_state = state.clone();
+                let checkpoint_first_replayable = checkpoint_state.first_replayable_block_hash().ok_or_else(|| {
+                    AtomicTokenError::Processing(
+                        "failed refreshing retained state hash cache: no contiguous retained replay journal window is available"
+                            .to_string(),
+                    )
+                })?;
+                let checkpoint_first_replayable_index =
+                    checkpoint_state.applied_chain_order.iter().position(|hash| *hash == checkpoint_first_replayable).ok_or_else(
+                        || {
+                            AtomicTokenError::Processing(
+                                "failed refreshing retained state hash cache: replay window root is not in applied chain".to_string(),
+                            )
+                        },
+                    )?;
+                let expected_chain = checkpoint_state.applied_chain_order[checkpoint_first_replayable_index..].to_vec();
+                let expected_hashes = checkpoint_state.state_hash_by_block.clone();
+
+                if !revalidation_version_is_current {
+                    let rebuilt_root = self.processor.state_store.rebuild_current_root_from_state_data(
+                        checkpoint_state.applied_chain_order.last().copied(),
+                        checkpoint_state.applied_chain_order.len() as u64,
+                        checkpoint_state.degraded,
+                        checkpoint_state.next_event_sequence,
+                    )?;
+                    info!(
+                        "[{IDENT}] Cryptix Atomic rebuilt current V2 root from state data before retained checkpoint refresh: {}",
+                        short_hex_for_log(&rebuilt_root)
+                    );
+                }
+
+                (checkpoint_state, expected_chain, expected_hashes)
+            };
+            let mut checkpoint_state = checkpoint_state;
+            if checkpoint_state.assets.is_empty() {
+                let mut stored_assets = Vec::new();
+                self.processor.state_store.visit_assets_excluding("", &HashSet::new(), |asset| {
+                    stored_assets.push(asset);
+                    Ok(())
+                })?;
+                for asset in stored_assets {
+                    checkpoint_state.assets.insert(asset.asset_id, asset);
+                }
+            }
+            let asset_definition_count = checkpoint_state.assets.len();
+            if asset_definition_count > 0 {
+                info!(
+                    "[{IDENT}] Cryptix Atomic retained-chain revalidation refreshing permanent metadata for {} asset definition(s) from retained acceptance data",
+                    asset_definition_count
+                );
+                let acceptance_data = session.async_get_blocks_acceptance_data(expected_chain.clone(), None).await?;
+                let auth_inputs = self.processor.collect_auth_inputs_for_added_blocks(&expected_chain).await?;
+                let repaired_assets = checkpoint_state
+                    .recover_missing_asset_metadata_from_retained_acceptance(
+                        &expected_chain,
+                        acceptance_data.as_ref(),
+                        &auth_inputs,
+                        &session,
+                    )
+                    .await?;
+                if repaired_assets.is_empty() {
+                    info!(
+                        "[{IDENT}] Cryptix Atomic retained-chain revalidation found no permanent asset metadata changes in retained acceptance data"
+                    );
+                } else {
+                    let asset_changes = repaired_assets.iter().map(|asset| (asset.asset_id, Some(asset.clone()))).collect::<Vec<_>>();
+                    self.processor.state_store.apply_current_state_delta(
+                        asset_changes,
+                        Vec::<(BalanceKey, Option<u128>)>::new(),
+                        Vec::<(NonceKey, Option<u64>)>::new(),
+                        Vec::<([u8; 32], Option<u64>)>::new(),
+                        Vec::<(BlockHash, Option<ProcessedOp>)>::new(),
+                    )?;
+                    {
+                        let mut state = self.processor.state.lock().await;
+                        for asset in repaired_assets.iter().cloned() {
+                            state.assets.insert(asset.asset_id, asset);
+                        }
+                    }
+                    info!(
+                        "[{IDENT}] Cryptix Atomic retained-chain revalidation recovered and persisted permanent metadata for {} legacy asset(s)",
+                        repaired_assets.len()
+                    );
+                }
+            }
+            self.processor.state_store.checkpoint_to(&temp_state_dir)?;
+            let temp_state_store =
+                Arc::new(AtomicStorageV2::open(&temp_state_dir, self.protocol_version, self.network_id.clone(), self.genesis_hash)?);
+            let mut staged_state = checkpoint_state;
+            staged_state.attach_state_store(temp_state_store);
+            staged_state.degraded = false;
+            staged_state.live_correct = false;
+            let refreshed = staged_state.recompute_state_hashes_for_retained_segment_from_current_store(&expected_chain)?;
+            let mut refreshed_retained_hashes = refreshed
+                .into_iter()
+                .filter(|(block_hash, state_hash)| expected_hashes.get(block_hash).copied() != Some(*state_hash))
+                .collect::<Vec<_>>();
+
+            if refreshed_retained_hashes.is_empty() {
+                let mut state = self.processor.state.lock().await;
+                if !state.degraded {
+                    state.live_correct = true;
+                }
+                self.processor.state_store.persist_runtime_flags(
+                    state.applied_chain_order.last().copied(),
+                    state.applied_chain_order.len() as u64,
+                    state.degraded,
+                    state.next_event_sequence,
+                )?;
+                self.processor.state_store.persist_revalidation_version(ATOMIC_REVALIDATION_VERSION)?;
+                drop(state);
+                self.processor.notify_state_progress();
+                info!(
+                    "[{IDENT}] Cryptix Atomic retained-chain revalidation verified {} retained checkpoint hash(es) from current V2 store",
+                    expected_chain.len()
+                );
+                return Ok(!force_healthy_revalidation);
+            }
+
+            let mut state = self.processor.state.lock().await;
+            let retained_hashes = state.applied_chain_order.iter().copied().collect::<HashSet<_>>();
+            refreshed_retained_hashes.retain(|(block_hash, _)| retained_hashes.contains(block_hash));
+            let refreshed_count = self.processor.state_store.replace_state_hashes(refreshed_retained_hashes.iter().copied())?;
+            for (block_hash, state_hash) in refreshed_retained_hashes {
+                state.state_hash_by_block.insert(block_hash, state_hash);
+            }
+            state.degraded = false;
+            state.live_correct = true;
+            self.processor.state_store.persist_runtime_flags(
+                state.applied_chain_order.last().copied(),
+                state.applied_chain_order.len() as u64,
+                state.degraded,
+                state.next_event_sequence,
+            )?;
+            self.processor.state_store.persist_revalidation_version(ATOMIC_REVALIDATION_VERSION)?;
+            drop(state);
+            self.processor.notify_state_progress();
+            info!(
+                "[{IDENT}] Cryptix Atomic retained-chain revalidation refreshed {} checkpoint hash(es) from current V2 store rollback",
+                refreshed_count
+            );
+            return Ok(refreshed_count > 0);
+        }
 
         if !session.async_is_chain_ancestor_of(first_replayable_parent, sink).await? {
             return Err(AtomicTokenError::Processing(format!(
@@ -1679,6 +1901,17 @@ impl AtomicTokenService {
             return Ok(false);
         }
 
+        let pruning_point = session.async_pruning_point().await;
+        if pruning_point != self.genesis_hash {
+            let pruning_point_header = session.async_get_header(pruning_point).await?;
+            if pruning_point_header.daa_score >= self.payload_hf_activation_daa_score {
+                return Err(AtomicTokenError::Processing(format!(
+                    "local Atomic backfill unavailable on pruned history: pruning point {} is at DAA {}, at/after Atomic activation DAA {}; a verified retained V2 state or Atomic token snapshot is required",
+                    pruning_point, pruning_point_header.daa_score, self.payload_hf_activation_daa_score
+                )));
+            }
+        }
+
         let replay_chain = session.async_get_virtual_chain_from_block(self.genesis_hash, None).await?;
         if replay_chain.added.is_empty() {
             return Ok(false);
@@ -1741,6 +1974,7 @@ impl AtomicTokenService {
             let state_store_bytes = self.processor.state_store.approximate_size_bytes();
             drop(state);
             let health = self.processor.health().await;
+            let catchup_estimate = self.processor.catchup_estimate(&health).await;
             self.processor.maybe_log_progress(
                 notification.added_chain_block_hashes.len(),
                 0,
@@ -1748,6 +1982,7 @@ impl AtomicTokenService {
                 health,
                 footprint,
                 state_store_bytes,
+                catchup_estimate,
             );
             info!("[{IDENT}] Cryptix Atomic local selected-chain backfill completed successfully");
         }
@@ -3386,6 +3621,64 @@ fn format_bytes_for_log(bytes: u64) -> String {
         format!("{:.2} KiB", bytes_f / KIB)
     } else {
         format!("{bytes} B")
+    }
+}
+
+fn format_catchup_estimate_for_log(
+    estimate: Option<AtomicCatchupEstimate>,
+    previous_log: Option<Instant>,
+    previous_daa_score: Option<u64>,
+    now: Instant,
+) -> String {
+    let Some(estimate) = estimate else {
+        return String::new();
+    };
+    let remaining_daa = estimate.sink_daa_score.saturating_sub(estimate.last_applied_daa_score);
+    let percent = if estimate.sink_daa_score == 0 {
+        100.0
+    } else {
+        (estimate.last_applied_daa_score as f64 / estimate.sink_daa_score as f64 * 100.0).min(100.0)
+    };
+
+    let mut suffix = format!(
+        ", catchup_daa={}/{}, remaining_daa={}, catchup={:.2}%",
+        estimate.last_applied_daa_score, estimate.sink_daa_score, remaining_daa, percent
+    );
+
+    if let (Some(previous_log), Some(previous_daa_score)) = (previous_log, previous_daa_score) {
+        let elapsed = now.duration_since(previous_log).as_secs_f64();
+        let advanced = estimate.last_applied_daa_score.saturating_sub(previous_daa_score);
+        if elapsed > 0.0 && advanced > 0 {
+            let daa_per_second = advanced as f64 / elapsed;
+            let eta = if remaining_daa == 0 {
+                Some(Duration::ZERO)
+            } else if daa_per_second > 0.0 {
+                Some(Duration::from_secs_f64(remaining_daa as f64 / daa_per_second))
+            } else {
+                None
+            };
+            if let Some(eta) = eta {
+                suffix.push_str(&format!(", rate={:.1} daa/s, eta={}", daa_per_second, format_duration_for_log(eta)));
+            } else {
+                suffix.push_str(&format!(", rate={:.1} daa/s", daa_per_second));
+            }
+        }
+    }
+
+    suffix
+}
+
+fn format_duration_for_log(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
     }
 }
 

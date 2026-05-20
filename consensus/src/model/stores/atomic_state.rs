@@ -56,6 +56,10 @@ const MAX_ATOMIC_LIQUIDITY_FEE_RECIPIENTS: usize = 2;
 const MIN_ATOMIC_LIQUIDITY_FEE_BPS: u16 = 10;
 const MAX_ATOMIC_LIQUIDITY_FEE_BPS: u16 = 1000;
 const MAX_ATOMIC_PLATFORM_TAG_LEN: usize = 50;
+const MAX_ATOMIC_NAME_LEN: usize = 32;
+const MAX_ATOMIC_SYMBOL_LEN: usize = 10;
+const MAX_ATOMIC_METADATA_LEN: usize = 256;
+const MAX_ATOMIC_DECIMALS: u8 = 18;
 pub const ATOMIC_NONCE_SCOPE_OWNER: u8 = 0;
 pub const ATOMIC_NONCE_SCOPE_ASSET: u8 = 1;
 
@@ -160,15 +164,31 @@ pub struct AtomicLiquidityPoolState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AtomicAssetState {
     #[serde(default)]
+    pub creator_owner_id: [u8; 32],
+    #[serde(default)]
     pub asset_class: AtomicAssetClass,
     #[serde(default = "default_atomic_token_version")]
     pub token_version: u8,
     pub mint_authority_owner_id: [u8; 32],
+    #[serde(default)]
+    pub decimals: u8,
     pub supply_mode: AtomicSupplyMode,
     pub max_supply: u128,
     pub total_supply: u128,
     #[serde(default)]
+    pub name: Vec<u8>,
+    #[serde(default)]
+    pub symbol: Vec<u8>,
+    #[serde(default)]
+    pub metadata: Vec<u8>,
+    #[serde(default)]
     pub platform_tag: Vec<u8>,
+    #[serde(default)]
+    pub created_block_hash: Option<[u8; 32]>,
+    #[serde(default)]
+    pub created_daa_score: Option<u64>,
+    #[serde(default)]
+    pub created_at: Option<u64>,
     #[serde(default)]
     pub liquidity: Option<AtomicLiquidityPoolState>,
 }
@@ -1112,6 +1132,30 @@ impl AtomicConsensusState {
         let mut expected_vault_index = HashMap::new();
         for (asset_id, asset) in self.assets.iter() {
             validate_token_version(asset.token_version)?;
+            if asset.decimals > MAX_ATOMIC_DECIMALS {
+                return Err(format!(
+                    "atomic asset `{}` decimals `{}` above max `{}`",
+                    faster_hex::hex_string(asset_id),
+                    asset.decimals,
+                    MAX_ATOMIC_DECIMALS
+                ));
+            }
+            if asset.name.len() > MAX_ATOMIC_NAME_LEN {
+                return Err(format!("atomic asset `{}` name exceeds max length", faster_hex::hex_string(asset_id)));
+            }
+            if asset.symbol.len() > MAX_ATOMIC_SYMBOL_LEN {
+                return Err(format!("atomic asset `{}` symbol exceeds max length", faster_hex::hex_string(asset_id)));
+            }
+            if asset.metadata.len() > MAX_ATOMIC_METADATA_LEN {
+                return Err(format!("atomic asset `{}` metadata exceeds max length", faster_hex::hex_string(asset_id)));
+            }
+            if std::str::from_utf8(&asset.name).is_err() || std::str::from_utf8(&asset.symbol).is_err() {
+                return Err(format!("atomic asset `{}` name/symbol must be valid utf-8", faster_hex::hex_string(asset_id)));
+            }
+            let created_flags = [asset.created_block_hash.is_some(), asset.created_daa_score.is_some(), asset.created_at.is_some()];
+            if created_flags.iter().any(|present| *present) && created_flags.iter().any(|present| !*present) {
+                return Err(format!("atomic asset `{}` has partial creation metadata", faster_hex::hex_string(asset_id)));
+            }
             if asset.platform_tag.len() > MAX_ATOMIC_PLATFORM_TAG_LEN {
                 return Err(format!("atomic asset `{}` platform tag exceeds max length", faster_hex::hex_string(asset_id)));
             }
@@ -1148,6 +1192,9 @@ impl AtomicConsensusState {
                     }
                 }
                 AtomicAssetClass::Liquidity => {
+                    if asset.decimals != 0 {
+                        return Err(format!("liquidity asset `{}` has non-zero decimals", faster_hex::hex_string(asset_id)));
+                    }
                     validate_liquidity_asset_normalized(*asset_id, asset, &mut expected_vault_index)?;
                 }
             }
@@ -1438,6 +1485,26 @@ fn hash_u128(hasher: &mut blake2b_simd::State, value: u128) {
     hasher.update(&value.to_le_bytes());
 }
 
+fn hash_optional_hash(hasher: &mut blake2b_simd::State, value: &Option<[u8; 32]>) {
+    match value {
+        Some(hash) => {
+            hash_u8(hasher, 1);
+            hasher.update(hash);
+        }
+        None => hash_u8(hasher, 0),
+    }
+}
+
+fn hash_optional_u64(hasher: &mut blake2b_simd::State, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            hash_u8(hasher, 1);
+            hash_u64(hasher, value);
+        }
+        None => hash_u8(hasher, 0),
+    }
+}
+
 fn hash_asset(hasher: &mut blake2b_simd::State, asset: &AtomicAssetState) {
     hash_u8(hasher, atomic_asset_class_to_u8(asset.asset_class));
     hash_u8(hasher, asset.token_version);
@@ -1555,7 +1622,10 @@ fn asset_delta_heap(asset: Option<&AtomicAssetState>) -> usize {
     let Some(asset) = asset else {
         return 0;
     };
-    asset.platform_tag.len()
+    asset.name.len()
+        + asset.symbol.len()
+        + asset.metadata.len()
+        + asset.platform_tag.len()
         + asset
             .liquidity
             .as_ref()
@@ -2027,21 +2097,52 @@ fn write_u128(out: &mut Vec<u8>, value: u128) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+fn write_optional_hash(out: &mut Vec<u8>, value: &Option<[u8; 32]>) {
+    match value {
+        Some(hash) => {
+            out.push(1);
+            out.extend_from_slice(hash);
+        }
+        None => out.push(0),
+    }
+}
+
+fn write_optional_u64(out: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            write_u64(out, value);
+        }
+        None => out.push(0),
+    }
+}
+
 fn write_atomic_asset(out: &mut Vec<u8>, asset: &AtomicAssetState) {
+    out.extend_from_slice(&asset.creator_owner_id);
     out.push(match asset.asset_class {
         AtomicAssetClass::Standard => 0,
         AtomicAssetClass::Liquidity => 1,
     });
     out.push(asset.token_version);
     out.extend_from_slice(&asset.mint_authority_owner_id);
+    out.push(asset.decimals);
     out.push(match asset.supply_mode {
         AtomicSupplyMode::Uncapped => 0,
         AtomicSupplyMode::Capped => 1,
     });
     write_u128(out, asset.max_supply);
     write_u128(out, asset.total_supply);
+    write_len(out, asset.name.len());
+    out.extend_from_slice(&asset.name);
+    write_len(out, asset.symbol.len());
+    out.extend_from_slice(&asset.symbol);
+    write_len(out, asset.metadata.len());
+    out.extend_from_slice(&asset.metadata);
     write_len(out, asset.platform_tag.len());
     out.extend_from_slice(&asset.platform_tag);
+    write_optional_hash(out, &asset.created_block_hash);
+    write_optional_u64(out, asset.created_daa_score);
+    write_optional_u64(out, asset.created_at);
     match asset.liquidity.as_ref() {
         Some(pool) => {
             out.push(1);
@@ -2142,6 +2243,22 @@ impl<'a> AtomicStateReader<'a> {
         Ok(u128::from_le_bytes(bytes))
     }
 
+    fn read_optional_hash32(&mut self) -> Result<Option<[u8; 32]>, String> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_hash32()?)),
+            raw => Err(format!("invalid optional hash presence flag `{raw}`")),
+        }
+    }
+
+    fn read_optional_u64(&mut self) -> Result<Option<u64>, String> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_u64()?)),
+            raw => Err(format!("invalid optional u64 presence flag `{raw}`")),
+        }
+    }
+
     fn read_len(&mut self) -> Result<u64, String> {
         self.read_u64()
     }
@@ -2152,6 +2269,90 @@ impl<'a> AtomicStateReader<'a> {
     }
 
     fn read_atomic_asset(&mut self) -> Result<AtomicAssetState, String> {
+        let cursor = self.cursor;
+        match self.read_current_atomic_asset() {
+            Ok(asset) => Ok(asset),
+            Err(err) => {
+                self.cursor = cursor;
+                self.read_legacy_atomic_asset().map_err(|_| err)
+            }
+        }
+    }
+
+    fn read_current_atomic_asset(&mut self) -> Result<AtomicAssetState, String> {
+        let creator_owner_id = self.read_hash32()?;
+        let asset_class = match self.read_u8()? {
+            0 => AtomicAssetClass::Standard,
+            1 => AtomicAssetClass::Liquidity,
+            raw => return Err(format!("invalid atomic asset class `{raw}`")),
+        };
+        let token_version = self.read_u8()?;
+        validate_token_version(token_version)?;
+        let mint_authority_owner_id = self.read_hash32()?;
+        let decimals = self.read_u8()?;
+        if decimals > MAX_ATOMIC_DECIMALS {
+            return Err(format!("atomic decimals `{decimals}` above max `{MAX_ATOMIC_DECIMALS}`"));
+        }
+        let supply_mode = match self.read_u8()? {
+            0 => AtomicSupplyMode::Uncapped,
+            1 => AtomicSupplyMode::Capped,
+            raw => return Err(format!("invalid atomic supply mode `{raw}`")),
+        };
+        let max_supply = self.read_u128()?;
+        let total_supply = self.read_u128()?;
+        let name_len = self.read_len_usize("atomic name")?;
+        if name_len > MAX_ATOMIC_NAME_LEN {
+            return Err(format!("atomic name length `{name_len}` exceeds max"));
+        }
+        let name = self.read_bytes(name_len)?.to_vec();
+        let symbol_len = self.read_len_usize("atomic symbol")?;
+        if symbol_len > MAX_ATOMIC_SYMBOL_LEN {
+            return Err(format!("atomic symbol length `{symbol_len}` exceeds max"));
+        }
+        let symbol = self.read_bytes(symbol_len)?.to_vec();
+        let metadata_len = self.read_len_usize("atomic metadata")?;
+        if metadata_len > MAX_ATOMIC_METADATA_LEN {
+            return Err(format!("atomic metadata length `{metadata_len}` exceeds max"));
+        }
+        let metadata = self.read_bytes(metadata_len)?.to_vec();
+        if std::str::from_utf8(&name).is_err() || std::str::from_utf8(&symbol).is_err() {
+            return Err("atomic name/symbol must be valid utf-8".to_string());
+        }
+        let platform_tag_len = self.read_len_usize("atomic platform tag")?;
+        if platform_tag_len > MAX_ATOMIC_PLATFORM_TAG_LEN {
+            return Err(format!("atomic platform tag length `{platform_tag_len}` exceeds max"));
+        }
+        let platform_tag = self.read_bytes(platform_tag_len)?.to_vec();
+        std::str::from_utf8(&platform_tag).map_err(|_| "atomic platform tag must be valid utf-8".to_string())?;
+        let created_block_hash = self.read_optional_hash32()?;
+        let created_daa_score = self.read_optional_u64()?;
+        let created_at = self.read_optional_u64()?;
+        let liquidity = match self.read_u8()? {
+            0 => None,
+            1 => Some(self.read_liquidity_pool()?),
+            raw => return Err(format!("invalid atomic liquidity presence flag `{raw}`")),
+        };
+        Ok(AtomicAssetState {
+            creator_owner_id,
+            asset_class,
+            token_version,
+            mint_authority_owner_id,
+            decimals,
+            supply_mode,
+            max_supply,
+            total_supply,
+            name,
+            symbol,
+            metadata,
+            platform_tag,
+            created_block_hash,
+            created_daa_score,
+            created_at,
+            liquidity,
+        })
+    }
+
+    fn read_legacy_atomic_asset(&mut self) -> Result<AtomicAssetState, String> {
         let asset_class = match self.read_u8()? {
             0 => AtomicAssetClass::Standard,
             1 => AtomicAssetClass::Liquidity,
@@ -2179,13 +2380,21 @@ impl<'a> AtomicStateReader<'a> {
             raw => return Err(format!("invalid atomic liquidity presence flag `{raw}`")),
         };
         Ok(AtomicAssetState {
+            creator_owner_id: [0u8; 32],
             asset_class,
             token_version,
             mint_authority_owner_id,
+            decimals: 0,
             supply_mode,
             max_supply,
             total_supply,
+            name: Vec::new(),
+            symbol: Vec::new(),
+            metadata: Vec::new(),
             platform_tag,
+            created_block_hash: None,
+            created_daa_score: None,
+            created_at: None,
             liquidity,
         })
     }
@@ -2303,23 +2512,39 @@ mod tests {
             atomic_owner_id_from_address_components(0, &fee_recipient_payload_b).expect("valid recipient owner B");
 
         let standard_asset = AtomicAssetState {
+            creator_owner_id: owner(0xA0),
             asset_class: AtomicAssetClass::Standard,
             token_version: ATOMIC_CURRENT_TOKEN_VERSION,
             mint_authority_owner_id: owner(0xA1),
+            decimals: 8,
             supply_mode: AtomicSupplyMode::Capped,
             max_supply: u128_from_words(0x0200, 9_999),
             total_supply: standard_total,
+            name: b"Interop Standard Token".to_vec(),
+            symbol: b"IST".to_vec(),
+            metadata: b"{\"interop\":true}".to_vec(),
             platform_tag: Vec::new(),
+            created_block_hash: Some(owner(0xC0)),
+            created_daa_score: Some(12_345),
+            created_at: Some(1_715_000_000_000),
             liquidity: None,
         };
         let liquidity_asset = AtomicAssetState {
+            creator_owner_id: owner(0xA2),
             asset_class: AtomicAssetClass::Liquidity,
             token_version: ATOMIC_CURRENT_TOKEN_VERSION,
             mint_authority_owner_id: [0; 32],
+            decimals: 0,
             supply_mode: AtomicSupplyMode::Capped,
             max_supply: liquidity_max_supply,
             total_supply: liquidity_total,
+            name: b"Interop Liquidity Token".to_vec(),
+            symbol: b"ILT".to_vec(),
+            metadata: b"{\"pool\":17}".to_vec(),
             platform_tag: Vec::new(),
+            created_block_hash: Some(owner(0xC1)),
+            created_daa_score: Some(12_346),
+            created_at: Some(1_715_000_000_001),
             liquidity: Some(AtomicLiquidityPoolState {
                 pool_nonce: 17,
                 curve_version: ATOMIC_CURRENT_LIQUIDITY_CURVE_VERSION,
@@ -2406,26 +2631,42 @@ mod tests {
         let mut right = AtomicConsensusState::default();
 
         let standard_asset = AtomicAssetState {
+            creator_owner_id: owner(0),
             asset_class: AtomicAssetClass::Standard,
             token_version: ATOMIC_CURRENT_TOKEN_VERSION,
             mint_authority_owner_id: owner(1),
+            decimals: 8,
             supply_mode: AtomicSupplyMode::Capped,
             max_supply: 1_000,
             total_supply: 11,
+            name: b"Order Token".to_vec(),
+            symbol: b"ORD".to_vec(),
+            metadata: Vec::new(),
             platform_tag: Vec::new(),
+            created_block_hash: None,
+            created_daa_score: None,
+            created_at: None,
             liquidity: None,
         };
         let fee_recipient_payload = vec![4; 32];
         let fee_recipient_owner =
             atomic_owner_id_from_address_components(0, &fee_recipient_payload).expect("test recipient owner should derive");
         let liquidity_asset = AtomicAssetState {
+            creator_owner_id: owner(2),
             asset_class: AtomicAssetClass::Liquidity,
             token_version: ATOMIC_CURRENT_TOKEN_VERSION,
             mint_authority_owner_id: [0; 32],
+            decimals: 0,
             supply_mode: AtomicSupplyMode::Capped,
             max_supply: 10_000,
             total_supply: 500,
+            name: b"Order LP".to_vec(),
+            symbol: b"OLP".to_vec(),
+            metadata: Vec::new(),
             platform_tag: Vec::new(),
+            created_block_hash: None,
+            created_daa_score: None,
+            created_at: None,
             liquidity: Some(AtomicLiquidityPoolState {
                 pool_nonce: 7,
                 curve_version: ATOMIC_CURRENT_LIQUIDITY_CURVE_VERSION,
@@ -2481,13 +2722,21 @@ mod tests {
         let nonce_key = AtomicNonceKey::owner(owner_id);
         let balance_key = AtomicBalanceKey { asset_id, owner_id };
         let asset = AtomicAssetState {
+            creator_owner_id: owner_id,
             asset_class: AtomicAssetClass::Standard,
             token_version: ATOMIC_CURRENT_TOKEN_VERSION,
             mint_authority_owner_id: owner_id,
+            decimals: 8,
             supply_mode: AtomicSupplyMode::Capped,
             max_supply: 1_000,
             total_supply: 10,
+            name: b"Delta Token".to_vec(),
+            symbol: b"DLT".to_vec(),
+            metadata: Vec::new(),
             platform_tag: Vec::new(),
+            created_block_hash: None,
+            created_daa_score: None,
+            created_at: None,
             liquidity: None,
         };
 
@@ -2521,13 +2770,21 @@ mod tests {
         let nonce_key = AtomicNonceKey::owner(owner_id);
         let balance_key = AtomicBalanceKey { asset_id, owner_id };
         let asset = AtomicAssetState {
+            creator_owner_id: owner_id,
             asset_class: AtomicAssetClass::Standard,
             token_version: ATOMIC_CURRENT_TOKEN_VERSION,
             mint_authority_owner_id: owner_id,
+            decimals: 8,
             supply_mode: AtomicSupplyMode::Capped,
             max_supply: 1_000,
             total_supply: 25,
+            name: b"Replay Token".to_vec(),
+            symbol: b"RPL".to_vec(),
+            metadata: Vec::new(),
             platform_tag: Vec::new(),
+            created_block_hash: None,
+            created_daa_score: None,
+            created_at: None,
             liquidity: None,
         };
 
@@ -2565,13 +2822,21 @@ mod tests {
         let balance_key = AtomicBalanceKey { asset_id, owner_id };
         let vault_outpoint = TransactionOutpoint::new(hash(0xDA), 2);
         let asset = AtomicAssetState {
+            creator_owner_id: owner_id,
             asset_class: AtomicAssetClass::Liquidity,
             token_version: ATOMIC_CURRENT_TOKEN_VERSION,
             mint_authority_owner_id: [0; 32],
+            decimals: 0,
             supply_mode: AtomicSupplyMode::Capped,
             max_supply: 1_000,
             total_supply: 100,
+            name: b"Stored LP".to_vec(),
+            symbol: b"SLP".to_vec(),
+            metadata: Vec::new(),
             platform_tag: Vec::new(),
+            created_block_hash: None,
+            created_daa_score: None,
+            created_at: None,
             liquidity: Some(AtomicLiquidityPoolState {
                 pool_nonce: 3,
                 curve_version: ATOMIC_CURRENT_LIQUIDITY_CURVE_VERSION,
@@ -2625,13 +2890,21 @@ mod tests {
         let owner_id = owner(0xE1);
         let balance_key = AtomicBalanceKey { asset_id, owner_id };
         let asset = AtomicAssetState {
+            creator_owner_id: owner_id,
             asset_class: AtomicAssetClass::Standard,
             token_version: ATOMIC_CURRENT_TOKEN_VERSION,
             mint_authority_owner_id: owner_id,
+            decimals: 8,
             supply_mode: AtomicSupplyMode::Capped,
             max_supply: 1_000,
             total_supply: 77,
+            name: b"Delete Token".to_vec(),
+            symbol: b"DEL".to_vec(),
+            metadata: Vec::new(),
             platform_tag: Vec::new(),
+            created_block_hash: None,
+            created_daa_score: None,
+            created_at: None,
             liquidity: None,
         };
 

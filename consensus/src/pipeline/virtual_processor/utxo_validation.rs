@@ -13,6 +13,7 @@ use crate::{
         block_transactions::BlockTransactionsStoreReader,
         daa::DaaStoreReader,
         ghostdag::GhostdagData,
+        headers::HeaderStoreReader,
     },
     processes::transaction_validator::{
         errors::{TxResult, TxRuleError},
@@ -63,6 +64,13 @@ const MAX_LIQUIDITY_SUPPLY_RAW: u128 = 10_000_000;
 const INITIAL_REAL_CPAY_RESERVES_SOMPI: u64 = SOMPI_PER_CRYPTIX;
 const MIN_CPAY_RESERVE_SOMPI: u64 = 1;
 const MIN_REAL_TOKEN_RESERVE: u128 = 1;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AtomicCreationContext {
+    pub source_block_hash: Hash,
+    pub source_block_daa_score: u64,
+    pub source_block_time: u64,
+}
 const LIQUIDITY_CURVE_MODE_BASIC: u8 = 0;
 const LIQUIDITY_CURVE_MODE_AGGRESSIVE: u8 = 1;
 const LIQUIDITY_CURVE_MODE_INDIVIDUAL: u8 = 2;
@@ -754,14 +762,24 @@ impl VirtualStateProcessor {
 
             // The first block in the mergeset is always the selected parent
             let is_selected_parent = i == 0;
+            let source_header = self.headers_store.get_header(merged_block).unwrap();
+            let atomic_creation_context = AtomicCreationContext {
+                source_block_hash: merged_block,
+                source_block_daa_score: source_header.daa_score,
+                source_block_time: source_header.timestamp,
+            };
 
             // No need to fully validate selected parent transactions since selected parent txs were already validated
             // as part of selected parent UTXO state verification with the exact same UTXO context.
             let validation_flags = if is_selected_parent { TxValidationFlags::SkipScriptChecks } else { TxValidationFlags::Full };
             let mut validated_transactions =
                 self.validate_transactions_in_parallel(&txs, &composed_view, pov_daa_score, validation_flags);
-            validated_transactions =
-                self.filter_validated_transactions_by_atomic_state(validated_transactions, pov_daa_score, &mut ctx.atomic_state);
+            validated_transactions = self.filter_validated_transactions_by_atomic_state(
+                validated_transactions,
+                pov_daa_score,
+                atomic_creation_context,
+                &mut ctx.atomic_state,
+            );
 
             let mut block_fee = 0u64;
             for (validated_tx, _) in validated_transactions.iter() {
@@ -850,8 +868,17 @@ impl VirtualStateProcessor {
         let mut validated_transactions =
             self.validate_transactions_in_parallel(&txs, &current_utxo_view, header.daa_score, TxValidationFlags::Full);
         let mut atomic_state = ctx.atomic_state.clone();
-        validated_transactions =
-            self.filter_validated_transactions_by_atomic_state(validated_transactions, header.daa_score, &mut atomic_state);
+        let atomic_creation_context = AtomicCreationContext {
+            source_block_hash: header.hash,
+            source_block_daa_score: header.daa_score,
+            source_block_time: header.timestamp,
+        };
+        validated_transactions = self.filter_validated_transactions_by_atomic_state(
+            validated_transactions,
+            header.daa_score,
+            atomic_creation_context,
+            &mut atomic_state,
+        );
         if validated_transactions.len() < txs.len() - 1 {
             // Some non-coinbase transactions are invalid
             return Err(InvalidTransactionsInUtxoContext(txs.len() - 1 - validated_transactions.len(), txs.len() - 1));
@@ -906,6 +933,7 @@ impl VirtualStateProcessor {
         &self,
         mut validated_transactions: Vec<(ValidatedTransaction<'a>, u32)>,
         pov_daa_score: u64,
+        creation_context: AtomicCreationContext,
         atomic_state: &mut AtomicConsensusState,
     ) -> Vec<(ValidatedTransaction<'a>, u32)> {
         validated_transactions.sort_by_key(|(_, tx_index)| *tx_index);
@@ -914,8 +942,13 @@ impl VirtualStateProcessor {
         let mut filtered = Vec::with_capacity(validated_transactions.len());
         for (validated_tx, tx_index) in validated_transactions.into_iter() {
             let tx_id = validated_tx.id();
-            match self.validate_and_apply_atomic_state_transition_with_growth(&validated_tx, pov_daa_score, atomic_state, &mut growth)
-            {
+            match self.validate_and_apply_atomic_state_transition_with_growth(
+                &validated_tx,
+                pov_daa_score,
+                creation_context,
+                atomic_state,
+                &mut growth,
+            ) {
                 Ok(()) => filtered.push((validated_tx, tx_index)),
                 Err(err) => {
                     info!("Rejecting transaction {} due to transaction rule error at block tx index {}: {}", tx_id, tx_index, err);
@@ -940,12 +973,13 @@ impl VirtualStateProcessor {
         &self,
         tx: &impl VerifiableTransaction,
         pov_daa_score: u64,
+        creation_context: AtomicCreationContext,
         atomic_state: &mut AtomicConsensusState,
         growth: &mut AtomicBlockStateGrowth,
     ) -> TxResult<()> {
         let delta = self.estimate_atomic_state_growth_for_tx(tx, pov_daa_score, atomic_state)?;
         growth.ensure_can_add(delta, self.atomic_state_growth_limits())?;
-        self.validate_and_apply_atomic_state_transition(tx, pov_daa_score, atomic_state)?;
+        self.validate_and_apply_atomic_state_transition(tx, pov_daa_score, creation_context, atomic_state)?;
         growth.commit(delta);
         Ok(())
     }
@@ -1042,10 +1076,11 @@ impl VirtualStateProcessor {
         Ok(growth)
     }
 
-    pub(crate) fn validate_and_apply_atomic_state_transition(
+    fn validate_and_apply_atomic_state_transition(
         &self,
         tx: &impl VerifiableTransaction,
         pov_daa_score: u64,
+        creation_context: AtomicCreationContext,
         atomic_state: &mut AtomicConsensusState,
     ) -> TxResult<()> {
         let payload_hf_active = self.transaction_validator.is_payload_hf_active(pov_daa_score);
@@ -1122,7 +1157,7 @@ impl VirtualStateProcessor {
         }
 
         self.validate_replacement_anchor(tx, owner_id, atomic_state)?;
-        self.apply_atomic_op_to_state(tx, tx.tx().id().as_bytes(), owner_id, parsed_payload.op, atomic_state)?;
+        self.apply_atomic_op_to_state(tx, tx.tx().id().as_bytes(), owner_id, parsed_payload.op, creation_context, atomic_state)?;
 
         atomic_state.set_next_nonce(nonce_key, next_nonce);
         self.apply_anchor_deltas_to_atomic_state(tx, atomic_state);
@@ -1206,18 +1241,19 @@ impl VirtualStateProcessor {
         tx_id_bytes: [u8; 32],
         owner_id: [u8; 32],
         op: AtomicPayloadOp,
+        creation_context: AtomicCreationContext,
         atomic_state: &mut AtomicConsensusState,
     ) -> TxResult<()> {
         match op {
             AtomicPayloadOp::CreateAsset {
                 token_version,
-                decimals: _,
+                decimals,
                 supply_mode,
                 max_supply,
                 mint_authority_owner_id,
-                name: _,
-                symbol: _,
-                metadata: _,
+                name,
+                symbol,
+                metadata,
                 platform_tag,
             } => {
                 let asset_id = tx_id_bytes;
@@ -1235,26 +1271,34 @@ impl VirtualStateProcessor {
                     atomic_state,
                     asset_id,
                     AtomicAssetState {
+                        creator_owner_id: owner_id,
                         asset_class: AtomicAssetClass::Standard,
                         token_version,
                         mint_authority_owner_id,
+                        decimals,
                         supply_mode,
                         max_supply,
                         total_supply: 0,
+                        name,
+                        symbol,
+                        metadata,
                         platform_tag,
+                        created_block_hash: Some(creation_context.source_block_hash.as_bytes()),
+                        created_daa_score: Some(creation_context.source_block_daa_score),
+                        created_at: Some(creation_context.source_block_time),
                         liquidity: None,
                     },
                 )?;
             }
             AtomicPayloadOp::CreateAssetWithMint {
                 token_version,
-                decimals: _,
+                decimals,
                 supply_mode,
                 max_supply,
                 mint_authority_owner_id,
-                name: _,
-                symbol: _,
-                metadata: _,
+                name,
+                symbol,
+                metadata,
                 initial_mint_amount,
                 initial_mint_to_owner_id,
                 platform_tag,
@@ -1293,13 +1337,21 @@ impl VirtualStateProcessor {
                     atomic_state,
                     asset_id,
                     AtomicAssetState {
+                        creator_owner_id: owner_id,
                         asset_class: AtomicAssetClass::Standard,
                         token_version,
                         mint_authority_owner_id,
+                        decimals,
                         supply_mode,
                         max_supply,
                         total_supply,
+                        name,
+                        symbol,
+                        metadata,
                         platform_tag,
+                        created_block_hash: Some(creation_context.source_block_hash.as_bytes()),
+                        created_daa_score: Some(creation_context.source_block_daa_score),
+                        created_at: Some(creation_context.source_block_time),
                         liquidity: None,
                     },
                 )?;
@@ -1312,9 +1364,9 @@ impl VirtualStateProcessor {
                 individual_virtual_token_multiplier_bps,
                 decimals,
                 max_supply,
-                name: _,
-                symbol: _,
-                metadata: _,
+                name,
+                symbol,
+                metadata,
                 seed_reserve_sompi,
                 fee_bps,
                 recipients,
@@ -1414,13 +1466,21 @@ impl VirtualStateProcessor {
                 let vault_outpoint = TransactionOutpoint::new(tx.tx().id(), vault_output_index);
                 let unlocked = liquidity_unlock_target_sompi == 0 || real_cpay_reserves_sompi >= liquidity_unlock_target_sompi;
                 let asset = AtomicAssetState {
+                    creator_owner_id: owner_id,
                     asset_class: AtomicAssetClass::Liquidity,
                     token_version,
                     mint_authority_owner_id: [0u8; 32],
+                    decimals,
                     supply_mode: AtomicSupplyMode::Capped,
                     max_supply,
                     total_supply,
+                    name,
+                    symbol,
+                    metadata,
                     platform_tag,
+                    created_block_hash: Some(creation_context.source_block_hash.as_bytes()),
+                    created_daa_score: Some(creation_context.source_block_daa_score),
+                    created_at: Some(creation_context.source_block_time),
                     liquidity: Some(AtomicLiquidityPoolState {
                         pool_nonce: 1,
                         curve_version,

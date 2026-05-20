@@ -39,7 +39,9 @@ use crate::{
     pipeline::{
         deps_manager::VirtualStateProcessingMessage,
         pruning_processor::processor::PruningProcessingMessage,
-        virtual_processor::utxo_validation::{atomic_nonce_key_for_op, AtomicBlockStateGrowth, UtxoProcessingContext},
+        virtual_processor::utxo_validation::{
+            atomic_nonce_key_for_op, AtomicBlockStateGrowth, AtomicCreationContext, UtxoProcessingContext,
+        },
         ProcessingCounters,
     },
     processes::{
@@ -959,9 +961,15 @@ impl VirtualStateProcessor {
         )?;
         let mut atomic_state = self.atomic_state_for_virtual_context(&virtual_state.atomic_state);
         let mut atomic_growth = AtomicBlockStateGrowth::default();
+        let creation_context = AtomicCreationContext {
+            source_block_hash: Hash::from_bytes([0u8; 32]),
+            source_block_daa_score: virtual_daa_score,
+            source_block_time: virtual_past_median_time,
+        };
         self.validate_and_apply_atomic_state_transition_with_growth(
             &mutable_tx.as_verifiable(),
             virtual_daa_score,
+            creation_context,
             &mut atomic_state,
             &mut atomic_growth,
         )?;
@@ -1278,6 +1286,11 @@ impl VirtualStateProcessor {
 
         let mut atomic_state = self.atomic_state_for_virtual_context(&virtual_state.atomic_state);
         let mut atomic_growth = AtomicBlockStateGrowth::default();
+        let creation_context = AtomicCreationContext {
+            source_block_hash: Hash::from_bytes([0u8; 32]),
+            source_block_daa_score: virtual_daa_score,
+            source_block_time: virtual_past_median_time,
+        };
         for idx in ordered_atomic_indices.into_iter() {
             if results[idx].is_err() {
                 continue;
@@ -1286,6 +1299,7 @@ impl VirtualStateProcessor {
             if let Err(err) = self.validate_and_apply_atomic_state_transition_with_growth(
                 &mtx.as_verifiable(),
                 virtual_daa_score,
+                creation_context,
                 &mut atomic_state,
                 &mut atomic_growth,
             ) {
@@ -1300,6 +1314,7 @@ impl VirtualStateProcessor {
             if let Err(err) = self.validate_and_apply_atomic_state_transition_with_growth(
                 &mtx.as_verifiable(),
                 virtual_daa_score,
+                creation_context,
                 &mut atomic_state,
                 &mut atomic_growth,
             ) {
@@ -1346,9 +1361,15 @@ impl VirtualStateProcessor {
         txs.iter()
             .map(|tx| {
                 let validated = self.validate_block_template_transaction(tx, virtual_state, utxo_view)?;
+                let creation_context = AtomicCreationContext {
+                    source_block_hash: Hash::from_bytes([0u8; 32]),
+                    source_block_daa_score: virtual_state.daa_score,
+                    source_block_time: virtual_state.past_median_time,
+                };
                 self.validate_and_apply_atomic_state_transition_with_growth(
                     &validated,
                     virtual_state.daa_score,
+                    creation_context,
                     atomic_state,
                     atomic_growth,
                 )?;
@@ -1474,9 +1495,15 @@ impl VirtualStateProcessor {
         for tx in txs.iter() {
             match self.validate_block_template_transaction(tx, virtual_state, utxo_view) {
                 Ok(validated) => {
+                    let creation_context = AtomicCreationContext {
+                        source_block_hash: Hash::from_bytes([0u8; 32]),
+                        source_block_daa_score: virtual_state.daa_score,
+                        source_block_time: virtual_state.past_median_time,
+                    };
                     if let Err(e) = self.validate_and_apply_atomic_state_transition_with_growth(
                         &validated,
                         virtual_state.daa_score,
+                        creation_context,
                         &mut atomic_state,
                         &mut atomic_growth,
                     ) {
@@ -2068,6 +2095,14 @@ impl VirtualStateProcessor {
         let mut replayed_transactions = 0u64;
 
         for accepted_block in acceptance_data.iter() {
+            let source_header = self.headers_store.get_header(accepted_block.block_hash).map_err(|err| {
+                format!("accepted block `{}` header unavailable while replaying `{block_hash}`: {err}", accepted_block.block_hash)
+            })?;
+            let creation_context = AtomicCreationContext {
+                source_block_hash: accepted_block.block_hash,
+                source_block_daa_score: source_header.daa_score,
+                source_block_time: source_header.timestamp,
+            };
             let txs = self.block_transactions_store.get(accepted_block.block_hash).map_err(|err| {
                 format!(
                     "accepted block `{}` transaction list unavailable while replaying `{block_hash}`: {err}",
@@ -2107,14 +2142,20 @@ impl VirtualStateProcessor {
                     entries.push(entry.clone());
                 }
                 let populated = PopulatedTransaction::new(tx, entries);
-                self.validate_and_apply_atomic_state_transition_with_growth(&populated, pov_daa_score, atomic_state, &mut growth)
-                    .map_err(|err| {
-                        format!(
-                            "failed replaying Atomic transition for accepted tx `{}` in block `{}` while rebuilding `{block_hash}`: {err}",
-                            tx.id(),
-                            accepted_block.block_hash
-                        )
-                    })?;
+                self.validate_and_apply_atomic_state_transition_with_growth(
+                    &populated,
+                    pov_daa_score,
+                    creation_context,
+                    atomic_state,
+                    &mut growth,
+                )
+                .map_err(|err| {
+                    format!(
+                        "failed replaying Atomic transition for accepted tx `{}` in block `{}` while rebuilding `{block_hash}`: {err}",
+                        tx.id(),
+                        accepted_block.block_hash
+                    )
+                })?;
                 replayed_transactions += 1;
             }
         }

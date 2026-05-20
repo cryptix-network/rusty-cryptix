@@ -12,7 +12,7 @@ use std::{
 };
 
 pub const ATOMIC_DB_SCHEMA_VERSION: u16 = 2;
-pub const ATOMIC_REVALIDATION_VERSION: u16 = 7;
+pub const ATOMIC_REVALIDATION_VERSION: u16 = 17;
 
 const META_SCHEMA_VERSION: &[u8] = b"meta/atomic_schema_version";
 const META_PROTOCOL_VERSION: &[u8] = b"meta/atomic_protocol_version";
@@ -774,6 +774,56 @@ impl AtomicStorageV2 {
         Ok(())
     }
 
+    pub fn rebuild_current_root_from_state_data(
+        &self,
+        current_block_hash: Option<BlockHash>,
+        chain_len: u64,
+        degraded: bool,
+        next_event_sequence: u64,
+    ) -> AtomicTokenResult<[u8; 32]> {
+        let mut root_accumulator = RootAccumulator::default();
+
+        self.visit_all_assets(|asset_id, asset| {
+            if asset.asset_id != asset_id {
+                return Err(AtomicTokenError::Processing("Atomic DB asset key/id mismatch while rebuilding root".to_string()));
+            }
+            root_accumulator.set(logical_asset_key(&asset_id), Some(root_value_for_asset(&asset)));
+            Ok(())
+        })?;
+        self.visit_all_balances(|key, amount| {
+            if amount > 0 {
+                root_accumulator.set(logical_balance_key(&key), Some(root_value_for_u128(amount)));
+            }
+            Ok(())
+        })?;
+        self.visit_all_nonces(|key, nonce| {
+            if nonce != 1 {
+                root_accumulator.set(logical_nonce_key(&key), Some(root_value_for_u64(nonce)));
+            }
+            Ok(())
+        })?;
+        self.visit_all_anchor_counts(|owner_id, count| {
+            if count > 0 {
+                root_accumulator.set(logical_anchor_count_key(&owner_id), Some(root_value_for_u64(count)));
+            }
+            Ok(())
+        })?;
+
+        let mut batch = WriteBatch::default();
+        for key in self.keys_with_prefix(PREFIX_LEAF_HASH)? {
+            batch.delete(key);
+        }
+        for key in self.keys_with_prefix(PREFIX_ROOT_BUCKET)? {
+            batch.delete(key);
+        }
+        let root = root_accumulator.write_to_batch(&mut batch)?;
+        self.write_current_meta_to_batch(&mut batch, current_block_hash, chain_len, root, degraded, next_event_sequence)?;
+        self.db
+            .write(batch)
+            .map_err(|err| AtomicTokenError::Processing(format!("failed rebuilding Atomic DB schema v2 current root: {err}")))?;
+        Ok(root)
+    }
+
     pub fn replace_state_hashes(&self, state_hashes: impl IntoIterator<Item = (BlockHash, [u8; 32])>) -> AtomicTokenResult<usize> {
         let mut batch = WriteBatch::default();
         let mut count = 0usize;
@@ -1459,6 +1509,167 @@ pub(crate) fn compute_state_root_from_parts(
     root_from_buckets(&buckets)
 }
 
+pub(crate) fn debug_state_root_report_from_parts(
+    assets: &HashMap<[u8; 32], TokenAsset>,
+    balances: &HashMap<BalanceKey, u128>,
+    nonces: &HashMap<NonceKey, u64>,
+    anchor_counts: &HashMap<[u8; 32], u64>,
+    max_entries: usize,
+) -> String {
+    let max_entries = max_entries.max(1);
+    let mut lines = Vec::new();
+    let root = compute_state_root_from_parts(assets, balances, nonces, anchor_counts);
+    lines.push(format!(
+        "token_root={} assets={} balances={} nonces={} anchor_counts={}",
+        hex_lower(&root),
+        assets.len(),
+        balances.values().filter(|amount| **amount > 0).count(),
+        nonces.values().filter(|nonce| **nonce != 1).count(),
+        anchor_counts.values().filter(|count| **count > 0).count()
+    ));
+
+    let mut asset_ids = assets.keys().copied().collect::<Vec<_>>();
+    asset_ids.sort_unstable();
+    for (index, asset_id) in asset_ids.iter().copied().enumerate() {
+        if index >= max_entries {
+            lines.push(format!("asset_more={}", asset_ids.len() - index));
+            break;
+        }
+        if let Some(asset) = assets.get(&asset_id) {
+            let logical_key = logical_asset_key(&asset_id);
+            let leaf = root_leaf_hash(&logical_key, &root_value_for_asset(asset));
+            lines.push(format!(
+                "asset[{index}] bucket={} leaf={} {}",
+                root_bucket_index(&logical_key),
+                hex_lower(&leaf),
+                debug_asset_summary(asset)
+            ));
+        }
+    }
+
+    let mut balance_keys = balances.keys().copied().filter(|key| balances.get(key).copied().unwrap_or(0) > 0).collect::<Vec<_>>();
+    balance_keys.sort_unstable();
+    for (index, key) in balance_keys.iter().copied().enumerate() {
+        if index >= max_entries {
+            lines.push(format!("balance_more={}", balance_keys.len() - index));
+            break;
+        }
+        let amount = balances.get(&key).copied().unwrap_or(0);
+        let logical_key = logical_balance_key(&key);
+        let leaf = root_leaf_hash(&logical_key, &root_value_for_u128(amount));
+        lines.push(format!(
+            "balance[{index}] bucket={} leaf={} asset={} owner={} amount={}",
+            root_bucket_index(&logical_key),
+            hex_lower(&leaf),
+            hex_lower(&key.asset_id),
+            hex_lower(&key.owner_id),
+            amount
+        ));
+    }
+
+    let mut nonce_keys = nonces.keys().copied().filter(|key| nonces.get(key).copied().unwrap_or(1) != 1).collect::<Vec<_>>();
+    nonce_keys.sort_unstable();
+    for (index, key) in nonce_keys.iter().copied().enumerate() {
+        if index >= max_entries {
+            lines.push(format!("nonce_more={}", nonce_keys.len() - index));
+            break;
+        }
+        let nonce = nonces.get(&key).copied().unwrap_or(1);
+        let logical_key = logical_nonce_key(&key);
+        let leaf = root_leaf_hash(&logical_key, &root_value_for_u64(nonce));
+        lines.push(format!(
+            "nonce[{index}] bucket={} leaf={} owner={} scope_kind={} scope_id={} value={}",
+            root_bucket_index(&logical_key),
+            hex_lower(&leaf),
+            hex_lower(&key.owner_id),
+            key.scope_kind,
+            hex_lower(&key.scope_id),
+            nonce
+        ));
+    }
+
+    let mut owners = anchor_counts
+        .keys()
+        .copied()
+        .filter(|owner_id| anchor_counts.get(owner_id).copied().unwrap_or(0) > 0)
+        .collect::<Vec<_>>();
+    owners.sort_unstable();
+    for (index, owner_id) in owners.iter().copied().enumerate() {
+        if index >= max_entries {
+            lines.push(format!("anchor_more={}", owners.len() - index));
+            break;
+        }
+        let count = anchor_counts.get(&owner_id).copied().unwrap_or(0);
+        let logical_key = logical_anchor_count_key(&owner_id);
+        let leaf = root_leaf_hash(&logical_key, &root_value_for_u64(count));
+        lines.push(format!(
+            "anchor[{index}] bucket={} leaf={} owner={} count={}",
+            root_bucket_index(&logical_key),
+            hex_lower(&leaf),
+            hex_lower(&owner_id),
+            count
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn debug_asset_summary(asset: &TokenAsset) -> String {
+    let mut out = format!(
+        "asset={} class={:?} token_version={} creator={} mint_authority={} decimals={} supply_mode={:?} max_supply={} total_supply={} name_hex={} symbol_hex={} metadata_hex={} platform_hex={} created_block={} created_daa={} created_at={}",
+        hex_lower(&asset.asset_id),
+        asset.asset_class,
+        asset.token_version,
+        hex_lower(&asset.creator_owner_id),
+        hex_lower(&asset.mint_authority_owner_id),
+        asset.decimals,
+        asset.supply_mode,
+        asset.max_supply,
+        asset.total_supply,
+        hex_lower(&asset.name),
+        hex_lower(&asset.symbol),
+        hex_lower(&asset.metadata),
+        hex_lower(&asset.platform_tag),
+        asset.created_block_hash.map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string()),
+        asset.created_daa_score.map(|value| value.to_string()).unwrap_or_else(|| "<none>".to_string()),
+        asset.created_at.map(|value| value.to_string()).unwrap_or_else(|| "<none>".to_string())
+    );
+    let Some(pool) = asset.liquidity.as_ref() else {
+        out.push_str(" liquidity=<none>");
+        return out;
+    };
+    out.push_str(&format!(
+        " liquidity={{pool_nonce={} curve_version={} curve_mode={} iv_cpay={} iv_token_bps={} real_cpay={} real_token={} virtual_cpay={} virtual_token={} unclaimed_fee_total={} fee_bps={} vault_outpoint={} vault_value={} unlock_target={} unlocked={} recipients={}",
+        pool.pool_nonce,
+        pool.curve_version,
+        pool.curve_mode,
+        pool.individual_virtual_cpay_reserves_sompi,
+        pool.individual_virtual_token_multiplier_bps,
+        pool.real_cpay_reserves_sompi,
+        pool.real_token_reserves,
+        pool.virtual_cpay_reserves_sompi,
+        pool.virtual_token_reserves,
+        pool.unclaimed_fee_total_sompi,
+        pool.fee_bps,
+        pool.vault_outpoint,
+        pool.vault_value_sompi,
+        pool.unlock_target_sompi,
+        pool.unlocked,
+        pool.fee_recipients.len()
+    ));
+    for (index, recipient) in pool.fee_recipients.iter().enumerate() {
+        out.push_str(&format!(
+            " recipient[{index}]={{owner={} version={} payload_hex={} unclaimed={}}}",
+            hex_lower(&recipient.owner_id),
+            recipient.address_version,
+            hex_lower(&recipient.address_payload),
+            recipient.unclaimed_sompi
+        ));
+    }
+    out.push('}');
+    out
+}
+
 fn apply_root_leaf(buckets: &mut [[u8; 32]; ATOMIC_ROOT_BUCKETS], logical_key: &[u8], value: &[u8]) {
     let leaf_hash = root_leaf_hash(logical_key, value);
     let bucket_index = root_bucket_index(logical_key);
@@ -1507,7 +1718,7 @@ fn push_root_option_u64(out: &mut Vec<u8>, value: Option<u64>) {
 
 fn root_value_for_asset(asset: &TokenAsset) -> Vec<u8> {
     let mut out = Vec::with_capacity(256 + asset.name.len() + asset.symbol.len() + asset.metadata.len() + asset.platform_tag.len());
-    out.extend_from_slice(b"CAT_ASSET_ROOT_V1");
+    out.extend_from_slice(b"CAT_ASSET_ROOT_V5");
     out.extend_from_slice(&asset.asset_id);
     out.extend_from_slice(&asset.creator_owner_id);
     out.push(token_asset_class_tag(&asset.asset_class));
@@ -1524,7 +1735,6 @@ fn root_value_for_asset(asset: &TokenAsset) -> Vec<u8> {
     push_root_option_hash(&mut out, &asset.created_block_hash);
     push_root_option_u64(&mut out, asset.created_daa_score);
     push_root_option_u64(&mut out, asset.created_at);
-
     match asset.liquidity.as_ref() {
         Some(pool) => {
             out.push(1);
@@ -1551,17 +1761,6 @@ fn root_value_for_asset(asset: &TokenAsset) -> Vec<u8> {
             out.extend_from_slice(&pool.vault_value_sompi.to_le_bytes());
             out.extend_from_slice(&pool.unlock_target_sompi.to_le_bytes());
             out.push(u8::from(pool.unlocked));
-
-            let mut holder_ids = pool.holder_addresses.keys().copied().collect::<Vec<_>>();
-            holder_ids.sort_unstable();
-            out.extend_from_slice(&(holder_ids.len() as u64).to_le_bytes());
-            for holder_id in holder_ids {
-                if let Some(holder) = pool.holder_addresses.get(&holder_id) {
-                    out.extend_from_slice(&holder_id);
-                    out.push(holder.address_version);
-                    push_root_bytes(&mut out, &holder.address_payload);
-                }
-            }
         }
         None => out.push(0),
     }
@@ -1855,6 +2054,46 @@ mod tests {
             .expect("delete balance");
         assert_ne!(root_b, root_c);
         assert_eq!(store.get_balance(&balance_key).expect("balance"), 0);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn zero_balance_delete_is_scoped_to_one_asset_owner_pair() {
+        let dir = unique_temp_dir("balance-index-scope");
+        let genesis_hash = BlockHash::from_u64_word(12);
+        let store = AtomicStorageV2::open(&dir, 6, "cryptix-simnet".to_string(), genesis_hash).expect("open store");
+        let asset_a = [0xA1; 32];
+        let asset_b = [0xB2; 32];
+        let shared_owner = [0xCC; 32];
+        let key_a = BalanceKey { asset_id: asset_a, owner_id: shared_owner };
+        let key_b = BalanceKey { asset_id: asset_b, owner_id: shared_owner };
+
+        store
+            .apply_current_state_delta(
+                std::iter::empty(),
+                [(key_a, Some(100u128)), (key_b, Some(200u128))],
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+            )
+            .expect("write balances");
+
+        let mut owner_balances = store.balances_by_owner(&shared_owner).expect("owner balances");
+        owner_balances.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(owner_balances, vec![(asset_a, 100), (asset_b, 200)]);
+        assert_eq!(store.holders_by_asset(&asset_a).expect("asset A holders"), vec![(shared_owner, 100)]);
+        assert_eq!(store.holders_by_asset(&asset_b).expect("asset B holders"), vec![(shared_owner, 200)]);
+
+        store
+            .apply_current_state_delta(std::iter::empty(), [(key_a, None)], std::iter::empty(), std::iter::empty(), std::iter::empty())
+            .expect("delete only asset A balance");
+
+        assert_eq!(store.get_balance(&key_a).expect("asset A balance removed"), 0);
+        assert_eq!(store.get_balance(&key_b).expect("asset B balance preserved"), 200);
+        assert_eq!(store.balances_by_owner(&shared_owner).expect("owner balance index"), vec![(asset_b, 200)]);
+        assert!(store.holders_by_asset(&asset_a).expect("asset A holder index").is_empty());
+        assert_eq!(store.holders_by_asset(&asset_b).expect("asset B holder index"), vec![(shared_owner, 200)]);
 
         let _ = fs::remove_dir_all(dir);
     }

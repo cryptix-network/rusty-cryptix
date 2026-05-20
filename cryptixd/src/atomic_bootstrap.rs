@@ -272,6 +272,10 @@ impl AtomicBootstrapService {
         true
     }
 
+    async fn defer_next_health_audit(&self) {
+        *self.last_health_audit.lock().await = Some(Instant::now());
+    }
+
     async fn collect_compatible_sources(&self, protocol_version: u32, network_id: &str) -> Vec<SourceClient> {
         let mut sources: Vec<SourceClient> = Vec::new();
         let candidates = self.candidate_endpoints();
@@ -850,7 +854,7 @@ impl AtomicBootstrapService {
     async fn audit_healthy_state_with_p2p(&self, health: &AtomicTokenHealth) -> Result<bool, String> {
         if health.runtime_state != AtomicTokenRuntimeState::Healthy || health.is_degraded || health.bootstrap_in_progress {
             info!(
-                "[atomic-bootstrap:p2p] healthy-state audit deferred: local_runtime={}, degraded={}, bootstrap_in_progress={}",
+                "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=local_token_index_not_ready runtime={} degraded={} bootstrap_in_progress={}",
                 health.runtime_state.as_str(),
                 health.is_degraded,
                 health.bootstrap_in_progress
@@ -860,7 +864,7 @@ impl AtomicBootstrapService {
 
         let active_peer_count = self.flow_context.active_peer_routers().len();
         if active_peer_count == 0 {
-            info!("[atomic-bootstrap:p2p] healthy-state audit skipped: no active P2P peers");
+            info!("[atomic-bootstrap:p2p] audit result: status=skipped scope=token reason=no_active_p2p_peers");
             return Ok(false);
         }
 
@@ -868,12 +872,15 @@ impl AtomicBootstrapService {
             Ok(Some(value)) => value,
             Ok(None) => {
                 info!(
-                    "[atomic-bootstrap:p2p] healthy-state audit deferred: no finality-stable retained/revalidated Atomic checkpoint is available right now"
+                    "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=no_finality_stable_revalidated_token_checkpoint action=wait_for_atomic_catchup_or_revalidation"
                 );
                 return Ok(false);
             }
             Err(err) => {
-                info!("[atomic-bootstrap:p2p] healthy-state audit skipped: stable audit anchor unavailable: {err}");
+                info!(
+                    "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=stable_token_audit_anchor_unavailable detail=\"{}\"",
+                    err
+                );
                 return Ok(false);
             }
         };
@@ -882,8 +889,8 @@ impl AtomicBootstrapService {
         let decision = match self.select_p2p_atomic_token_state_hash_quorum(anchor_hash, anchor_daa_score).await {
             Ok(decision) => decision,
             Err(err) => {
-                trace!(
-                    "[atomic-bootstrap:p2p] healthy-state audit skipped at DAA-rendezvous block {} (daa={}): {}",
+                info!(
+                    "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=peer_token_checkpoint_unavailable anchor={} daa={} action=run_consensus_only_audit token_verified=false detail=\"{}\"",
                     anchor_hash,
                     anchor_daa_score,
                     err
@@ -895,7 +902,7 @@ impl AtomicBootstrapService {
         let local_state_hash_hex = hex_encode(local_state_hash);
         if decision.snapshot_id == local_state_hash_hex {
             info!(
-                "[atomic-bootstrap:p2p] healthy-state audit passed at DAA-rendezvous block {} (daa={}): local state hash {} confirmed by {}; runtime={}, active peer(s)={}",
+                "[atomic-bootstrap:p2p] audit result: status=passed scope=token reason=token_checkpoint_matched anchor={} daa={} local_hash={} policy=\"{}\" runtime={} active_peers={}",
                 anchor_hash,
                 anchor_daa_score,
                 local_state_hash_hex,
@@ -907,20 +914,48 @@ impl AtomicBootstrapService {
         }
 
         let reason = format!(
-            "P2P healthy-state audit mismatch at DAA-rendezvous block {} (daa={}): local state hash {} differs from quorum state hash {} using {}",
+            "audit result: status=failed scope=token reason=token_checkpoint_mismatch anchor={} daa={} local_hash={} quorum_hash={} policy=\"{}\"",
             anchor_hash, anchor_daa_score, local_state_hash_hex, decision.snapshot_id, decision.policy_description
         );
+
+        match self.audit_healthy_consensus_state_with_p2p(anchor_hash, anchor_daa_score).await {
+            Ok(true) => {
+                info!(
+                    "[atomic-bootstrap:p2p] audit result: status=failed scope=token reason=token_checkpoint_mismatch_consensus_only_passed local_hash={} peer_hash={} policy=\"{}\" token_verified=false action=repair_or_revalidate_atomic_index",
+                    local_state_hash_hex,
+                    decision.snapshot_id,
+                    decision.policy_description
+                );
+            }
+            Ok(false) => {}
+            Err(err) => {
+                info!(
+                    "[atomic-bootstrap:p2p] audit result: status=skipped scope=consensus_only reason=unavailable_after_token_failure anchor={} daa={} token_verified=false detail=\"{}\"",
+                    anchor_hash, anchor_daa_score, err
+                );
+            }
+        }
+
+        if let Err(err) = self.atomic_token_service.log_p2p_audit_debug_at_block(anchor_hash).await {
+            info!(
+                "[atomic-bootstrap:p2p] local Atomic token index debug unavailable at DAA-rendezvous block {} (daa={}): {}",
+                anchor_hash, anchor_daa_score, err
+            );
+        }
+
         warn!("[atomic-bootstrap:p2p] {reason}");
 
         match self.atomic_token_service.revalidate_retained_state_for_audit_once().await {
             Ok(true) => {
                 info!("[atomic-bootstrap:p2p] local retained-chain repair completed after P2P audit mismatch");
+                self.defer_next_health_audit().await;
                 return Ok(false);
             }
             Ok(false) => {
                 warn!(
                     "[atomic-bootstrap:p2p] local retained-chain audit revalidation found no local repair to apply; keeping local state live and retrying peer audit later"
                 );
+                self.defer_next_health_audit().await;
                 return Ok(false);
             }
             Err(err) => {
@@ -944,7 +979,7 @@ impl AtomicBootstrapService {
             .map_err(|err| format!("local consensus Atomic state hash unavailable for `{anchor_hash}`: {err}"))?
         else {
             info!(
-                "[atomic-bootstrap:p2p] consensus-state audit skipped at DAA-rendezvous block {} (daa={}): local consensus has no Atomic state hash",
+                "[atomic-bootstrap:p2p] audit result: status=skipped scope=consensus_only reason=local_consensus_atomic_state_hash_unavailable anchor={} daa={} token_verified=false",
                 anchor_hash, anchor_daa_score
             );
             return Ok(false);
@@ -954,7 +989,7 @@ impl AtomicBootstrapService {
             Ok(decision) => decision,
             Err(err) => {
                 info!(
-                    "[atomic-bootstrap:p2p] consensus-state audit skipped at DAA-rendezvous block {} (daa={}): {}",
+                    "[atomic-bootstrap:p2p] audit result: status=skipped scope=consensus_only reason=peer_consensus_state_unavailable anchor={} daa={} token_verified=false detail=\"{}\"",
                     anchor_hash, anchor_daa_score, err
                 );
                 return Ok(false);
@@ -964,19 +999,19 @@ impl AtomicBootstrapService {
         let local_consensus_state_hash_hex = hex_encode(local_consensus_state_hash);
         if decision.snapshot_id == local_consensus_state_hash_hex {
             info!(
-                "[atomic-bootstrap:p2p] consensus-state audit passed at DAA-rendezvous block {} (daa={}): local consensus state hash {} confirmed by {}",
+                "[atomic-bootstrap:p2p] audit result: status=passed scope=consensus_only reason=consensus_state_hash_matched anchor={} daa={} local_hash={} policy=\"{}\" token_verified=false action=wait_for_token_audit_pass",
                 anchor_hash, anchor_daa_score, local_consensus_state_hash_hex, decision.policy_description
             );
             return Ok(true);
         }
 
         let reason = format!(
-            "P2P consensus-state audit mismatch at DAA-rendezvous block {} (daa={}): local consensus state hash {} differs from quorum state hash {} using {}",
+            "audit result: status=failed scope=consensus_only reason=consensus_state_hash_mismatch anchor={} daa={} local_hash={} quorum_hash={} policy=\"{}\" token_verified=false",
             anchor_hash, anchor_daa_score, local_consensus_state_hash_hex, decision.snapshot_id, decision.policy_description
         );
         warn!("[atomic-bootstrap:p2p] {reason}");
         warn!(
-            "[atomic-bootstrap:p2p] consensus-state mismatch does not degrade the Atomic indexer directly; normal P2P consensus/IBD remains authoritative"
+            "[atomic-bootstrap:p2p] audit action: scope=consensus_only result=no_atomic_index_degrade reason=consensus_only_mismatch_normal_p2p_consensus_remains_authoritative"
         );
         Ok(false)
     }

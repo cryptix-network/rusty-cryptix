@@ -77,7 +77,12 @@ use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use uuid::Uuid;
 
 /// The P2P protocol version. Currently the only one supported.
-const PROTOCOL_VERSION: u32 = 13;
+const PROTOCOL_VERSION: u32 = 18;
+const PRE_PERMANENT_TOKEN_DEFINITION_STATE_PROTOCOL_VERSION: u32 = 17;
+const PRE_PRUNING_STABLE_TOKEN_ROOT_PROTOCOL_VERSION: u32 = 16;
+const PRE_TOKEN_ROOT_REBUILD_PROTOCOL_VERSION: u32 = 15;
+const PRE_TOKEN_ROOT_INCLUDED_INDEX_CACHE_PROTOCOL_VERSION: u32 = 14;
+const PRE_ATOMIC_STORE_ROOT_REVALIDATION_PROTOCOL_VERSION: u32 = 13;
 const PRE_CANONICAL_ATOMIC_TOKEN_ORDER_PROTOCOL_VERSION: u32 = 12;
 const PRE_EXPLICIT_ATOMIC_REVALIDATION_PROTOCOL_VERSION: u32 = 11;
 const PRE_RETAINED_CHECKPOINT_P2P_AUDIT_PROTOCOL_VERSION: u32 = 10;
@@ -1511,6 +1516,26 @@ impl ConnectionInitializer for FlowContext {
                 (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), PROTOCOL_VERSION)
             }
             // Pre-HF compatibility lines.
+            PRE_PERMANENT_TOKEN_DEFINITION_STATE_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_PERMANENT_TOKEN_DEFINITION_STATE_PROTOCOL_VERSION,
+            ),
+            PRE_PRUNING_STABLE_TOKEN_ROOT_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_PRUNING_STABLE_TOKEN_ROOT_PROTOCOL_VERSION,
+            ),
+            PRE_TOKEN_ROOT_REBUILD_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_TOKEN_ROOT_REBUILD_PROTOCOL_VERSION,
+            ),
+            PRE_TOKEN_ROOT_INCLUDED_INDEX_CACHE_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_TOKEN_ROOT_INCLUDED_INDEX_CACHE_PROTOCOL_VERSION,
+            ),
+            PRE_ATOMIC_STORE_ROOT_REVALIDATION_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_ATOMIC_STORE_ROOT_REVALIDATION_PROTOCOL_VERSION,
+            ),
             PRE_CANONICAL_ATOMIC_TOKEN_ORDER_PROTOCOL_VERSION if !enforce_hardfork_core => (
                 v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
                 PRE_CANONICAL_ATOMIC_TOKEN_ORDER_PROTOCOL_VERSION,

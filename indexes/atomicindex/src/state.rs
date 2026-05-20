@@ -473,6 +473,8 @@ fn validate_liquidity_unlock_target(unlock_target_sompi: u64) -> Result<(), Noop
 struct CanonicalTxRef {
     txid: BlockHash,
     source_block_hash: BlockHash,
+    source_block_daa_score: u64,
+    source_block_time: u64,
     tx_index: u32,
     acceptance_entry_position: u32,
     tx: Transaction,
@@ -613,6 +615,116 @@ impl AtomicTokenState {
 
     pub fn attach_state_store(&mut self, state_store: Arc<AtomicStorageV2>) {
         self.state_store = Some(state_store);
+    }
+
+    pub fn assets_missing_permanent_metadata(&self) -> Vec<[u8; 32]> {
+        let mut asset_ids = self
+            .assets
+            .iter()
+            .filter_map(|(asset_id, asset)| {
+                let missing_creation_metadata =
+                    asset.created_block_hash.is_none() || asset.created_daa_score.is_none() || asset.created_at.is_none();
+                missing_creation_metadata.then_some(*asset_id)
+            })
+            .collect::<Vec<_>>();
+        asset_ids.sort_unstable();
+        asset_ids
+    }
+
+    pub async fn recover_missing_asset_metadata_from_retained_acceptance(
+        &mut self,
+        retained_chain: &[BlockHash],
+        acceptance_data: &[Arc<AcceptanceData>],
+        auth_inputs: &HashMap<TransactionOutpoint, UtxoEntry>,
+        session: &ConsensusProxy,
+    ) -> AtomicTokenResult<Vec<TokenAsset>> {
+        if retained_chain.len() != acceptance_data.len() {
+            return Err(AtomicTokenError::Processing(format!(
+                "failed recovering permanent Atomic asset metadata: acceptance-data length mismatch ({} != {})",
+                acceptance_data.len(),
+                retained_chain.len()
+            )));
+        }
+
+        let mut candidates = self.assets.keys().copied().collect::<HashSet<_>>();
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut repaired = Vec::new();
+        for (accepting_block_hash, block_acceptance_data) in retained_chain.iter().copied().zip(acceptance_data.iter()) {
+            let normalized = self.flatten_acceptance_for_block(accepting_block_hash, block_acceptance_data, session).await?;
+            for tx_ref in normalized.refs.iter() {
+                if candidates.is_empty() {
+                    return Ok(repaired);
+                }
+                let asset_id = tx_ref.tx.id().as_bytes();
+                if !candidates.contains(&asset_id) {
+                    continue;
+                }
+                let Some(Ok(parsed)) = parse_atomic_token_payload(&tx_ref.tx.payload) else {
+                    continue;
+                };
+                let Some(asset) = self.assets.get(&asset_id).cloned() else {
+                    continue;
+                };
+                let Ok(auth_context) = self.resolve_auth_context(&tx_ref.tx, parsed.header.auth_input_index, auth_inputs) else {
+                    continue;
+                };
+                let mut repaired_asset = asset.clone();
+                match parsed.op {
+                    TokenOp::CreateAsset(op) => {
+                        repaired_asset.creator_owner_id = auth_context.owner_id;
+                        repaired_asset.asset_class = TokenAssetClass::Standard;
+                        repaired_asset.token_version = op.token_version;
+                        repaired_asset.mint_authority_owner_id = op.mint_authority_owner_id;
+                        repaired_asset.decimals = op.decimals;
+                        repaired_asset.supply_mode = op.supply_mode;
+                        repaired_asset.max_supply = op.max_supply;
+                        repaired_asset.name = op.name;
+                        repaired_asset.symbol = op.symbol;
+                        repaired_asset.metadata = op.metadata;
+                        repaired_asset.platform_tag = op.platform_tag;
+                    }
+                    TokenOp::CreateAssetWithMint(op) => {
+                        repaired_asset.creator_owner_id = auth_context.owner_id;
+                        repaired_asset.asset_class = TokenAssetClass::Standard;
+                        repaired_asset.token_version = op.token_version;
+                        repaired_asset.mint_authority_owner_id = op.mint_authority_owner_id;
+                        repaired_asset.decimals = op.decimals;
+                        repaired_asset.supply_mode = op.supply_mode;
+                        repaired_asset.max_supply = op.max_supply;
+                        repaired_asset.name = op.name;
+                        repaired_asset.symbol = op.symbol;
+                        repaired_asset.metadata = op.metadata;
+                        repaired_asset.platform_tag = op.platform_tag;
+                    }
+                    TokenOp::CreateLiquidityAsset(op) => {
+                        repaired_asset.creator_owner_id = auth_context.owner_id;
+                        repaired_asset.asset_class = TokenAssetClass::Liquidity;
+                        repaired_asset.token_version = op.token_version;
+                        repaired_asset.mint_authority_owner_id = [0u8; 32];
+                        repaired_asset.decimals = op.decimals;
+                        repaired_asset.supply_mode = SupplyMode::Capped;
+                        repaired_asset.max_supply = op.max_supply;
+                        repaired_asset.name = op.name;
+                        repaired_asset.symbol = op.symbol;
+                        repaired_asset.metadata = op.metadata;
+                        repaired_asset.platform_tag = op.platform_tag;
+                    }
+                    _ => continue,
+                }
+                repaired_asset.created_block_hash = Some(tx_ref.source_block_hash);
+                repaired_asset.created_daa_score = Some(tx_ref.source_block_daa_score);
+                repaired_asset.created_at = Some(tx_ref.source_block_time);
+                if repaired_asset != asset {
+                    self.assets.insert(asset_id, repaired_asset.clone());
+                    repaired.push(repaired_asset);
+                }
+                candidates.remove(&asset_id);
+            }
+        }
+        Ok(repaired)
     }
 
     pub fn detach_state_store(&mut self) {
@@ -1260,6 +1372,81 @@ impl AtomicTokenState {
         Ok(refreshed)
     }
 
+    pub fn recompute_state_hashes_for_retained_segment_from_current_store(
+        &mut self,
+        retained_segment: &[BlockHash],
+    ) -> AtomicTokenResult<HashMap<BlockHash, [u8; 32]>> {
+        if retained_segment.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if self.state_store.is_none() {
+            return Err(AtomicTokenError::Processing(
+                "failed refreshing retained state hash cache: no persistent V2 state store is attached".to_string(),
+            ));
+        }
+
+        let segment_start = self.applied_chain_order.iter().position(|hash| *hash == retained_segment[0]).ok_or_else(|| {
+            AtomicTokenError::Processing(
+                "failed refreshing retained state hash cache: requested segment start is not in applied chain".to_string(),
+            )
+        })?;
+        let segment_end =
+            self.applied_chain_order.iter().position(|hash| *hash == *retained_segment.last().unwrap()).ok_or_else(|| {
+                AtomicTokenError::Processing(
+                    "failed refreshing retained state hash cache: requested segment end is not in applied chain".to_string(),
+                )
+            })?;
+        if segment_end < segment_start {
+            return Err(AtomicTokenError::Processing(
+                "failed refreshing retained state hash cache: requested segment end appears before start".to_string(),
+            ));
+        }
+        if &self.applied_chain_order[segment_start..=segment_end] != retained_segment {
+            return Err(AtomicTokenError::Processing(
+                "failed refreshing retained state hash cache: requested blocks are not a contiguous retained chain segment"
+                    .to_string(),
+            ));
+        }
+
+        let post_segment_blocks = self.applied_chain_order[segment_end + 1..].to_vec();
+        for block_hash in post_segment_blocks.into_iter().rev() {
+            let journal = self.rollback_block_internal(block_hash, false).map_err(|_| {
+                AtomicTokenError::Processing(format!(
+                    "failed refreshing retained state hash cache: missing journal while rolling back post-segment block `{block_hash}`"
+                ))
+            })?;
+            self.commit_rollback_to_store(block_hash, &journal, &[])?;
+        }
+
+        let mut refreshed = HashMap::with_capacity(retained_segment.len());
+        let should_log_progress = retained_segment.len() >= 1024;
+        let mut last_log = Instant::now();
+        for (idx, block_hash) in retained_segment.iter().rev().copied().enumerate() {
+            let root = self.state_store.as_ref().and_then(|store| store.current_root().ok().flatten()).ok_or_else(|| {
+                AtomicTokenError::Processing(
+                    "failed refreshing retained state hash cache: persistent V2 state store has no current root".to_string(),
+                )
+            })?;
+            refreshed.insert(block_hash, root);
+
+            let journal = self.rollback_block_internal(block_hash, false).map_err(|_| {
+                AtomicTokenError::Processing(format!(
+                    "failed refreshing retained state hash cache: missing journal while rolling back block `{block_hash}`"
+                ))
+            })?;
+            self.commit_rollback_to_store(block_hash, &journal, &[])?;
+            if should_log_progress && last_log.elapsed() >= LONG_ATOMIC_REPLAY_LOG_INTERVAL {
+                info!(
+                    "[{IDENT}] refreshed retained Atomic state hash cache from V2 store progress: {}/{} block(s)",
+                    idx.saturating_add(1),
+                    retained_segment.len()
+                );
+                last_log = Instant::now();
+            }
+        }
+        Ok(refreshed)
+    }
+
     pub fn refresh_retained_state_hashes_from_current_state(&mut self) -> AtomicTokenResult<usize> {
         let first_replayable = self.first_replayable_block_hash().ok_or_else(|| {
             AtomicTokenError::Processing(
@@ -1388,18 +1575,21 @@ impl AtomicTokenState {
         acceptance_data: &AcceptanceData,
         session: &ConsensusProxy,
     ) -> AtomicTokenResult<NormalizedAcceptance> {
-        let mut block_cache: HashMap<BlockHash, Arc<Vec<Transaction>>> = HashMap::new();
+        let mut block_cache: HashMap<BlockHash, (Arc<Vec<Transaction>>, u64, u64)> = HashMap::new();
         let mut refs: Vec<CanonicalTxRef> = Vec::new();
 
         for (acceptance_entry_position, mergeset_entry) in acceptance_data.iter().enumerate() {
-            let txs = if let Some(txs) = block_cache.get(&mergeset_entry.block_hash) {
-                txs.clone()
-            } else {
-                let block = session.async_get_block(mergeset_entry.block_hash).await?;
-                let txs = block.transactions;
-                block_cache.insert(mergeset_entry.block_hash, txs.clone());
-                txs
-            };
+            let (txs, source_block_daa_score, source_block_time) =
+                if let Some((txs, daa_score, timestamp)) = block_cache.get(&mergeset_entry.block_hash) {
+                    (txs.clone(), *daa_score, *timestamp)
+                } else {
+                    let block = session.async_get_block(mergeset_entry.block_hash).await?;
+                    let daa_score = block.header.daa_score;
+                    let timestamp = block.header.timestamp;
+                    let txs = block.transactions;
+                    block_cache.insert(mergeset_entry.block_hash, (txs.clone(), daa_score, timestamp));
+                    (txs, daa_score, timestamp)
+                };
 
             for accepted_tx in mergeset_entry.accepted_transactions.iter() {
                 let tx_index = accepted_tx.index_within_block as usize;
@@ -1420,6 +1610,8 @@ impl AtomicTokenState {
                 refs.push(CanonicalTxRef {
                     txid: accepted_tx.transaction_id,
                     source_block_hash: mergeset_entry.block_hash,
+                    source_block_daa_score,
+                    source_block_time,
                     tx_index: accepted_tx.index_within_block,
                     acceptance_entry_position: acceptance_entry_position as u32,
                     tx,
@@ -1433,7 +1625,7 @@ impl AtomicTokenState {
         &mut self,
         accepting_block_hash: BlockHash,
         accepting_block_daa_score: u64,
-        accepting_block_time: u64,
+        _accepting_block_time: u64,
         tx_ref: &CanonicalTxRef,
         ordinal: u32,
         auth_inputs: &HashMap<TransactionOutpoint, UtxoEntry>,
@@ -1462,9 +1654,9 @@ impl AtomicTokenState {
                     tx,
                     &parsed,
                     auth_inputs,
-                    accepting_block_hash,
-                    accepting_block_daa_score,
-                    accepting_block_time,
+                    tx_ref.source_block_hash,
+                    tx_ref.source_block_daa_score,
+                    tx_ref.source_block_time,
                     journal,
                 );
                 match result {
@@ -1534,9 +1726,9 @@ impl AtomicTokenState {
         tx: &Transaction,
         parsed: &ParsedTokenPayload,
         auth_inputs: &HashMap<TransactionOutpoint, UtxoEntry>,
-        accepting_block_hash: BlockHash,
-        accepting_block_daa_score: u64,
-        accepting_block_time: u64,
+        source_block_hash: BlockHash,
+        source_block_daa_score: u64,
+        source_block_time: u64,
         journal: &mut JournalBuilder,
     ) -> Result<TokenEventDetails, NoopReason> {
         let spent_vault_inputs = self.collect_spent_liquidity_vault_inputs(tx, auth_inputs)?;
@@ -1574,18 +1766,18 @@ impl AtomicTokenState {
                 tx.id().as_bytes(),
                 owner_id,
                 op,
-                accepting_block_hash,
-                accepting_block_daa_score,
-                accepting_block_time,
+                source_block_hash,
+                source_block_daa_score,
+                source_block_time,
                 journal,
             )?,
             TokenOp::CreateAssetWithMint(op) => self.execute_create_asset_with_mint(
                 tx.id().as_bytes(),
                 owner_id,
                 op,
-                accepting_block_hash,
-                accepting_block_daa_score,
-                accepting_block_time,
+                source_block_hash,
+                source_block_daa_score,
+                source_block_time,
                 journal,
             )?,
             TokenOp::CreateLiquidityAsset(op) => {
@@ -1593,9 +1785,9 @@ impl AtomicTokenState {
                     tx,
                     &auth_context,
                     op,
-                    accepting_block_hash,
-                    accepting_block_daa_score,
-                    accepting_block_time,
+                    source_block_hash,
+                    source_block_daa_score,
+                    source_block_time,
                     journal,
                 )?;
                 details.to_owner_id = (token_out > 0).then_some(owner_id);
@@ -1696,9 +1888,9 @@ impl AtomicTokenState {
         txid_bytes: [u8; 32],
         creator_owner_id: [u8; 32],
         op: &CreateAssetOp,
-        accepting_block_hash: BlockHash,
-        accepting_block_daa_score: u64,
-        accepting_block_time: u64,
+        source_block_hash: BlockHash,
+        source_block_daa_score: u64,
+        source_block_time: u64,
         journal: &mut JournalBuilder,
     ) -> Result<(), NoopReason> {
         if self.asset_value(&txid_bytes).is_some() {
@@ -1736,9 +1928,9 @@ impl AtomicTokenState {
                 symbol: op.symbol.clone(),
                 metadata: op.metadata.clone(),
                 platform_tag: op.platform_tag.clone(),
-                created_block_hash: Some(accepting_block_hash),
-                created_daa_score: Some(accepting_block_daa_score),
-                created_at: Some(accepting_block_time),
+                created_block_hash: Some(source_block_hash),
+                created_daa_score: Some(source_block_daa_score),
+                created_at: Some(source_block_time),
                 liquidity: None,
             },
         );
@@ -1750,9 +1942,9 @@ impl AtomicTokenState {
         txid_bytes: [u8; 32],
         creator_owner_id: [u8; 32],
         op: &CreateAssetWithMintOp,
-        accepting_block_hash: BlockHash,
-        accepting_block_daa_score: u64,
-        accepting_block_time: u64,
+        source_block_hash: BlockHash,
+        source_block_daa_score: u64,
+        source_block_time: u64,
         journal: &mut JournalBuilder,
     ) -> Result<(), NoopReason> {
         let create = CreateAssetOp {
@@ -1770,9 +1962,9 @@ impl AtomicTokenState {
             txid_bytes,
             creator_owner_id,
             &create,
-            accepting_block_hash,
-            accepting_block_daa_score,
-            accepting_block_time,
+            source_block_hash,
+            source_block_daa_score,
+            source_block_time,
             journal,
         )?;
 
@@ -1903,9 +2095,9 @@ impl AtomicTokenState {
         tx: &Transaction,
         creator_auth: &AuthContext,
         op: &CreateLiquidityAssetOp,
-        accepting_block_hash: BlockHash,
-        accepting_block_daa_score: u64,
-        accepting_block_time: u64,
+        source_block_hash: BlockHash,
+        source_block_daa_score: u64,
+        source_block_time: u64,
         journal: &mut JournalBuilder,
     ) -> Result<u128, NoopReason> {
         let creator_owner_id = creator_auth.owner_id;
@@ -2013,9 +2205,9 @@ impl AtomicTokenState {
             symbol: op.symbol.clone(),
             metadata: op.metadata.clone(),
             platform_tag: op.platform_tag.clone(),
-            created_block_hash: Some(accepting_block_hash),
-            created_daa_score: Some(accepting_block_daa_score),
-            created_at: Some(accepting_block_time),
+            created_block_hash: Some(source_block_hash),
+            created_daa_score: Some(source_block_daa_score),
+            created_at: Some(source_block_time),
             liquidity: Some(LiquidityPoolState {
                 pool_nonce: 1,
                 curve_version: op.curve_version,
@@ -4051,8 +4243,19 @@ mod tests {
     }
 
     fn tx_ref(tx: Transaction, source_block_hash: BlockHash, tx_index: u32, acceptance_entry_position: u32) -> CanonicalTxRef {
+        tx_ref_with_source_metadata(tx, source_block_hash, 0, 0, tx_index, acceptance_entry_position)
+    }
+
+    fn tx_ref_with_source_metadata(
+        tx: Transaction,
+        source_block_hash: BlockHash,
+        source_block_daa_score: u64,
+        source_block_time: u64,
+        tx_index: u32,
+        acceptance_entry_position: u32,
+    ) -> CanonicalTxRef {
         let txid = tx.id();
-        CanonicalTxRef { txid, source_block_hash, tx_index, acceptance_entry_position, tx }
+        CanonicalTxRef { txid, source_block_hash, source_block_daa_score, source_block_time, tx_index, acceptance_entry_position, tx }
     }
 
     fn apply_block(
@@ -4234,7 +4437,7 @@ mod tests {
 
         let hash = state.compute_state_hash();
         let hash_hex = to_hex(&hash);
-        assert_eq!(hash_hex, "456a93ce07e8c8e014768659f18ee3cd4e82ea0e1d2861511000aa724f3fd25b");
+        assert_eq!(hash_hex, "3ad3d91ea19241c69d6a5ab618798ba3086f20b66b38cc329fd913ce42efd8e9");
     }
 
     #[test]
@@ -4248,7 +4451,7 @@ mod tests {
     }
 
     #[test]
-    fn state_hash_commits_liquidity_holder_addresses() {
+    fn state_hash_ignores_liquidity_holder_addresses() {
         let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
         let asset_id = [0x10; 32];
         let creator_owner = [0x20; 32];
@@ -4304,7 +4507,54 @@ mod tests {
             .insert(holder_owner, LiquidityHolderAddressState { address_version: 0, address_payload: vec![0x55; 32] });
 
         let after = state.compute_state_hash();
-        assert_ne!(before, after);
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn state_hash_commits_asset_definition_metadata() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let asset_id = [0x11; 32];
+
+        state.assets.insert(
+            asset_id,
+            TokenAsset {
+                asset_id,
+                creator_owner_id: [0x20; 32],
+                asset_class: TokenAssetClass::Standard,
+                token_version: CURRENT_TOKEN_VERSION,
+                mint_authority_owner_id: [0x30; 32],
+                decimals: 8,
+                supply_mode: SupplyMode::Capped,
+                max_supply: 1_000,
+                total_supply: 100,
+                name: b"Token".to_vec(),
+                symbol: b"TKN".to_vec(),
+                metadata: vec![0xAA],
+                platform_tag: b"platform".to_vec(),
+                created_block_hash: Some(BlockHash::from_u64_word(1)),
+                created_daa_score: Some(10),
+                created_at: Some(20),
+                liquidity: None,
+            },
+        );
+
+        let before = state.compute_state_hash();
+        let asset = state.assets.get_mut(&asset_id).expect("asset should exist");
+        asset.creator_owner_id = [0x21; 32];
+        asset.decimals = 2;
+        asset.name = b"Renamed".to_vec();
+        asset.symbol = b"REN".to_vec();
+        asset.metadata = vec![0xBB, 0xCC];
+        asset.created_block_hash = Some(BlockHash::from_u64_word(2));
+        asset.created_daa_score = Some(11);
+        asset.created_at = Some(21);
+
+        let after_metadata_change = state.compute_state_hash();
+        assert_ne!(before, after_metadata_change);
+
+        state.assets.get_mut(&asset_id).expect("asset should exist").total_supply += 1;
+        let after_consensus_change = state.compute_state_hash();
+        assert_ne!(before, after_consensus_change);
     }
 
     #[test]
@@ -5126,7 +5376,7 @@ mod tests {
             BlockHash::from_u64_word(6001),
             123_456,
             1_715_123_000_000,
-            &tx_ref(create_tx.clone(), BlockHash::from_u64_word(7001), 0, 0),
+            &tx_ref_with_source_metadata(create_tx.clone(), BlockHash::from_u64_word(7001), 123_450, 1_715_122_999_000, 0, 0),
             0,
             &auth_inputs,
             &mut journal,
@@ -5151,9 +5401,9 @@ mod tests {
         );
 
         let asset = state.get_asset(asset_id).expect("asset should exist");
-        assert_eq!(asset.created_block_hash, Some(BlockHash::from_u64_word(6001)));
-        assert_eq!(asset.created_daa_score, Some(123_456));
-        assert_eq!(asset.created_at, Some(1_715_123_000_000));
+        assert_eq!(asset.created_block_hash, Some(BlockHash::from_u64_word(7001)));
+        assert_eq!(asset.created_daa_score, Some(123_450));
+        assert_eq!(asset.created_at, Some(1_715_122_999_000));
 
         let transfer_event = state.events.iter().find(|event| event.txid == transfer_tx.id()).expect("transfer event should exist");
         assert_eq!(transfer_event.details.op_type, Some(TokenOpCode::Transfer));
@@ -5308,6 +5558,8 @@ mod tests {
         let conflict = CanonicalTxRef {
             txid: base.txid,
             source_block_hash: BlockHash::from_u64_word(5),
+            source_block_daa_score: 0,
+            source_block_time: 0,
             tx_index: 9,
             acceptance_entry_position: 0,
             tx,
