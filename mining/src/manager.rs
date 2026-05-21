@@ -476,6 +476,9 @@ impl MiningManager {
                         rbf_policy,
                     ) {
                         Ok(TransactionPostValidation { removed: _, accepted: Some(accepted_transaction) }) => {
+                            if let Err(err) = mempool.remove_promoted_orphan(&orphan_id) {
+                                warn!("Failed to remove promoted orphan {} after successful validation: {}", orphan_id, err);
+                            }
                             accepted_transactions.push(accepted_transaction.clone());
                             self.counters.increase_tx_counts(1, priority);
                             mempool.get_unorphaned_transactions_after_accepted_transaction(&accepted_transaction)
@@ -685,7 +688,8 @@ impl MiningManager {
         block_daa_score: u64,
         block_transactions: &[Transaction],
     ) -> MiningManagerResult<Vec<Arc<Transaction>>> {
-        // TODO: should use tx acceptance data to verify that new block txs are actually accepted into virtual state.
+        // Only call this with transactions known to be accepted into virtual state. FlowContext feeds this from
+        // consensus acceptance data; unit tests may still use whole block payloads.
         // TODO: avoid returning a result from this function (and the underlying function). Any possible error is a
         // problem of the internal implementation and unrelated to the caller
 
@@ -695,6 +699,22 @@ impl MiningManager {
         // alternate no & write lock on mempool
         let accepted_transactions = self.validate_and_insert_unorphaned_transactions(consensus, unorphaned_transactions);
 
+        Ok(accepted_transactions)
+    }
+
+    pub fn handle_accepted_transactions(
+        &self,
+        consensus: &dyn ConsensusApi,
+        accepting_block_daa_score: u64,
+        accepted_transactions: &[Transaction],
+    ) -> MiningManagerResult<Vec<Arc<Transaction>>> {
+        if accepted_transactions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let unorphaned_transactions =
+            self.mempool.write().handle_accepted_transactions(accepting_block_daa_score, accepted_transactions)?;
+        let accepted_transactions = self.validate_and_insert_unorphaned_transactions(consensus, unorphaned_transactions);
         Ok(accepted_transactions)
     }
 
@@ -1045,6 +1065,18 @@ impl MiningManagerProxy {
         consensus
             .clone()
             .spawn_blocking(move |c| self.inner.handle_new_block_transactions(c, block_daa_score, &block_transactions))
+            .await
+    }
+
+    pub async fn handle_accepted_transactions(
+        self,
+        consensus: &ConsensusProxy,
+        accepting_block_daa_score: u64,
+        accepted_transactions: Arc<Vec<Transaction>>,
+    ) -> MiningManagerResult<Vec<Arc<Transaction>>> {
+        consensus
+            .clone()
+            .spawn_blocking(move |c| self.inner.handle_accepted_transactions(c, accepting_block_daa_score, &accepted_transactions))
             .await
     }
 

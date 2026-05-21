@@ -219,6 +219,7 @@ impl BlockBodyProcessor {
         self.counters.body_counts.fetch_add(1, Ordering::Relaxed);
         self.counters.txs_counts.fetch_add(block.transactions.len() as u64, Ordering::Relaxed);
         self.counters.mass_counts.fetch_add(mass, Ordering::Relaxed);
+        self.counters.highest_body_daa_score.fetch_max(block.header.daa_score, Ordering::Relaxed);
         Ok(BlockStatus::StatusUTXOPendingVerification)
     }
 

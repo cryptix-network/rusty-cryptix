@@ -12,6 +12,8 @@ pub struct ProcessingCounters {
     pub chain_block_counts: AtomicU64,
     pub chain_disqualified_counts: AtomicU64,
     pub mass_counts: AtomicU64,
+    pub highest_body_daa_score: AtomicU64,
+    pub virtual_daa_score: AtomicU64,
 }
 
 impl ProcessingCounters {
@@ -27,6 +29,8 @@ impl ProcessingCounters {
             chain_block_counts: self.chain_block_counts.load(Ordering::Relaxed),
             chain_disqualified_counts: self.chain_disqualified_counts.load(Ordering::Relaxed),
             mass_counts: self.mass_counts.load(Ordering::Relaxed),
+            highest_body_daa_score: self.highest_body_daa_score.load(Ordering::Relaxed),
+            virtual_daa_score: self.virtual_daa_score.load(Ordering::Relaxed),
         }
     }
 }
@@ -43,6 +47,8 @@ pub struct ProcessingCountersSnapshot {
     pub chain_block_counts: u64,
     pub chain_disqualified_counts: u64,
     pub mass_counts: u64,
+    pub highest_body_daa_score: u64,
+    pub virtual_daa_score: u64,
 }
 
 impl core::ops::Sub for &ProcessingCountersSnapshot {
@@ -60,6 +66,8 @@ impl core::ops::Sub for &ProcessingCountersSnapshot {
             chain_block_counts: self.chain_block_counts.saturating_sub(rhs.chain_block_counts),
             chain_disqualified_counts: self.chain_disqualified_counts.saturating_sub(rhs.chain_disqualified_counts),
             mass_counts: self.mass_counts.saturating_sub(rhs.mass_counts),
+            highest_body_daa_score: self.highest_body_daa_score.saturating_sub(rhs.highest_body_daa_score),
+            virtual_daa_score: self.virtual_daa_score.saturating_sub(rhs.virtual_daa_score),
         }
     }
 }

@@ -75,6 +75,8 @@ const SNAPSHOT_IMPORT_CHUNK_KEYS: usize = 4096;
 const BOOTSTRAP_STORE_MAX_SNAPSHOTS_PER_NETWORK: usize = 16;
 const ATOMIC_TEMP_DIR_MAX_AGE: Duration = Duration::from_secs(3600);
 const ATOMIC_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const ATOMIC_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(300);
+const ATOMIC_HEALTH_STORE_COUNT_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const ATOMIC_LONG_OPERATION_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const DEGRADED_READ_WARN_INTERVAL: Duration = Duration::from_secs(10);
 const P2P_AUDIT_RENDEZVOUS_DAA_LAG: u64 = 60;
@@ -204,6 +206,10 @@ struct AtomicProgressLogState {
     last_log: Option<Instant>,
     last_runtime_state: Option<AtomicTokenRuntimeState>,
     last_logged_daa_score: Option<u64>,
+    last_health_log: Option<Instant>,
+    last_health_logged_daa_score: Option<u64>,
+    last_health_store_counts: Option<AtomicStorageSnapshotCounts>,
+    last_health_store_counts_log: Option<Instant>,
     last_degraded_read_log: Option<Instant>,
 }
 
@@ -365,8 +371,7 @@ impl AtomicTokenProcessor {
                 let state_store_bytes = self.state_store.approximate_size_bytes();
                 drop(state);
 
-                let health = self.health().await;
-                let catchup_estimate = self.catchup_estimate(&health).await;
+                let (health, catchup_estimate) = self.health_and_catchup_estimate().await;
                 self.maybe_log_progress(
                     added_count,
                     removed_count,
@@ -461,14 +466,13 @@ impl AtomicTokenProcessor {
         health
     }
 
-    async fn health(&self) -> AtomicTokenHealth {
+    async fn health_and_catchup_estimate(&self) -> (AtomicTokenHealth, Option<AtomicCatchupEstimate>) {
         let mut health = self.local_health().await;
+        let catchup_estimate = self.catchup_estimate(&health).await;
         if health.runtime_state == AtomicTokenRuntimeState::Healthy
             && !health.is_degraded
             && !health.bootstrap_in_progress
-            && self
-                .catchup_estimate(&health)
-                .await
+            && catchup_estimate
                 .map(|estimate| {
                     estimate.sink_daa_score.saturating_sub(estimate.last_applied_daa_score) > TOKEN_HEALTH_RECOVERING_LAG_DAA
                 })
@@ -476,7 +480,92 @@ impl AtomicTokenProcessor {
         {
             health.runtime_state = AtomicTokenRuntimeState::Recovering;
         }
-        health
+        (health, catchup_estimate)
+    }
+
+    async fn health(&self) -> AtomicTokenHealth {
+        self.health_and_catchup_estimate().await.0
+    }
+
+    async fn log_health_heartbeat(&self, reason: &str) {
+        let (health, catchup_estimate) = self.health_and_catchup_estimate().await;
+        let (retained_blocks, verified_state, footprint) = {
+            let state = self.state.read().await;
+            (state.applied_chain_order.len(), state.has_verified_state(), state.footprint())
+        };
+        let now = Instant::now();
+        let (counts, counts_source) = self.health_counts_for_log(now, &footprint);
+        let state_store_bytes = self.state_store.approximate_size_bytes();
+        let (previous_log, previous_daa_score) = {
+            let mut progress_log = self.progress_log.lock().expect("Atomic progress log mutex poisoned");
+            let previous_log = progress_log.last_health_log;
+            let previous_daa_score = progress_log.last_health_logged_daa_score;
+            progress_log.last_health_log = Some(now);
+            progress_log.last_health_logged_daa_score = catchup_estimate.map(|estimate| estimate.last_applied_daa_score);
+            (previous_log, previous_daa_score)
+        };
+        let last_applied = health.last_applied_block.map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string());
+        let catchup_suffix = format_catchup_estimate_for_log(catchup_estimate, previous_log, previous_daa_score, now);
+        info!(
+            "[{IDENT}] Cryptix Atomic health: runtime={}, live_correct={}, degraded={}, bootstrap_in_progress={}, verified_state={}, reason={}, last_applied={}, event_seq={}, state_hash={}, retained_blocks={}, state_counts={}, assets={}, balances={}, nonces={}, anchors={}, vaults_overlay={}, events={}, journals={}, checkpoints={}, state_store={}{}",
+            health.runtime_state.as_str(),
+            health.live_correct,
+            health.is_degraded,
+            health.bootstrap_in_progress,
+            verified_state,
+            reason,
+            last_applied,
+            health.last_sequence,
+            short_hex_for_log(&health.current_state_hash),
+            retained_blocks,
+            counts_source,
+            counts.assets,
+            counts.balances,
+            counts.nonces,
+            counts.anchor_counts,
+            footprint.liquidity_vault_outpoints,
+            counts.events,
+            counts.chain_order,
+            counts.state_hashes,
+            state_store_bytes.map(format_bytes_for_log).unwrap_or_else(|| "n/a".to_string()),
+            catchup_suffix,
+        );
+    }
+
+    fn health_counts_for_log(
+        &self,
+        now: Instant,
+        footprint: &AtomicTokenStateFootprint,
+    ) -> (AtomicStorageSnapshotCounts, &'static str) {
+        let (cached_counts, refresh_due) = {
+            let progress_log = self.progress_log.lock().expect("Atomic progress log mutex poisoned");
+            let refresh_due = progress_log
+                .last_health_store_counts_log
+                .map(|last| now.duration_since(last) >= ATOMIC_HEALTH_STORE_COUNT_REFRESH_INTERVAL)
+                .unwrap_or(true);
+            (progress_log.last_health_store_counts, refresh_due)
+        };
+
+        if refresh_due {
+            match self.state_store.snapshot_counts() {
+                Ok(counts) => {
+                    let mut progress_log = self.progress_log.lock().expect("Atomic progress log mutex poisoned");
+                    progress_log.last_health_store_counts = Some(counts);
+                    progress_log.last_health_store_counts_log = Some(now);
+                    return (counts, "v2_store");
+                }
+                Err(err) => {
+                    warn!("[{IDENT}] failed reading Atomic V2 store counts for health log: {err}");
+                    if let Some(counts) = cached_counts {
+                        return (counts, "v2_store_cached_after_error");
+                    }
+                }
+            }
+        } else if let Some(counts) = cached_counts {
+            return (counts, "v2_store_cached");
+        }
+
+        (snapshot_counts_from_overlay_footprint(footprint), "overlay_fallback")
     }
 
     async fn consensus_sink(&self) -> BlockHash {
@@ -2617,10 +2706,18 @@ impl AsyncService for AtomicTokenService {
                 self.processor.set_bootstrap_in_progress(false);
             }
 
+            let mut atomic_health_log_interval = tokio::time::interval(ATOMIC_HEALTH_LOG_INTERVAL);
+            atomic_health_log_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            atomic_health_log_interval.tick().await;
+            self.processor.log_health_heartbeat("startup").await;
+
             loop {
                 tokio::select! {
                     _ = shutdown_signal.clone() => {
                         break;
+                    }
+                    _ = atomic_health_log_interval.tick() => {
+                        self.processor.log_health_heartbeat("periodic").await;
                     }
                     notification = self.recv_channel.recv() => {
                         match notification {
@@ -3603,6 +3700,20 @@ fn short_hex_for_log(data: &[u8]) -> String {
         return hex_encode(data);
     }
     format!("{}...{}", hex_encode(&data[..4]), hex_encode(&data[data.len() - 4..]))
+}
+
+fn snapshot_counts_from_overlay_footprint(footprint: &AtomicTokenStateFootprint) -> AtomicStorageSnapshotCounts {
+    AtomicStorageSnapshotCounts {
+        assets: footprint.assets as u64,
+        balances: footprint.balances as u64,
+        nonces: footprint.nonces as u64,
+        anchor_counts: footprint.anchor_counts as u64,
+        processed_ops: footprint.processed_ops as u64,
+        state_hashes: footprint.state_hash_checkpoints as u64,
+        event_sequences: footprint.event_sequence_checkpoints as u64,
+        chain_order: footprint.retained_blocks as u64,
+        events: footprint.events as u64,
+    }
 }
 
 fn unique_atomic_temp_dir(atomic_data_dir: &Path, label: &str) -> AtomicTokenResult<PathBuf> {

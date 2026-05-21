@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
 };
 
+#[derive(Clone)]
 pub(crate) struct MempoolTransaction {
     pub(crate) mtx: MutableTransaction,
     pub(crate) priority: Priority,

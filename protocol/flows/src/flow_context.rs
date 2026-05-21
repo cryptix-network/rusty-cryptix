@@ -21,6 +21,7 @@ use cryptix_addressmanager::AddressManager;
 use cryptix_connectionmanager::ConnectionManager;
 use cryptix_consensus_core::api::{BlockValidationFuture, BlockValidationFutures};
 use cryptix_consensus_core::block::Block;
+use cryptix_consensus_core::blockstatus::BlockStatus;
 use cryptix_consensus_core::config::{params::Params, Config};
 use cryptix_consensus_core::errors::block::RuleError;
 use cryptix_consensus_core::tx::{Transaction, TransactionId};
@@ -38,7 +39,7 @@ use cryptix_core::{
 use cryptix_core::{time::unix_now, warn};
 use cryptix_hashes::Hash;
 use cryptix_mining::mempool::tx::{Orphan, Priority};
-use cryptix_mining::{manager::MiningManagerProxy, mempool::tx::RbfPolicy};
+use cryptix_mining::{manager::MiningManagerProxy, mempool::tx::RbfPolicy, model::tx_query::TransactionQuery};
 use cryptix_notify::notifier::Notify;
 use cryptix_p2p_lib::{
     common::ProtocolError,
@@ -55,7 +56,7 @@ use cryptix_utils::iter::IterExtensions;
 use cryptix_utils::networking::PeerId;
 use futures::future::join_all;
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -71,13 +72,14 @@ use std::{
 };
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-    RwLock as AsyncRwLock,
+    Mutex as AsyncMutex, RwLock as AsyncRwLock,
 };
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use uuid::Uuid;
 
 /// The P2P protocol version. Currently the only one supported.
 const PROTOCOL_VERSION: u32 = 18;
+const MAX_TRANSACTION_RELAY_ANCESTORS: usize = 64;
 const PRE_PERMANENT_TOKEN_DEFINITION_STATE_PROTOCOL_VERSION: u32 = 17;
 const PRE_PRUNING_STABLE_TOKEN_ROOT_PROTOCOL_VERSION: u32 = 16;
 const PRE_TOKEN_ROOT_REBUILD_PROTOCOL_VERSION: u32 = 15;
@@ -277,12 +279,18 @@ impl BlockEventLogger {
 
                 match (summary.submit_count, summary.relay_count) {
                     (0, 0) => {}
-                    (1, 0) => info!("Accepted block {} via submit block", summary.submit()),
-                    (n, 0) => info!("Accepted {} blocks ...{} via submit block", n, summary.submit()),
-                    (0, 1) => info!("Accepted block {} via relay", summary.relay()),
-                    (0, m) => info!("Accepted {} blocks ...{} via relay", m, summary.relay()),
+                    (1, 0) => info!("Inserted block {} via submit block (virtual validity pending)", summary.submit()),
+                    (n, 0) => info!("Inserted {} blocks ...{} via submit block (virtual validity pending)", n, summary.submit()),
+                    (0, 1) => info!("Inserted block {} via relay (virtual validity pending)", summary.relay()),
+                    (0, m) => info!("Inserted {} blocks ...{} via relay (virtual validity pending)", m, summary.relay()),
                     (n, m) => {
-                        info!("Accepted {} blocks ...{}, {} via relay and {} via submit block", n + m, summary.submit(), m, n)
+                        info!(
+                            "Inserted {} blocks ...{} ({} via relay, {} via submit block; virtual validity pending)",
+                            n + m,
+                            summary.submit(),
+                            m,
+                            n
+                        )
                     }
                 }
 
@@ -311,6 +319,7 @@ pub struct FlowContextInner {
     shared_block_requests: Arc<Mutex<HashMap<Hash, RequestScopeMetadata>>>,
     transactions_spread: AsyncRwLock<TransactionsSpread>,
     shared_transaction_requests: Arc<Mutex<HashMap<TransactionId, RequestScopeMetadata>>>,
+    mempool_virtual_sink: AsyncMutex<Option<Hash>>,
     is_ibd_running: Arc<AtomicBool>,
     ibd_metadata: Arc<RwLock<Option<IbdMetadata>>>,
     pub address_manager: Arc<Mutex<AddressManager>>,
@@ -457,6 +466,7 @@ impl FlowContext {
                     Duration::from_millis(config.tx_relay_broadcast_interval_ms),
                 )),
                 shared_transaction_requests: Arc::new(Mutex::new(HashMap::new())),
+                mempool_virtual_sink: AsyncMutex::new(None),
                 is_ibd_running: Default::default(),
                 ibd_metadata: Default::default(),
                 hub,
@@ -977,12 +987,21 @@ impl FlowContext {
             warn!("Validation failed for block {}: {}", hash, err);
             return Err(err)?;
         }
+        self.on_new_block(consensus, Default::default(), block, virtual_state_task).await;
+
+        if consensus.async_get_block_status(hash).await == Some(BlockStatus::StatusDisqualifiedFromChain) {
+            let reason = format!(
+                "RPC submitted block {} was disqualified by virtual UTXO/Atomic validation; refusing to relay it to peers",
+                hash
+            );
+            warn!("{}", reason);
+            return Err(ProtocolError::OtherOwned(reason));
+        }
+
         // Advertise the local claim before the block inv so post-HF peers can verify a valid node-ID sponsor first.
         self.broadcast_local_block_producer_claim(hash).await;
         self.broadcast_to_unrestricted_peers(make_message!(Payload::InvRelayBlock, InvRelayBlockMessage { hash: Some(hash.into()) }))
             .await;
-
-        self.on_new_block(consensus, Default::default(), block, virtual_state_task).await;
         self.log_block_event(BlockLogEvent::Submit(hash));
 
         Ok(())
@@ -993,8 +1012,8 @@ impl FlowContext {
             logger.log(event)
         } else {
             match event {
-                BlockLogEvent::Relay(hash) => info!("Accepted block {} via relay", hash),
-                BlockLogEvent::Submit(hash) => info!("Accepted block {} via submit block", hash),
+                BlockLogEvent::Relay(hash) => info!("Inserted block {} via relay (virtual validity pending)", hash),
+                BlockLogEvent::Submit(hash) => info!("Inserted block {} via submit block (virtual validity pending)", hash),
                 BlockLogEvent::Orphaned(orphan, roots_count) => {
                     info!("Received a block with {} missing ancestors, adding to orphan pool: {}", roots_count, orphan)
                 }
@@ -1026,30 +1045,14 @@ impl FlowContext {
 
         // Process blocks in topological order
         blocks.sort_by(|a, b| a.0.header.blue_work.partial_cmp(&b.0.header.blue_work).unwrap());
-        // Use a ProcessQueue so we get rid of duplicates
-        let mut transactions_to_broadcast = ProcessQueue::new();
-        for (block, virtual_state_task) in ancestor_batch.zip().chain(once((block, virtual_state_task))).chain(blocks.into_iter()) {
+        for (_, virtual_state_task) in ancestor_batch.zip().chain(once((block, virtual_state_task))).chain(blocks.into_iter()) {
             // We only care about waiting for virtual to process the block at this point, before proceeding with post-processing
             // actions such as updating the mempool. We know this will not err since `block_task` already completed w/o error
             let _ = virtual_state_task.await;
-            if let Ok(txs) = self
-                .mining_manager()
-                .clone()
-                .handle_new_block_transactions(consensus, block.header.daa_score, block.transactions.clone())
-                .await
-            {
-                transactions_to_broadcast.enqueue_chunk(txs.into_iter().map(|x| x.id()));
-            }
         }
+        let transactions_to_broadcast = self.process_mempool_virtual_acceptance(consensus).await;
 
-        // Transaction relay is disabled if the node is out of sync and thus not mining
-        if !consensus.async_is_nearly_synced().await {
-            self.refresh_strong_node_claims_window(consensus).await;
-            return;
-        }
-
-        // TODO: Throttle these transactions as well if needed
-        self.broadcast_transactions(transactions_to_broadcast, false).await;
+        let is_nearly_synced = consensus.async_is_nearly_synced().await;
 
         if self.should_run_mempool_scanning_task().await {
             // Spawn a task executing the removal of expired low priority transactions and, if time has come too,
@@ -1060,10 +1063,11 @@ impl FlowContext {
             let mining_manager = self.mining_manager().clone();
             let consensus_clone = consensus.clone();
             let context = self.clone();
+            let can_rebroadcast = is_nearly_synced;
             debug!("<> Starting mempool scanning task #{}...", self.mempool_scanning_job_count().await);
             tokio::spawn(async move {
                 mining_manager.clone().expire_low_priority_transactions(&consensus_clone).await;
-                if context.should_rebroadcast().await {
+                if can_rebroadcast && context.should_rebroadcast().await {
                     let (tx, mut rx) = unbounded_channel();
                     tokio::spawn(async move {
                         mining_manager.revalidate_high_priority_transactions(&consensus_clone, tx).await;
@@ -1081,7 +1085,125 @@ impl FlowContext {
                 debug!("<> Mempool scanning task is done");
             });
         }
+
+        // Transaction relay is disabled if the node is out of sync.
+        if !is_nearly_synced {
+            self.refresh_strong_node_claims_window(consensus).await;
+            return;
+        }
+
+        // TODO: Throttle these transactions as well if needed
+        self.broadcast_transactions(transactions_to_broadcast, false).await;
         self.refresh_strong_node_claims_window(consensus).await;
+    }
+
+    async fn process_mempool_virtual_acceptance(&self, consensus: &ConsensusProxy) -> ProcessQueue<TransactionId> {
+        let mut transactions_to_broadcast = ProcessQueue::new();
+        let mut last_sink_guard = self.mempool_virtual_sink.lock().await;
+        let sink = consensus.async_get_sink().await;
+        let Some(previous_sink) = *last_sink_guard else {
+            *last_sink_guard = Some(sink);
+            return transactions_to_broadcast;
+        };
+        if previous_sink == sink {
+            return transactions_to_broadcast;
+        }
+
+        let chain_path = match consensus.async_get_virtual_chain_from_block(previous_sink, None).await {
+            Ok(chain_path) => chain_path,
+            Err(err) => {
+                warn!(
+                    "Skipping mempool virtual acceptance update: failed reading virtual chain path from {} to {}: {}",
+                    previous_sink, sink, err
+                );
+                return transactions_to_broadcast;
+            }
+        };
+        if chain_path.added.is_empty() {
+            *last_sink_guard = Some(sink);
+            return transactions_to_broadcast;
+        }
+
+        let acceptance_data = match consensus.async_get_blocks_acceptance_data(chain_path.added.clone(), None).await {
+            Ok(acceptance_data) => acceptance_data,
+            Err(err) => {
+                warn!(
+                    "Skipping mempool virtual acceptance update: failed reading acceptance data for {} selected-chain block(s): {}",
+                    chain_path.added.len(),
+                    err
+                );
+                return transactions_to_broadcast;
+            }
+        };
+
+        let mut accepted_tx_count = 0usize;
+        for (accepting_block_hash, acceptance_data) in chain_path.added.iter().copied().zip(acceptance_data.iter()) {
+            let accepting_block_daa_score = match consensus.async_get_header(accepting_block_hash).await {
+                Ok(header) => header.daa_score,
+                Err(err) => {
+                    warn!(
+                        "Skipping mempool virtual acceptance update for accepting block {}: failed reading header: {}",
+                        accepting_block_hash, err
+                    );
+                    continue;
+                }
+            };
+
+            let mut accepted_transactions = Vec::new();
+            for block_acceptance in acceptance_data.iter() {
+                let accepted_block = match consensus.async_get_block(block_acceptance.block_hash).await {
+                    Ok(block) => block,
+                    Err(err) => {
+                        warn!(
+                            "Skipping accepted transaction entries for block {} while updating mempool from virtual acceptance data: {}",
+                            block_acceptance.block_hash, err
+                        );
+                        continue;
+                    }
+                };
+                for accepted_tx in block_acceptance.accepted_transactions.iter() {
+                    if accepted_tx.index_within_block == 0 {
+                        continue;
+                    }
+                    let Some(transaction) = accepted_block.transactions.get(accepted_tx.index_within_block as usize) else {
+                        warn!(
+                            "Skipping malformed acceptance entry for block {}: tx_index={} out of range (txs={})",
+                            block_acceptance.block_hash,
+                            accepted_tx.index_within_block,
+                            accepted_block.transactions.len()
+                        );
+                        continue;
+                    };
+                    accepted_transactions.push(transaction.clone());
+                }
+            }
+
+            if accepted_transactions.is_empty() {
+                continue;
+            }
+            accepted_tx_count += accepted_transactions.len();
+            match self
+                .mining_manager()
+                .clone()
+                .handle_accepted_transactions(consensus, accepting_block_daa_score, Arc::new(accepted_transactions))
+                .await
+            {
+                Ok(txs) => transactions_to_broadcast.enqueue_chunk(txs.into_iter().map(|x| x.id())),
+                Err(err) => {
+                    warn!("Failed updating mempool from virtual acceptance data at accepting block {}: {}", accepting_block_hash, err)
+                }
+            }
+        }
+
+        debug!(
+            "Mempool virtual acceptance update: previous_sink={}, sink={}, selected_added={}, accepted_non_coinbase_txs={}",
+            previous_sink,
+            sink,
+            chain_path.added.len(),
+            accepted_tx_count
+        );
+        *last_sink_guard = Some(sink);
+        transactions_to_broadcast
     }
 
     /// Notifies that the UTXO set was reset due to pruning point change via IBD.
@@ -1173,7 +1295,70 @@ impl FlowContext {
     /// The broadcast itself may happen only during a subsequent call to this function since it is done at most
     /// after a predefined interval or when the queue length is larger than the Inv message capacity.
     pub async fn broadcast_transactions<I: IntoIterator<Item = TransactionId>>(&self, transaction_ids: I, should_throttle: bool) {
+        let transaction_ids = self.expand_transaction_ids_with_mempool_ancestors(transaction_ids).await;
         self.transactions_spread.write().await.broadcast_transactions(transaction_ids, should_throttle).await
+    }
+
+    async fn expand_transaction_ids_with_mempool_ancestors<I: IntoIterator<Item = TransactionId>>(
+        &self,
+        transaction_ids: I,
+    ) -> Vec<TransactionId> {
+        let roots = transaction_ids.into_iter().collect::<Vec<_>>();
+        if roots.is_empty() {
+            return roots;
+        }
+
+        let mining_manager = self.mining_manager().clone();
+        let mut expanded = Vec::with_capacity(roots.len());
+        let mut seen = HashSet::with_capacity(roots.len());
+
+        for root in roots.iter().copied() {
+            let mut stack = vec![(root, false)];
+            let mut ancestor_walks = 0usize;
+
+            while let Some((transaction_id, emit)) = stack.pop() {
+                if emit {
+                    if seen.insert(transaction_id) {
+                        expanded.push(transaction_id);
+                    }
+                    continue;
+                }
+                if seen.contains(&transaction_id) {
+                    continue;
+                }
+
+                stack.push((transaction_id, true));
+                if ancestor_walks >= MAX_TRANSACTION_RELAY_ANCESTORS {
+                    continue;
+                }
+
+                let Some(transaction) =
+                    mining_manager.clone().get_transaction(transaction_id, TransactionQuery::TransactionsOnly).await
+                else {
+                    continue;
+                };
+
+                for input in transaction.tx.inputs.iter().rev() {
+                    let parent_id = input.previous_outpoint.transaction_id;
+                    if seen.contains(&parent_id) {
+                        continue;
+                    }
+                    if mining_manager.clone().has_transaction(parent_id, TransactionQuery::TransactionsOnly).await {
+                        ancestor_walks += 1;
+                        if ancestor_walks > MAX_TRANSACTION_RELAY_ANCESTORS {
+                            break;
+                        }
+                        stack.push((parent_id, false));
+                    }
+                }
+            }
+        }
+
+        if expanded.len() > roots.len() {
+            let added_ancestors = expanded.len() - roots.len();
+            debug!("Transaction propagation added {} mempool ancestor transaction ids before child announcements", added_ancestors);
+        }
+        expanded
     }
 
     pub async fn broadcast_fast_intent(&self, intent: &FastIntentP2pData) {

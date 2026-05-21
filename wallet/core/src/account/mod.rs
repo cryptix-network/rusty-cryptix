@@ -336,10 +336,7 @@ pub trait Account: AnySync + Send + Sync + 'static {
                 let futures = scans.iter().map(|scan| scan.scan_smart(self.utxo_context())).collect::<Vec<_>>();
                 summaries = join_all(futures).await.into_iter().collect::<Result<Vec<_>>>()?;
 
-                let known_address_set_all = known_addresses
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect::<HashSet<_>>();
+                let known_address_set_all = known_addresses.unwrap_or_default().into_iter().collect::<HashSet<_>>();
                 if !known_address_set_all.is_empty() {
                     let fallback_window = window_size.unwrap_or(crate::utxo::scan::DEFAULT_WINDOW_SIZE) as u32;
                     let receive_known_depth = match receive_extent {
@@ -351,7 +348,8 @@ pub trait Account: AnySync + Send + Sync + 'static {
                         ScanExtent::EmptyWindow => change_index.saturating_add(fallback_window),
                     };
                     let known_search_depth = receive_known_depth.max(change_known_depth);
-                    let receive_hydrated = receive_manager.hydrate_known_address_indexes(&known_address_set_all, known_search_depth)?;
+                    let receive_hydrated =
+                        receive_manager.hydrate_known_address_indexes(&known_address_set_all, known_search_depth)?;
                     let change_hydrated = change_manager.hydrate_known_address_indexes(&known_address_set_all, known_search_depth)?;
                     if receive_hydrated > 0 || change_hydrated > 0 {
                         log_info!(

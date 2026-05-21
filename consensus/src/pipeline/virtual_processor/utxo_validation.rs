@@ -748,6 +748,8 @@ impl VirtualStateProcessor {
         ctx.multiset_hash.add_transaction(&validated_coinbase, pov_daa_score);
         let validated_coinbase_id = validated_coinbase.id();
         ctx.accepted_tx_ids.push(validated_coinbase_id);
+        let mut accepted_txids = HashSet::from([validated_coinbase_id]);
+        let mut accepted_spent_outpoints = HashSet::<TransactionOutpoint>::new();
 
         for (i, (merged_block, txs)) in once((ctx.selected_parent(), selected_parent_transactions))
             .chain(
@@ -774,19 +776,55 @@ impl VirtualStateProcessor {
             let validation_flags = if is_selected_parent { TxValidationFlags::SkipScriptChecks } else { TxValidationFlags::Full };
             let mut validated_transactions =
                 self.validate_transactions_in_parallel(&txs, &composed_view, pov_daa_score, validation_flags);
-            validated_transactions = self.filter_validated_transactions_by_atomic_state(
-                validated_transactions,
-                pov_daa_score,
-                atomic_creation_context,
-                &mut ctx.atomic_state,
-            );
+            validated_transactions.sort_by_key(|(_, tx_index)| *tx_index);
 
             let mut block_fee = 0u64;
-            for (validated_tx, _) in validated_transactions.iter() {
-                ctx.mergeset_diff.add_transaction(validated_tx, pov_daa_score).unwrap();
-                ctx.multiset_hash.add_transaction(validated_tx, pov_daa_score);
-                ctx.accepted_tx_ids.push(validated_tx.id());
+            let mut accepted_transactions = Vec::with_capacity(validated_transactions.len());
+            let mut growth = AtomicBlockStateGrowth::default();
+            for (validated_tx, tx_idx) in validated_transactions.into_iter() {
+                let txid = validated_tx.id();
+                if accepted_txids.contains(&txid) {
+                    warn!(
+                        "Consensus skipped duplicate accepted transaction before Atomic replay: txid={}, source_block={}, tx_index={}, reason=duplicate_txid_already_accepted_in_virtual_mergeset",
+                        txid,
+                        merged_block,
+                        tx_idx
+                    );
+                    continue;
+                }
+                if let Some(conflicting_input) =
+                    validated_tx.inputs().iter().find(|input| accepted_spent_outpoints.contains(&input.previous_outpoint))
+                {
+                    warn!(
+                        "Consensus skipped UTXO-conflicting accepted transaction before Atomic replay: txid={}, source_block={}, tx_index={}, previous_outpoint={}, reason=input_already_spent_in_virtual_mergeset",
+                        txid,
+                        merged_block,
+                        tx_idx,
+                        conflicting_input.previous_outpoint
+                    );
+                    continue;
+                }
+                match self.validate_and_apply_atomic_state_transition_with_growth(
+                    &validated_tx,
+                    pov_daa_score,
+                    atomic_creation_context,
+                    &mut ctx.atomic_state,
+                    &mut growth,
+                ) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        info!("Rejecting transaction {} due to transaction rule error at block tx index {}: {}", txid, tx_idx, err);
+                        continue;
+                    }
+                }
+
+                ctx.mergeset_diff.add_transaction(&validated_tx, pov_daa_score).unwrap();
+                ctx.multiset_hash.add_transaction(&validated_tx, pov_daa_score);
+                ctx.accepted_tx_ids.push(txid);
+                accepted_txids.insert(txid);
+                accepted_spent_outpoints.extend(validated_tx.inputs().iter().map(|input| input.previous_outpoint));
                 block_fee += validated_tx.calculated_fee;
+                accepted_transactions.push(AcceptedTxEntry { transaction_id: txid, index_within_block: tx_idx });
             }
 
             if is_selected_parent {
@@ -794,21 +832,11 @@ impl VirtualStateProcessor {
                 ctx.mergeset_acceptance_data.push(MergesetBlockAcceptanceData {
                     block_hash: merged_block,
                     accepted_transactions: once(AcceptedTxEntry { transaction_id: validated_coinbase_id, index_within_block: 0 })
-                        .chain(
-                            validated_transactions
-                                .into_iter()
-                                .map(|(tx, tx_idx)| AcceptedTxEntry { transaction_id: tx.id(), index_within_block: tx_idx }),
-                        )
+                        .chain(accepted_transactions.into_iter())
                         .collect(),
                 });
             } else {
-                ctx.mergeset_acceptance_data.push(MergesetBlockAcceptanceData {
-                    block_hash: merged_block,
-                    accepted_transactions: validated_transactions
-                        .into_iter()
-                        .map(|(tx, tx_idx)| AcceptedTxEntry { transaction_id: tx.id(), index_within_block: tx_idx })
-                        .collect(),
-                });
+                ctx.mergeset_acceptance_data.push(MergesetBlockAcceptanceData { block_hash: merged_block, accepted_transactions });
             }
 
             let coinbase_data = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
@@ -955,9 +983,27 @@ impl VirtualStateProcessor {
         validated_transactions.sort_by_key(|(_, tx_index)| *tx_index);
 
         let mut growth = AtomicBlockStateGrowth::default();
+        let mut seen_txids = HashSet::new();
+        let mut spent_outpoints = HashSet::<TransactionOutpoint>::new();
         let mut filtered = Vec::with_capacity(validated_transactions.len());
         for (validated_tx, tx_index) in validated_transactions.into_iter() {
             let tx_id = validated_tx.id();
+            if !seen_txids.insert(tx_id) {
+                warn!(
+                    "Rejecting duplicate transaction before Atomic validation: txid={}, tx_index={}, reason=duplicate_txid_in_candidate_set",
+                    tx_id, tx_index
+                );
+                continue;
+            }
+            if let Some(conflicting_input) =
+                validated_tx.inputs().iter().find(|input| spent_outpoints.contains(&input.previous_outpoint))
+            {
+                warn!(
+                    "Rejecting UTXO-conflicting transaction before Atomic validation: txid={}, tx_index={}, previous_outpoint={}, reason=input_already_spent_in_candidate_set",
+                    tx_id, tx_index, conflicting_input.previous_outpoint
+                );
+                continue;
+            }
             match self.validate_and_apply_atomic_state_transition_with_growth(
                 &validated_tx,
                 pov_daa_score,
@@ -965,7 +1011,10 @@ impl VirtualStateProcessor {
                 atomic_state,
                 &mut growth,
             ) {
-                Ok(()) => filtered.push((validated_tx, tx_index)),
+                Ok(()) => {
+                    spent_outpoints.extend(validated_tx.inputs().iter().map(|input| input.previous_outpoint));
+                    filtered.push((validated_tx, tx_index));
+                }
                 Err(err) => {
                     info!("Rejecting transaction {} due to transaction rule error at block tx index {}: {}", tx_id, tx_index, err);
                 }

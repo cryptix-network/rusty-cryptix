@@ -20,12 +20,23 @@ impl Mempool {
         block_daa_score: u64,
         block_transactions: &[Transaction],
     ) -> RuleResult<Vec<MempoolTransaction>> {
+        if block_transactions.len() <= 1 {
+            return Ok(Vec::new());
+        }
+        self.handle_accepted_transactions(block_daa_score, &block_transactions[1..])
+    }
+
+    pub(crate) fn handle_accepted_transactions(
+        &mut self,
+        accepting_block_daa_score: u64,
+        accepted_transactions: &[Transaction],
+    ) -> RuleResult<Vec<MempoolTransaction>> {
         let _sw = Stopwatch::<400>::with_threshold("handle_new_block_transactions op");
         let mut unorphaned_transactions = vec![];
         let mut tx_accepted_counts = 0;
         let mut input_counts = 0;
         let mut output_counts = 0;
-        for transaction in block_transactions[1..].iter() {
+        for transaction in accepted_transactions.iter() {
             let transaction_id = transaction.id();
             // Rust rewrite: This behavior does differ from golang implementation.
             // If the transaction got accepted via a peer but is still an orphan here, do not remove
@@ -37,14 +48,14 @@ impl Mempool {
             self.remove_double_spends(transaction)?;
             self.remove_accepted_atomic_conflicts(transaction)?;
             self.orphan_pool.remove_orphan(&transaction_id, false, TxRemovalReason::Accepted, "")?;
-            if self.accepted_transactions.add(transaction_id, block_daa_score) {
+            if self.accepted_transactions.add(transaction_id, accepting_block_daa_score) {
                 tx_accepted_counts += 1;
                 input_counts += transaction.inputs.len();
                 output_counts += transaction.outputs.len();
             }
             unorphaned_transactions.extend(self.get_unorphaned_transactions_after_accepted_transaction(transaction));
         }
-        self.counters.block_tx_counts.fetch_add(block_transactions.len() as u64 - 1, Ordering::Relaxed);
+        self.counters.block_tx_counts.fetch_add(accepted_transactions.len() as u64, Ordering::Relaxed);
         self.counters.tx_accepted_counts.fetch_add(tx_accepted_counts, Ordering::Relaxed);
         self.counters.input_counts.fetch_add(input_counts as u64, Ordering::Relaxed);
         self.counters.output_counts.fetch_add(output_counts as u64, Ordering::Relaxed);

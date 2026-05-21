@@ -64,6 +64,7 @@ const MAX_SNAPSHOT_FILE_SIZE_BYTES: u64 = MAX_BOOTSTRAP_SNAPSHOT_FILE_SIZE_BYTES
 const MAX_REPLAY_FILE_SIZE_BYTES: u64 = MAX_BOOTSTRAP_REPLAY_WINDOW_SIZE_BYTES;
 const MAX_TOTAL_CHUNKS: usize = 65_536;
 const HEALTH_AUDIT_INTERVAL: Duration = Duration::from_secs(60);
+const PENDING_AUDIT_LOG_INTERVAL: Duration = Duration::from_secs(300);
 #[allow(dead_code)]
 #[derive(Clone, Debug, BorshDeserialize)]
 struct SnapshotManifestV2 {
@@ -161,6 +162,7 @@ pub struct AtomicBootstrapService {
     atomic_data_dir: PathBuf,
     retry_interval: Duration,
     last_health_audit: Mutex<Option<Instant>>,
+    last_pending_audit_logs: Mutex<HashMap<&'static str, Instant>>,
     bootstrap_attempt_lock: Mutex<()>,
     audit_context_revalidation_attempted: AtomicBool,
     source_penalties: Mutex<HashMap<String, SourcePenalty>>,
@@ -221,6 +223,7 @@ impl AtomicBootstrapService {
             atomic_data_dir,
             retry_interval: Duration::from_secs(retry_interval_sec),
             last_health_audit: Default::default(),
+            last_pending_audit_logs: Default::default(),
             bootstrap_attempt_lock: Default::default(),
             audit_context_revalidation_attempted: AtomicBool::new(false),
             source_penalties: Default::default(),
@@ -275,6 +278,18 @@ impl AtomicBootstrapService {
         }
         *guard = Some(now);
         true
+    }
+
+    async fn log_pending_audit(&self, reason: &'static str, message: String) {
+        let now = Instant::now();
+        let mut guard = self.last_pending_audit_logs.lock().await;
+        let should_log = guard.get(reason).map(|last| now.duration_since(*last) >= PENDING_AUDIT_LOG_INTERVAL).unwrap_or(true);
+        if should_log {
+            guard.insert(reason, now);
+            info!("{message}");
+        } else {
+            trace!("{message}");
+        }
     }
 
     async fn defer_next_health_audit(&self) {
@@ -858,12 +873,16 @@ impl AtomicBootstrapService {
 
     async fn audit_healthy_state_with_p2p(&self, health: &AtomicTokenHealth) -> Result<bool, String> {
         if health.runtime_state != AtomicTokenRuntimeState::Healthy || health.is_degraded || health.bootstrap_in_progress {
-            info!(
-                "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=local_token_index_not_ready runtime={} degraded={} bootstrap_in_progress={}",
+            self.log_pending_audit(
+                "local_token_index_not_ready",
+                format!(
+                    "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=local_token_index_not_ready runtime={} degraded={} bootstrap_in_progress={}",
                 health.runtime_state.as_str(),
                 health.is_degraded,
-                health.bootstrap_in_progress
-            );
+                    health.bootstrap_in_progress
+                ),
+            )
+            .await;
             return Ok(false);
         }
 
@@ -894,16 +913,22 @@ impl AtomicBootstrapService {
                             match self.atomic_token_service.get_p2p_audit_context().await {
                                 Ok(Some(value)) => Some(value),
                                 Ok(None) => {
-                                    info!(
-                                        "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=no_finality_stable_revalidated_token_checkpoint_after_local_refresh action=wait_for_new_finality_stable_checkpoint"
-                                    );
+                                    self.log_pending_audit(
+                                        "no_finality_stable_revalidated_token_checkpoint_after_local_refresh",
+                                        "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=no_finality_stable_revalidated_token_checkpoint_after_local_refresh action=wait_for_new_finality_stable_checkpoint".to_string(),
+                                    )
+                                    .await;
                                     return Ok(false);
                                 }
                                 Err(err) => {
-                                    info!(
-                                        "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=stable_token_audit_anchor_unavailable_after_local_refresh detail=\"{}\"",
-                                        err
-                                    );
+                                    self.log_pending_audit(
+                                        "stable_token_audit_anchor_unavailable_after_local_refresh",
+                                        format!(
+                                            "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=stable_token_audit_anchor_unavailable_after_local_refresh detail=\"{}\"",
+                                            err
+                                        ),
+                                    )
+                                    .await;
                                     return Ok(false);
                                 }
                             }
@@ -918,23 +943,31 @@ impl AtomicBootstrapService {
                     if let Some(value) = refreshed_context {
                         value
                     } else {
-                        info!(
-                            "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=no_finality_stable_revalidated_token_checkpoint action=wait_for_atomic_catchup_or_revalidation"
-                        );
+                        self.log_pending_audit(
+                            "no_finality_stable_revalidated_token_checkpoint",
+                            "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=no_finality_stable_revalidated_token_checkpoint action=wait_for_atomic_catchup_or_revalidation".to_string(),
+                        )
+                        .await;
                         return Ok(false);
                     }
                 } else {
-                    info!(
-                        "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=no_finality_stable_revalidated_token_checkpoint action=wait_for_atomic_catchup_or_revalidation"
-                    );
+                    self.log_pending_audit(
+                        "no_finality_stable_revalidated_token_checkpoint",
+                        "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=no_finality_stable_revalidated_token_checkpoint action=wait_for_atomic_catchup_or_revalidation".to_string(),
+                    )
+                    .await;
                     return Ok(false);
                 }
             }
             Err(err) => {
-                info!(
-                    "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=stable_token_audit_anchor_unavailable detail=\"{}\"",
-                    err
-                );
+                self.log_pending_audit(
+                    "stable_token_audit_anchor_unavailable",
+                    format!(
+                        "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=stable_token_audit_anchor_unavailable detail=\"{}\"",
+                        err
+                    ),
+                )
+                .await;
                 return Ok(false);
             }
         };
@@ -943,12 +976,16 @@ impl AtomicBootstrapService {
         let decision = match self.select_p2p_atomic_token_state_hash_quorum(anchor_hash, anchor_daa_score).await {
             Ok(decision) => decision,
             Err(err) => {
-                info!(
-                    "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=peer_token_checkpoint_unavailable anchor={} daa={} action=run_consensus_only_audit token_verified=false detail=\"{}\"",
-                    anchor_hash,
-                    anchor_daa_score,
-                    err
-                );
+                self.log_pending_audit(
+                    "peer_token_checkpoint_unavailable",
+                    format!(
+                        "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=peer_token_checkpoint_unavailable anchor={} daa={} action=run_consensus_only_audit token_verified=false detail=\"{}\"",
+                        anchor_hash,
+                        anchor_daa_score,
+                        err
+                    ),
+                )
+                .await;
                 return self.audit_healthy_consensus_state_with_p2p(anchor_hash, anchor_daa_score).await;
             }
         };
@@ -1298,11 +1335,15 @@ impl AtomicBootstrapService {
             && !health.is_degraded
             && self.configured_rpc_peers.is_empty()
         {
-            info!(
-                "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=local_token_index_catching_up action=wait_for_atomic_catchup runtime={} local_runtime={}",
-                effective_health.runtime_state.as_str(),
-                health.runtime_state.as_str()
-            );
+            self.log_pending_audit(
+                "local_token_index_catching_up",
+                format!(
+                    "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=local_token_index_catching_up action=wait_for_atomic_catchup runtime={} local_runtime={}",
+                    effective_health.runtime_state.as_str(),
+                    health.runtime_state.as_str()
+                ),
+            )
+            .await;
             return Ok(false);
         }
         let should_audit_healthy_state = if !health.is_degraded

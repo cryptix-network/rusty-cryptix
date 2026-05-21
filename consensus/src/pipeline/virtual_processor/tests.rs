@@ -263,8 +263,71 @@ async fn basic_utxo_disqualified_test() {
 
     assert_ne!(sink, disqualified_tip);
     assert_eq!(sink, ctx.consensus.get_sink());
-    assert_eq!(BlockHashSet::from_iter([sink, disqualified_tip]), BlockHashSet::from_iter(ctx.consensus.get_tips().into_iter()));
+    assert_eq!(BlockHashSet::from_iter([sink]), BlockHashSet::from_iter(ctx.consensus.get_tips().into_iter()));
     assert!(!ctx.consensus.get_virtual_parents().contains(&disqualified_tip));
+}
+
+#[tokio::test]
+async fn atomic_disqualified_branch_does_not_poison_virtual_progress() {
+    let (mut ctx, fixture) = setup_dual_owner_liquidity_pool().await;
+    let valid_sink_before = ctx.consensus.get_sink();
+    assert_eq!(ctx.consensus.get_block_status(valid_sink_before), Some(BlockStatus::StatusUTXOValid));
+
+    let disqualified_tip = ctx.build_and_insert_disqualified_chain(vec![fixture.create_block_hash], 4).await;
+    assert_eq!(ctx.consensus.get_block_status(disqualified_tip), Some(BlockStatus::StatusDisqualifiedFromChain));
+    assert_eq!(ctx.consensus.get_sink(), valid_sink_before);
+    assert!(!ctx.consensus.get_tips().contains(&disqualified_tip));
+    assert!(!ctx.consensus.get_virtual_parents().contains(&disqualified_tip));
+
+    let mut last_valid_hash = valid_sink_before;
+    for nonce in 900..905 {
+        ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+        let valid_extension = ctx.build_block_template(nonce, ctx.simulated_time);
+        last_valid_hash = valid_extension.block.header.hash;
+        ctx.validate_and_insert_block(valid_extension.block.to_immutable()).await;
+        assert_eq!(ctx.consensus.get_block_status(last_valid_hash), Some(BlockStatus::StatusUTXOValid));
+        assert!(!ctx.consensus.get_virtual_parents().contains(&disqualified_tip));
+    }
+
+    assert!(ctx.consensus.reachability_service().is_chain_ancestor_of(valid_sink_before, last_valid_hash));
+    assert_eq!(ctx.consensus.get_sink(), last_valid_hash);
+    let atomic = ctx.consensus.virtual_atomic_state();
+    assert!(atomic.assets.contains_key(&fixture.asset_id));
+    let asset = atomic.assets.get(&fixture.asset_id).expect("liquidity asset should remain live");
+    assert_eq!(asset.liquidity.as_ref().expect("pool should remain live").pool_nonce, fixture.pool.pool_nonce);
+}
+
+#[tokio::test]
+async fn disqualified_only_tip_restores_last_valid_parent() {
+    cryptix_core::log::try_init_logger("info");
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.max_block_parents = 4;
+            p.mergeset_size_limit = 10;
+        })
+        .build();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    for _ in 0..6 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await.assert_valid_utxo_tip();
+    }
+
+    let valid_sink = ctx.consensus.get_sink();
+    assert_eq!(BlockHashSet::from_iter([valid_sink]), BlockHashSet::from_iter(ctx.consensus.get_tips().into_iter()));
+
+    let disqualified_tip = ctx.build_and_insert_disqualified_chain(vec![valid_sink], 1).await;
+    assert_eq!(ctx.consensus.get_block_status(disqualified_tip), Some(BlockStatus::StatusDisqualifiedFromChain));
+    assert_eq!(ctx.consensus.get_sink(), valid_sink);
+    assert_eq!(BlockHashSet::from_iter([valid_sink]), BlockHashSet::from_iter(ctx.consensus.get_tips().into_iter()));
+    assert!(!ctx.consensus.get_virtual_parents().contains(&disqualified_tip));
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let valid_extension = ctx.build_block_template(910, ctx.simulated_time);
+    let valid_extension_hash = valid_extension.block.header.hash;
+    ctx.validate_and_insert_block(valid_extension.block.to_immutable()).await;
+    assert_eq!(ctx.consensus.get_block_status(valid_extension_hash), Some(BlockStatus::StatusUTXOValid));
+    assert_eq!(ctx.consensus.get_sink(), valid_extension_hash);
 }
 
 #[tokio::test]
@@ -323,10 +386,7 @@ async fn double_search_disqualified_test() {
     assert_ne!(sink, disqualified_tip_1);
     assert_ne!(sink, disqualified_tip_2);
     assert_eq!(sink, ctx.consensus.get_sink());
-    assert_eq!(
-        BlockHashSet::from_iter([sink, disqualified_tip_1, disqualified_tip_2]),
-        BlockHashSet::from_iter(ctx.consensus.get_tips().into_iter())
-    );
+    assert_eq!(BlockHashSet::from_iter([sink]), BlockHashSet::from_iter(ctx.consensus.get_tips().into_iter()));
     assert!(!ctx.consensus.get_virtual_parents().contains(&disqualified_tip_1));
     assert!(!ctx.consensus.get_virtual_parents().contains(&disqualified_tip_2));
 
@@ -1115,6 +1175,117 @@ async fn atomic_same_owner_nonce_conflict_in_parallel_blocks_applies_once() {
     let applied_assets = [asset_a, asset_b].into_iter().filter(|asset_id| atomic.assets.contains_key(asset_id)).count();
     assert_eq!(applied_assets, 1);
     assert_eq!(atomic.next_nonces.get(&AtomicNonceKey::owner(owner_id)), Some(&2));
+}
+
+#[tokio::test]
+async fn atomic_duplicate_txid_in_parallel_blocks_is_accepted_once() {
+    let mut ctx = liquidity_test_context();
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    for _ in 0..4 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let utxos = find_virtual_utxos_by_script(&ctx, &owner_script, 1);
+    let tx_fee = 10_000u64;
+    let parent = ctx.consensus.get_sink();
+
+    let create = payload_tx(
+        vec![TransactionInput::new(utxos[0].0, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(utxos[0].1.amount - tx_fee, owner_script.clone())],
+        payload_create_asset(0, 1, owner_id, b"DupTx", b"DUP"),
+    );
+    let txid = create.id();
+    let asset_id = txid.as_bytes();
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let block_a = ctx.build_utxo_valid_block_with_parents_and_transactions(vec![parent], vec![create.clone()], 46, ctx.simulated_time);
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let block_b = ctx.build_utxo_valid_block_with_parents_and_transactions(vec![parent], vec![create], 47, ctx.simulated_time);
+
+    ctx.validate_and_insert_block(block_a.to_immutable()).await;
+    ctx.validate_and_insert_block(block_b.to_immutable()).await;
+
+    let atomic = ctx.consensus.virtual_atomic_state();
+    assert!(atomic.assets.contains_key(&asset_id));
+    assert_eq!(atomic.next_nonces.get(&AtomicNonceKey::owner(owner_id)), Some(&2));
+
+    let acceptance_data =
+        ctx.consensus.get_block_acceptance_data(ctx.consensus.get_sink()).expect("sink acceptance data should exist");
+    let duplicate_accepts = acceptance_data
+        .iter()
+        .flat_map(|block_acceptance| block_acceptance.accepted_transactions.iter())
+        .filter(|accepted| accepted.transaction_id == txid)
+        .count();
+    assert!(
+        duplicate_accepts <= 1,
+        "same txid must not be accepted twice in one virtual mergeset; observed {duplicate_accepts} acceptance entries"
+    );
+}
+
+#[tokio::test]
+async fn atomic_block_template_rejects_duplicate_txid_before_atomic_state() {
+    let mut ctx = liquidity_test_context();
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    for _ in 0..4 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let utxos = find_virtual_utxos_by_script(&ctx, &owner_script, 1);
+    let tx_fee = 10_000u64;
+    let create = payload_tx(
+        vec![TransactionInput::new(utxos[0].0, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(utxos[0].1.amount - tx_fee, owner_script)],
+        payload_create_asset(0, 1, owner_id, b"DupTemplate", b"DPT"),
+    );
+
+    let result = ctx.consensus.build_block_template(
+        ctx.miner_data.clone(),
+        Box::new(OnetimeTxSelector::new(vec![create.clone(), create.clone()])),
+        TemplateBuildMode::Standard,
+    );
+    assert!(result.is_err(), "duplicate txid must not be allowed into a block template");
+    assert!(!ctx.consensus.virtual_atomic_state().assets.contains_key(&create.id().as_bytes()));
+}
+
+#[tokio::test]
+async fn atomic_mempool_batch_rejects_duplicate_txid_before_atomic_state() {
+    let mut ctx = liquidity_test_context();
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    for _ in 0..4 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let utxos = find_virtual_utxos_by_script(&ctx, &owner_script, 1);
+    let tx_fee = 10_000u64;
+    let create = payload_tx(
+        vec![TransactionInput::new(utxos[0].0, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(utxos[0].1.amount - tx_fee, owner_script)],
+        payload_create_asset(0, 1, owner_id, b"DupBatch", b"DPB"),
+    );
+
+    let mut batch = vec![
+        MutableTransaction::with_entries(Arc::new(create.clone()), vec![utxos[0].1.clone()]),
+        MutableTransaction::with_entries(Arc::new(create.clone()), vec![utxos[0].1.clone()]),
+    ];
+    let results = ctx.consensus.validate_mempool_transactions_in_parallel(&mut batch, &TransactionValidationBatchArgs::default());
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1, "one duplicate txid instance may validate: {results:?}");
+    assert_eq!(
+        results.iter().filter(|result| result.is_err()).count(),
+        1,
+        "one duplicate txid instance must be rejected before Atomic state: {results:?}"
+    );
+    assert!(
+        format!("{:?}", results[1]).contains("duplicate transaction in mempool validation batch"),
+        "duplicate batch rejection should be explicit: {results:?}"
+    );
+    assert!(!ctx.consensus.virtual_atomic_state().assets.contains_key(&create.id().as_bytes()));
 }
 
 #[tokio::test]

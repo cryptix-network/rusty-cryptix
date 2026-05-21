@@ -1219,9 +1219,12 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let session = self.consensus_manager.consensus().unguarded_session();
         let virtual_daa_score = session.get_virtual_daa_score();
         let is_nearly_synced = self.has_sufficient_peer_connectivity() && session.async_is_nearly_synced().await;
-        if virtual_daa_score >= self.config.params.payload_hf_activation_daa_score && !is_nearly_synced {
+        if virtual_daa_score >= self.config.params.payload_hf_activation_daa_score
+            && !is_nearly_synced
+            && !self.config.enable_unsynced_mining
+        {
             warn!(
-                "Rejecting get_block_template while node is not nearly synced after payload HF: virtual_daa_score={}, activation_daa={}, allow_submit_block_when_not_synced={}; mining from a partial Atomic/UTXO view can create blocks with invalid state commitments",
+                "Rejecting get_block_template while node is not nearly synced after payload HF: virtual_daa_score={}, activation_daa={}, enable_unsynced_mining={}; mining from a partial Atomic/UTXO view can create blocks with invalid state commitments",
                 virtual_daa_score,
                 self.config.params.payload_hf_activation_daa_score,
                 self.config.enable_unsynced_mining
@@ -1230,6 +1233,16 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                 "mining template unavailable: node is not nearly synced after payload hardfork; wait for sync/Atomic catch-up before mining"
                     .to_string(),
             ));
+        }
+        if virtual_daa_score >= self.config.params.payload_hf_activation_daa_score
+            && !is_nearly_synced
+            && self.config.enable_unsynced_mining
+        {
+            warn!(
+                "Allowing get_block_template while node is not nearly synced after payload HF because enable_unsynced_mining is set: virtual_daa_score={}, activation_daa={}; this is testing-oriented and can create blocks from a partial Atomic/UTXO view",
+                virtual_daa_score,
+                self.config.params.payload_hf_activation_daa_score
+            );
         }
 
         // Build block template

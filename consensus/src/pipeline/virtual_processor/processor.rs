@@ -27,8 +27,8 @@ use crate::{
             reachability::DbReachabilityStore,
             relations::{DbRelationsStore, RelationsStoreReader},
             selected_chain::{DbSelectedChainStore, SelectedChainStore, SelectedChainStoreReader},
-            statuses::{DbStatusesStore, StatusesStore, StatusesStoreBatchExtensions, StatusesStoreReader},
-            tips::{DbTipsStore, TipsStoreReader},
+            statuses::{DbStatusesStore, StatusesStoreBatchExtensions, StatusesStoreReader},
+            tips::{DbTipsStore, TipsStore, TipsStoreReader},
             utxo_diffs::{DbUtxoDiffsStore, UtxoDiffsStoreReader},
             utxo_multisets::{DbUtxoMultisetsStore, UtxoMultisetsStoreReader},
             virtual_state::{LkgVirtualState, VirtualState, VirtualStateStoreReader, VirtualStores},
@@ -88,11 +88,11 @@ use cryptix_muhash::MuHash;
 use cryptix_notify::{events::EventType, notifier::Notify};
 
 use super::errors::{PruningImportError, PruningImportResult};
-use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
+use crossbeam_channel::{Receiver as CrossbeamReceiver, RecvTimeoutError, Sender as CrossbeamSender};
 use cryptix_consensus_core::tx::ValidatedTransaction;
 use cryptix_utils::binary_heap::BinaryHeapExtensions;
 use itertools::Itertools;
-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
+use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use rand::{seq::SliceRandom, Rng};
 use rayon::{
     prelude::{IntoParallelRefMutIterator, ParallelIterator},
@@ -101,10 +101,13 @@ use rayon::{
 use rocksdb::WriteBatch;
 use std::{
     cmp::min,
-    collections::{BinaryHeap, HashMap, VecDeque},
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     ops::Deref,
     sync::{atomic::Ordering, Arc},
+    time::{Duration, Instant},
 };
+
+const ATOMIC_CONSENSUS_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct AtomicTxOrderPriority {
@@ -123,6 +126,22 @@ struct AtomicTxOrderInfo {
     pool: Option<([u8; 32], u64)>,
     creates_asset_id: Option<[u8; 32]>,
     references_asset_id: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AtomicConsensusLogSummary {
+    root: [u8; 32],
+    root_only: bool,
+    assets: u64,
+    balances: u64,
+    nonces: u64,
+    anchors: u64,
+    vaults: Option<usize>,
+}
+
+#[derive(Debug, Default)]
+struct AtomicConsensusLogState {
+    last_log_at: Option<Instant>,
 }
 
 pub struct VirtualStateProcessor {
@@ -187,6 +206,7 @@ pub struct VirtualStateProcessor {
 
     // Counters
     counters: Arc<ProcessingCounters>,
+    atomic_consensus_log_state: Mutex<AtomicConsensusLogState>,
 
     // Storage mass hardfork DAA score
     pub(crate) storage_mass_activation_daa_score: u64,
@@ -257,6 +277,7 @@ impl VirtualStateProcessor {
             pruning_lock,
             notification_root,
             counters,
+            atomic_consensus_log_state: Mutex::new(AtomicConsensusLogState::default()),
             storage_mass_activation_daa_score: params.storage_mass_activation_daa_score,
             atomic_max_new_assets_per_block: params.atomic_max_new_assets_per_block,
             atomic_max_new_balance_keys_per_block: params.atomic_max_new_balance_keys_per_block,
@@ -267,7 +288,15 @@ impl VirtualStateProcessor {
     }
 
     pub fn worker(self: &Arc<Self>) {
-        'outer: while let Ok(msg) = self.receiver.recv() {
+        'outer: loop {
+            let msg = match self.receiver.recv_timeout(ATOMIC_CONSENSUS_LOG_INTERVAL) {
+                Ok(msg) => msg,
+                Err(RecvTimeoutError::Timeout) => {
+                    self.log_current_atomic_consensus_state("periodic");
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
             if msg.is_exit_message() {
                 break;
             }
@@ -303,6 +332,7 @@ impl VirtualStateProcessor {
         let virtual_read = self.virtual_stores.upgradable_read();
         let prev_state = virtual_read.state.get().unwrap();
         let finality_point = self.virtual_finality_point(&prev_state.ghostdag_data, pruning_point);
+        self.sanitize_disqualified_body_tips(prev_state.ghostdag_data.selected_parent);
 
         // PRUNE SAFETY: in order to avoid locking the prune lock throughout virtual resolving we make sure
         // to only process blocks in the future of the finality point (F) which are never pruned (since finality depth << pruning depth).
@@ -360,6 +390,8 @@ impl VirtualStateProcessor {
                 &chain_path,
             )
             .expect("all possible rule errors are unexpected here");
+
+        self.log_atomic_consensus_state_summary("virtual_update", &new_virtual_state);
 
         // Update the pruning processor about the virtual state change
         let sink_ghostdag_data = self.ghostdag_primary_store.get_compact_data(new_sink).unwrap();
@@ -482,11 +514,20 @@ impl VirtualStateProcessor {
         // Walk back up to the new virtual selected parent candidate
         let mut chain_block_counter = 0;
         let mut chain_disqualified_counter = 0;
+        let mut logged_disqualified_parent_propagation = false;
         for (selected_parent, current) in self.reachability_service.forward_chain_iterator(split_point, to, true).tuple_windows() {
             if selected_parent != diff_point {
                 // This indicates that the selected parent is disqualified, propagate up and continue
                 if self.statuses_store.read().get(current).unwrap() != StatusDisqualifiedFromChain {
-                    self.statuses_store.write().set(current, StatusDisqualifiedFromChain).unwrap();
+                    if !logged_disqualified_parent_propagation {
+                        let current_daa = self.headers_store.get_header(current).map(|h| h.daa_score).unwrap_or_default();
+                        warn!(
+                            "Disqualifying selected-chain block(s) because selected parent is already disqualified: first_child={}, selected_parent={}, last_valid_diff_point={}, current_daa={}, target_tip={}",
+                            current, selected_parent, diff_point, current_daa, to
+                        );
+                        logged_disqualified_parent_propagation = true;
+                    }
+                    self.mark_block_disqualified(current);
                     chain_disqualified_counter += 1;
                 }
                 continue;
@@ -534,8 +575,23 @@ impl VirtualStateProcessor {
             let res = self.verify_expected_utxo_state(&mut ctx, &selected_parent_utxo_view, &header);
 
             if let Err(rule_error) = res {
-                info!("Block {} is disqualified from virtual chain: {}", current, rule_error);
-                self.statuses_store.write().set(current, StatusDisqualifiedFromChain).unwrap();
+                let txs = self.block_transactions_store.get(current).ok();
+                let tx_count = txs.as_ref().map(|txs| txs.len()).unwrap_or_default();
+                let payload_tx_count =
+                    txs.as_ref().map(|txs| txs.iter().filter(|tx| !tx.payload.is_empty()).count()).unwrap_or_default();
+                warn!(
+                    "Disqualifying block after UTXO/Atomic verification failed: block={}, selected_parent={}, daa={}, blue_score={}, txs={}, non_coinbase_txs={}, payload_txs={}, utxo_commitment={}, reason={}",
+                    current,
+                    selected_parent,
+                    header.daa_score,
+                    header.blue_score,
+                    tx_count,
+                    tx_count.saturating_sub(1),
+                    payload_tx_count,
+                    header.utxo_commitment,
+                    rule_error
+                );
+                self.mark_block_disqualified(current);
                 chain_disqualified_counter += 1;
             } else {
                 debug!("VIRTUAL PROCESSOR, UTXO validated for {current}");
@@ -558,6 +614,95 @@ impl VirtualStateProcessor {
         }
 
         diff_point
+    }
+
+    fn mark_block_disqualified(&self, block: Hash) {
+        let replacement_tips = self.disqualified_tip_replacement_parents(block);
+        let mut batch = WriteBatch::default();
+        let status_write_guard = self.statuses_store.set_batch(&mut batch, block, StatusDisqualifiedFromChain).unwrap();
+        let mut tips_write_guard = self.body_tips_store.write();
+        tips_write_guard.update_tips_batch(&mut batch, &replacement_tips, &[block]).unwrap();
+        self.db.write(batch).unwrap();
+        drop(status_write_guard);
+        drop(tips_write_guard);
+    }
+
+    fn sanitize_disqualified_body_tips(&self, fallback_tip: Hash) {
+        let disqualified_tips = {
+            let body_tips_read = self.body_tips_store.read();
+            body_tips_read
+                .get()
+                .unwrap()
+                .read()
+                .iter()
+                .copied()
+                .filter(|&tip| self.statuses_store.read().get(tip).unwrap() == StatusDisqualifiedFromChain)
+                .collect_vec()
+        };
+
+        let tips_are_empty = { self.body_tips_store.read().get().unwrap().read().is_empty() };
+        if disqualified_tips.is_empty() && !tips_are_empty {
+            return;
+        }
+
+        let mut replacement_tips =
+            disqualified_tips.iter().copied().flat_map(|tip| self.disqualified_tip_replacement_parents(tip)).collect_vec();
+        if tips_are_empty
+            && self.statuses_store.read().get(fallback_tip).unwrap() != StatusDisqualifiedFromChain
+            && self.relations_service.has(fallback_tip).unwrap_or(false)
+        {
+            replacement_tips.push(fallback_tip);
+        }
+        replacement_tips.sort_unstable();
+        replacement_tips.dedup();
+
+        if !disqualified_tips.is_empty() || tips_are_empty {
+            warn!(
+                "Consensus pruned disqualified body tip(s) before virtual resolve: removed={}, restored={}, fallback_tip={}, body_tips_empty={}",
+                disqualified_tips.len(),
+                replacement_tips.len(),
+                fallback_tip,
+                tips_are_empty
+            );
+        }
+
+        let mut batch = WriteBatch::default();
+        let mut tips_write_guard = self.body_tips_store.write();
+        tips_write_guard.update_tips_batch(&mut batch, &replacement_tips, &disqualified_tips).unwrap();
+        self.db.write(batch).unwrap();
+        drop(tips_write_guard);
+    }
+
+    fn disqualified_tip_replacement_parents(&self, block: Hash) -> Vec<Hash> {
+        let is_tip = {
+            let body_tips_read = self.body_tips_store.read();
+            body_tips_read.get().unwrap().read().contains(&block)
+        };
+        if !is_tip {
+            return Vec::new();
+        }
+
+        self.relations_service
+            .get_parents(block)
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|&parent| self.statuses_store.read().get(parent).unwrap() != StatusDisqualifiedFromChain)
+            .filter(|&parent| self.all_body_children_disqualified(parent, block))
+            .collect()
+    }
+
+    fn all_body_children_disqualified(&self, parent: Hash, pending_disqualified_child: Hash) -> bool {
+        let children = match self.relations_service.get_children(parent) {
+            Ok(children) => children,
+            Err(StoreError::KeyNotFound(_)) => return false,
+            Err(err) => panic!("unexpected error {err}"),
+        };
+
+        let all_children_disqualified = children.read().iter().copied().all(|child| {
+            child == pending_disqualified_child || self.statuses_store.read().get(child).unwrap() == StatusDisqualifiedFromChain
+        });
+        all_children_disqualified
     }
 
     fn commit_utxo_state(
@@ -665,6 +810,7 @@ impl VirtualStateProcessor {
         let mut compact_virtual_state = new_virtual_state.as_ref().clone();
         compact_virtual_state.atomic_state = compact_virtual_state.atomic_state.as_virtual_root_state();
         let new_virtual_state = Arc::new(compact_virtual_state);
+        let new_virtual_daa_score = new_virtual_state.daa_score;
 
         // Update virtual state
         virtual_write.state.set_batch(&mut batch, new_virtual_state).unwrap();
@@ -674,10 +820,61 @@ impl VirtualStateProcessor {
 
         // Flush the batch changes
         self.db.write(batch).unwrap();
+        self.counters.virtual_daa_score.store(new_virtual_daa_score, Ordering::Relaxed);
 
         // Calling the drops explicitly after the batch is written in order to avoid possible errors.
         drop(virtual_write);
         drop(selected_chain_write);
+    }
+
+    fn log_atomic_consensus_state_summary(&self, reason: &str, virtual_state: &VirtualState) {
+        let root_accumulator = virtual_state.atomic_state.root_accumulator();
+        let summary = AtomicConsensusLogSummary {
+            root: virtual_state.atomic_state.canonical_hash(),
+            root_only: virtual_state.atomic_state.is_root_only(),
+            assets: root_accumulator.asset_count(),
+            balances: root_accumulator.balance_count(),
+            nonces: root_accumulator.nonce_count(),
+            anchors: root_accumulator.anchor_count(),
+            vaults: virtual_state.atomic_state.materialized_vault_count(),
+        };
+
+        let now = Instant::now();
+        let mut log_state = self.atomic_consensus_log_state.lock();
+        let interval_elapsed =
+            log_state.last_log_at.map(|last| now.duration_since(last) >= ATOMIC_CONSENSUS_LOG_INTERVAL).unwrap_or(true);
+        if !interval_elapsed {
+            return;
+        }
+        log_state.last_log_at = Some(now);
+        drop(log_state);
+
+        let vaults = summary.vaults.map(|vaults| vaults.to_string()).unwrap_or_else(|| "unknown_root_only".to_string());
+        info!(
+            "[atomic] Atomic consensus state: local_state=consistent live_correct=true reason={} daa={} hf_active={} root={} root_only={} assets={} balances={} nonces={} anchors={} vaults={} selected_parent={} parents={} utxo_add={} utxo_remove={}",
+            reason,
+            virtual_state.daa_score,
+            self.transaction_validator.is_payload_hf_active(virtual_state.daa_score),
+            faster_hex::hex_string(&summary.root),
+            summary.root_only,
+            summary.assets,
+            summary.balances,
+            summary.nonces,
+            summary.anchors,
+            vaults,
+            virtual_state.ghostdag_data.selected_parent,
+            virtual_state.parents.len(),
+            virtual_state.utxo_diff.added().len(),
+            virtual_state.utxo_diff.removed().len(),
+        );
+    }
+
+    fn log_current_atomic_consensus_state(&self, reason: &str) {
+        let virtual_read = self.virtual_stores.read();
+        match virtual_read.state.get() {
+            Ok(virtual_state) => self.log_atomic_consensus_state_summary(reason, &virtual_state),
+            Err(err) => warn!("failed reading virtual state for Atomic consensus status log: {err}"),
+        }
     }
 
     /// Returns the max number of tips to consider as virtual parents in a single virtual resolve operation.
@@ -806,6 +1003,10 @@ impl VirtualStateProcessor {
 
         // Try adding parents as long as mergeset size and number of parents limits are not reached
         while let Some(candidate) = candidates.pop_front() {
+            if self.statuses_store.read().get(candidate).unwrap() == StatusDisqualifiedFromChain {
+                debug!("Skipping disqualified virtual parent candidate {candidate}");
+                continue;
+            }
             if mergeset_size >= self.mergeset_size_limit || virtual_parents.len() >= max_block_parents {
                 break;
             }
@@ -815,6 +1016,10 @@ impl VirtualStateProcessor {
                     virtual_parents.push(candidate);
                 }
                 MergesetIncreaseResult::Rejected { new_candidate } => {
+                    if self.statuses_store.read().get(new_candidate).unwrap() == StatusDisqualifiedFromChain {
+                        debug!("Skipping disqualified replacement virtual parent candidate {new_candidate}");
+                        continue;
+                    }
                     // If we already have a candidate in the past of new candidate then skip.
                     if self.reachability_service.is_any_dag_ancestor(&mut candidates.iter().copied(), new_candidate) {
                         continue; // TODO (optimization): not sure this check is needed if candidates invariant as antichain is kept
@@ -1266,6 +1471,37 @@ impl VirtualStateProcessor {
                 .collect::<Vec<TxResult<()>>>()
         });
 
+        // Incoming P2P/RPC batches may contain the same transaction more than once, or
+        // conflicting transactions racing on the same UTXO. Keep the batch deterministic
+        // and avoid feeding duplicated candidates into the temporary Atomic state.
+        let mut seen_batch_txids = HashSet::new();
+        let mut seen_batch_spent_outpoints = HashSet::<TransactionOutpoint>::new();
+        for (idx, mtx) in mutable_txs.iter().enumerate() {
+            if results[idx].is_err() {
+                continue;
+            }
+            let txid = mtx.id();
+            if !seen_batch_txids.insert(txid) {
+                warn!(
+                    "Mempool batch rejected duplicate transaction before Atomic validation: txid={}, reason=duplicate_txid_in_validation_batch",
+                    txid
+                );
+                results[idx] = Err(TxRuleError::InvalidAtomicPayload("duplicate transaction in mempool validation batch".to_string()));
+                continue;
+            }
+            if let Some(conflicting_input) =
+                mtx.tx.as_ref().inputs.iter().find(|input| seen_batch_spent_outpoints.contains(&input.previous_outpoint))
+            {
+                warn!(
+                    "Mempool batch rejected UTXO-conflicting transaction before Atomic validation: txid={}, previous_outpoint={}, reason=input_already_spent_in_validation_batch",
+                    txid, conflicting_input.previous_outpoint
+                );
+                results[idx] = Err(TxRuleError::MissingTxOutpoints);
+                continue;
+            }
+            seen_batch_spent_outpoints.extend(mtx.tx.as_ref().inputs.iter().map(|input| input.previous_outpoint));
+        }
+
         // Enforce CAT nonce/state transitions deterministically so results do not
         // depend on caller-provided slice order. Non-CAT transactions still pass
         // through the atomic-state validator so reserved liquidity vault scripts
@@ -1360,24 +1596,70 @@ impl VirtualStateProcessor {
         atomic_state: &mut AtomicConsensusState,
         atomic_growth: &mut AtomicBlockStateGrowth,
     ) -> Vec<TxResult<u64>> {
-        txs.iter()
-            .map(|tx| {
-                let validated = self.validate_block_template_transaction(tx, virtual_state, utxo_view)?;
-                let creation_context = AtomicCreationContext {
-                    source_block_hash: Hash::from_bytes([0u8; 32]),
-                    source_block_daa_score: virtual_state.daa_score,
-                    source_block_time: virtual_state.past_median_time,
-                };
-                self.validate_and_apply_atomic_state_transition_with_growth(
-                    &validated,
-                    virtual_state.daa_score,
-                    creation_context,
-                    atomic_state,
-                    atomic_growth,
-                )?;
-                Ok(validated.calculated_fee)
-            })
-            .collect()
+        let mut txid_counts = HashMap::new();
+        for tx in txs.iter() {
+            *txid_counts.entry(tx.id()).or_insert(0usize) += 1;
+        }
+        let duplicate_txids = txid_counts.iter().filter_map(|(txid, count)| (*count > 1).then_some(*txid)).collect::<HashSet<_>>();
+        let mut seen_txids = HashSet::new();
+        let mut spent_outpoints = HashSet::<TransactionOutpoint>::new();
+        let mut results = Vec::with_capacity(txs.len());
+        for tx in txs.iter() {
+            let txid = tx.id();
+            if duplicate_txids.contains(&txid) {
+                warn!(
+                    "Block template rejected duplicate transaction before Atomic validation: txid={}, reason=duplicate_txid_in_template_candidate_set",
+                    txid
+                );
+                results
+                    .push(Err(TxRuleError::InvalidAtomicPayload("duplicate transaction in block template candidate set".to_string())));
+                continue;
+            }
+            let validated = match self.validate_block_template_transaction(tx, virtual_state, utxo_view) {
+                Ok(validated) => validated,
+                Err(err) => {
+                    results.push(Err(err));
+                    continue;
+                }
+            };
+            if !seen_txids.insert(txid) {
+                warn!(
+                    "Block template rejected duplicate transaction before Atomic validation: txid={}, reason=duplicate_txid_in_template_candidate_set",
+                    txid
+                );
+                results
+                    .push(Err(TxRuleError::InvalidAtomicPayload("duplicate transaction in block template candidate set".to_string())));
+                continue;
+            }
+            if let Some(conflicting_input) = validated.inputs().iter().find(|input| spent_outpoints.contains(&input.previous_outpoint))
+            {
+                warn!(
+                    "Block template rejected UTXO-conflicting transaction before Atomic validation: txid={}, previous_outpoint={}, reason=input_already_spent_in_template_candidate_set",
+                    txid, conflicting_input.previous_outpoint
+                );
+                results.push(Err(TxRuleError::MissingTxOutpoints));
+                continue;
+            }
+            let creation_context = AtomicCreationContext {
+                source_block_hash: Hash::from_bytes([0u8; 32]),
+                source_block_daa_score: virtual_state.daa_score,
+                source_block_time: virtual_state.past_median_time,
+            };
+            match self.validate_and_apply_atomic_state_transition_with_growth(
+                &validated,
+                virtual_state.daa_score,
+                creation_context,
+                atomic_state,
+                atomic_growth,
+            ) {
+                Ok(()) => {
+                    spent_outpoints.extend(validated.inputs().iter().map(|input| input.previous_outpoint));
+                    results.push(Ok(validated.calculated_fee));
+                }
+                Err(err) => results.push(Err(err)),
+            }
+        }
+        results
     }
 
     fn validate_block_template_transaction<'a>(
@@ -1494,9 +1776,23 @@ impl VirtualStateProcessor {
         let mut invalid_transactions = HashMap::new();
         let mut atomic_state = self.atomic_state_for_virtual_context(&virtual_state.atomic_state);
         let mut atomic_growth = AtomicBlockStateGrowth::default();
+        let mut seen_txids = HashSet::new();
+        let mut spent_outpoints = HashSet::<TransactionOutpoint>::new();
         for tx in txs.iter() {
             match self.validate_block_template_transaction(tx, virtual_state, utxo_view) {
                 Ok(validated) => {
+                    let txid = validated.id();
+                    if !seen_txids.insert(txid) {
+                        invalid_transactions.insert(
+                            txid,
+                            TxRuleError::InvalidAtomicPayload("duplicate transaction in block template validation set".to_string()),
+                        );
+                        continue;
+                    }
+                    if validated.inputs().iter().any(|input| spent_outpoints.contains(&input.previous_outpoint)) {
+                        invalid_transactions.insert(txid, TxRuleError::MissingTxOutpoints);
+                        continue;
+                    }
                     let creation_context = AtomicCreationContext {
                         source_block_hash: Hash::from_bytes([0u8; 32]),
                         source_block_daa_score: virtual_state.daa_score,
@@ -1510,6 +1806,8 @@ impl VirtualStateProcessor {
                         &mut atomic_growth,
                     ) {
                         invalid_transactions.insert(tx.id(), e);
+                    } else {
+                        spent_outpoints.extend(validated.inputs().iter().map(|input| input.previous_outpoint));
                     }
                 }
                 Err(e) => {

@@ -853,6 +853,19 @@ impl AtomicTokenState {
         self.state_store.as_ref().and_then(|store| store.get_processed_op(txid).ok().flatten())
     }
 
+    fn processed_op_value_strict(&self, txid: &BlockHash) -> AtomicTokenResult<Option<ProcessedOp>> {
+        if let Some(op) = self.processed_ops.get(txid) {
+            return Ok(Some(op.clone()));
+        }
+        if self.deleted_processed_ops.contains(txid) {
+            return Ok(None);
+        }
+        match self.state_store.as_ref() {
+            Some(store) => store.get_processed_op(txid),
+            None => Ok(None),
+        }
+    }
+
     fn clear_storage_overlay(&mut self) {
         self.assets.clear();
         self.balances.clear();
@@ -1236,7 +1249,7 @@ impl AtomicTokenState {
             }
 
             for (ordinal, tx_ref) in normalized.refs.into_iter().enumerate() {
-                self.apply_transaction(
+                let apply_anchor_deltas = self.apply_transaction(
                     accepting_block_hash,
                     accepting_header.daa_score,
                     accepting_header.timestamp,
@@ -1245,7 +1258,9 @@ impl AtomicTokenState {
                     auth_inputs,
                     &mut journal,
                 );
-                self.apply_anchor_deltas_for_tx(&tx_ref.tx, auth_inputs, &mut journal);
+                if apply_anchor_deltas {
+                    self.apply_anchor_deltas_for_tx(&tx_ref.tx, auth_inputs, &mut journal);
+                }
             }
 
             let block_journal = journal.into_block_journal();
@@ -1636,22 +1651,46 @@ impl AtomicTokenState {
         ordinal: u32,
         auth_inputs: &HashMap<TransactionOutpoint, UtxoEntry>,
         journal: &mut JournalBuilder,
-    ) {
+    ) -> bool {
         let tx = &tx_ref.tx;
         if accepting_block_daa_score < self.payload_hf_activation_daa_score {
-            return;
+            return true;
         }
         if !tx.subnetwork_id.is_payload() || tx.payload.is_empty() {
-            return;
+            return true;
         }
 
         let parsed = match parse_atomic_token_payload(&tx.payload) {
             Some(value) => value,
-            None => return,
+            None => return true,
         };
 
-        if self.processed_op_value(&tx.id()).is_some() {
-            return;
+        let existing_processed_op = match self.processed_op_value_strict(&tx.id()) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    "[{IDENT}] failed reading persisted duplicate CAT replay guard; marking degraded and suppressing replay: txid={}, accepting_block={}, source_block={}, tx_index={}, error={}",
+                    tx.id(),
+                    accepting_block_hash,
+                    tx_ref.source_block_hash,
+                    tx_ref.tx_index,
+                    err
+                );
+                self.mark_degraded();
+                return false;
+            }
+        };
+
+        if let Some(existing) = existing_processed_op {
+            warn!(
+                "[{IDENT}] duplicate accepted CAT transaction suppressed during Atomic replay: txid={}, original_accepting_block={}, duplicate_accepting_block={}, duplicate_source_block={}, duplicate_tx_index={}; token op and anchor deltas were not applied again",
+                tx.id(),
+                existing.accepting_block_hash,
+                accepting_block_hash,
+                tx_ref.source_block_hash,
+                tx_ref.tx_index
+            );
+            return false;
         }
 
         match parsed {
@@ -1725,6 +1764,7 @@ impl AtomicTokenState {
                 );
             }
         }
+        true
     }
 
     fn execute_parsed_op(
@@ -4102,6 +4142,11 @@ mod tests {
         subnets::SUBNETWORK_ID_PAYLOAD,
         tx::{ScriptVec, TransactionInput, TransactionOutput},
     };
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn to_hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -4272,13 +4317,50 @@ mod tests {
     ) {
         let mut journal = JournalBuilder::default();
         for (ordinal, tx_ref) in refs.iter().enumerate() {
-            state.apply_transaction(accepting_block_hash, 0, 0, tx_ref, ordinal as u32, auth_inputs, &mut journal);
-            state.apply_anchor_deltas_for_tx(&tx_ref.tx, auth_inputs, &mut journal);
+            let apply_anchor_deltas =
+                state.apply_transaction(accepting_block_hash, 0, 0, tx_ref, ordinal as u32, auth_inputs, &mut journal);
+            if apply_anchor_deltas {
+                state.apply_anchor_deltas_for_tx(&tx_ref.tx, auth_inputs, &mut journal);
+            }
         }
         state.block_journals.insert(accepting_block_hash, journal.into_block_journal());
         state.state_hash_by_block.insert(accepting_block_hash, state.compute_state_hash());
         state.event_sequence_by_block.insert(accepting_block_hash, state.next_event_sequence);
         state.applied_chain_order.push(accepting_block_hash);
+    }
+
+    fn apply_block_and_commit(
+        state: &mut AtomicTokenState,
+        accepting_block_hash: BlockHash,
+        refs: Vec<CanonicalTxRef>,
+        auth_inputs: &HashMap<TransactionOutpoint, UtxoEntry>,
+    ) {
+        let old_event_len = state.events.len();
+        let mut journal = JournalBuilder::default();
+        for (ordinal, tx_ref) in refs.iter().enumerate() {
+            let apply_anchor_deltas =
+                state.apply_transaction(accepting_block_hash, 0, 0, tx_ref, ordinal as u32, auth_inputs, &mut journal);
+            if apply_anchor_deltas {
+                state.apply_anchor_deltas_for_tx(&tx_ref.tx, auth_inputs, &mut journal);
+            }
+        }
+        let block_journal = journal.into_block_journal();
+        let event_sequence = state.next_event_sequence;
+        let chain_index = state.applied_chain_order.len() as u64;
+        let new_events = state.events[old_event_len..].to_vec();
+        let state_hash = state
+            .commit_applied_block_to_store(accepting_block_hash, &block_journal, chain_index, event_sequence, &new_events)
+            .expect("commit applied block to V2 store")
+            .unwrap_or_else(|| state.compute_state_hash());
+        state.block_journals.insert(accepting_block_hash, block_journal);
+        state.state_hash_by_block.insert(accepting_block_hash, state_hash);
+        state.event_sequence_by_block.insert(accepting_block_hash, event_sequence);
+        state.applied_chain_order.push(accepting_block_hash);
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("cryptix-atomic-state-{name}-{}-{nonce}", std::process::id()))
     }
 
     #[test]
@@ -5312,6 +5394,96 @@ mod tests {
         apply_block(&mut recovered, block2, refs_block2, &auth_inputs);
 
         assert_eq!(recovered.compute_state_hash(), expected_hash);
+    }
+
+    #[test]
+    fn duplicate_processed_cat_replay_does_not_apply_anchor_deltas_again() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let owner_script = test_script(94);
+        let receiver_script = test_script(95);
+        let owner = owner_id(&state, &owner_script);
+        let receiver = owner_id(&state, &receiver_script);
+        let outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(8200), 0);
+        let mut auth_inputs = HashMap::new();
+        auth_inputs.insert(outpoint, UtxoEntry::new(1000, owner_script.clone(), 0, false));
+
+        let create_tx = tx_with_inputs_outputs(
+            vec![(outpoint, 1)],
+            vec![TransactionOutput::new(1, owner_script), TransactionOutput::new(1, receiver_script)],
+            payload_create_asset(0, 1, 8, owner, b"DupAnchor", b"DPA", b""),
+        );
+        let duplicate_txid = create_tx.id();
+
+        apply_block(
+            &mut state,
+            BlockHash::from_u64_word(8201),
+            vec![tx_ref(create_tx.clone(), BlockHash::from_u64_word(9201), 0, 0)],
+            &auth_inputs,
+        );
+        assert_eq!(state.get_anchor_count(receiver), 1);
+
+        apply_block(
+            &mut state,
+            BlockHash::from_u64_word(8202),
+            vec![tx_ref(create_tx, BlockHash::from_u64_word(9202), 0, 0)],
+            &auth_inputs,
+        );
+
+        assert_eq!(state.get_anchor_count(receiver), 1, "duplicate CAT replay must not mutate anchor counts");
+        assert_eq!(state.events.iter().filter(|event| event.txid == duplicate_txid).count(), 1);
+        assert_eq!(state.processed_ops.get(&duplicate_txid).map(|op| op.accepting_block_hash), Some(BlockHash::from_u64_word(8201)));
+    }
+
+    #[test]
+    fn persisted_processed_cat_guard_survives_v2_overlay_clear() {
+        let dir = unique_temp_dir("persisted-processed-op-guard");
+        let store = Arc::new(
+            AtomicStorageV2::open(&dir, 1, "cryptix-simnet".to_string(), BlockHash::from_u64_word(1)).expect("open V2 store"),
+        );
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        state.attach_state_store(store.clone());
+
+        let owner_script = test_script(104);
+        let receiver_script = test_script(105);
+        let owner = owner_id(&state, &owner_script);
+        let receiver = owner_id(&state, &receiver_script);
+        let outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(9200), 0);
+        let mut auth_inputs = HashMap::new();
+        auth_inputs.insert(outpoint, UtxoEntry::new(1000, owner_script.clone(), 0, false));
+
+        let create_tx = tx_with_inputs_outputs(
+            vec![(outpoint, 1)],
+            vec![TransactionOutput::new(1, owner_script), TransactionOutput::new(1, receiver_script)],
+            payload_create_asset(0, 1, 8, owner, b"StoredDup", b"SDP", b""),
+        );
+        let txid = create_tx.id();
+        let first_block = BlockHash::from_u64_word(9201);
+        let duplicate_block = BlockHash::from_u64_word(9202);
+
+        apply_block_and_commit(
+            &mut state,
+            first_block,
+            vec![tx_ref(create_tx.clone(), BlockHash::from_u64_word(9301), 0, 0)],
+            &auth_inputs,
+        );
+        assert!(state.processed_ops.is_empty(), "V2 commit should clear the in-memory processed-op overlay");
+        assert_eq!(store.get_processed_op(&txid).expect("stored processed op").map(|op| op.accepting_block_hash), Some(first_block));
+        assert_eq!(state.get_anchor_count(receiver), 1);
+
+        apply_block_and_commit(
+            &mut state,
+            duplicate_block,
+            vec![tx_ref(create_tx, BlockHash::from_u64_word(9302), 0, 0)],
+            &auth_inputs,
+        );
+
+        assert_eq!(state.get_anchor_count(receiver), 1, "duplicate guard must be read from the V2 store after overlay clear");
+        assert_eq!(state.events.iter().filter(|event| event.txid == txid).count(), 1);
+        assert_eq!(store.get_processed_op(&txid).expect("stored processed op").map(|op| op.accepting_block_hash), Some(first_block));
+
+        drop(state);
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

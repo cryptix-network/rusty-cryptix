@@ -20,6 +20,10 @@ pub trait TipsStoreReader {
 
 pub trait TipsStore: TipsStoreReader {
     fn add_tip(&mut self, new_tip: Hash, new_tip_parents: &[Hash]) -> StoreResult<ReadLock<BlockHashSet>>;
+    fn update_tips_batch(&mut self, batch: &mut WriteBatch, added_tips: &[Hash], removed_tips: &[Hash]) -> StoreResult<()> {
+        self.update_tips_with_writer(BatchDbWriter::new(batch), added_tips, removed_tips)
+    }
+    fn update_tips_with_writer(&mut self, writer: impl DbWriter, added_tips: &[Hash], removed_tips: &[Hash]) -> StoreResult<()>;
     fn add_tip_batch(
         &mut self,
         batch: &mut WriteBatch,
@@ -75,6 +79,11 @@ impl TipsStoreReader for DbTipsStore {
 impl TipsStore for DbTipsStore {
     fn add_tip(&mut self, new_tip: Hash, new_tip_parents: &[Hash]) -> StoreResult<ReadLock<BlockHashSet>> {
         self.access.update(DirectDbWriter::new(&self.db), &[new_tip], new_tip_parents)
+    }
+
+    fn update_tips_with_writer(&mut self, writer: impl DbWriter, added_tips: &[Hash], removed_tips: &[Hash]) -> StoreResult<()> {
+        self.access.update(writer, added_tips, removed_tips)?;
+        Ok(())
     }
 
     fn add_tip_with_writer(

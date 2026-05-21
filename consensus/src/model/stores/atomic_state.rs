@@ -276,6 +276,22 @@ impl Default for AtomicConsensusRootAccumulator {
 }
 
 impl AtomicConsensusRootAccumulator {
+    pub fn nonce_count(&self) -> u64 {
+        self.nonce_count
+    }
+
+    pub fn asset_count(&self) -> u64 {
+        self.asset_count
+    }
+
+    pub fn balance_count(&self) -> u64 {
+        self.balance_count
+    }
+
+    pub fn anchor_count(&self) -> u64 {
+        self.anchor_count
+    }
+
     fn from_state_maps(state: &AtomicConsensusState) -> Self {
         let mut root = Self::default();
         for (key, value) in state.next_nonces.iter() {
@@ -663,6 +679,14 @@ impl AtomicConsensusState {
 
     pub fn as_virtual_root_state(&self) -> Self {
         Self::root_only(self.root_accumulator())
+    }
+
+    pub fn is_root_only(&self) -> bool {
+        !self.has_in_memory_values() && self.root_accumulator != AtomicConsensusRootAccumulator::default()
+    }
+
+    pub fn materialized_vault_count(&self) -> Option<usize> {
+        (self.current_store.is_none() && !self.is_root_only()).then_some(self.liquidity_vault_outpoints.len())
     }
 
     fn has_in_memory_values(&self) -> bool {

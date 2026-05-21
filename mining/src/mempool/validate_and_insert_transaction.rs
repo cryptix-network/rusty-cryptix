@@ -227,6 +227,11 @@ impl Mempool {
         unorphaned_transactions
     }
 
+    pub(crate) fn remove_promoted_orphan(&mut self, transaction_id: &TransactionId) -> RuleResult<()> {
+        self.orphan_pool.remove_orphan(transaction_id, false, TxRemovalReason::Unorphaned, "")?;
+        Ok(())
+    }
+
     fn unorphan_transaction(&mut self, transaction_id: &TransactionId) -> RuleResult<MempoolTransaction> {
         // Rust rewrite:
         // - Instead of adding the validated transaction to mempool transaction pool,
@@ -235,13 +240,11 @@ impl Mempool {
         // - The function no longer validates the transaction in mempool (signatures) nor in context.
         //   This job is delegated to a fn called later in the process (Manager::validate_and_insert_unorphaned_transactions).
 
-        // Remove the transaction identified by transaction_id from the orphan pool.
-        let mut transactions = self.orphan_pool.remove_orphan(transaction_id, false, TxRemovalReason::Unorphaned, "")?;
-
-        // At this point, `transactions` contains exactly one transaction.
-        // The one we just removed from the orphan pool.
-        assert_eq!(transactions.len(), 1, "the list returned by remove_orphan is expected to contain exactly one transaction");
-        let transaction = transactions.pop().unwrap();
+        // Do not remove the transaction from the orphan pool yet. A block body can arrive before the
+        // parent output is actually available in virtual UTXO, especially in a DAG or after a relay gap.
+        // The manager removes the orphan only after full consensus validation and successful mempool insertion.
+        let transaction =
+            self.orphan_pool.get(transaction_id).ok_or(RuleError::RejectMissingOrphanTransaction(*transaction_id))?.clone();
         let rbf_policy = Self::get_orphan_transaction_rbf_policy(transaction.priority);
 
         self.validate_transaction_unacceptance(&transaction.mtx)?;
