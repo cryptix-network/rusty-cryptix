@@ -32,7 +32,10 @@ use std::{
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -159,6 +162,7 @@ pub struct AtomicBootstrapService {
     retry_interval: Duration,
     last_health_audit: Mutex<Option<Instant>>,
     bootstrap_attempt_lock: Mutex<()>,
+    audit_context_revalidation_attempted: AtomicBool,
     source_penalties: Mutex<HashMap<String, SourcePenalty>>,
     allow_peer_majority_fallback_override: bool,
     seed_confirmed_min_non_seed_sources: usize,
@@ -218,6 +222,7 @@ impl AtomicBootstrapService {
             retry_interval: Duration::from_secs(retry_interval_sec),
             last_health_audit: Default::default(),
             bootstrap_attempt_lock: Default::default(),
+            audit_context_revalidation_attempted: AtomicBool::new(false),
             source_penalties: Default::default(),
             allow_peer_majority_fallback_override,
             seed_confirmed_min_non_seed_sources,
@@ -871,10 +876,59 @@ impl AtomicBootstrapService {
         let (context, anchor_daa_score) = match self.atomic_token_service.get_p2p_audit_context().await {
             Ok(Some(value)) => value,
             Ok(None) => {
-                info!(
-                    "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=no_finality_stable_revalidated_token_checkpoint action=wait_for_atomic_catchup_or_revalidation"
-                );
-                return Ok(false);
+                if !self.audit_context_revalidation_attempted.swap(true, Ordering::SeqCst) {
+                    info!(
+                        "[atomic-bootstrap:p2p] no retained token audit checkpoint is available after catch-up; refreshing retained checkpoint hashes once before deferring"
+                    );
+                    let refreshed_context = match self.atomic_token_service.revalidate_retained_state_for_audit_once().await {
+                        Ok(repaired) => {
+                            if repaired {
+                                info!(
+                                    "[atomic-bootstrap:p2p] local retained-chain checkpoint refresh completed; retrying token audit context"
+                                );
+                            } else {
+                                info!(
+                                    "[atomic-bootstrap:p2p] local retained-chain checkpoint refresh found no persisted repair; retrying token audit context"
+                                );
+                            }
+                            match self.atomic_token_service.get_p2p_audit_context().await {
+                                Ok(Some(value)) => Some(value),
+                                Ok(None) => {
+                                    info!(
+                                        "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=no_finality_stable_revalidated_token_checkpoint_after_local_refresh action=wait_for_new_finality_stable_checkpoint"
+                                    );
+                                    return Ok(false);
+                                }
+                                Err(err) => {
+                                    info!(
+                                        "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=stable_token_audit_anchor_unavailable_after_local_refresh detail=\"{}\"",
+                                        err
+                                    );
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                "[atomic-bootstrap:p2p] local retained-chain checkpoint refresh failed while preparing token audit: {err}"
+                            );
+                            None
+                        }
+                    };
+                    if let Some(value) = refreshed_context {
+                        value
+                    } else {
+                        info!(
+                            "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=no_finality_stable_revalidated_token_checkpoint action=wait_for_atomic_catchup_or_revalidation"
+                        );
+                        return Ok(false);
+                    }
+                } else {
+                    info!(
+                        "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=no_finality_stable_revalidated_token_checkpoint action=wait_for_atomic_catchup_or_revalidation"
+                    );
+                    return Ok(false);
+                }
             }
             Err(err) => {
                 info!(
@@ -1239,8 +1293,21 @@ impl AtomicBootstrapService {
             );
             return Ok(false);
         }
+        if effective_health.runtime_state == AtomicTokenRuntimeState::Recovering
+            && health.runtime_state == AtomicTokenRuntimeState::Healthy
+            && !health.is_degraded
+            && self.configured_rpc_peers.is_empty()
+        {
+            info!(
+                "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=local_token_index_catching_up action=wait_for_atomic_catchup runtime={} local_runtime={}",
+                effective_health.runtime_state.as_str(),
+                health.runtime_state.as_str()
+            );
+            return Ok(false);
+        }
         let should_audit_healthy_state = if !health.is_degraded
             && health.runtime_state == AtomicTokenRuntimeState::Healthy
+            && effective_health.runtime_state == AtomicTokenRuntimeState::Healthy
             && health.last_applied_block.is_some()
         {
             if !self.should_run_health_audit().await {
@@ -1274,17 +1341,6 @@ impl AtomicBootstrapService {
             );
             return Ok(false);
         }
-        if effective_health.runtime_state == AtomicTokenRuntimeState::Recovering
-            && health.runtime_state == AtomicTokenRuntimeState::Healthy
-            && !health.is_degraded
-            && self.configured_rpc_peers.is_empty()
-        {
-            trace!(
-                "[atomic-bootstrap:p2p] Atomic state is locally healthy but still catching up to consensus sink; snapshot bootstrap not needed"
-            );
-            return Ok(false);
-        }
-
         let mut local_repair_error = None;
         if health.runtime_state == AtomicTokenRuntimeState::NotReady {
             match self.atomic_token_service.repair_from_local_selected_chain_once().await {

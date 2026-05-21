@@ -51,7 +51,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 const SERVICE_IDENT: &str = "cryptix-atomic-service";
 const TOKEN_PROTOCOL_VERSION: u16 = 6;
@@ -78,6 +78,8 @@ const ATOMIC_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const ATOMIC_LONG_OPERATION_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const DEGRADED_READ_WARN_INTERVAL: Duration = Duration::from_secs(10);
 const P2P_AUDIT_RENDEZVOUS_DAA_LAG: u64 = 60;
+const TOKEN_HEALTH_RECOVERING_LAG_DAA: u64 = 60;
+const TOKEN_HISTORY_PRUNE_BATCH_BLOCKS: usize = 2048;
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 struct SnapshotManifestV2 {
@@ -193,7 +195,7 @@ struct AtomicTokenProcessor {
     processed_chain_blocks: AtomicU64,
     progress_log: StdMutex<AtomicProgressLogState>,
     state_progress_notify: Notify,
-    state: Mutex<AtomicTokenState>,
+    state: RwLock<AtomicTokenState>,
     state_store: Arc<AtomicStorageV2>,
 }
 
@@ -226,7 +228,7 @@ impl AtomicTokenProcessor {
             processed_chain_blocks: AtomicU64::new(0),
             progress_log: Default::default(),
             state_progress_notify: Notify::new(),
-            state: Mutex::new(state),
+            state: RwLock::new(state),
             state_store,
         }
     }
@@ -273,7 +275,7 @@ impl AtomicTokenProcessor {
             ConsensusNotification::UtxosChanged(_) => Ok(()),
             ConsensusNotification::VirtualChainChanged(msg) => {
                 let already_applied_prefix_len = {
-                    let state = self.state.lock().await;
+                    let state = self.state.read().await;
                     if msg.removed_chain_block_hashes.is_empty() {
                         msg.added_chain_block_hashes
                             .iter()
@@ -309,7 +311,7 @@ impl AtomicTokenProcessor {
                     }
                 };
 
-                let mut state = self.state.lock().await;
+                let mut state = self.state.write().await;
                 if let Err(err) = state.apply_virtual_chain_change(&msg, &auth_inputs_snapshot, &self.consensus_manager).await {
                     if !state.degraded {
                         warn!("[{IDENT}] marking Cryptix Atomic degraded after processing error: {err}");
@@ -325,28 +327,37 @@ impl AtomicTokenProcessor {
                     self.notify_state_progress();
                     return Err(err);
                 }
-                if let Some(pruned) = state.prune_history_with_details(self.max_retained_blocks) {
-                    if let Err(err) = self.state_store.prune_history(
-                        &pruned.pruned_hashes,
-                        &state.applied_chain_order,
-                        pruned.last_pruned_event_sequence,
-                    ) {
-                        if !state.degraded {
-                            warn!("[{IDENT}] marking Cryptix Atomic degraded after history prune persistence error: {err}");
+                if self.should_prune_history(state.applied_chain_order.len()) {
+                    if let Some(pruned) = state.prune_history_with_details(self.max_retained_blocks) {
+                        if let Err(err) = self.state_store.prune_history(
+                            &pruned.pruned_hashes,
+                            &pruned.pruned_processed_op_txids,
+                            &state.applied_chain_order,
+                            pruned.last_pruned_event_sequence,
+                        ) {
+                            if !state.degraded {
+                                warn!("[{IDENT}] marking Cryptix Atomic degraded after history prune persistence error: {err}");
+                            }
+                            state.mark_degraded();
+                            let _ = self.state_store.persist_runtime_flags(
+                                state.applied_chain_order.last().copied(),
+                                state.applied_chain_order.len() as u64,
+                                state.degraded,
+                                state.next_event_sequence,
+                            );
+                            drop(state);
+                            self.notify_state_progress();
+                            return Err(err);
                         }
-                        state.mark_degraded();
-                        let _ = self.state_store.persist_runtime_flags(
-                            state.applied_chain_order.last().copied(),
-                            state.applied_chain_order.len() as u64,
-                            state.degraded,
-                            state.next_event_sequence,
+                        if pruned.pruned_processed_ops {
+                            trace!("[{IDENT}] Cryptix Atomic pruning removed processed op guard entries");
+                        }
+                    } else {
+                        let retained_blocks = state.applied_chain_order.len();
+                        warn!(
+                            "[{IDENT}] Cryptix Atomic history prune was requested but no history was pruned; retained_blocks={}, max_retained={}",
+                            retained_blocks, self.max_retained_blocks
                         );
-                        drop(state);
-                        self.notify_state_progress();
-                        return Err(err);
-                    }
-                    if pruned.pruned_processed_ops {
-                        trace!("[{IDENT}] Cryptix Atomic pruning removed processed op guard entries");
                     }
                 }
                 let retained_blocks = state.applied_chain_order.len();
@@ -370,6 +381,10 @@ impl AtomicTokenProcessor {
             }
             _ => Ok(()),
         }
+    }
+
+    fn should_prune_history(&self, retained_blocks: usize) -> bool {
+        retained_blocks > self.max_retained_blocks.saturating_add(TOKEN_HISTORY_PRUNE_BATCH_BLOCKS)
     }
 
     fn maybe_log_progress(
@@ -434,12 +449,12 @@ impl AtomicTokenProcessor {
     }
 
     async fn state_hash(&self) -> [u8; 32] {
-        self.state.lock().await.get_state_hash()
+        self.state.read().await.get_state_hash()
     }
 
     async fn local_health(&self) -> AtomicTokenHealth {
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
-        let state = self.state.lock().await;
+        let state = self.state.read().await;
         let mut health = state.get_health();
         health.bootstrap_in_progress = bootstrap_in_progress;
         health.runtime_state = state.runtime_state(bootstrap_in_progress);
@@ -447,7 +462,21 @@ impl AtomicTokenProcessor {
     }
 
     async fn health(&self) -> AtomicTokenHealth {
-        self.local_health().await
+        let mut health = self.local_health().await;
+        if health.runtime_state == AtomicTokenRuntimeState::Healthy
+            && !health.is_degraded
+            && !health.bootstrap_in_progress
+            && self
+                .catchup_estimate(&health)
+                .await
+                .map(|estimate| {
+                    estimate.sink_daa_score.saturating_sub(estimate.last_applied_daa_score) > TOKEN_HEALTH_RECOVERING_LAG_DAA
+                })
+                .unwrap_or(false)
+        {
+            health.runtime_state = AtomicTokenRuntimeState::Recovering;
+        }
+        health
     }
 
     async fn consensus_sink(&self) -> BlockHash {
@@ -468,7 +497,7 @@ impl AtomicTokenProcessor {
             let current_sink = self.consensus_sink().await;
             let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
             let (last_applied, target_is_retained, runtime_state) = {
-                let state = self.state.lock().await;
+                let state = self.state.read().await;
                 (
                     state.applied_chain_order.last().copied(),
                     state.state_hash_by_block.contains_key(&target_sink),
@@ -532,31 +561,31 @@ impl AtomicTokenProcessor {
     }
 
     async fn balance(&self, asset_id: [u8; 32], owner_id: [u8; 32]) -> u128 {
-        self.state.lock().await.get_balance(asset_id, owner_id)
+        self.state.read().await.get_balance(asset_id, owner_id)
     }
 
     async fn owner_nonce(&self, owner_id: [u8; 32]) -> u64 {
-        self.state.lock().await.get_owner_nonce(owner_id)
+        self.state.read().await.get_owner_nonce(owner_id)
     }
 
     async fn token_nonce(&self, owner_id: [u8; 32], asset_id: [u8; 32]) -> u64 {
-        self.state.lock().await.get_token_nonce(owner_id, asset_id)
+        self.state.read().await.get_token_nonce(owner_id, asset_id)
     }
 
     async fn asset(&self, asset_id: [u8; 32]) -> Option<TokenAsset> {
-        self.state.lock().await.get_asset(asset_id)
+        self.state.read().await.get_asset(asset_id)
     }
 
     async fn op_status(&self, txid: BlockHash) -> Option<ProcessedOp> {
-        self.state.lock().await.get_op_status(txid)
+        self.state.read().await.get_op_status(txid)
     }
 
     async fn events_since(&self, after_sequence: u64, limit: usize) -> Vec<TokenEvent> {
-        self.state.lock().await.get_events_since(after_sequence, limit)
+        self.state.read().await.get_events_since(after_sequence, limit)
     }
 
     async fn events_since_capped(&self, after_sequence: u64, limit: usize, max_sequence: u64) -> Vec<TokenEvent> {
-        self.state.lock().await.get_events_since_capped(after_sequence, limit, max_sequence)
+        self.state.read().await.get_events_since_capped(after_sequence, limit, max_sequence)
     }
 
     async fn read_context(
@@ -566,7 +595,7 @@ impl AtomicTokenProcessor {
     ) -> Option<AtomicTokenReadContext> {
         let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
-        let state = self.state.lock().await;
+        let state = self.state.read().await;
         if !Self::state_matches_latest_sink(&state, latest_sink) {
             return None;
         }
@@ -586,7 +615,7 @@ impl AtomicTokenProcessor {
     ) -> Option<(AtomicTokenReadContext, u128)> {
         let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
-        let state = self.state.lock().await;
+        let state = self.state.read().await;
         if !Self::state_matches_latest_sink(&state, latest_sink) {
             return None;
         }
@@ -611,7 +640,7 @@ impl AtomicTokenProcessor {
     ) -> Option<(AtomicTokenReadContext, u64)> {
         let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
-        let state = self.state.lock().await;
+        let state = self.state.read().await;
         if !Self::state_matches_latest_sink(&state, latest_sink) {
             return None;
         }
@@ -638,7 +667,7 @@ impl AtomicTokenProcessor {
     ) -> Option<(AtomicTokenReadContext, u64)> {
         let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
-        let state = self.state.lock().await;
+        let state = self.state.read().await;
         if !Self::state_matches_latest_sink(&state, latest_sink) {
             return None;
         }
@@ -662,7 +691,7 @@ impl AtomicTokenProcessor {
     ) -> Option<(AtomicTokenReadContext, Option<TokenAsset>)> {
         let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
-        let state = self.state.lock().await;
+        let state = self.state.read().await;
         if !Self::state_matches_latest_sink(&state, latest_sink) {
             return None;
         }
@@ -686,7 +715,7 @@ impl AtomicTokenProcessor {
     ) -> Option<(AtomicTokenReadContext, Option<ProcessedOp>)> {
         let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
-        let state = self.state.lock().await;
+        let state = self.state.read().await;
         if !Self::state_matches_latest_sink(&state, latest_sink) {
             return None;
         }
@@ -712,7 +741,7 @@ impl AtomicTokenProcessor {
     ) -> Option<(AtomicTokenReadContext, Vec<TokenAsset>, u64)> {
         let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
-        let state = self.state.lock().await;
+        let state = self.state.read().await;
         if !Self::state_matches_latest_sink(&state, latest_sink) {
             return None;
         }
@@ -740,7 +769,7 @@ impl AtomicTokenProcessor {
     ) -> Option<AtomicTokenReadView> {
         let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
-        let state = self.state.lock().await;
+        let state = self.state.read().await;
         if !Self::state_matches_latest_sink(&state, latest_sink) {
             return None;
         }
@@ -868,7 +897,7 @@ impl AtomicTokenProcessor {
     ) -> Option<(AtomicTokenReadContext, Vec<TokenOwnerBalanceEntry>)> {
         let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
-        let state = self.state.lock().await;
+        let state = self.state.read().await;
         if !Self::state_matches_latest_sink(&state, latest_sink) {
             return None;
         }
@@ -895,7 +924,7 @@ impl AtomicTokenProcessor {
     ) -> Option<(AtomicTokenReadContext, Vec<TokenHolderEntry>)> {
         let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
-        let state = self.state.lock().await;
+        let state = self.state.read().await;
         if !Self::state_matches_latest_sink(&state, latest_sink) {
             return None;
         }
@@ -923,7 +952,7 @@ impl AtomicTokenProcessor {
     {
         let latest_sink = self.latest_read_sink(requested_at_block_hash).await?;
         let bootstrap_in_progress = self.bootstrap_in_progress.load(Ordering::SeqCst);
-        let state = self.state.lock().await;
+        let state = self.state.read().await;
         if !Self::state_matches_latest_sink(&state, latest_sink) {
             return None;
         }
@@ -954,7 +983,7 @@ impl AtomicTokenProcessor {
     }
 
     async fn mark_degraded_best_effort(&self, reason: &str) {
-        let mut state = self.state.lock().await;
+        let mut state = self.state.write().await;
         if !state.degraded {
             warn!("[{IDENT}] marking Cryptix Atomic degraded: {reason}");
         }
@@ -1096,7 +1125,7 @@ impl AtomicTokenService {
     }
 
     pub async fn get_state_hash_at_block(&self, at_block_hash: BlockHash) -> Option<[u8; 32]> {
-        self.processor.state.lock().await.get_state_hash_at_block(at_block_hash)
+        self.processor.state.read().await.get_state_hash_at_block(at_block_hash)
     }
 
     pub async fn get_p2p_audit_context(&self) -> AtomicTokenResult<Option<(AtomicTokenReadContext, u64)>> {
@@ -1142,7 +1171,7 @@ impl AtomicTokenService {
         if self.processor.state_store.revalidation_version()? != Some(ATOMIC_REVALIDATION_VERSION) {
             return Ok(None);
         }
-        let state = self.processor.state.lock().await;
+        let state = self.processor.state.read().await;
         if state.degraded || !state.live_correct || !state.has_verified_state() {
             return Ok(None);
         }
@@ -1151,7 +1180,7 @@ impl AtomicTokenService {
 
     pub async fn mark_degraded_and_persist(&self, reason: &str) -> AtomicTokenResult<()> {
         let _operation_guard = self.processor.operation_lock.lock().await;
-        let mut state = self.processor.state.lock().await;
+        let mut state = self.processor.state.write().await;
         if !state.degraded {
             warn!("[{IDENT}] marking Cryptix Atomic state degraded: {reason}");
         }
@@ -1262,7 +1291,7 @@ impl AtomicTokenService {
 
     pub async fn revalidate_retained_state_once(&self) -> AtomicTokenResult<bool> {
         {
-            let state = self.processor.state.lock().await;
+            let state = self.processor.state.read().await;
             if !state.degraded && state.live_correct && state.has_verified_state() {
                 info!("[{IDENT}] Cryptix Atomic retained-chain revalidation skipped: local state is already healthy");
                 return Ok(false);
@@ -1282,7 +1311,7 @@ impl AtomicTokenService {
         if self.processor.bootstrap_in_progress.load(Ordering::SeqCst) {
             return Ok(false);
         }
-        let has_verified_state = { self.processor.state.lock().await.has_verified_state() };
+        let has_verified_state = { self.processor.state.read().await.has_verified_state() };
         if has_verified_state {
             self.revalidate_retained_state_once().await
         } else {
@@ -1305,7 +1334,7 @@ impl AtomicTokenService {
             None => return Ok(false),
         };
 
-        let mut state = self.processor.state.lock().await;
+        let mut state = self.processor.state.write().await;
         if state.degraded || !state.has_verified_state() {
             return Ok(false);
         }
@@ -1341,7 +1370,7 @@ impl AtomicTokenService {
     }
 
     async fn catch_up_loaded_state_to_consensus_sink(&self) -> AtomicTokenResult<bool> {
-        let last_applied = { self.processor.state.lock().await.applied_chain_order.last().copied() };
+        let last_applied = { self.processor.state.read().await.applied_chain_order.last().copied() };
         let Some(last_applied) = last_applied else {
             return Ok(false);
         };
@@ -1419,7 +1448,7 @@ impl AtomicTokenService {
         let revalidation_version_is_current = self.processor.state_store.revalidation_version()? == Some(ATOMIC_REVALIDATION_VERSION);
 
         let loaded_state = {
-            let state = self.processor.state.lock().await;
+            let state = self.processor.state.read().await;
             if !state.has_verified_state() {
                 return Ok(false);
             }
@@ -1477,7 +1506,7 @@ impl AtomicTokenService {
             let temp_state_dir = unique_atomic_temp_dir(&self.atomic_data_dir, "checkpoint-refresh")?;
             let _temp_state_cleanup = RemoveDirOnDrop::new(temp_state_dir.clone());
             let (checkpoint_state, expected_chain, expected_hashes) = {
-                let state = self.processor.state.lock().await;
+                let state = self.processor.state.read().await;
                 let checkpoint_state = state.clone();
                 let checkpoint_first_replayable = checkpoint_state.first_replayable_block_hash().ok_or_else(|| {
                     AtomicTokenError::Processing(
@@ -1552,7 +1581,7 @@ impl AtomicTokenService {
                         Vec::<(BlockHash, Option<ProcessedOp>)>::new(),
                     )?;
                     {
-                        let mut state = self.processor.state.lock().await;
+                        let mut state = self.processor.state.write().await;
                         for asset in repaired_assets.iter().cloned() {
                             state.assets.insert(asset.asset_id, asset);
                         }
@@ -1577,7 +1606,7 @@ impl AtomicTokenService {
                 .collect::<Vec<_>>();
 
             if refreshed_retained_hashes.is_empty() {
-                let mut state = self.processor.state.lock().await;
+                let mut state = self.processor.state.write().await;
                 if !state.degraded {
                     state.live_correct = true;
                 }
@@ -1597,7 +1626,7 @@ impl AtomicTokenService {
                 return Ok(!force_healthy_revalidation);
             }
 
-            let mut state = self.processor.state.lock().await;
+            let mut state = self.processor.state.write().await;
             let retained_hashes = state.applied_chain_order.iter().copied().collect::<HashSet<_>>();
             refreshed_retained_hashes.retain(|(block_hash, _)| retained_hashes.contains(block_hash));
             let refreshed_count = self.processor.state_store.replace_state_hashes(refreshed_retained_hashes.iter().copied())?;
@@ -1793,7 +1822,7 @@ impl AtomicTokenService {
             );
         }
 
-        let mut state = self.processor.state.lock().await;
+        let mut state = self.processor.state.write().await;
         let active_state_needs_repair = loaded_state.degraded
             || retained_path_diverged
             || replay_extends_loaded_chain
@@ -1804,6 +1833,7 @@ impl AtomicTokenService {
             if let Some(pruned) = staged_state.prune_history_with_details(self.max_retained_blocks) {
                 temp_state_store.prune_history(
                     &pruned.pruned_hashes,
+                    &pruned.pruned_processed_op_txids,
                     &staged_state.applied_chain_order,
                     pruned.last_pruned_event_sequence,
                 )?;
@@ -1837,6 +1867,7 @@ impl AtomicTokenService {
         if let Some(pruned) = state.prune_history_with_details(self.max_retained_blocks) {
             self.processor.state_store.prune_history(
                 &pruned.pruned_hashes,
+                &pruned.pruned_processed_op_txids,
                 &state.applied_chain_order,
                 pruned.last_pruned_event_sequence,
             )?;
@@ -1889,7 +1920,7 @@ impl AtomicTokenService {
 
     async fn backfill_empty_state_from_local_selected_chain(&self) -> AtomicTokenResult<bool> {
         {
-            let state = self.processor.state.lock().await;
+            let state = self.processor.state.read().await;
             if state.has_verified_state() {
                 return Ok(false);
             }
@@ -1942,7 +1973,7 @@ impl AtomicTokenService {
 
         self.processor.set_bootstrap_in_progress(true);
         let result = async {
-            let mut state = self.processor.state.lock().await;
+            let mut state = self.processor.state.write().await;
             if state.has_verified_state() {
                 return Ok(false);
             }
@@ -1950,6 +1981,7 @@ impl AtomicTokenService {
             if let Some(pruned) = state.prune_history_with_details(self.max_retained_blocks) {
                 self.processor.state_store.prune_history(
                     &pruned.pruned_hashes,
+                    &pruned.pruned_processed_op_txids,
                     &state.applied_chain_order,
                     pruned.last_pruned_event_sequence,
                 )?;
@@ -1970,7 +2002,7 @@ impl AtomicTokenService {
         self.processor.set_bootstrap_in_progress(false);
 
         if result.as_ref().copied().unwrap_or(false) {
-            let state = self.processor.state.lock().await;
+            let state = self.processor.state.read().await;
             let retained_blocks = state.applied_chain_order.len();
             let footprint = state.footprint();
             let state_store_bytes = self.processor.state_store.approximate_size_bytes();
@@ -1998,7 +2030,7 @@ impl AtomicTokenService {
             ));
         }
 
-        let state = self.processor.state.lock().await;
+        let state = self.processor.state.read().await;
         if state.degraded {
             return Err(AtomicTokenError::Processing(
                 "bootstrap source export unavailable: local Atomic state is degraded".to_string(),
@@ -2023,7 +2055,7 @@ impl AtomicTokenService {
         let sink_header = session.async_get_header(sink).await?;
 
         if self.unsafe_skip_snapshot_finality_check {
-            let state = self.processor.state.lock().await;
+            let state = self.processor.state.read().await;
             let anchor_hash = *state.applied_chain_order.last().ok_or_else(|| {
                 AtomicTokenError::Processing("snapshot export failed: no local Atomic chain order available".to_string())
             })?;
@@ -2081,7 +2113,7 @@ impl AtomicTokenService {
         let (anchor_hash, _anchor_daa_score) = self.current_snapshot_anchor().await?;
         let anchor_hash_bytes = hash_to_array(anchor_hash);
         let already_present = {
-            let state = self.processor.state.lock().await;
+            let state = self.processor.state.read().await;
             let local_anchor_state_hash = state.get_state_hash_at_block(anchor_hash);
             list_snapshot_catalog(&self.snapshot_store_dir)?.into_iter().any(|entry| {
                 entry.manifest.protocol_version == self.protocol_version
@@ -2496,6 +2528,7 @@ impl AtomicTokenService {
             if let Some(pruned) = staged_state.prune_history_with_details(self.max_retained_blocks) {
                 temp_state_store.prune_history(
                     &pruned.pruned_hashes,
+                    &pruned.pruned_processed_op_txids,
                     &staged_state.applied_chain_order,
                     pruned.last_pruned_event_sequence,
                 )?;
@@ -2507,7 +2540,7 @@ impl AtomicTokenService {
             let active_state =
                 copy_snapshot_store_into_active(&temp_state_store, self.processor.state_store.clone(), staged_state)?;
             {
-                let mut live_state = self.processor.state.lock().await;
+                let mut live_state = self.processor.state.write().await;
                 *live_state = active_state;
             }
             self.processor.state_store.persist_revalidation_version(ATOMIC_REVALIDATION_VERSION)?;

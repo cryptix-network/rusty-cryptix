@@ -476,6 +476,83 @@ impl Wallet {
         Ok(ids)
     }
 
+    async fn activate_accounts_smart_impl(
+        self: &Arc<Wallet>,
+        account_ids: Option<&[AccountId]>,
+        wallet_secret: Option<&Secret>,
+        window_size: Option<usize>,
+        monitor_window_size: Option<usize>,
+        extent: Option<u32>,
+        start_index: Option<u32>,
+        relative_to_current_index: bool,
+        known_addresses: Option<Vec<Address>>,
+    ) -> Result<(Vec<AccountId>, Vec<AccountDescriptor>, Vec<SmartScanSummary>)> {
+        let stored_accounts = if let Some(ids) = account_ids {
+            self.inner.store.as_account_store().unwrap().load_multiple(ids).await?
+        } else {
+            self.inner.store.as_account_store().unwrap().iter(None).await?.try_collect::<Vec<_>>().await?
+        };
+
+        let ids = stored_accounts.iter().map(|(account, _)| *account.id()).collect::<Vec<_>>();
+        let mut account_descriptors = Vec::new();
+        let mut summaries = Vec::new();
+
+        for (account_storage, meta) in stored_accounts.into_iter() {
+            let account = if account_storage.kind.as_ref() == LEGACY_ACCOUNT_KIND {
+                self.legacy_accounts().get(account_storage.id()).ok_or_else(|| Error::LegacyAccountNotInitialized)?
+            } else {
+                try_load_account(self, account_storage, meta).await?
+            };
+
+            let legacy_account = account.clone().as_legacy_account().ok();
+            if let Some(legacy_account) = legacy_account.as_ref() {
+                let wallet_secret = wallet_secret
+                    .ok_or_else(|| Error::Custom("walletSecret is required to smart-activate legacy accounts".to_string()))?;
+                legacy_account.create_private_context(wallet_secret, None, None).await?;
+            }
+
+            self.active_accounts().insert(account.clone());
+
+            let scan_result = if self.is_connected() {
+                account
+                    .clone()
+                    .scan_smart(
+                        window_size,
+                        monitor_window_size,
+                        extent,
+                        start_index,
+                        relative_to_current_index,
+                        known_addresses.clone(),
+                    )
+                    .await
+            } else {
+                Ok(Vec::new())
+            };
+
+            if let Some(legacy_account) = legacy_account.as_ref() {
+                let clear_result = legacy_account.clear_private_context().await;
+                if scan_result.is_ok() {
+                    clear_result?;
+                } else if let Err(err) = clear_result {
+                    log_warn!("failed to clear legacy private context after smart activation scan error: {err}");
+                }
+            }
+            summaries.extend(scan_result?);
+
+            if let Some(metadata) = account.metadata()? {
+                self.inner.store.as_account_store()?.update_metadata(vec![metadata]).await?;
+            }
+
+            let account_descriptor = account.descriptor()?;
+            self.notify(Events::AccountUpdate { account_descriptor: account_descriptor.clone() }).await?;
+            account_descriptors.push(account_descriptor);
+        }
+
+        self.notify(Events::AccountActivation { ids: ids.clone() }).await?;
+
+        Ok((ids, account_descriptors, summaries))
+    }
+
     /// Activates accounts (performs account address space counts, initializes balance tracking, etc.)
     pub async fn activate_accounts(self: &Arc<Wallet>, account_ids: Option<&[AccountId]>, _guard: &WalletGuard<'_>) -> Result<()> {
         // This is a wrapper of activate_accounts_impl() that catches errors and notifies the UI
@@ -484,6 +561,39 @@ impl Wallet {
             Err(err)
         } else {
             Ok(())
+        }
+    }
+
+    pub async fn activate_accounts_smart(
+        self: &Arc<Wallet>,
+        account_ids: Option<&[AccountId]>,
+        wallet_secret: Option<&Secret>,
+        window_size: Option<usize>,
+        monitor_window_size: Option<usize>,
+        extent: Option<u32>,
+        start_index: Option<u32>,
+        relative_to_current_index: bool,
+        known_addresses: Option<Vec<Address>>,
+        _guard: &WalletGuard<'_>,
+    ) -> Result<(Vec<AccountDescriptor>, Vec<SmartScanSummary>)> {
+        match self
+            .activate_accounts_smart_impl(
+                account_ids,
+                wallet_secret,
+                window_size,
+                monitor_window_size,
+                extent,
+                start_index,
+                relative_to_current_index,
+                known_addresses,
+            )
+            .await
+        {
+            Ok((_ids, account_descriptors, summaries)) => Ok((account_descriptors, summaries)),
+            Err(err) => {
+                self.notify(Events::WalletError { message: err.to_string() }).await?;
+                Err(err)
+            }
         }
     }
 

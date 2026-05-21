@@ -242,14 +242,18 @@ pub trait Account: AnySync + Send + Sync + 'static {
                         &balance,
                         current_daa_score,
                         window_size,
+                        None,
                         Some(extent),
+                        None,
                     ),
                     Scan::new_with_address_manager(
                         derivation.change_address_manager(),
                         &balance,
                         current_daa_score,
                         window_size,
+                        None,
                         Some(extent),
+                        None,
                     ),
                 ];
 
@@ -270,6 +274,117 @@ pub trait Account: AnySync + Send + Sync + 'static {
         self.utxo_context().update_balance().await?;
 
         Ok(())
+    }
+
+    async fn scan_smart(
+        self: Arc<Self>,
+        window_size: Option<usize>,
+        monitor_window_size: Option<usize>,
+        extent: Option<u32>,
+        start_index: Option<u32>,
+        relative_to_current_index: bool,
+        known_addresses: Option<Vec<Address>>,
+    ) -> Result<Vec<SmartScanSummary>> {
+        self.utxo_context().clear().await?;
+
+        let current_daa_score = self.wallet().current_daa_score().ok_or(Error::NotConnected)?;
+        let balance = Arc::new(AtomicBalance::default());
+        let mut summaries = Vec::new();
+
+        match self.clone().as_derivation_capable() {
+            Ok(account) => {
+                let derivation = account.derivation();
+
+                let receive_manager = derivation.receive_address_manager();
+                let change_manager = derivation.change_address_manager();
+                let receive_index = receive_manager.index();
+                let change_index = change_manager.index();
+                let receive_start_index = if relative_to_current_index { Some(receive_index) } else { start_index };
+                let change_start_index = if relative_to_current_index { Some(change_index) } else { start_index };
+                let receive_extent = match extent {
+                    Some(depth) if relative_to_current_index => ScanExtent::Depth(receive_index.saturating_add(depth)),
+                    Some(depth) => ScanExtent::Depth(depth),
+                    None => ScanExtent::EmptyWindow,
+                };
+                let change_extent = match extent {
+                    Some(depth) if relative_to_current_index => ScanExtent::Depth(change_index.saturating_add(depth)),
+                    Some(depth) => ScanExtent::Depth(depth),
+                    None => ScanExtent::EmptyWindow,
+                };
+
+                let scans = [
+                    Scan::new_with_address_manager(
+                        receive_manager.clone(),
+                        &balance,
+                        current_daa_score,
+                        window_size,
+                        monitor_window_size,
+                        Some(receive_extent),
+                        receive_start_index,
+                    ),
+                    Scan::new_with_address_manager(
+                        change_manager.clone(),
+                        &balance,
+                        current_daa_score,
+                        window_size,
+                        monitor_window_size,
+                        Some(change_extent),
+                        change_start_index,
+                    ),
+                ];
+
+                let futures = scans.iter().map(|scan| scan.scan_smart(self.utxo_context())).collect::<Vec<_>>();
+                summaries = join_all(futures).await.into_iter().collect::<Result<Vec<_>>>()?;
+
+                let known_address_set_all = known_addresses
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<HashSet<_>>();
+                if !known_address_set_all.is_empty() {
+                    let fallback_window = window_size.unwrap_or(crate::utxo::scan::DEFAULT_WINDOW_SIZE) as u32;
+                    let receive_known_depth = match receive_extent {
+                        ScanExtent::Depth(depth) => depth,
+                        ScanExtent::EmptyWindow => receive_index.saturating_add(fallback_window),
+                    };
+                    let change_known_depth = match change_extent {
+                        ScanExtent::Depth(depth) => depth,
+                        ScanExtent::EmptyWindow => change_index.saturating_add(fallback_window),
+                    };
+                    let known_search_depth = receive_known_depth.max(change_known_depth);
+                    let receive_hydrated = receive_manager.hydrate_known_address_indexes(&known_address_set_all, known_search_depth)?;
+                    let change_hydrated = change_manager.hydrate_known_address_indexes(&known_address_set_all, known_search_depth)?;
+                    if receive_hydrated > 0 || change_hydrated > 0 {
+                        log_info!(
+                            "smart account activation hydrated {} receive and {} change known address index entries up to depth {}",
+                            receive_hydrated,
+                            change_hydrated,
+                            known_search_depth
+                        );
+                    }
+                }
+
+                let known_address_set = known_address_set_all
+                    .into_iter()
+                    .filter(|address| !self.utxo_context().addresses().contains(&Arc::new(address.clone())))
+                    .collect::<HashSet<_>>();
+                if !known_address_set.is_empty() {
+                    let scan = Scan::new_with_address_set(known_address_set, &balance, current_daa_score);
+                    summaries.push(scan.scan_smart(self.utxo_context()).await?);
+                }
+            }
+            Err(_) => {
+                let mut address_set = HashSet::<Address>::new();
+                address_set.insert(self.receive_address()?);
+                address_set.insert(self.change_address()?);
+
+                let scan = Scan::new_with_address_set(address_set, &balance, current_daa_score);
+                summaries.push(scan.scan_smart(self.utxo_context()).await?);
+            }
+        }
+
+        self.utxo_context().update_balance().await?;
+
+        Ok(summaries)
     }
 
     fn sig_op_count(&self) -> u8;

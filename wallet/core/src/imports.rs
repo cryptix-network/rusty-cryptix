@@ -20,7 +20,7 @@ pub use crate::rpc::{DynRpcApi, RpcCtl};
 pub use crate::serializer::*;
 pub use crate::storage::*;
 pub use crate::utxo::balance::Balance;
-pub use crate::utxo::scan::{Scan, ScanExtent};
+pub use crate::utxo::scan::{Scan, ScanExtent, SmartScanSummary};
 pub use crate::utxo::{Maturity, NetworkParams, OutgoingTransaction, UtxoContext, UtxoEntryReference, UtxoProcessor};
 pub use crate::wallet::*;
 pub use crate::{storage, utils};

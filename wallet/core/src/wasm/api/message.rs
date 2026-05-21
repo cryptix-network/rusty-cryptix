@@ -1070,6 +1070,72 @@ try_from! ( args: AccountsScanResponse, IAccountsScanResponse, {
 // ---
 
 declare! {
+    IAccountsScanSmartRequest,
+    r#"
+    /**
+     * Smart account scan. Leaves the legacy accountsScan API unchanged.
+     * @category Wallet API
+     */
+    export interface IAccountsScanSmartRequest {
+        accountId: HexString;
+        walletSecret?: string;
+        depth?: number;
+        windowSize?: number;
+        monitorWindowSize?: number;
+    }
+    "#,
+}
+
+try_from! (args: IAccountsScanSmartRequest, AccountsScanSmartRequest, {
+    let account_id = args.get_account_id("accountId")?;
+    let wallet_secret = args.try_get_secret("walletSecret")?;
+    let depth = args
+        .try_get_value("depth")?
+        .map(|value| {
+            let value = value.try_as_u64()?;
+            u32::try_from(value).map_err(|_| Error::InvalidArgument("depth".to_string()))
+        })
+        .transpose()?;
+    let window_size = args
+        .try_get_value("windowSize")?
+        .map(|value| {
+            let value = value.try_as_u64()?;
+            u32::try_from(value).map_err(|_| Error::InvalidArgument("windowSize".to_string()))
+        })
+        .transpose()?;
+    let monitor_window_size = args
+        .try_get_value("monitorWindowSize")?
+        .map(|value| {
+            let value = value.try_as_u64()?;
+            u32::try_from(value).map_err(|_| Error::InvalidArgument("monitorWindowSize".to_string()))
+        })
+        .transpose()?;
+
+    Ok(AccountsScanSmartRequest { account_id, wallet_secret, depth, window_size, monitor_window_size })
+});
+
+declare! {
+    IAccountsScanSmartResponse,
+    r#"
+    /**
+     * @category Wallet API
+     */
+    export interface IAccountsScanSmartResponse {
+        accountDescriptor: IAccountDescriptor;
+        scannedAddressCount: number;
+        discoveredAddressCount: number;
+        registeredAddressCount: number;
+    }
+    "#,
+}
+
+try_from! ( args: AccountsScanSmartResponse, IAccountsScanSmartResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+// ---
+
+declare! {
     IAccountsCreateRequest,
     r#"
     /**
@@ -1278,6 +1344,52 @@ declare! {
 
 try_from! ( _args: AccountsActivateResponse, IAccountsActivateResponse, {
     Ok(IAccountsActivateResponse::default())
+});
+
+// ---
+
+declare! {
+    IAccountsActivateSmartRequest,
+    "IAccountsActivateSmartRequest",
+    r#"
+    /**
+     * Activates accounts using the smart scan policy.
+     * @category Wallet API
+     */
+    export interface IAccountsActivateSmartRequest {
+        accountIds?: HexString[];
+        walletSecret?: string;
+        depth?: number;
+        windowSize?: number;
+        monitorWindowSize?: number;
+        startIndex?: number;
+        relativeToCurrentIndex?: boolean;
+        knownAddresses?: Array<Address | string>;
+    }
+    "#,
+}
+
+try_from! (args: IAccountsActivateSmartRequest, AccountsActivateSmartRequest, {
+    Ok(from_value::<AccountsActivateSmartRequest>(args.into())?)
+});
+
+declare! {
+    IAccountsActivateSmartResponse,
+    r#"
+    /**
+     * @category Wallet API
+     */
+    export interface IAccountsActivateSmartResponse {
+        accountDescriptors: IAccountDescriptor[];
+        scannedAddressCount: number;
+        discoveredAddressCount: number;
+        registeredAddressCount: number;
+    }
+    "#,
+}
+
+try_from! ( args: AccountsActivateSmartResponse, IAccountsActivateSmartResponse, {
+    Ok(to_value(&args)?.into())
 });
 
 // ---

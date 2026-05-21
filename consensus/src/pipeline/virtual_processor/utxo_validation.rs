@@ -41,7 +41,7 @@ use cryptix_consensus_core::{
     },
     BlockHashMap, BlockHashSet, HashMapCustomHasher,
 };
-use cryptix_core::{info, trace};
+use cryptix_core::{info, trace, warn};
 use cryptix_hashes::Hash;
 use cryptix_math::Uint256;
 use cryptix_muhash::MuHash;
@@ -838,10 +838,26 @@ impl VirtualStateProcessor {
         // Verify header state commitment. Before the payload HF this is the raw UTXO commitment;
         // after the HF it commits to both UTXO and Atomic consensus state.
         let utxo_commitment = ctx.multiset_hash.finalize();
-        let expected_commitment = ctx
-            .atomic_state
-            .header_commitment_for_state(utxo_commitment, self.transaction_validator.is_payload_hf_active(header.daa_score));
+        let atomic_state_hash = ctx.atomic_state.canonical_hash();
+        let payload_hf_active = self.transaction_validator.is_payload_hf_active(header.daa_score);
+        let expected_commitment = ctx.atomic_state.header_commitment_for_state(utxo_commitment, payload_hf_active);
         if expected_commitment != header.utxo_commitment {
+            let pre_hf_commitment = AtomicConsensusState::header_commitment(utxo_commitment, atomic_state_hash, false);
+            let post_hf_commitment = AtomicConsensusState::header_commitment(utxo_commitment, atomic_state_hash, true);
+            warn!(
+                "UTXO commitment mismatch diagnostics for block {}: daa={}, payload_hf_active={}, header={}, raw_utxo={}, atomic_state_hash={}, pre_hf_commitment={}, post_hf_commitment={}, header_matches_raw={}, header_matches_pre_hf={}, header_matches_post_hf={}",
+                header.hash,
+                header.daa_score,
+                payload_hf_active,
+                header.utxo_commitment,
+                utxo_commitment,
+                faster_hex::hex_string(&atomic_state_hash),
+                pre_hf_commitment,
+                post_hf_commitment,
+                header.utxo_commitment == utxo_commitment,
+                header.utxo_commitment == pre_hf_commitment,
+                header.utxo_commitment == post_hf_commitment
+            );
             return Err(BadUTXOCommitment(header.hash, header.utxo_commitment, expected_commitment));
         }
         trace!("correct commitment: {}, {}", header.hash, expected_commitment);

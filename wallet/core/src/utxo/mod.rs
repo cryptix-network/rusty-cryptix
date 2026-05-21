@@ -24,7 +24,7 @@ pub use outgoing::OutgoingTransaction;
 pub use pending::PendingUtxoEntryReference;
 pub use processor::UtxoProcessor;
 pub use reference::{Maturity, TryIntoUtxoEntryReferences, UtxoEntryReference, UtxoEntryReferenceExtension};
-pub use scan::{Scan, ScanExtent};
+pub use scan::{Scan, ScanExtent, SmartScanSummary};
 pub use settings::*;
 pub use stream::UtxoStream;
 pub use sync::SyncMonitor;

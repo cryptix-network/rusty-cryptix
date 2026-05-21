@@ -325,6 +325,17 @@ pub trait WalletApi: Send + Sync + AnySync {
     /// initialized for the duration of the scan.
     async fn accounts_scan_call(self: Arc<Self>, request: AccountsScanRequest) -> Result<AccountsScanResponse>;
 
+    /// Smart account scan variant that keeps the legacy scan behavior available
+    /// under [`accounts_scan_call`](Self::accounts_scan_call) while avoiding
+    /// permanent registration of every scanned empty address.
+    async fn accounts_scan_smart_call(self: Arc<Self>, request: AccountsScanSmartRequest) -> Result<AccountsScanSmartResponse>;
+
+    /// Activate accounts using the smart scan policy.
+    async fn accounts_activate_smart_call(
+        self: Arc<Self>,
+        request: AccountsActivateSmartRequest,
+    ) -> Result<AccountsActivateSmartResponse>;
+
     /// Wrapper around [`accounts_create_call()`](Self::accounts_create_call)
     async fn accounts_create(
         self: Arc<Self>,

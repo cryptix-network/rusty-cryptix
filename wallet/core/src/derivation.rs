@@ -121,6 +121,33 @@ impl AddressManager {
         self.get_range_with_args(indexes, true)
     }
 
+    pub fn hydrate_known_address_indexes(&self, known_addresses: &HashSet<Address>, max_index: u32) -> Result<usize> {
+        if known_addresses.is_empty() {
+            return Ok(0);
+        }
+
+        let mut hydrated = 0usize;
+        let mut start = 0u32;
+        let end_limit = max_index.saturating_add(1);
+        const HYDRATE_CHUNK_SIZE: u32 = 512;
+
+        while start < end_limit {
+            let end = start.saturating_add(HYDRATE_CHUNK_SIZE).min(end_limit);
+            if end <= start {
+                break;
+            }
+            let addresses = self.get_range(start..end)?;
+            for address in addresses {
+                if known_addresses.contains(&address) {
+                    hydrated = hydrated.saturating_add(1);
+                }
+            }
+            start = end;
+        }
+
+        Ok(hydrated)
+    }
+
     pub fn get_range_with_args(&self, indexes: std::ops::Range<u32>, update_indexes: bool) -> Result<Vec<Address>> {
         let manager_length = self.pubkey_managers.len();
 

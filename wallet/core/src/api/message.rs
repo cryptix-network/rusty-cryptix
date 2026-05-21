@@ -383,6 +383,25 @@ pub struct AccountsScanResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AccountsScanSmartRequest {
+    pub account_id: AccountId,
+    pub wallet_secret: Option<Secret>,
+    pub depth: Option<u32>,
+    pub window_size: Option<u32>,
+    pub monitor_window_size: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsScanSmartResponse {
+    pub account_descriptor: AccountDescriptor,
+    pub scanned_address_count: u32,
+    pub discovered_address_count: u32,
+    pub registered_address_count: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountsCreateRequest {
     pub wallet_secret: Secret,
     pub account_create_args: AccountCreateArgs,
@@ -438,6 +457,28 @@ pub struct AccountsActivateRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountsActivateResponse {}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsActivateSmartRequest {
+    pub account_ids: Option<Vec<AccountId>>,
+    pub wallet_secret: Option<Secret>,
+    pub depth: Option<u32>,
+    pub window_size: Option<u32>,
+    pub monitor_window_size: Option<u32>,
+    pub start_index: Option<u32>,
+    pub relative_to_current_index: Option<bool>,
+    pub known_addresses: Option<Vec<Address>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsActivateSmartResponse {
+    pub account_descriptors: Vec<AccountDescriptor>,
+    pub scanned_address_count: u32,
+    pub discovered_address_count: u32,
+    pub registered_address_count: u32,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "camelCase")]

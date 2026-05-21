@@ -13,6 +13,17 @@ use workflow_core::{
     task::spawn,
 };
 
+fn smart_scan_count(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn summarize_smart_scans(summaries: &[SmartScanSummary]) -> (u32, u32, u32) {
+    let scanned = summaries.iter().map(|summary| summary.scanned_address_count).sum::<usize>();
+    let discovered = summaries.iter().map(|summary| summary.discovered_address_count).sum::<usize>();
+    let registered = summaries.iter().map(|summary| summary.registered_address_count).sum::<usize>();
+    (smart_scan_count(scanned), smart_scan_count(discovered), smart_scan_count(registered))
+}
+
 #[async_trait]
 impl WalletApi for super::Wallet {
     async fn register_notifications(self: Arc<Self>, channel: Sender<WalletNotification>) -> Result<u64> {
@@ -399,6 +410,96 @@ impl WalletApi for super::Wallet {
         self.notify(Events::AccountUpdate { account_descriptor: account_descriptor.clone() }).await?;
 
         Ok(AccountsScanResponse { account_descriptor })
+    }
+
+    async fn accounts_scan_smart_call(self: Arc<Self>, request: AccountsScanSmartRequest) -> Result<AccountsScanSmartResponse> {
+        let AccountsScanSmartRequest { account_id, wallet_secret, depth, window_size, monitor_window_size } = request;
+
+        let guard = self.guard();
+        let guard = guard.lock().await;
+
+        let account = self.get_account_by_id(&account_id, &guard).await?.ok_or(Error::AccountNotFound(account_id))?;
+        let legacy_account = account.clone().as_legacy_account().ok();
+
+        if let Some(legacy_account) = legacy_account.as_ref() {
+            let wallet_secret = wallet_secret
+                .as_ref()
+                .ok_or_else(|| Error::Custom("walletSecret is required to smart-scan legacy accounts".to_string()))?;
+            legacy_account.create_private_context(wallet_secret, None, None).await?;
+        }
+
+        let scan_result = account
+            .clone()
+            .scan_smart(
+                window_size.map(|value| value as usize),
+                monitor_window_size.map(|value| value as usize),
+                depth,
+                None,
+                false,
+                None,
+            )
+            .await;
+        if let Some(legacy_account) = legacy_account.as_ref() {
+            let clear_result = legacy_account.clear_private_context().await;
+            if scan_result.is_ok() {
+                clear_result?;
+            } else if let Err(err) = clear_result {
+                log_warn!("failed to clear legacy private context after smart scan error: {err}");
+            }
+        }
+        let summaries = scan_result?;
+
+        if let Some(metadata) = account.metadata()? {
+            self.store().as_account_store()?.update_metadata(vec![metadata]).await?;
+        }
+
+        let account_descriptor = account.descriptor()?;
+        self.notify(Events::AccountUpdate { account_descriptor: account_descriptor.clone() }).await?;
+
+        let (scanned_address_count, discovered_address_count, registered_address_count) = summarize_smart_scans(&summaries);
+
+        Ok(AccountsScanSmartResponse { account_descriptor, scanned_address_count, discovered_address_count, registered_address_count })
+    }
+
+    async fn accounts_activate_smart_call(
+        self: Arc<Self>,
+        request: AccountsActivateSmartRequest,
+    ) -> Result<AccountsActivateSmartResponse> {
+        let AccountsActivateSmartRequest {
+            account_ids,
+            wallet_secret,
+            depth,
+            window_size,
+            monitor_window_size,
+            start_index,
+            relative_to_current_index,
+            known_addresses,
+        } = request;
+
+        let guard = self.guard();
+        let guard = guard.lock().await;
+
+        let (account_descriptors, summaries) = self
+            .activate_accounts_smart(
+                account_ids.as_deref(),
+                wallet_secret.as_ref(),
+                window_size.map(|value| value as usize),
+                monitor_window_size.map(|value| value as usize),
+                depth,
+                start_index,
+                relative_to_current_index.unwrap_or(false),
+                known_addresses,
+                &guard,
+            )
+            .await?;
+        let (scanned_address_count, discovered_address_count, registered_address_count) = summarize_smart_scans(&summaries);
+
+        Ok(AccountsActivateSmartResponse {
+            account_descriptors,
+            scanned_address_count,
+            discovered_address_count,
+            registered_address_count,
+        })
     }
 
     async fn accounts_create_call(self: Arc<Self>, request: AccountsCreateRequest) -> Result<AccountsCreateResponse> {

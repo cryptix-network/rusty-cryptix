@@ -44,9 +44,11 @@ impl HandleAntipastRequests {
 
             // `RequestAntipast` is expected to be called by the syncee for getting the antipast of `sink`
             // intersected by past of the relayed block. We do not expect the relay block to be too much after
-            // the sink (in fact usually it should be in its past or anticone), hence we bound the expected traversal to be
-            // in the order of `mergeset_size_limit`.
-            let hashes = session.async_get_antipast_from_pov(block, context, Some(self.ctx.config.mergeset_size_limit * 2)).await?;
+            // the sink (in fact usually it should be in its past or anticone). The traversal can still pass
+            // through wider DAG regions or already-disqualified side branches, so the correct safety bound is
+            // the live pruning window, not a small multiple of the merge-set limit.
+            let max_traversal_allowed = self.ctx.config.pruning_depth;
+            let hashes = session.async_get_antipast_from_pov(block, context, Some(max_traversal_allowed)).await?;
             let mut headers = session
                 .spawn_blocking(|c| hashes.into_iter().map(|h| c.get_header(h)).collect::<Result<Vec<_>, ConsensusError>>())
                 .await?;

@@ -24,6 +24,7 @@ use cryptix_atomicindex::{
     state::{
         nonce_key_for_op, AtomicTokenHealth, AtomicTokenReadContext, AtomicTokenReadView, AtomicTokenRuntimeState,
         LiquidityFeeRecipientState, LiquidityPoolState, NonceKey, ProcessedOp, TokenAsset, TokenAssetClass, TokenEvent,
+        TokenHolderEntry, TokenOwnerBalanceEntry,
     },
 };
 use cryptix_consensus_core::api::counters::ProcessingCounters;
@@ -465,6 +466,34 @@ impl RpcCoreService {
 
     fn ensure_token_simulation_ready(view: &AtomicTokenReadView) -> RpcResult<()> {
         Self::ensure_token_read_ready(view)
+    }
+
+    fn page_token_owner_balances(
+        mut balances: Vec<TokenOwnerBalanceEntry>,
+        offset: usize,
+        limit: usize,
+    ) -> (Vec<TokenOwnerBalanceEntry>, u64) {
+        let total = balances.len() as u64;
+        if limit == 0 || offset >= balances.len() {
+            return (Vec::new(), total);
+        }
+        let end = offset.saturating_add(limit).min(balances.len());
+        balances.select_nth_unstable_by(end - 1, |a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        balances.truncate(end);
+        balances.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        (balances.into_iter().skip(offset).collect(), total)
+    }
+
+    fn page_token_holders(mut holders: Vec<TokenHolderEntry>, offset: usize, limit: usize) -> (Vec<TokenHolderEntry>, u64) {
+        let total = holders.len() as u64;
+        if limit == 0 || offset >= holders.len() {
+            return (Vec::new(), total);
+        }
+        let end = offset.saturating_add(limit).min(holders.len());
+        holders.select_nth_unstable_by(end - 1, |a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        holders.truncate(end);
+        holders.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        (holders.into_iter().skip(offset).collect(), total)
     }
 
     fn liquidity_read_view_unavailable_error(at_block_hash: Option<RpcHash>) -> RpcError {
@@ -1187,11 +1216,26 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             return Err(cryptix_addresses::AddressError::InvalidPrefix(request.pay_address.prefix.to_string()))?;
         }
 
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let virtual_daa_score = session.get_virtual_daa_score();
+        let is_nearly_synced = self.has_sufficient_peer_connectivity() && session.async_is_nearly_synced().await;
+        if virtual_daa_score >= self.config.params.payload_hf_activation_daa_score && !is_nearly_synced {
+            warn!(
+                "Rejecting get_block_template while node is not nearly synced after payload HF: virtual_daa_score={}, activation_daa={}, allow_submit_block_when_not_synced={}; mining from a partial Atomic/UTXO view can create blocks with invalid state commitments",
+                virtual_daa_score,
+                self.config.params.payload_hf_activation_daa_score,
+                self.config.enable_unsynced_mining
+            );
+            return Err(RpcError::General(
+                "mining template unavailable: node is not nearly synced after payload hardfork; wait for sync/Atomic catch-up before mining"
+                    .to_string(),
+            ));
+        }
+
         // Build block template
         let script_public_key = cryptix_txscript::pay_to_address_script(&request.pay_address);
         let extra_data = version().as_bytes().iter().chain(once(&(b'/'))).chain(&request.extra_data).cloned().collect::<Vec<_>>();
         let miner_data: MinerData = MinerData::new(script_public_key, extra_data);
-        let session = self.consensus_manager.consensus().unguarded_session();
         let block_template = self.mining_manager.clone().get_block_template(&session, miner_data).await?;
 
         // Check coinbase tx payload length
@@ -1199,11 +1243,10 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             return Err(RpcError::CoinbasePayloadLengthAboveMax(self.config.max_coinbase_payload_len));
         }
 
-        let is_nearly_synced =
-            self.config.is_nearly_synced(block_template.selected_parent_timestamp, block_template.selected_parent_daa_score);
         Ok(GetBlockTemplateResponse {
             block: block_template.block.into(),
-            is_synced: self.has_sufficient_peer_connectivity() && is_nearly_synced,
+            is_synced: is_nearly_synced
+                && self.config.is_nearly_synced(block_template.selected_parent_timestamp, block_template.selected_parent_daa_score),
         })
     }
 
@@ -2636,13 +2679,12 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
         let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_OWNER_BALANCES_LIMIT_MAX);
         let offset = usize::try_from(offset).map_err(|e| RpcError::General(e.to_string()))?;
-        let (read_context, mut balances) =
+        let (read_context, balances) =
             atomic.get_indexed_balances_by_owner(owner_id, include_assets, at_block_hash).await.ok_or(RpcError::StaleContext)?;
         Self::ensure_token_context_read_ready(&read_context)?;
 
-        balances.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let total = balances.len() as u64;
-        let balances = balances.into_iter().skip(offset).take(limit).map(Self::map_token_owner_balance).collect();
+        let (balances, total) = Self::page_token_owner_balances(balances, offset, limit);
+        let balances = balances.into_iter().map(Self::map_token_owner_balance).collect();
         let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetTokenBalancesByOwnerResponse { balances, total, context })
     }
@@ -2657,13 +2699,12 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
         let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_HOLDERS_LIMIT_MAX);
         let offset = usize::try_from(offset).map_err(|e| RpcError::General(e.to_string()))?;
-        let (read_context, mut holders) =
+        let (read_context, holders) =
             atomic.get_indexed_holders_by_asset(asset_id, at_block_hash).await.ok_or(RpcError::StaleContext)?;
         Self::ensure_token_context_read_ready(&read_context)?;
-        holders.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-        let total = holders.len() as u64;
-        let holders = holders.into_iter().skip(offset).take(limit).map(Self::map_token_holder).collect();
+        let (holders, total) = Self::page_token_holders(holders, offset, limit);
+        let holders = holders.into_iter().map(Self::map_token_holder).collect();
         let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetTokenHoldersResponse { holders, total, context })
     }
@@ -2896,7 +2937,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let asset_id_bytes = Self::parse_hex_32(&asset_id, "assetId")?;
         let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_LIQUIDITY_HOLDERS_LIMIT_MAX);
         let offset = usize::try_from(offset).map_err(|e| RpcError::General(e.to_string()))?;
-        let (read_context, asset, mut holders, owner_to_address_state) = atomic
+        let (read_context, asset, holders, owner_to_address_state) = atomic
             .get_indexed_liquidity_holders(asset_id_bytes, at_block_hash)
             .await
             .ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
@@ -2907,7 +2948,6 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             return Err(RpcError::General("asset is not a liquidity asset".to_string()));
         }
         asset.liquidity.as_ref().ok_or_else(|| RpcError::General("liquidity state missing for asset".to_string()))?;
-        holders.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         let prefix = self.config.prefix();
         let owner_to_address: HashMap<[u8; 32], String> = owner_to_address_state
@@ -2918,9 +2958,8 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             })
             .collect();
 
-        let total = holders.len() as u64;
-        let holders =
-            holders.into_iter().skip(offset).take(limit).map(|entry| Self::map_liquidity_holder(entry, &owner_to_address)).collect();
+        let (holders, total) = Self::page_token_holders(holders, offset, limit);
+        let holders = holders.into_iter().map(|entry| Self::map_liquidity_holder(entry, &owner_to_address)).collect();
         let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetLiquidityHoldersResponse { holders, total, context })
     }

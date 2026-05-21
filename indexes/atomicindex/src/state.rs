@@ -576,6 +576,7 @@ pub struct AtomicTokenStateFootprint {
 
 pub struct AtomicTokenPruneResult {
     pub pruned_hashes: Vec<BlockHash>,
+    pub pruned_processed_op_txids: Vec<BlockHash>,
     pub last_pruned_event_sequence: Option<u64>,
     pub pruned_processed_ops: bool,
 }
@@ -1291,6 +1292,11 @@ impl AtomicTokenState {
         let pruned_hashes_set = pruned_hashes.iter().copied().collect::<HashSet<_>>();
         let last_pruned_event_sequence =
             pruned_hashes.iter().filter_map(|block_hash| self.event_sequence_by_block.get(block_hash).copied()).max();
+        let pruned_processed_op_txids = pruned_hashes
+            .iter()
+            .filter_map(|block_hash| self.block_journals.get(block_hash))
+            .flat_map(|journal| journal.added_processed_ops.iter().copied())
+            .collect::<Vec<_>>();
 
         for block_hash in pruned_hashes.iter().copied() {
             self.block_journals.remove(&block_hash);
@@ -1300,14 +1306,14 @@ impl AtomicTokenState {
 
         let processed_ops_before = self.processed_ops.len();
         self.processed_ops.retain(|_, op| !pruned_hashes_set.contains(&op.accepting_block_hash));
-        let pruned_processed_ops = self.processed_ops.len() != processed_ops_before;
+        let pruned_processed_ops = self.processed_ops.len() != processed_ops_before || !pruned_processed_op_txids.is_empty();
 
         if let Some(last_pruned_event_sequence) = last_pruned_event_sequence {
             self.events.retain(|event| event.sequence > last_pruned_event_sequence);
             self.rebuild_event_id_index();
         }
 
-        Some(AtomicTokenPruneResult { pruned_hashes, last_pruned_event_sequence, pruned_processed_ops })
+        Some(AtomicTokenPruneResult { pruned_hashes, pruned_processed_op_txids, last_pruned_event_sequence, pruned_processed_ops })
     }
 
     pub fn recompute_state_hashes_for_retained_segment(

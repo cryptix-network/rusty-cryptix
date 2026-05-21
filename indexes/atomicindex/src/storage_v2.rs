@@ -9,6 +9,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 pub const ATOMIC_DB_SCHEMA_VERSION: u16 = 2;
@@ -21,6 +22,7 @@ const META_GENESIS_HASH: &[u8] = b"meta/atomic_genesis_hash";
 const META_CURRENT_ROOT: &[u8] = b"meta/atomic_current_root";
 const META_CURRENT_HEIGHT: &[u8] = b"meta/atomic_current_height";
 const META_CURRENT_BLOCK_HASH: &[u8] = b"meta/atomic_current_block_hash";
+const META_CHAIN_ORDER_BASE: &[u8] = b"meta/atomic_chain_order_base";
 const META_DEGRADED: &[u8] = b"meta/atomic_degraded";
 const META_NEXT_EVENT_SEQUENCE: &[u8] = b"meta/atomic_next_event_sequence";
 const META_REVALIDATION_VERSION: &[u8] = b"meta/atomic_revalidation_version";
@@ -90,6 +92,7 @@ pub struct AtomicStorageV2 {
     protocol_version: u16,
     network_id: String,
     genesis_hash: BlockHash,
+    root_buckets_cache: Mutex<Option<[[u8; 32]; ATOMIC_ROOT_BUCKETS]>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -133,7 +136,7 @@ impl AtomicStorageV2 {
         options.set_wal_size_limit_mb(0);
         let db = DB::open(&options, &path)
             .map_err(|err| AtomicTokenError::Processing(format!("failed opening Atomic DB schema v2: {err}")))?;
-        let store = Self { path, db, protocol_version, network_id, genesis_hash };
+        let store = Self { path, db, protocol_version, network_id, genesis_hash, root_buckets_cache: Mutex::new(None) };
         store.initialize_or_validate_meta()?;
         Ok(store)
     }
@@ -449,10 +452,14 @@ impl AtomicStorageV2 {
     where
         F: FnMut(u64, BlockHash) -> AtomicTokenResult<()>,
     {
+        let base = self.chain_order_base()?;
         self.read_prefix(PREFIX_CHAIN_ORDER, |suffix, value| {
             let index = decode_u64_suffix(suffix, "chain order index")?;
+            let relative_index = index.checked_sub(base).ok_or_else(|| {
+                AtomicTokenError::Processing(format!("Atomic DB chain order index `{index}` is below persisted base `{base}`"))
+            })?;
             let block_hash: BlockHash = decode_value(value, "chain order block hash")?;
-            visitor(index, block_hash)
+            visitor(relative_index, block_hash)
         })
     }
 
@@ -574,10 +581,12 @@ impl AtomicStorageV2 {
 
         let root = root_accumulator.write_to_batch(&mut batch)?;
         batch.put(META_CURRENT_ROOT, encode_value(&root, "current root")?);
+        batch.put(META_CHAIN_ORDER_BASE, encode_value(&0u64, "chain order base")?);
 
         self.db
             .write(batch)
             .map_err(|err| AtomicTokenError::Processing(format!("failed committing Atomic DB schema v2 batch: {err}")))?;
+        self.clear_root_buckets_cache()?;
         Ok(())
     }
 
@@ -662,6 +671,7 @@ impl AtomicStorageV2 {
         self.db
             .write(batch)
             .map_err(|err| AtomicTokenError::Processing(format!("failed copying Atomic DB current-state keys: {err}")))?;
+        self.clear_root_buckets_cache()?;
 
         Ok(root)
     }
@@ -681,6 +691,7 @@ impl AtomicStorageV2 {
         degraded: bool,
         next_event_sequence: u64,
     ) -> AtomicTokenResult<[u8; 32]> {
+        let chain_order_index = self.chain_order_storage_index(chain_index)?;
         let mut batch = WriteBatch::default();
         let mut root_changes = Vec::new();
         self.write_state_changes_to_batch(
@@ -697,7 +708,7 @@ impl AtomicStorageV2 {
         batch.put(journal_key(&block_hash), encode_value(journal, "block journal")?);
         batch.put(state_hash_key(&block_hash), encode_value(&root, "state hash")?);
         batch.put(event_sequence_key(&block_hash), encode_value(&event_sequence, "event sequence")?);
-        batch.put(chain_order_key(chain_index), encode_value(&block_hash, "chain order block hash")?);
+        batch.put(chain_order_key(chain_order_index), encode_value(&block_hash, "chain order block hash")?);
         for event in new_events {
             batch.put(event_key(event), encode_value(event, "event")?);
         }
@@ -730,6 +741,7 @@ impl AtomicStorageV2 {
         degraded: bool,
         next_event_sequence: u64,
     ) -> AtomicTokenResult<[u8; 32]> {
+        let chain_order_index = self.chain_order_storage_index(chain_len)?;
         let mut batch = WriteBatch::default();
         let mut root_changes = Vec::new();
         self.write_state_changes_to_batch(
@@ -746,7 +758,7 @@ impl AtomicStorageV2 {
         batch.delete(journal_key(&removed_block_hash));
         batch.delete(state_hash_key(&removed_block_hash));
         batch.delete(event_sequence_key(&removed_block_hash));
-        batch.delete(chain_order_key(chain_len));
+        batch.delete(chain_order_key(chain_order_index));
         for event in new_events {
             batch.put(event_key(event), encode_value(event, "event")?);
         }
@@ -821,6 +833,7 @@ impl AtomicStorageV2 {
         self.db
             .write(batch)
             .map_err(|err| AtomicTokenError::Processing(format!("failed rebuilding Atomic DB schema v2 current root: {err}")))?;
+        self.clear_root_buckets_cache()?;
         Ok(root)
     }
 
@@ -871,24 +884,23 @@ impl AtomicStorageV2 {
     pub fn prune_history(
         &self,
         pruned_hashes: &[BlockHash],
+        pruned_processed_op_txids: &[BlockHash],
         retained_chain_order: &[BlockHash],
         last_pruned_event_sequence: Option<u64>,
     ) -> AtomicTokenResult<()> {
         if pruned_hashes.is_empty() {
             return Ok(());
         }
-        let pruned = pruned_hashes.iter().copied().collect::<std::collections::HashSet<_>>();
+        let chain_order_base = self.chain_order_base()?;
         let mut batch = WriteBatch::default();
-        for block_hash in pruned_hashes {
+        for (offset, block_hash) in pruned_hashes.iter().enumerate() {
             batch.delete(journal_key(block_hash));
             batch.delete(state_hash_key(block_hash));
             batch.delete(event_sequence_key(block_hash));
-        }
-        for key in self.keys_with_prefix(PREFIX_CHAIN_ORDER)? {
-            batch.delete(key);
-        }
-        for (index, block_hash) in retained_chain_order.iter().enumerate() {
-            batch.put(chain_order_key(index as u64), encode_value(block_hash, "chain order block hash")?);
+            let index = chain_order_base
+                .checked_add(offset as u64)
+                .ok_or_else(|| AtomicTokenError::Processing("Atomic DB chain order base overflow during prune".to_string()))?;
+            batch.delete(chain_order_key(index));
         }
         if let Some(last_pruned_event_sequence) = last_pruned_event_sequence {
             for key in self.keys_with_prefix(PREFIX_EVENT)? {
@@ -898,17 +910,16 @@ impl AtomicStorageV2 {
                 }
             }
         }
-        self.read_prefix(PREFIX_PROCESSED_OP, |suffix, value| {
-            let txid = decode_block_hash(suffix, "processed op txid")?;
-            let op: ProcessedOp = decode_value(value, "processed op")?;
-            if pruned.contains(&op.accepting_block_hash) {
-                batch.delete(processed_op_key(&txid));
-            }
-            Ok(())
-        })?;
+        for txid in pruned_processed_op_txids {
+            batch.delete(processed_op_key(txid));
+        }
         let root = self.current_root()?.unwrap_or([0u8; 32]);
+        let new_chain_order_base = chain_order_base
+            .checked_add(pruned_hashes.len() as u64)
+            .ok_or_else(|| AtomicTokenError::Processing("Atomic DB chain order base overflow after prune".to_string()))?;
         batch.put(META_CURRENT_ROOT, encode_value(&root, "current root")?);
         batch.put(META_CURRENT_HEIGHT, encode_value(&(retained_chain_order.len() as u64), "current height")?);
+        batch.put(META_CHAIN_ORDER_BASE, encode_value(&new_chain_order_base, "chain order base")?);
         self.db
             .write(batch)
             .map_err(|err| AtomicTokenError::Processing(format!("failed pruning Atomic DB schema v2 history: {err}")))?;
@@ -1080,6 +1091,16 @@ impl AtomicStorageV2 {
         Ok(())
     }
 
+    fn chain_order_base(&self) -> AtomicTokenResult<u64> {
+        self.get_typed(META_CHAIN_ORDER_BASE).map(|value| value.unwrap_or(0))
+    }
+
+    fn chain_order_storage_index(&self, relative_index: u64) -> AtomicTokenResult<u64> {
+        self.chain_order_base()?
+            .checked_add(relative_index)
+            .ok_or_else(|| AtomicTokenError::Processing("Atomic DB chain order storage index overflow".to_string()))
+    }
+
     fn initialize_or_validate_meta(&self) -> AtomicTokenResult<()> {
         let Some(schema_version) = self.get_typed::<u16>(META_SCHEMA_VERSION)? else {
             let mut batch = WriteBatch::default();
@@ -1177,7 +1198,14 @@ impl AtomicStorageV2 {
         batch: &mut WriteBatch,
         changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> AtomicTokenResult<[u8; 32]> {
-        let mut buckets = self.load_root_buckets()?;
+        let mut cache = self
+            .root_buckets_cache
+            .lock()
+            .map_err(|_| AtomicTokenError::Processing("Atomic DB root bucket cache lock is poisoned".to_string()))?;
+        if cache.is_none() {
+            *cache = Some(self.load_root_buckets()?);
+        }
+        let buckets = cache.as_mut().expect("root bucket cache initialized");
         for (logical_key, value) in changes {
             let leaf_key = leaf_hash_key(&logical_key);
             let old_leaf = self.get_typed::<[u8; 32]>(&leaf_key)?.unwrap_or([0u8; 32]);
@@ -1196,6 +1224,15 @@ impl AtomicStorageV2 {
             batch.put(root_bucket_key(bucket_index as u16), encode_value(&buckets[bucket_index], "root bucket")?);
         }
         Ok(root_from_buckets(&buckets))
+    }
+
+    fn clear_root_buckets_cache(&self) -> AtomicTokenResult<()> {
+        let mut cache = self
+            .root_buckets_cache
+            .lock()
+            .map_err(|_| AtomicTokenError::Processing("Atomic DB root bucket cache lock is poisoned".to_string()))?;
+        *cache = None;
+        Ok(())
     }
 
     fn load_root_buckets(&self) -> AtomicTokenResult<[[u8; 32]; ATOMIC_ROOT_BUCKETS]> {
@@ -1896,9 +1933,10 @@ fn decode_event_key_suffix(suffix: &[u8]) -> AtomicTokenResult<u64> {
 mod tests {
     use super::AtomicStorageV2;
     use crate::{
-        payload::SupplyMode,
+        payload::{ApplyStatus, NoopReason, SupplyMode},
         state::{
-            AtomicTokenState, BalanceKey, LiquidityHolderAddressState, LiquidityPoolState, NonceKey, TokenAsset, TokenAssetClass,
+            AtomicTokenState, BalanceKey, BlockJournal, LiquidityHolderAddressState, LiquidityPoolState, NonceKey, ProcessedOp,
+            TokenAsset, TokenAssetClass,
         },
     };
     use cryptix_consensus_core::{tx::TransactionOutpoint, Hash as BlockHash};
@@ -2165,6 +2203,65 @@ mod tests {
         assert_eq!(runtime_state.applied_chain_order, vec![block_hash]);
         assert_eq!(store.get_balance(&key).expect("balance point read"), 900);
         assert_eq!(store.balances_by_owner(&owner_id).expect("owner index"), vec![(asset_id, 900)]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prune_history_keeps_chain_order_without_full_rewrite() {
+        let dir = unique_temp_dir("chain-order-base");
+        let genesis_hash = BlockHash::from_u64_word(13);
+        let store = AtomicStorageV2::open(&dir, 6, "cryptix-simnet".to_string(), genesis_hash).expect("open store");
+        let first = BlockHash::from_u64_word(1);
+        let second = BlockHash::from_u64_word(2);
+        let third = BlockHash::from_u64_word(3);
+        let fourth = BlockHash::from_u64_word(4);
+        let pruned_txid = BlockHash::from_u64_word(1001);
+
+        let mut state = AtomicTokenState::new(6, "cryptix-simnet".to_string());
+        state.applied_chain_order.extend([first, second, third]);
+        state.processed_ops.insert(
+            pruned_txid,
+            ProcessedOp { accepting_block_hash: first, apply_status: ApplyStatus::Applied, noop_reason: NoopReason::None },
+        );
+        for block_hash in state.applied_chain_order.iter().copied() {
+            state.state_hash_by_block.insert(block_hash, state.compute_state_hash());
+        }
+        store.persist_state(&state).expect("persist state");
+
+        store.prune_history(&[first, second], &[pruned_txid], &[third], None).expect("prune history");
+        let runtime = store.load_runtime_state().expect("runtime load after prune").expect("state present");
+        assert_eq!(runtime.applied_chain_order, vec![third]);
+        assert!(store.get_processed_op(&pruned_txid).expect("processed op lookup").is_none());
+
+        store
+            .commit_applied_block_delta(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                fourth,
+                &BlockJournal::default(),
+                1,
+                0,
+                &[],
+                false,
+                0,
+            )
+            .expect("append after prune");
+
+        let runtime = store.load_runtime_state().expect("runtime load after append").expect("state present");
+        assert_eq!(runtime.applied_chain_order, vec![third, fourth]);
+
+        let mut chain_order = Vec::new();
+        store
+            .visit_all_chain_order(|index, block_hash| {
+                chain_order.push((index, block_hash));
+                Ok(())
+            })
+            .expect("visit chain order");
+        assert_eq!(chain_order, vec![(0, third), (1, fourth)]);
 
         let _ = fs::remove_dir_all(dir);
     }
