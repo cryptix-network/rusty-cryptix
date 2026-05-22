@@ -160,6 +160,8 @@ const TOKEN_ASSETS_LIMIT_MAX: usize = 2048;
 const TOKEN_OWNER_BALANCES_LIMIT_MAX: usize = 4096;
 const TOKEN_HOLDERS_LIMIT_MAX: usize = 4096;
 const TOKEN_LIQUIDITY_HOLDERS_LIMIT_MAX: usize = 4096;
+const LIQUIDITY_SUBMIT_READY_RECHECK_ATTEMPTS: usize = 6;
+const LIQUIDITY_SUBMIT_READY_RECHECK_DELAY: Duration = Duration::from_millis(150);
 const TX_LOOKUP_MAX_IDS: usize = 512;
 const TX_LOOKUP_LOOKBACK_MARGIN_DAA: u64 = 64;
 const TX_LOOKUP_LOOKBACK_MIN_HEADERS: usize = 256;
@@ -531,62 +533,123 @@ impl RpcCoreService {
             .and_then(|(found_outpoint, entry)| (found_outpoint == outpoint).then_some(entry))
     }
 
-    async fn ensure_latest_liquidity_pool_vault_spendable(
+    async fn check_latest_liquidity_pool_vault_spendable(
         &self,
         endpoint: &str,
         requested_at_block_hash: Option<RpcHash>,
         asset_id: [u8; 32],
         context: &AtomicTokenReadContext,
         pool: &LiquidityPoolState,
-    ) -> RpcResult<()> {
+        log_failure: bool,
+    ) -> RpcResult<Result<(), String>> {
         if requested_at_block_hash.is_some() {
-            return Ok(());
+            return Ok(Ok(()));
         }
 
         let outpoint = pool.vault_outpoint;
         let Some(entry) = self.virtual_utxo_entry_exact(outpoint).await else {
-            warn!(
-                "Refusing {} latest liquidity pool read because Atomic pool vault is not spendable in virtual UTXO: asset_id={} pool_nonce={} pool_vault={} pool_vault_value_sompi={} atomic_block={} atomic_state_hash={} runtime={} degraded={} event_seq={}",
-                endpoint,
-                asset_id.as_slice().to_hex(),
-                pool.pool_nonce,
-                outpoint,
-                pool.vault_value_sompi,
-                context.at_block_hash,
-                context.state_hash.as_slice().to_hex(),
-                context.runtime_state.as_str(),
-                context.is_degraded,
-                context.event_sequence_cutoff
-            );
-            return Err(Self::liquidity_submit_read_not_ready_error(
-                "Atomic pool vault is not spendable in the current virtual UTXO; retry after Atomic/UTXO state catches up",
-            ));
+            let detail =
+                "Atomic pool vault is not spendable in the current virtual UTXO; retry after Atomic/UTXO state catches up".to_string();
+            if log_failure {
+                let session = self.consensus_manager.consensus().session().await;
+                let current_sink = session.async_get_sink().await;
+                let virtual_daa = session.get_virtual_daa_score();
+                warn!(
+                    "{} latest liquidity pool read is not submit-ready because Atomic pool vault is not spendable in virtual UTXO: asset_id={} pool_nonce={} pool_vault={} pool_vault_value_sompi={} atomic_block={} current_sink={} virtual_daa={} atomic_state_hash={} runtime={} degraded={} event_seq={}",
+                    endpoint,
+                    asset_id.as_slice().to_hex(),
+                    pool.pool_nonce,
+                    outpoint,
+                    pool.vault_value_sompi,
+                    context.at_block_hash,
+                    current_sink,
+                    virtual_daa,
+                    context.state_hash.as_slice().to_hex(),
+                    context.runtime_state.as_str(),
+                    context.is_degraded,
+                    context.event_sequence_cutoff
+                );
+            }
+            return Ok(Err(detail));
         };
 
         let class = ScriptClass::from_script(&entry.script_public_key);
         let is_liquidity_vault = matches!(&class, ScriptClass::LiquidityVault);
         if !is_liquidity_vault || entry.amount != pool.vault_value_sompi {
-            warn!(
-                "Refusing {} latest liquidity pool read because Atomic pool vault does not match virtual UTXO entry: asset_id={} pool_nonce={} pool_vault={} pool_vault_value_sompi={} utxo_amount={} utxo_script_class={:?} atomic_block={} atomic_state_hash={} runtime={} degraded={} event_seq={}",
-                endpoint,
-                asset_id.as_slice().to_hex(),
-                pool.pool_nonce,
-                outpoint,
-                pool.vault_value_sompi,
-                entry.amount,
-                class,
-                context.at_block_hash,
-                context.state_hash.as_slice().to_hex(),
-                context.runtime_state.as_str(),
-                context.is_degraded,
-                context.event_sequence_cutoff
-            );
-            return Err(Self::liquidity_submit_read_not_ready_error(
-                "Atomic pool vault does not match the current virtual UTXO; retry after Atomic/UTXO state catches up",
-            ));
+            let detail =
+                "Atomic pool vault does not match the current virtual UTXO; retry after Atomic/UTXO state catches up".to_string();
+            if log_failure {
+                let session = self.consensus_manager.consensus().session().await;
+                let current_sink = session.async_get_sink().await;
+                let virtual_daa = session.get_virtual_daa_score();
+                warn!(
+                    "{} latest liquidity pool read is not submit-ready because Atomic pool vault does not match virtual UTXO entry: asset_id={} pool_nonce={} pool_vault={} pool_vault_value_sompi={} utxo_amount={} utxo_script_class={:?} atomic_block={} current_sink={} virtual_daa={} atomic_state_hash={} runtime={} degraded={} event_seq={}",
+                    endpoint,
+                    asset_id.as_slice().to_hex(),
+                    pool.pool_nonce,
+                    outpoint,
+                    pool.vault_value_sompi,
+                    entry.amount,
+                    class,
+                    context.at_block_hash,
+                    current_sink,
+                    virtual_daa,
+                    context.state_hash.as_slice().to_hex(),
+                    context.runtime_state.as_str(),
+                    context.is_degraded,
+                    context.event_sequence_cutoff
+                );
+            }
+            return Ok(Err(detail));
         }
 
-        Ok(())
+        Ok(Ok(()))
+    }
+
+    async fn latest_liquidity_asset_with_submit_ready_vault(
+        &self,
+        atomic: &AtomicTokenService,
+        endpoint: &str,
+        asset_id: [u8; 32],
+        at_block_hash: Option<RpcHash>,
+    ) -> RpcResult<(AtomicTokenReadContext, Option<TokenAsset>)> {
+        let mut last_not_ready = None;
+        for attempt in 0..=LIQUIDITY_SUBMIT_READY_RECHECK_ATTEMPTS {
+            let (read_context, asset) = atomic
+                .get_asset_with_context(asset_id, at_block_hash)
+                .await
+                .ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
+            Self::ensure_token_context_read_ready(&read_context)?;
+
+            if let Some(liquidity) = asset.as_ref().and_then(|asset| asset.liquidity.as_ref()) {
+                match self
+                    .check_latest_liquidity_pool_vault_spendable(
+                        endpoint,
+                        at_block_hash,
+                        asset_id,
+                        &read_context,
+                        liquidity,
+                        attempt == LIQUIDITY_SUBMIT_READY_RECHECK_ATTEMPTS,
+                    )
+                    .await?
+                {
+                    Ok(()) => return Ok((read_context, asset)),
+                    Err(detail) => {
+                        last_not_ready = Some(detail);
+                    }
+                }
+            } else {
+                return Ok((read_context, asset));
+            }
+
+            if attempt < LIQUIDITY_SUBMIT_READY_RECHECK_ATTEMPTS {
+                tokio::time::sleep(LIQUIDITY_SUBMIT_READY_RECHECK_DELAY).await;
+            }
+        }
+
+        Err(Self::liquidity_submit_read_not_ready_error(
+            last_not_ready.unwrap_or_else(|| "Atomic/UTXO state did not become submit-ready in time".to_string()),
+        ))
     }
 
     async fn atomic_context_from_read_context(&self, context: &AtomicTokenReadContext) -> RpcResult<RpcTokenContext> {
@@ -2971,18 +3034,6 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             }
             asset.liquidity.as_ref().map(|liquidity| Self::map_liquidity_pool_state(asset, liquidity, prefix))
         });
-        if let Some(asset) = asset.as_ref() {
-            if let Some(liquidity) = asset.liquidity.as_ref() {
-                self.ensure_latest_liquidity_pool_vault_spendable(
-                    "getLiquidityPoolState",
-                    at_block_hash,
-                    asset_id,
-                    &read_context,
-                    liquidity,
-                )
-                .await?;
-            }
-        }
 
         let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetLiquidityPoolStateResponse { pool, context })
@@ -2996,18 +3047,14 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let GetLiquidityQuoteRequest { asset_id, side, exact_in_amount, at_block_hash } = request;
         let atomic = self.atomic_service()?;
         let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
-        let (read_context, asset) = atomic
-            .get_asset_with_context(asset_id, at_block_hash)
-            .await
-            .ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
-        Self::ensure_token_context_read_ready(&read_context)?;
+        let (read_context, asset) =
+            self.latest_liquidity_asset_with_submit_ready_vault(&atomic, "getLiquidityQuote", asset_id, at_block_hash).await?;
 
         let asset = asset.as_ref().ok_or_else(|| RpcError::General("liquidity asset not found".to_string()))?;
         if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
             return Err(RpcError::General("asset is not a liquidity asset".to_string()));
         }
         let pool = asset.liquidity.as_ref().ok_or_else(|| RpcError::General("liquidity state missing for asset".to_string()))?;
-        self.ensure_latest_liquidity_pool_vault_spendable("getLiquidityQuote", at_block_hash, asset_id, &read_context, pool).await?;
 
         let (effective_exact_in_amount, fee_amount_sompi, net_in_amount, amount_out) = match side {
             LIQUIDITY_QUOTE_SIDE_BUY => {

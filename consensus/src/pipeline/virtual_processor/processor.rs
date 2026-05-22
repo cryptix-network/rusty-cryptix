@@ -108,6 +108,7 @@ use std::{
 };
 
 const ATOMIC_CONSENSUS_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const ATOMIC_CONSENSUS_VAULT_LOG_COUNT_LIMIT: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct AtomicTxOrderPriority {
@@ -849,7 +850,17 @@ impl VirtualStateProcessor {
         log_state.last_log_at = Some(now);
         drop(log_state);
 
-        let vaults = summary.vaults.map(|vaults| vaults.to_string()).unwrap_or_else(|| "unknown_root_only".to_string());
+        let vaults = match summary.vaults {
+            Some(vaults) => vaults.to_string(),
+            None if summary.root_only => {
+                match self.atomic_state_store.current_vault_index_count_limited(ATOMIC_CONSENSUS_VAULT_LOG_COUNT_LIMIT) {
+                    Ok(Some(vaults)) => vaults.to_string(),
+                    Ok(None) => format!(">{}", ATOMIC_CONSENSUS_VAULT_LOG_COUNT_LIMIT),
+                    Err(err) => format!("unknown_store_error:{err}"),
+                }
+            }
+            None => "unknown".to_string(),
+        };
         info!(
             "[atomic] Atomic consensus state: local_state=consistent live_correct=true reason={} daa={} hf_active={} root={} root_only={} assets={} balances={} nonces={} anchors={} vaults={} selected_parent={} parents={} utxo_add={} utxo_remove={}",
             reason,

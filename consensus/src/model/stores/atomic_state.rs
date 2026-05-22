@@ -1760,6 +1760,22 @@ impl DbAtomicStateStore {
         read_current_value(&self.db, ATOMIC_STATE_CURRENT_VAULT_SUBPREFIX, encode_outpoint_key(outpoint))
     }
 
+    pub fn current_vault_index_count_limited(&self, max_exact_count: usize) -> Result<Option<usize>, StoreError> {
+        let prefix = atomic_state_subprefix(ATOMIC_STATE_CURRENT_VAULT_SUBPREFIX);
+        let mut count = 0usize;
+        for item in self.db.prefix_iterator(&prefix) {
+            let (key, _) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            count = count.saturating_add(1);
+            if count > max_exact_count {
+                return Ok(None);
+            }
+        }
+        Ok(Some(count))
+    }
+
     pub fn apply_current_chain_path_batch(
         &self,
         batch: &mut WriteBatch,
