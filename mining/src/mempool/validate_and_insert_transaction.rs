@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::mempool::{
-    atomic_slots::is_cat_transaction,
+    atomic_slots::{atomic_mempool_debug_summary, is_cat_transaction},
     errors::{RuleError, RuleResult},
     model::{
         pool::Pool,
@@ -15,7 +15,7 @@ use cryptix_consensus_core::{
     constants::UNACCEPTED_DAA_SCORE,
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
 };
-use cryptix_core::{debug, info};
+use cryptix_core::{debug, info, warn};
 
 impl Mempool {
     pub(crate) fn pre_validate_and_populate_transaction(
@@ -59,6 +59,20 @@ impl Mempool {
             Ok(_) => {}
             Err(RuleError::RejectMissingOutpoint) => {
                 if orphan == Orphan::Forbidden {
+                    let missing_outpoints = transaction.missing_outpoints().collect::<Vec<_>>();
+                    let first_missing =
+                        missing_outpoints.iter().take(8).map(|outpoint| outpoint.to_string()).collect::<Vec<_>>().join(",");
+                    warn!(
+                        "Rejecting transaction as disallowed orphan: tx={} {} priority={:?} rbf_policy={:?} virtual_daa={} inputs={} missing_outpoints={} first_missing=[{}]",
+                        transaction_id,
+                        atomic_mempool_debug_summary(transaction.tx.as_ref()),
+                        priority,
+                        rbf_policy,
+                        consensus.get_virtual_daa_score(),
+                        transaction.tx.as_ref().inputs.len(),
+                        missing_outpoints.len(),
+                        first_missing
+                    );
                     return Err(RuleError::RejectDisallowedOrphan(transaction_id));
                 }
                 let _ = self.get_replace_by_fee_constraint(&transaction, rbf_policy)?;

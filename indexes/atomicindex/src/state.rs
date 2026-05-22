@@ -503,13 +503,6 @@ fn normalize_acceptance_refs(_accepting_block_hash: BlockHash, refs: Vec<Canonic
         unique_refs.push(tx_ref);
     }
 
-    unique_refs.sort_by(|a, b| {
-        a.source_block_hash
-            .as_bytes()
-            .cmp(&b.source_block_hash.as_bytes())
-            .then(a.tx_index.cmp(&b.tx_index))
-            .then(a.txid.as_bytes().cmp(&b.txid.as_bytes()))
-    });
     Ok(NormalizedAcceptance { refs: unique_refs, conflicting_txids })
 }
 
@@ -4129,7 +4122,11 @@ fn map_liquidity_math_error(err: LiquidityMathError) -> NoopReason {
 }
 
 fn is_replay_integrity_failure(reason: NoopReason) -> bool {
-    matches!(reason, NoopReason::BadAuthInput | NoopReason::InternalMalformedAcceptance)
+    // We only replay transactions consensus already accepted into the virtual chain.
+    // Any CAT semantic failure here means the index view has diverged from consensus
+    // or the persisted V2 state is stale/corrupt, so fail closed instead of reporting
+    // a healthy but submit-unsafe token state.
+    !matches!(reason, NoopReason::None)
 }
 
 #[cfg(test)]
@@ -4468,7 +4465,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_nonce_cat_op_is_noop_without_degrading_indexer() {
+    fn stale_nonce_cat_op_degrades_indexer_because_accepted_cat_must_replay_cleanly() {
         let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
         let owner_script = test_script(9);
         let owner_id = owner_id(&state, &owner_script);
@@ -4483,12 +4480,12 @@ mod tests {
 
         apply_block(&mut state, BlockHash::from_u64_word(6321), vec![tx_ref(tx, BlockHash::from_u64_word(6000), 0, 0)], &auth_inputs);
 
-        assert!(!state.degraded, "stale nonce is a deterministic CAT noop, not an indexer integrity failure");
+        assert!(state.degraded, "accepted CAT replay failures must fail closed instead of leaving a stale healthy index");
         assert!(!state.assets.contains_key(&hash_bytes(txid)));
         assert_eq!(state.get_owner_nonce(owner_id), 2);
         let processed = state.processed_ops.get(&txid).expect("stale tx should be recorded as noop");
         assert_eq!(processed.apply_status, ApplyStatus::Noop);
-        assert_eq!(processed.noop_reason, NoopReason::BadNonce);
+        assert_eq!(processed.noop_reason, NoopReason::InternalMalformedAcceptance);
     }
 
     #[test]
@@ -5684,7 +5681,7 @@ mod tests {
     }
 
     #[test]
-    fn conformance_acceptance_normalization_golden_vector() {
+    fn conformance_acceptance_normalization_preserves_consensus_order() {
         let script = test_script(7);
         let outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(555), 0);
 
@@ -5701,13 +5698,13 @@ mod tests {
 
         assert!(normalized.conflicting_txids.is_empty());
         assert_eq!(normalized.refs.len(), 3);
-        assert_eq!(normalized.refs[0].txid, b.txid);
-        assert_eq!(normalized.refs[1].txid, c.txid);
-        assert_eq!(normalized.refs[2].txid, a.txid);
+        assert_eq!(normalized.refs[0].txid, a.txid);
+        assert_eq!(normalized.refs[1].txid, b.txid);
+        assert_eq!(normalized.refs[2].txid, c.txid);
     }
 
     #[test]
-    fn conformance_acceptance_normalization_ignores_local_mergeset_position() {
+    fn conformance_acceptance_normalization_deduplicates_without_reordering() {
         let script = test_script(17);
         let outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(556), 0);
 
@@ -5723,8 +5720,8 @@ mod tests {
 
         assert!(normalized.conflicting_txids.is_empty());
         assert_eq!(normalized.refs.len(), 2);
-        assert_eq!(normalized.refs[0].txid, b.txid);
-        assert_eq!(normalized.refs[1].txid, a_late.txid);
+        assert_eq!(normalized.refs[0].txid, a_late.txid);
+        assert_eq!(normalized.refs[1].txid, b.txid);
     }
 
     #[test]

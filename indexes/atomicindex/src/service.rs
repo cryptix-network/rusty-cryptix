@@ -13,6 +13,7 @@ use async_channel::Receiver;
 use blake2b_simd::Params as Blake2bParams;
 use borsh::{BorshDeserialize, BorshSerialize};
 use cryptix_consensus_core::{
+    acceptance_data::AcceptanceData,
     config::Config,
     hashing::{
         sighash::{calc_schnorr_signature_hash, SigHashReusedValues},
@@ -251,19 +252,74 @@ impl AtomicTokenProcessor {
     async fn collect_auth_inputs_for_added_blocks(
         &self,
         added_chain_block_hashes: &[BlockHash],
+        acceptance_data: &[Arc<AcceptanceData>],
     ) -> AtomicTokenResult<HashMap<TransactionOutpoint, UtxoEntry>> {
+        if added_chain_block_hashes.len() != acceptance_data.len() {
+            return Err(AtomicTokenError::Processing(format!(
+                "failed collecting Atomic auth inputs: block/acceptance length mismatch ({} != {})",
+                added_chain_block_hashes.len(),
+                acceptance_data.len()
+            )));
+        }
         let consensus = self.consensus_manager.consensus();
         let session = consensus.session().await;
         let mut auth_inputs = HashMap::new();
+        let mut replay_outputs = HashMap::new();
+        let mut block_cache: HashMap<BlockHash, Arc<Vec<Transaction>>> = HashMap::new();
         let total = added_chain_block_hashes.len();
         let should_log_progress = total >= 1024;
         let mut last_log = Instant::now();
         if should_log_progress {
             info!("[{IDENT}] collecting Atomic auth inputs for {} replay block(s)", total);
         }
-        for (idx, block_hash) in added_chain_block_hashes.iter().copied().enumerate() {
+        for (idx, (block_hash, block_acceptance_data)) in
+            added_chain_block_hashes.iter().copied().zip(acceptance_data.iter()).enumerate()
+        {
+            let accepting_header = session.async_get_header(block_hash).await?;
             let utxo_diff = session.async_get_block_utxo_diff(block_hash).await?;
             auth_inputs.extend(utxo_diff.remove.iter().map(|(outpoint, entry)| (*outpoint, entry.clone())));
+            for mergeset_entry in block_acceptance_data.iter() {
+                let txs = if let Some(txs) = block_cache.get(&mergeset_entry.block_hash) {
+                    txs.clone()
+                } else {
+                    let block = session.async_get_block(mergeset_entry.block_hash).await?;
+                    let txs = block.transactions;
+                    block_cache.insert(mergeset_entry.block_hash, txs.clone());
+                    txs
+                };
+                for accepted_tx in mergeset_entry.accepted_transactions.iter() {
+                    let tx = txs.get(accepted_tx.index_within_block as usize).ok_or_else(|| {
+                        AtomicTokenError::Processing(format!(
+                            "failed collecting Atomic auth inputs: tx index `{}` out of range for source block `{}`",
+                            accepted_tx.index_within_block, mergeset_entry.block_hash
+                        ))
+                    })?;
+                    if tx.id() != accepted_tx.transaction_id {
+                        return Err(AtomicTokenError::Processing(format!(
+                            "failed collecting Atomic auth inputs: tx id mismatch in source block `{}` at index `{}`",
+                            mergeset_entry.block_hash, accepted_tx.index_within_block
+                        )));
+                    }
+
+                    for input in tx.inputs.iter() {
+                        if let Some(entry) = replay_outputs.remove(&input.previous_outpoint) {
+                            auth_inputs.entry(input.previous_outpoint).or_insert(entry);
+                        }
+                    }
+
+                    let txid = tx.id();
+                    let is_coinbase = tx.is_coinbase();
+                    for (output_index, output) in tx.outputs.iter().enumerate() {
+                        let output_index = u32::try_from(output_index).map_err(|_| {
+                            AtomicTokenError::Processing("failed collecting Atomic auth inputs: tx output index overflow".to_string())
+                        })?;
+                        let outpoint = TransactionOutpoint::new(txid, output_index);
+                        let entry =
+                            UtxoEntry::new(output.value, output.script_public_key.clone(), accepting_header.daa_score, is_coinbase);
+                        replay_outputs.insert(outpoint, entry);
+                    }
+                }
+            }
             if should_log_progress && last_log.elapsed() >= ATOMIC_LONG_OPERATION_LOG_INTERVAL {
                 info!("[{IDENT}] collecting Atomic auth inputs progress: {}/{} block(s)", idx.saturating_add(1), total);
                 last_log = Instant::now();
@@ -307,7 +363,12 @@ impl AtomicTokenProcessor {
                 };
                 let added_count = msg.added_chain_block_hashes.len();
                 let removed_count = msg.removed_chain_block_hashes.len();
-                let auth_inputs_snapshot = match self.collect_auth_inputs_for_added_blocks(msg.added_chain_block_hashes.as_ref()).await
+                let auth_inputs_snapshot = match self
+                    .collect_auth_inputs_for_added_blocks(
+                        msg.added_chain_block_hashes.as_ref(),
+                        msg.added_chain_blocks_acceptance_data.as_ref(),
+                    )
+                    .await
                 {
                     Ok(value) => value,
                     Err(err) => {
@@ -1647,7 +1708,8 @@ impl AtomicTokenService {
                     asset_definition_count
                 );
                 let acceptance_data = session.async_get_blocks_acceptance_data(expected_chain.clone(), None).await?;
-                let auth_inputs = self.processor.collect_auth_inputs_for_added_blocks(&expected_chain).await?;
+                let auth_inputs =
+                    self.processor.collect_auth_inputs_for_added_blocks(&expected_chain, acceptance_data.as_ref()).await?;
                 let repaired_assets = checkpoint_state
                     .recover_missing_asset_metadata_from_retained_acceptance(
                         &expected_chain,
@@ -1791,7 +1853,7 @@ impl AtomicTokenService {
             )));
         }
         info!("[{IDENT}] Cryptix Atomic startup state revalidation loaded acceptance data for {} block(s)", acceptance_data.len());
-        let auth_inputs = self.processor.collect_auth_inputs_for_added_blocks(&replay_added).await?;
+        let auth_inputs = self.processor.collect_auth_inputs_for_added_blocks(&replay_added, acceptance_data.as_ref()).await?;
 
         let temp_state_dir = unique_atomic_temp_dir(&self.atomic_data_dir, "startup-revalidation")?;
         let _temp_state_cleanup = RemoveDirOnDrop::new(temp_state_dir.clone());
@@ -1820,6 +1882,12 @@ impl AtomicTokenService {
             VirtualChainChangedNotification::new(Arc::new(replay_added.clone()), Arc::new(Vec::new()), Arc::new(acceptance_data));
         info!("[{IDENT}] Cryptix Atomic startup state revalidation replaying {} block(s)", replay_added.len());
         staged_state.apply_virtual_chain_change(&replay_notification, &auth_inputs, &self.processor.consensus_manager).await?;
+        if staged_state.degraded {
+            return Err(AtomicTokenError::Processing(
+                "startup state revalidation failed: deterministic replay produced a degraded Atomic state; see accepted CAT replay integrity warnings above"
+                    .to_string(),
+            ));
+        }
         info!("[{IDENT}] Cryptix Atomic startup state revalidation replay completed; verifying retained state hashes");
 
         let final_replayed_block_hash = expected_chain.get(matching_prefix_len - 1).copied().ok_or_else(|| {
@@ -1972,7 +2040,11 @@ impl AtomicTokenService {
         if pruned_state_hashes > 0 {
             info!("[{IDENT}] Cryptix Atomic startup state revalidation pruned {} stale state hash checkpoint(s)", pruned_state_hashes);
         }
-        state.degraded = false;
+        if state.degraded {
+            return Err(AtomicTokenError::Processing(
+                "startup state revalidation failed: active Atomic state remained degraded after deterministic replay".to_string(),
+            ));
+        }
         state.live_correct = true;
 
         self.processor.state_store.persist_runtime_flags(
@@ -2053,7 +2125,7 @@ impl AtomicTokenService {
                 replay_chain.added.len()
             )));
         }
-        let auth_inputs = self.processor.collect_auth_inputs_for_added_blocks(&replay_chain.added).await?;
+        let auth_inputs = self.processor.collect_auth_inputs_for_added_blocks(&replay_chain.added, acceptance_data.as_ref()).await?;
         let notification = VirtualChainChangedNotification::new(
             Arc::new(replay_chain.added.clone()),
             Arc::new(Vec::new()),
@@ -2541,6 +2613,8 @@ impl AtomicTokenService {
                     replay_chain.added.len()
                 )));
             }
+            let auth_inputs =
+                self.processor.collect_auth_inputs_for_added_blocks(&replay_chain.added, acceptance_data.as_ref()).await?;
 
             // Stage snapshot import and deterministic replay off-line, then swap into live state only if fully verified.
             let temp_state_dir = unique_atomic_temp_dir(&self.atomic_data_dir, "snapshot-import")?;
@@ -2570,9 +2644,6 @@ impl AtomicTokenService {
             let mut last_import_replay_log = Instant::now();
             for (idx, (accepting_block_hash, acceptance)) in replay_chain.added.into_iter().zip(acceptance_data.into_iter()).enumerate()
             {
-                let utxo_diff = session.async_get_block_utxo_diff(accepting_block_hash).await?;
-                let auth_inputs: HashMap<TransactionOutpoint, UtxoEntry> =
-                    utxo_diff.remove.iter().map(|(outpoint, entry)| (*outpoint, entry.clone())).collect();
                 let replay_notification = VirtualChainChangedNotification::new(
                     Arc::new(vec![accepting_block_hash]),
                     Arc::new(Vec::new()),

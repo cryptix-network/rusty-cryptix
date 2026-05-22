@@ -279,18 +279,12 @@ impl BlockEventLogger {
 
                 match (summary.submit_count, summary.relay_count) {
                     (0, 0) => {}
-                    (1, 0) => info!("Inserted block {} via submit block (virtual validity pending)", summary.submit()),
-                    (n, 0) => info!("Inserted {} blocks ...{} via submit block (virtual validity pending)", n, summary.submit()),
-                    (0, 1) => info!("Inserted block {} via relay (virtual validity pending)", summary.relay()),
-                    (0, m) => info!("Inserted {} blocks ...{} via relay (virtual validity pending)", m, summary.relay()),
+                    (1, 0) => info!("Submit block {} via LOCAL", summary.submit()),
+                    (n, 0) => info!("Submit {} blocks ...{} via LOCAL", n, summary.submit()),
+                    (0, 1) => info!("Submit block {} via RELAY", summary.relay()),
+                    (0, m) => info!("Submit {} blocks ...{} via RELAY", m, summary.relay()),
                     (n, m) => {
-                        info!(
-                            "Inserted {} blocks ...{} ({} via relay, {} via submit block; virtual validity pending)",
-                            n + m,
-                            summary.submit(),
-                            m,
-                            n
-                        )
+                        info!("Submit {} blocks ...{} ({} via RELAY, {} via LOCAL)", n + m, summary.submit(), m, n)
                     }
                 }
 
@@ -1012,8 +1006,8 @@ impl FlowContext {
             logger.log(event)
         } else {
             match event {
-                BlockLogEvent::Relay(hash) => info!("Inserted block {} via relay (virtual validity pending)", hash),
-                BlockLogEvent::Submit(hash) => info!("Inserted block {} via submit block (virtual validity pending)", hash),
+                BlockLogEvent::Relay(hash) => info!("Submit block {} via RELAY", hash),
+                BlockLogEvent::Submit(hash) => info!("Submit block {} via LOCAL", hash),
                 BlockLogEvent::Orphaned(orphan, roots_count) => {
                     info!("Received a block with {} missing ancestors, adding to orphan pool: {}", roots_count, orphan)
                 }

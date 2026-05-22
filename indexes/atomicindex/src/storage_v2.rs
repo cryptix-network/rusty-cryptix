@@ -13,7 +13,7 @@ use std::{
 };
 
 pub const ATOMIC_DB_SCHEMA_VERSION: u16 = 2;
-pub const ATOMIC_REVALIDATION_VERSION: u16 = 17;
+pub const ATOMIC_REVALIDATION_VERSION: u16 = 19;
 
 const META_SCHEMA_VERSION: &[u8] = b"meta/atomic_schema_version";
 const META_PROTOCOL_VERSION: &[u8] = b"meta/atomic_protocol_version";

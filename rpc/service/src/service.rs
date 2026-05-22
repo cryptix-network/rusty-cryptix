@@ -36,7 +36,7 @@ use cryptix_consensus_core::{
     config::Config,
     constants::MAX_SOMPI,
     network::NetworkType,
-    tx::{ScriptPublicKey, Transaction, TransactionId, COINBASE_TRANSACTION_INDEX},
+    tx::{ScriptPublicKey, Transaction, TransactionId, TransactionOutpoint, UtxoEntry, COINBASE_TRANSACTION_INDEX},
 };
 use cryptix_consensus_notify::{
     notifier::ConsensusNotifier,
@@ -53,6 +53,7 @@ use cryptix_core::{
     task::tick::TickService,
     trace, warn,
 };
+use cryptix_hashes::Hash as BlockHash;
 use cryptix_index_core::indexed_utxos::BalanceByScriptPublicKey;
 use cryptix_index_core::{
     connection::IndexChannelConnection, indexed_utxos::UtxoSetByScriptPublicKey, notification::Notification as IndexNotification,
@@ -508,6 +509,86 @@ impl RpcCoreService {
         RpcError::General(format!("{code}: {}", detail.as_ref()))
     }
 
+    fn liquidity_submit_read_not_ready_error(detail: impl AsRef<str>) -> RpcError {
+        RpcError::General(format!("liquidity pool state is not submit-ready: {}", detail.as_ref()))
+    }
+
+    async fn consensus_atomic_state_hash(&self, block_hash: BlockHash) -> RpcResult<Option<[u8; 32]>> {
+        let session = self.consensus_manager.consensus().session().await;
+        session
+            .async_get_atomic_state_hash(block_hash)
+            .await
+            .map_err(|err| RpcError::General(format!("failed reading consensus atomic state hash: {err}")))
+    }
+
+    async fn virtual_utxo_entry_exact(&self, outpoint: TransactionOutpoint) -> Option<UtxoEntry> {
+        let session = self.consensus_manager.consensus().session().await;
+        session
+            .async_get_virtual_utxos(Some(outpoint), 1, false)
+            .await
+            .into_iter()
+            .next()
+            .and_then(|(found_outpoint, entry)| (found_outpoint == outpoint).then_some(entry))
+    }
+
+    async fn ensure_latest_liquidity_pool_vault_spendable(
+        &self,
+        endpoint: &str,
+        requested_at_block_hash: Option<RpcHash>,
+        asset_id: [u8; 32],
+        context: &AtomicTokenReadContext,
+        pool: &LiquidityPoolState,
+    ) -> RpcResult<()> {
+        if requested_at_block_hash.is_some() {
+            return Ok(());
+        }
+
+        let outpoint = pool.vault_outpoint;
+        let Some(entry) = self.virtual_utxo_entry_exact(outpoint).await else {
+            warn!(
+                "Refusing {} latest liquidity pool read because Atomic pool vault is not spendable in virtual UTXO: asset_id={} pool_nonce={} pool_vault={} pool_vault_value_sompi={} atomic_block={} atomic_state_hash={} runtime={} degraded={} event_seq={}",
+                endpoint,
+                asset_id.as_slice().to_hex(),
+                pool.pool_nonce,
+                outpoint,
+                pool.vault_value_sompi,
+                context.at_block_hash,
+                context.state_hash.as_slice().to_hex(),
+                context.runtime_state.as_str(),
+                context.is_degraded,
+                context.event_sequence_cutoff
+            );
+            return Err(Self::liquidity_submit_read_not_ready_error(
+                "Atomic pool vault is not spendable in the current virtual UTXO; retry after Atomic/UTXO state catches up",
+            ));
+        };
+
+        let class = ScriptClass::from_script(&entry.script_public_key);
+        let is_liquidity_vault = matches!(&class, ScriptClass::LiquidityVault);
+        if !is_liquidity_vault || entry.amount != pool.vault_value_sompi {
+            warn!(
+                "Refusing {} latest liquidity pool read because Atomic pool vault does not match virtual UTXO entry: asset_id={} pool_nonce={} pool_vault={} pool_vault_value_sompi={} utxo_amount={} utxo_script_class={:?} atomic_block={} atomic_state_hash={} runtime={} degraded={} event_seq={}",
+                endpoint,
+                asset_id.as_slice().to_hex(),
+                pool.pool_nonce,
+                outpoint,
+                pool.vault_value_sompi,
+                entry.amount,
+                class,
+                context.at_block_hash,
+                context.state_hash.as_slice().to_hex(),
+                context.runtime_state.as_str(),
+                context.is_degraded,
+                context.event_sequence_cutoff
+            );
+            return Err(Self::liquidity_submit_read_not_ready_error(
+                "Atomic pool vault does not match the current virtual UTXO; retry after Atomic/UTXO state catches up",
+            ));
+        }
+
+        Ok(())
+    }
+
     async fn atomic_context_from_read_context(&self, context: &AtomicTokenReadContext) -> RpcResult<RpcTokenContext> {
         let consensus = self.consensus_manager.consensus();
         let session = consensus.session().await;
@@ -670,6 +751,130 @@ impl RpcCoreService {
 
     fn liquidity_sell_locked(pool: &LiquidityPoolState) -> bool {
         pool.unlock_target_sompi > 0 && !pool.unlocked
+    }
+
+    fn liquidity_payload_submit_diagnostics(transaction: &Transaction) -> (String, Option<[u8; 32]>, Option<u64>) {
+        match parse_atomic_token_payload(transaction.payload.as_slice()) {
+            Some(Ok(parsed)) => match parsed.op {
+                TokenOp::CreateAsset(_) => ("create_asset".to_string(), None, None),
+                TokenOp::Transfer(op) => ("transfer".to_string(), Some(op.asset_id), None),
+                TokenOp::Mint(op) => ("mint".to_string(), Some(op.asset_id), None),
+                TokenOp::Burn(op) => ("burn".to_string(), Some(op.asset_id), None),
+                TokenOp::CreateAssetWithMint(_) => ("create_asset_with_mint".to_string(), None, None),
+                TokenOp::CreateLiquidityAsset(_) => ("create_liquidity_asset".to_string(), None, None),
+                TokenOp::BuyLiquidityExactIn(op) => {
+                    ("buy_liquidity_exact_in".to_string(), Some(op.asset_id), Some(op.expected_pool_nonce))
+                }
+                TokenOp::SellLiquidityExactIn(op) => {
+                    ("sell_liquidity_exact_in".to_string(), Some(op.asset_id), Some(op.expected_pool_nonce))
+                }
+                TokenOp::ClaimLiquidityFees(op) => {
+                    ("claim_liquidity_fees".to_string(), Some(op.asset_id), Some(op.expected_pool_nonce))
+                }
+            },
+            Some(Err(reason)) => (format!("cat_parse_error:{reason:?}"), None, None),
+            None => ("non_cat".to_string(), None, None),
+        }
+    }
+
+    async fn log_submit_transaction_orphan_rejection(
+        &self,
+        transaction: &Transaction,
+        requested_allow_orphan: bool,
+        effective_allow_orphan: bool,
+        error_message: &str,
+    ) {
+        let lower = error_message.to_ascii_lowercase();
+        if !lower.contains("orphan") || !lower.contains("disallowed") {
+            return;
+        }
+
+        let transaction_id = transaction.id();
+        let (op_label, asset_id, expected_pool_nonce) = Self::liquidity_payload_submit_diagnostics(transaction);
+        let asset_id_hex = asset_id.map(|id| id.as_slice().to_hex()).unwrap_or_else(|| "none".to_string());
+        let expected_pool_nonce = expected_pool_nonce.map(|nonce| nonce.to_string()).unwrap_or_else(|| "none".to_string());
+        let input_outpoints: Vec<TransactionOutpoint> = transaction.inputs.iter().map(|input| input.previous_outpoint).collect();
+        let first_inputs = input_outpoints.iter().take(12).map(|outpoint| outpoint.to_string()).collect::<Vec<_>>().join(",");
+
+        let mut atomic_context = "unavailable".to_string();
+        let mut pool_exists = false;
+        let mut pool_vault = "none".to_string();
+        let mut pool_vault_in_tx_inputs = false;
+        let mut pool_nonce = "none".to_string();
+        let mut pool_vault_value_sompi = "none".to_string();
+        let mut pool_vault_virtual_utxo = "not_checked".to_string();
+        let mut consensus_atomic_root_hash = "not_checked".to_string();
+
+        if let Some(asset_id) = asset_id {
+            match self.atomic_service() {
+                Ok(atomic) => match atomic.get_asset_with_context(asset_id, None).await {
+                    Some((context, asset)) => {
+                        match self.consensus_atomic_state_hash(context.at_block_hash).await {
+                            Ok(Some(hash)) => {
+                                consensus_atomic_root_hash = hash.as_slice().to_hex();
+                            }
+                            Ok(None) => {
+                                consensus_atomic_root_hash = "missing".to_string();
+                            }
+                            Err(err) => {
+                                consensus_atomic_root_hash = format!("error:{err}");
+                            }
+                        }
+                        atomic_context = format!(
+                            "block={} runtime={} degraded={} state_hash={} event_seq={}",
+                            context.at_block_hash,
+                            context.runtime_state.as_str(),
+                            context.is_degraded,
+                            context.state_hash.as_slice().to_hex(),
+                            context.event_sequence_cutoff
+                        );
+                        if let Some(pool) = asset.and_then(|asset| asset.liquidity) {
+                            let vault_outpoint = pool.vault_outpoint;
+                            pool_exists = true;
+                            pool_vault = vault_outpoint.to_string();
+                            pool_vault_in_tx_inputs = input_outpoints.iter().any(|input| *input == vault_outpoint);
+                            pool_nonce = pool.pool_nonce.to_string();
+                            pool_vault_value_sompi = pool.vault_value_sompi.to_string();
+                            pool_vault_virtual_utxo = match self.virtual_utxo_entry_exact(vault_outpoint).await {
+                                Some(entry) => format!(
+                                    "present amount={} script_class={:?}",
+                                    entry.amount,
+                                    ScriptClass::from_script(&entry.script_public_key)
+                                ),
+                                None => "missing".to_string(),
+                            };
+                        }
+                    }
+                    None => {
+                        atomic_context = "asset_context_unavailable".to_string();
+                    }
+                },
+                Err(err) => {
+                    atomic_context = format!("atomic_service_unavailable:{err}");
+                }
+            }
+        }
+
+        warn!(
+            "RPC SubmitTransaction disallowed orphan diagnostics: tx={} requested_allow_orphan={} effective_allow_orphan={} op={} asset_id={} expected_pool_nonce={} inputs={} first_inputs=[{}] atomic_context=\"{}\" consensus_atomic_root_hash={} pool_exists={} pool_nonce={} pool_vault={} pool_vault_in_tx_inputs={} pool_vault_value_sompi={} pool_vault_virtual_utxo=\"{}\" error=\"{}\"",
+            transaction_id,
+            requested_allow_orphan,
+            effective_allow_orphan,
+            op_label,
+            asset_id_hex,
+            expected_pool_nonce,
+            input_outpoints.len(),
+            first_inputs,
+            atomic_context,
+            consensus_atomic_root_hash,
+            pool_exists,
+            pool_nonce,
+            pool_vault,
+            pool_vault_in_tx_inputs,
+            pool_vault_value_sompi,
+            pool_vault_virtual_utxo,
+            error_message
+        );
     }
 
     fn liquidity_claim_preview_status(pool: &LiquidityPoolState, claimable_sompi: u64) -> (bool, Option<String>) {
@@ -1729,8 +1934,9 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         _connection: Option<&DynRpcConnection>,
         request: SubmitTransactionRequest,
     ) -> RpcResult<SubmitTransactionResponse> {
-        let allow_orphan = self.config.unsafe_rpc && request.allow_orphan;
-        if !self.config.unsafe_rpc && request.allow_orphan {
+        let requested_allow_orphan = request.allow_orphan;
+        let allow_orphan = self.config.unsafe_rpc && requested_allow_orphan;
+        if !self.config.unsafe_rpc && requested_allow_orphan {
             debug!("SubmitTransaction RPC command called with AllowOrphan enabled while node in safe RPC mode -- switching to ForbidOrphan.");
         }
 
@@ -1746,11 +1952,14 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             true => Orphan::Allowed,
             false => Orphan::Forbidden,
         };
-        self.flow_context.submit_rpc_transaction(&session, transaction, orphan).await.map_err(|err| {
-            let err = RpcError::RejectedTransaction(transaction_id, err.to_string());
+        if let Err(err) = self.flow_context.submit_rpc_transaction(&session, transaction.clone(), orphan).await {
+            let error_message = err.to_string();
+            self.log_submit_transaction_orphan_rejection(&transaction, requested_allow_orphan, allow_orphan, error_message.as_str())
+                .await;
+            let err = RpcError::RejectedTransaction(transaction_id, error_message);
             debug!("{err}");
-            err
-        })?;
+            return Err(err);
+        }
         Ok(SubmitTransactionResponse::new(transaction_id))
     }
 
@@ -2762,6 +2971,18 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             }
             asset.liquidity.as_ref().map(|liquidity| Self::map_liquidity_pool_state(asset, liquidity, prefix))
         });
+        if let Some(asset) = asset.as_ref() {
+            if let Some(liquidity) = asset.liquidity.as_ref() {
+                self.ensure_latest_liquidity_pool_vault_spendable(
+                    "getLiquidityPoolState",
+                    at_block_hash,
+                    asset_id,
+                    &read_context,
+                    liquidity,
+                )
+                .await?;
+            }
+        }
 
         let context = self.atomic_context_from_read_context(&read_context).await?;
         Ok(GetLiquidityPoolStateResponse { pool, context })
@@ -2786,6 +3007,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             return Err(RpcError::General("asset is not a liquidity asset".to_string()));
         }
         let pool = asset.liquidity.as_ref().ok_or_else(|| RpcError::General("liquidity state missing for asset".to_string()))?;
+        self.ensure_latest_liquidity_pool_vault_spendable("getLiquidityQuote", at_block_hash, asset_id, &read_context, pool).await?;
 
         let (effective_exact_in_amount, fee_amount_sompi, net_in_amount, amount_out) = match side {
             LIQUIDITY_QUOTE_SIDE_BUY => {

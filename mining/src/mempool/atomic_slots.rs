@@ -59,6 +59,34 @@ pub(crate) fn is_cat_transaction(tx: &Transaction) -> bool {
     tx.subnetwork_id == SUBNETWORK_ID_PAYLOAD && tx.payload.starts_with(CAT_MAGIC)
 }
 
+pub(crate) fn atomic_mempool_debug_summary(tx: &Transaction) -> String {
+    if !is_cat_transaction(tx) {
+        return "cat=false".to_string();
+    }
+
+    let op_code = tx.payload.get(CAT_MAGIC.len() + 1).copied();
+    let op_label = match op_code {
+        Some(0) => "create_asset",
+        Some(1) => "transfer",
+        Some(2) => "mint",
+        Some(3) => "burn",
+        Some(4) => "create_asset_with_mint",
+        Some(5) => "create_liquidity_asset",
+        Some(6) => "buy_liquidity_exact_in",
+        Some(7) => "sell_liquidity_exact_in",
+        Some(8) => "claim_liquidity_fees",
+        Some(other) => return format!("cat=true op=unsupported({other})"),
+        None => return "cat=true op=truncated".to_string(),
+    };
+
+    let liquidity_slot = match atomic_mempool_liquidity_pool_slot(tx) {
+        Ok(Some(slot)) => slot.to_string(),
+        Ok(None) => "none".to_string(),
+        Err(err) => format!("parse_error={err}"),
+    };
+    format!("cat=true op={op_label} liquidity_slot={liquidity_slot}")
+}
+
 pub(crate) fn atomic_mempool_slots(transaction: &MutableTransaction) -> RuleResult<Vec<AtomicMempoolSlot>> {
     if !is_cat_transaction(transaction.tx.as_ref()) {
         return Ok(vec![]);
