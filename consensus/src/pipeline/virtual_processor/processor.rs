@@ -59,7 +59,7 @@ use cryptix_consensus_core::{
     acceptance_data::AcceptanceData,
     api::args::{TransactionValidationArgs, TransactionValidationBatchArgs},
     block::{BlockTemplate, MutableBlock, TemplateBuildMode, TemplateTransactionSelector},
-    blockstatus::BlockStatus::{StatusDisqualifiedFromChain, StatusUTXOValid},
+    blockstatus::BlockStatus::{StatusDisqualifiedFromChain, StatusHeaderOnly, StatusInvalid, StatusUTXOValid},
     coinbase::MinerData,
     config::genesis::GenesisBlock,
     errors::consensus::{ConsensusError, ConsensusResult},
@@ -1161,6 +1161,43 @@ impl VirtualStateProcessor {
         }
     }
 
+    fn ensure_virtual_parents_are_template_safe(&self, virtual_state: &VirtualState) -> Result<(), RuleError> {
+        let selected_parent = virtual_state.ghostdag_data.selected_parent;
+        let selected_parent_status = self.statuses_store.read().get(selected_parent).unwrap();
+        if selected_parent_status != StatusUTXOValid {
+            warn!(
+                "Refusing block template because virtual selected parent is not UTXO-valid: selected_parent={}, status={:?}, daa={}, parents={}",
+                selected_parent,
+                selected_parent_status,
+                virtual_state.daa_score,
+                virtual_state.parents.len()
+            );
+            return Err(RuleError::KnownInvalid);
+        }
+
+        for parent in virtual_state.parents.iter().copied() {
+            let status = self.statuses_store.read().get(parent).unwrap();
+            match status {
+                StatusInvalid | StatusDisqualifiedFromChain | StatusHeaderOnly => {
+                    warn!(
+                        "Refusing block template because virtual parent is not template-safe: parent={}, status={:?}, selected_parent={}, daa={}, parents={}",
+                        parent,
+                        status,
+                        selected_parent,
+                        virtual_state.daa_score,
+                        virtual_state.parents.len()
+                    );
+                    return Err(RuleError::KnownInvalid);
+                }
+                StatusUTXOValid => {}
+                // Non-selected merge parents can legitimately still be pending in a BlockDAG.
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
     fn validate_mempool_transaction_impl(
         &self,
         mutable_tx: &mut MutableTransaction,
@@ -1704,6 +1741,7 @@ impl VirtualStateProcessor {
         let virtual_read = self.virtual_stores.read();
         let virtual_state = virtual_read.state.get().unwrap();
         let virtual_utxo_view = &virtual_read.utxo_set;
+        self.ensure_virtual_parents_are_template_safe(&virtual_state)?;
         if !self.ensure_current_atomic_store_matches_virtual(&virtual_read, &virtual_state) {
             return Err(RuleError::KnownInvalid);
         }

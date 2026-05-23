@@ -2,7 +2,10 @@ use crate::{
     consensus::test_consensus::TestConsensus,
     model::{
         services::reachability::ReachabilityService,
-        stores::atomic_state::{AtomicAssetClass, AtomicBalanceKey, AtomicLiquidityPoolState, AtomicNonceKey},
+        stores::{
+            atomic_state::{AtomicAssetClass, AtomicBalanceKey, AtomicLiquidityPoolState, AtomicNonceKey},
+            statuses::StatusesStore,
+        },
     },
     processes::transaction_validator::transaction_validator_populated::atomic_owner_id_from_script,
 };
@@ -328,6 +331,29 @@ async fn disqualified_only_tip_restores_last_valid_parent() {
     ctx.validate_and_insert_block(valid_extension.block.to_immutable()).await;
     assert_eq!(ctx.consensus.get_block_status(valid_extension_hash), Some(BlockStatus::StatusUTXOValid));
     assert_eq!(ctx.consensus.get_sink(), valid_extension_hash);
+}
+
+#[tokio::test]
+async fn block_template_refuses_disqualified_virtual_selected_parent() {
+    cryptix_core::log::try_init_logger("info");
+    let config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    ctx.build_block_template_row(0..3).validate_and_insert_row().await.assert_valid_utxo_tip();
+
+    let selected_parent = ctx.consensus.get_sink();
+    assert_eq!(ctx.consensus.get_block_status(selected_parent), Some(BlockStatus::StatusUTXOValid));
+    ctx.consensus.virtual_processor().statuses_store.write().set(selected_parent, BlockStatus::StatusDisqualifiedFromChain).unwrap();
+
+    let err = ctx
+        .consensus
+        .build_block_template(
+            ctx.miner_data.clone(),
+            Box::new(OnetimeTxSelector::new(Default::default())),
+            TemplateBuildMode::Standard,
+        )
+        .unwrap_err();
+
+    assert!(matches!(err, crate::errors::RuleError::KnownInvalid));
 }
 
 #[tokio::test]

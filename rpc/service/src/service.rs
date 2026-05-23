@@ -95,11 +95,11 @@ use cryptix_utils::sysinfo::SystemInfo;
 use cryptix_utils::{channel::Channel, triggers::SingleTrigger};
 use cryptix_utils_tower::counters::TowerConnectionCounters;
 use cryptix_utxoindex::api::UtxoIndexProxy;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     collections::{HashMap, HashSet},
     iter::once,
-    sync::{atomic::Ordering, Arc},
+    sync::{atomic::Ordering, Arc, Mutex},
     vec,
 };
 use tokio::{
@@ -149,12 +149,14 @@ pub struct RpcCoreService {
     fee_estimate_cache: ExpiringCache<RpcFeeEstimate>,
     fee_estimate_verbose_cache: ExpiringCache<cryptix_mining::errors::MiningManagerResult<GetFeeEstimateExperimentalResponse>>,
     hfa_engine: Arc<HfaEngine>,
+    get_block_template_unsynced_last_log: Mutex<Option<Instant>>,
 }
 
 const RPC_CORE: &str = "rpc-core";
 const NORMAL_POLICY_REJECT_FAST_LOCK_CONFLICT: &str = "normal_policy_reject_fast_lock_conflict";
 const HFA_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
 const TOKEN_EVENTS_NOTIFY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const GET_BLOCK_TEMPLATE_UNSYNCED_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const TOKEN_EVENTS_LIMIT_MAX: usize = 4096;
 const TOKEN_ASSETS_LIMIT_MAX: usize = 2048;
 const TOKEN_OWNER_BALANCES_LIMIT_MAX: usize = 4096;
@@ -312,7 +314,22 @@ impl RpcCoreService {
             fee_estimate_cache: ExpiringCache::new(Duration::from_millis(500), Duration::from_millis(1000)),
             fee_estimate_verbose_cache: ExpiringCache::new(Duration::from_millis(500), Duration::from_millis(1000)),
             hfa_engine,
+            get_block_template_unsynced_last_log: Mutex::new(None),
         }
+    }
+
+    fn should_log_get_block_template_unsynced(&self) -> bool {
+        let now = Instant::now();
+        let mut last_log = self.get_block_template_unsynced_last_log.lock().expect("getBlockTemplate log throttle mutex poisoned");
+        let should_log = match *last_log {
+            Some(last) => now.duration_since(last) >= GET_BLOCK_TEMPLATE_UNSYNCED_LOG_INTERVAL,
+            None => true,
+        };
+        if should_log {
+            *last_log = Some(now);
+            return true;
+        }
+        false
     }
 
     pub fn start_impl(&self) {
@@ -1491,12 +1508,14 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             && !is_nearly_synced
             && !self.config.enable_unsynced_mining
         {
-            warn!(
-                "Rejecting get_block_template while node is not nearly synced after payload HF: virtual_daa_score={}, activation_daa={}, enable_unsynced_mining={}; mining from a partial Atomic/UTXO view can create blocks with invalid state commitments",
-                virtual_daa_score,
-                self.config.params.payload_hf_activation_daa_score,
-                self.config.enable_unsynced_mining
-            );
+            if self.should_log_get_block_template_unsynced() {
+                warn!(
+                    "Rejecting get_block_template while node is not nearly synced after payload HF: virtual_daa_score={}, activation_daa={}, enable_unsynced_mining={}; mining from a partial Atomic/UTXO view can create blocks with invalid state commitments (warning throttled to once per 60s)",
+                    virtual_daa_score,
+                    self.config.params.payload_hf_activation_daa_score,
+                    self.config.enable_unsynced_mining
+                );
+            }
             return Err(RpcError::General(
                 "mining template unavailable: node is not nearly synced after payload hardfork; wait for sync/Atomic catch-up before mining"
                     .to_string(),
@@ -1506,11 +1525,13 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             && !is_nearly_synced
             && self.config.enable_unsynced_mining
         {
-            warn!(
-                "Allowing get_block_template while node is not nearly synced after payload HF because enable_unsynced_mining is set: virtual_daa_score={}, activation_daa={}; this is testing-oriented and can create blocks from a partial Atomic/UTXO view",
-                virtual_daa_score,
-                self.config.params.payload_hf_activation_daa_score
-            );
+            if self.should_log_get_block_template_unsynced() {
+                warn!(
+                    "Allowing get_block_template while node is not nearly synced after payload HF because enable_unsynced_mining is set: virtual_daa_score={}, activation_daa={}; this is testing-oriented and can create blocks from a partial Atomic/UTXO view (warning throttled to once per 60s)",
+                    virtual_daa_score,
+                    self.config.params.payload_hf_activation_daa_score
+                );
+            }
         }
 
         // Build block template

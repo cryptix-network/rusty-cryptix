@@ -33,7 +33,7 @@ impl MempoolUtxoSet {
             // Delete the output this input spends, in case it was created by mempool.
             // If the outpoint doesn't exist in self.pool_unspent_outputs - this means
             // it was created in the DAG (a.k.a. in consensus).
-            self.pool_unspent_outputs.remove(&outpoint);
+            self.pool_unspent_outputs.remove(&input.previous_outpoint);
 
             self.outpoint_owner_id.insert(input.previous_outpoint, transaction_id);
         }
@@ -103,5 +103,71 @@ impl MempoolUtxoSet {
             }
         }
         double_spends
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cryptix_consensus_core::{
+        constants::TX_VERSION,
+        subnets::SUBNETWORK_ID_NATIVE,
+        tx::{scriptvec, ScriptPublicKey, Transaction, TransactionInput, TransactionOutput},
+    };
+    use std::sync::Arc;
+
+    fn script_public_key() -> ScriptPublicKey {
+        ScriptPublicKey::new(0, scriptvec![0x51])
+    }
+
+    fn entry(amount: u64) -> UtxoEntry {
+        UtxoEntry::new(amount, script_public_key(), 0, false)
+    }
+
+    fn tx_spending(previous_outpoint: TransactionOutpoint, amount: u64) -> Arc<Transaction> {
+        Arc::new(Transaction::new(
+            TX_VERSION,
+            vec![TransactionInput::new(previous_outpoint, vec![], 0, 0)],
+            vec![TransactionOutput::new(amount, script_public_key())],
+            0,
+            SUBNETWORK_ID_NATIVE,
+            0,
+            vec![],
+        ))
+    }
+
+    #[test]
+    fn adding_child_removes_spent_parent_output_from_mempool_utxo_set() {
+        let mut utxo_set = MempoolUtxoSet::new();
+        let parent_input = TransactionOutpoint::new(TransactionId::from_u64_word(1), 0);
+        let parent_tx = tx_spending(parent_input, 10);
+        let parent_outpoint = TransactionOutpoint::new(parent_tx.id(), 0);
+        let parent = MutableTransaction {
+            tx: parent_tx,
+            entries: vec![Some(entry(11))],
+            calculated_fee: Some(1),
+            calculated_compute_mass: Some(1),
+        };
+
+        utxo_set.add_transaction(&parent);
+        assert!(utxo_set.pool_unspent_outputs.contains_key(&parent_outpoint));
+
+        let child_tx = tx_spending(parent_outpoint, 9);
+        let child_outpoint = TransactionOutpoint::new(child_tx.id(), 0);
+        let child = MutableTransaction {
+            tx: child_tx,
+            entries: vec![Some(entry(10))],
+            calculated_fee: Some(1),
+            calculated_compute_mass: Some(1),
+        };
+
+        utxo_set.add_transaction(&child);
+
+        assert!(
+            !utxo_set.pool_unspent_outputs.contains_key(&parent_outpoint),
+            "a mempool-created output must stop being spendable after a child transaction spends it"
+        );
+        assert!(utxo_set.pool_unspent_outputs.contains_key(&child_outpoint));
+        assert_eq!(utxo_set.get_outpoint_owner_id(&parent_outpoint), Some(&child.id()));
     }
 }

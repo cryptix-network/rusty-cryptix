@@ -5,7 +5,7 @@ use crate::{
 };
 use cryptix_consensus_core::{api::BlockValidationFutures, block::Block, blockstatus::BlockStatus, errors::block::RuleError};
 use cryptix_consensusmanager::{BlockProcessingBatch, ConsensusProxy};
-use cryptix_core::debug;
+use cryptix_core::{debug, warn};
 use cryptix_hashes::Hash;
 use cryptix_p2p_lib::{
     common::ProtocolError,
@@ -216,36 +216,54 @@ impl HandleRelayInvsFlow {
                 Err(rule_error) => return Err(rule_error.into()),
             };
 
-            // As a policy, we only relay blocks who stand a chance to enter past(virtual).
-            // The only mining rule which permanently excludes a block is the merge depth bound
-            // (as opposed to "max parents" and "mergeset size limit" rules)
-            if broadcast {
-                for block in &ancestor_batch.blocks {
-                    let hash = block.hash();
-                    self.ctx.broadcast_block_producer_claims_for_hash(hash).await;
-                    self.ctx
-                        .broadcast_to_unrestricted_peers(make_message!(
-                            Payload::InvRelayBlock,
-                            InvRelayBlockMessage { hash: Some(hash.into()) }
-                        ))
-                        .await;
-                }
-
-                self.ctx.broadcast_block_producer_claims_for_hash(inv.hash).await;
-                self.ctx
-                    .broadcast_to_unrestricted_peers(make_message!(
-                        Payload::InvRelayBlock,
-                        InvRelayBlockMessage { hash: Some(inv.hash.into()) }
-                    ))
-                    .await;
-            }
+            let ancestor_hashes = ancestor_batch.blocks.iter().map(|block| block.hash()).collect::<Vec<_>>();
 
             // We spawn post-processing as a separate task so that this loop
             // can continue processing the following relay blocks
             let ctx = self.ctx.clone();
+            let relay_hash = inv.hash;
+            let should_broadcast = broadcast;
             tokio::spawn(async move {
                 ctx.on_new_block(&session, ancestor_batch, block, virtual_state_task).await;
-                ctx.log_block_event(BlockLogEvent::Relay(inv.hash));
+
+                if should_broadcast {
+                    for hash in ancestor_hashes {
+                        if matches!(
+                            session.async_get_block_status(hash).await,
+                            Some(BlockStatus::StatusDisqualifiedFromChain | BlockStatus::StatusInvalid)
+                        ) {
+                            warn!("Not relaying block {} because it was disqualified by virtual UTXO/Atomic validation", hash);
+                            continue;
+                        }
+                        ctx.broadcast_block_producer_claims_for_hash(hash).await;
+                        ctx.broadcast_to_unrestricted_peers(make_message!(
+                            Payload::InvRelayBlock,
+                            InvRelayBlockMessage { hash: Some(hash.into()) }
+                        ))
+                        .await;
+                    }
+
+                    if matches!(
+                        session.async_get_block_status(relay_hash).await,
+                        Some(BlockStatus::StatusDisqualifiedFromChain | BlockStatus::StatusInvalid)
+                    ) {
+                        warn!("Not relaying block {} because it was disqualified by virtual UTXO/Atomic validation", relay_hash);
+                        return;
+                    }
+                    ctx.broadcast_block_producer_claims_for_hash(relay_hash).await;
+                    ctx.broadcast_to_unrestricted_peers(make_message!(
+                        Payload::InvRelayBlock,
+                        InvRelayBlockMessage { hash: Some(relay_hash.into()) }
+                    ))
+                    .await;
+                }
+
+                if !matches!(
+                    session.async_get_block_status(relay_hash).await,
+                    Some(BlockStatus::StatusDisqualifiedFromChain | BlockStatus::StatusInvalid)
+                ) {
+                    ctx.log_block_event(BlockLogEvent::Relay(relay_hash));
+                }
             });
         }
     }

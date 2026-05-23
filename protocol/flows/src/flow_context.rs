@@ -983,7 +983,10 @@ impl FlowContext {
         }
         self.on_new_block(consensus, Default::default(), block, virtual_state_task).await;
 
-        if consensus.async_get_block_status(hash).await == Some(BlockStatus::StatusDisqualifiedFromChain) {
+        if matches!(
+            consensus.async_get_block_status(hash).await,
+            Some(BlockStatus::StatusDisqualifiedFromChain | BlockStatus::StatusInvalid)
+        ) {
             let reason = format!(
                 "RPC submitted block {} was disqualified by virtual UTXO/Atomic validation; refusing to relay it to peers",
                 hash
@@ -1029,13 +1032,7 @@ impl FlowContext {
     ) {
         let hash = block.hash();
         let mut blocks = self.unorphan_blocks(consensus, hash).await;
-
-        // Broadcast unorphaned blocks
-        let msgs = blocks
-            .iter()
-            .map(|(b, _)| make_message!(Payload::InvRelayBlock, InvRelayBlockMessage { hash: Some(b.hash().into()) }))
-            .collect();
-        self.broadcast_many_to_unrestricted_peers(msgs).await;
+        let unorphaned_hashes = blocks.iter().map(|(block, _)| block.hash()).collect::<Vec<_>>();
 
         // Process blocks in topological order
         blocks.sort_by(|a, b| a.0.header.blue_work.partial_cmp(&b.0.header.blue_work).unwrap());
@@ -1044,6 +1041,21 @@ impl FlowContext {
             // actions such as updating the mempool. We know this will not err since `block_task` already completed w/o error
             let _ = virtual_state_task.await;
         }
+
+        // Broadcast unorphaned blocks only after virtual validation had a chance to disqualify invalid branches.
+        let mut msgs = Vec::with_capacity(unorphaned_hashes.len());
+        for hash in unorphaned_hashes {
+            if matches!(
+                consensus.async_get_block_status(hash).await,
+                Some(BlockStatus::StatusDisqualifiedFromChain | BlockStatus::StatusInvalid)
+            ) {
+                warn!("Not relaying unorphaned block {} because it was disqualified by virtual UTXO/Atomic validation", hash);
+                continue;
+            }
+            msgs.push(make_message!(Payload::InvRelayBlock, InvRelayBlockMessage { hash: Some(hash.into()) }));
+        }
+        self.broadcast_many_to_unrestricted_peers(msgs).await;
+
         let transactions_to_broadcast = self.process_mempool_virtual_acceptance(consensus).await;
 
         let is_nearly_synced = consensus.async_is_nearly_synced().await;

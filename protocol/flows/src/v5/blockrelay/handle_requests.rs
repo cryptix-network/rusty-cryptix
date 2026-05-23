@@ -1,5 +1,6 @@
 use crate::{flow_context::FlowContext, flow_trait::Flow};
-use cryptix_core::debug;
+use cryptix_consensus_core::blockstatus::BlockStatus;
+use cryptix_core::{debug, warn};
 use cryptix_p2p_lib::{
     common::ProtocolError,
     dequeue_with_request_id, make_message, make_response,
@@ -42,6 +43,14 @@ impl HandleRelayBlockRequests {
             let session = self.ctx.consensus().unguarded_session();
 
             for hash in hashes {
+                if matches!(
+                    session.async_get_block_status(hash).await,
+                    Some(BlockStatus::StatusDisqualifiedFromChain | BlockStatus::StatusInvalid)
+                ) {
+                    warn!("Not serving relay block {} to peer {} because it is not UTXO/Atomic-valid", hash, self.router);
+                    continue;
+                }
+
                 let block = session.async_get_block(hash).await?;
                 for claim in self.ctx.block_producer_claims_for_hash(hash) {
                     self.router.enqueue(make_message!(Payload::BlockProducerClaimV1, claim)).await?;
