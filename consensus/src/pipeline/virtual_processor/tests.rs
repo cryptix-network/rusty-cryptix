@@ -1565,7 +1565,9 @@ async fn batch_mempool_validation_rejects_duplicate_liquidity_pool_nonce_across_
     assert!(
         results.iter().filter_map(|result| result.as_ref().err()).any(|err| {
             let text = format!("{err:?}");
-            text.contains("stale liquidity nonce") || text.contains("unknown LiquidityVault input outpoint")
+            text.contains("stale liquidity nonce")
+                || text.contains("unknown LiquidityVault input outpoint")
+                || text.contains("MissingTxOutpoints")
         }),
         "duplicate pool nonce should be rejected after the first accepted transition advances the pool head: {results:?}"
     );

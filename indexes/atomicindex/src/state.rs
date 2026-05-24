@@ -1986,30 +1986,60 @@ impl AtomicTokenState {
         source_block_time: u64,
         journal: &mut JournalBuilder,
     ) -> Result<(), NoopReason> {
-        let create = CreateAssetOp {
-            token_version: op.token_version,
-            decimals: op.decimals,
-            supply_mode: op.supply_mode,
-            max_supply: op.max_supply,
-            mint_authority_owner_id: op.mint_authority_owner_id,
-            name: op.name.clone(),
-            symbol: op.symbol.clone(),
-            metadata: op.metadata.clone(),
-            platform_tag: op.platform_tag.clone(),
-        };
-        self.execute_create_asset(
-            txid_bytes,
-            creator_owner_id,
-            &create,
-            source_block_hash,
-            source_block_daa_score,
-            source_block_time,
-            journal,
-        )?;
+        if self.asset_value(&txid_bytes).is_some() {
+            return Err(NoopReason::AssetAlreadyExists);
+        }
+        if op.token_version != CURRENT_TOKEN_VERSION {
+            return Err(NoopReason::BadTokenVersion);
+        }
+        if op.decimals > crate::payload::MAX_DECIMALS {
+            return Err(NoopReason::BadDecimals);
+        }
+        match op.supply_mode {
+            SupplyMode::Capped if op.max_supply == 0 => return Err(NoopReason::BadMaxSupply),
+            SupplyMode::Uncapped if op.max_supply != 0 => return Err(NoopReason::BadMaxSupply),
+            _ => {}
+        }
 
+        let mut total_supply = 0u128;
+        let mut initial_mint_balance: Option<(BalanceKey, u128)> = None;
         if op.initial_mint_amount > 0 {
-            let mint = MintOp { asset_id: txid_bytes, to_owner_id: op.initial_mint_to_owner_id, amount: op.initial_mint_amount };
-            self.execute_mint(op.mint_authority_owner_id, &mint, journal)?;
+            if matches!(op.supply_mode, SupplyMode::Capped) && op.initial_mint_amount > op.max_supply {
+                return Err(NoopReason::SupplyCapExceeded);
+            }
+            let receiver_key = BalanceKey { asset_id: txid_bytes, owner_id: op.initial_mint_to_owner_id };
+            let receiver_balance = self.balance_value(&receiver_key);
+            let receiver_after = receiver_balance.checked_add(op.initial_mint_amount).ok_or(NoopReason::BalanceOverflow)?;
+            total_supply = op.initial_mint_amount;
+            initial_mint_balance = Some((receiver_key, receiver_after));
+        }
+
+        self.record_asset_before(txid_bytes, journal);
+        self.set_asset_state(
+            txid_bytes,
+            TokenAsset {
+                asset_id: txid_bytes,
+                creator_owner_id,
+                asset_class: TokenAssetClass::Standard,
+                token_version: op.token_version,
+                mint_authority_owner_id: op.mint_authority_owner_id,
+                decimals: op.decimals,
+                supply_mode: op.supply_mode,
+                max_supply: op.max_supply,
+                total_supply,
+                name: op.name.clone(),
+                symbol: op.symbol.clone(),
+                metadata: op.metadata.clone(),
+                platform_tag: op.platform_tag.clone(),
+                created_block_hash: Some(source_block_hash),
+                created_daa_score: Some(source_block_daa_score),
+                created_at: Some(source_block_time),
+                liquidity: None,
+            },
+        );
+        if let Some((receiver_key, receiver_after)) = initial_mint_balance {
+            self.record_balance_before(receiver_key, journal);
+            self.set_balance_amount(receiver_key, receiver_after);
         }
         Ok(())
     }
@@ -2186,6 +2216,7 @@ impl AtomicTokenState {
         let mut unclaimed_fee_total_sompi = 0u64;
         let mut total_supply = 0u128;
         let mut holder_addresses: HashMap<[u8; 32], LiquidityHolderAddressState> = HashMap::new();
+        let mut launch_receiver_after: Option<(BalanceKey, u128)> = None;
 
         if op.launch_buy_sompi > 0 {
             let fee_trade = calculate_trade_fee(op.launch_buy_sompi, op.fee_bps).map_err(map_liquidity_math_error)?;
@@ -2215,10 +2246,9 @@ impl AtomicTokenState {
             total_supply = token_out;
 
             let receiver_key = BalanceKey { asset_id, owner_id: creator_owner_id };
-            self.record_balance_before(receiver_key, journal);
             let receiver_balance = self.balance_value(&receiver_key);
             let receiver_after = receiver_balance.checked_add(token_out).ok_or(NoopReason::BalanceOverflow)?;
-            self.set_balance_amount(receiver_key, receiver_after);
+            launch_receiver_after = Some((receiver_key, receiver_after));
             holder_addresses.insert(
                 creator_owner_id,
                 LiquidityHolderAddressState {
@@ -2269,6 +2299,10 @@ impl AtomicTokenState {
         };
         self.validate_liquidity_invariants(&asset)?;
         self.set_asset_state(asset_id, asset);
+        if let Some((receiver_key, receiver_after)) = launch_receiver_after {
+            self.record_balance_before(receiver_key, journal);
+            self.set_balance_amount(receiver_key, receiver_after);
+        }
         Ok(total_supply)
     }
 
@@ -2341,12 +2375,13 @@ impl AtomicTokenState {
 
         let receiver_balance = self.balance_value(&receiver_key);
         let receiver_after = receiver_balance.checked_add(token_out).ok_or(NoopReason::BalanceOverflow)?;
-        self.set_balance_amount(receiver_key, receiver_after);
 
-        asset.total_supply = asset.total_supply.checked_add(token_out).ok_or(NoopReason::SupplyOverflow)?;
+        let new_total_supply = asset.total_supply.checked_add(token_out).ok_or(NoopReason::SupplyOverflow)?;
+        asset.total_supply = new_total_supply;
         asset.liquidity = Some(pool);
         self.validate_liquidity_invariants(&asset)?;
         self.set_asset_state(op.asset_id, asset);
+        self.set_balance_amount(receiver_key, receiver_after);
         Ok(token_out)
     }
 
@@ -2411,16 +2446,18 @@ impl AtomicTokenState {
         pool.pool_nonce = pool.pool_nonce.checked_add(1).ok_or(NoopReason::SupplyOverflow)?;
 
         if sender_after == 0 {
-            self.remove_balance(sender_key);
             pool.holder_addresses.remove(&seller_owner_id);
-        } else {
-            self.set_balance_amount(sender_key, sender_after);
         }
 
         asset.total_supply = supply_after;
         asset.liquidity = Some(pool);
         self.validate_liquidity_invariants(&asset)?;
         self.set_asset_state(op.asset_id, asset);
+        if sender_after == 0 {
+            self.remove_balance(sender_key);
+        } else {
+            self.set_balance_amount(sender_key, sender_after);
+        }
         Ok(())
     }
 
@@ -4811,6 +4848,123 @@ mod tests {
             state.execute_buy_liquidity(&buy_tx, &buyer_auth, &buy_op, &buy_auth_inputs, &mut journal),
             Err(NoopReason::InvalidAmount)
         );
+    }
+
+    #[test]
+    fn rejected_liquidity_buy_does_not_partially_mint_balance() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let owner_payload = vec![0x2A; 32];
+        let owner = state.owner_id_from_address_components(0, owner_payload.as_slice()).expect("owner id should derive");
+        let asset_id = [0x2A; 32];
+        let vault_outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(42), 0);
+        let real_token_reserves = 1_000_000u128;
+        let virtual_cpay_reserves = 1_000_000u64;
+        let virtual_token_reserves = 1_000_000u128;
+        let quote_gross_in = 10_000u64;
+        let token_out = cpmm_buy(real_token_reserves, virtual_cpay_reserves, virtual_token_reserves, quote_gross_in)
+            .expect("buy quote should calculate")
+            .0;
+        assert!(token_out > 0, "test setup expected non-zero token_out");
+        let canonical_in = crate::liquidity_math::min_gross_input_for_token_out(
+            real_token_reserves,
+            virtual_cpay_reserves,
+            virtual_token_reserves,
+            token_out,
+            0,
+        )
+        .expect("canonical input should calculate");
+
+        state.assets.insert(
+            asset_id,
+            TokenAsset {
+                asset_id,
+                creator_owner_id: owner,
+                asset_class: TokenAssetClass::Liquidity,
+                token_version: CURRENT_TOKEN_VERSION,
+                mint_authority_owner_id: [0u8; 32],
+                decimals: 0,
+                supply_mode: SupplyMode::Capped,
+                max_supply: u128::MAX,
+                total_supply: u128::MAX,
+                name: b"Overflow".to_vec(),
+                symbol: b"OVF".to_vec(),
+                metadata: vec![],
+                platform_tag: Vec::new(),
+                created_block_hash: None,
+                created_daa_score: None,
+                created_at: None,
+                liquidity: Some(LiquidityPoolState {
+                    pool_nonce: 1,
+                    curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
+                    curve_mode: DEFAULT_LIQUIDITY_CURVE_MODE,
+                    individual_virtual_cpay_reserves_sompi: 0,
+                    individual_virtual_token_multiplier_bps: 0,
+                    real_cpay_reserves_sompi: 1_000,
+                    real_token_reserves,
+                    virtual_cpay_reserves_sompi: virtual_cpay_reserves,
+                    virtual_token_reserves,
+                    unclaimed_fee_total_sompi: 0,
+                    fee_bps: 0,
+                    fee_recipients: vec![],
+                    vault_outpoint,
+                    vault_value_sompi: 1_000,
+                    unlock_target_sompi: 0,
+                    unlocked: true,
+                    holder_addresses: HashMap::new(),
+                }),
+            },
+        );
+        state.rebuild_liquidity_vault_outpoint_index();
+
+        let buy_tx = tx_with_inputs_outputs(
+            vec![(vault_outpoint, 0)],
+            vec![TransactionOutput::new(1_000 + canonical_in, liquidity_vault_script())],
+            vec![],
+        );
+        let mut buy_auth_inputs = HashMap::new();
+        buy_auth_inputs.insert(vault_outpoint, UtxoEntry::new(1_000, liquidity_vault_script(), 0, false));
+        let buyer_auth = AuthContext { owner_id: owner, address_version: 0, address_payload: owner_payload };
+        let buy_op = BuyLiquidityExactInOp { asset_id, expected_pool_nonce: 1, cpay_in_sompi: canonical_in, min_token_out: 1 };
+        let mut journal = JournalBuilder::default();
+
+        assert_eq!(
+            state.execute_buy_liquidity(&buy_tx, &buyer_auth, &buy_op, &buy_auth_inputs, &mut journal),
+            Err(NoopReason::SupplyOverflow)
+        );
+        assert_eq!(state.get_balance(asset_id, owner), 0, "rejected buy must not mint balance");
+        let pool = state.assets.get(&asset_id).and_then(|asset| asset.liquidity.as_ref()).expect("pool should still exist");
+        assert_eq!(pool.pool_nonce, 1);
+        assert_eq!(pool.vault_outpoint, vault_outpoint);
+        assert_eq!(pool.vault_value_sompi, 1_000);
+    }
+
+    #[test]
+    fn rejected_create_asset_with_mint_does_not_leave_partial_asset() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let asset_id = [0x3A; 32];
+        let creator = [0x3B; 32];
+        let receiver = [0x3C; 32];
+        let op = CreateAssetWithMintOp {
+            token_version: CURRENT_TOKEN_VERSION,
+            decimals: 8,
+            supply_mode: SupplyMode::Capped,
+            max_supply: 100,
+            mint_authority_owner_id: creator,
+            name: b"Cap".to_vec(),
+            symbol: b"CAP".to_vec(),
+            metadata: vec![],
+            platform_tag: Vec::new(),
+            initial_mint_amount: 101,
+            initial_mint_to_owner_id: receiver,
+        };
+        let mut journal = JournalBuilder::default();
+
+        assert_eq!(
+            state.execute_create_asset_with_mint(asset_id, creator, &op, BlockHash::from_u64_word(1), 1, 1, &mut journal),
+            Err(NoopReason::SupplyCapExceeded)
+        );
+        assert!(state.asset_value(&asset_id).is_none(), "rejected create-mint must not create an asset");
+        assert_eq!(state.get_balance(asset_id, receiver), 0, "rejected create-mint must not mint balance");
     }
 
     #[test]

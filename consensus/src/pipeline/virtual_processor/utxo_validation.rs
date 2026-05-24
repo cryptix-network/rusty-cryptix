@@ -1380,6 +1380,7 @@ impl VirtualStateProcessor {
                     AtomicPayloadSupplyMode::Capped => AtomicSupplyMode::Capped,
                 };
                 let mut total_supply = 0u128;
+                let mut initial_mint_balance: Option<(AtomicBalanceKey, u128)> = None;
                 if initial_mint_amount > 0 {
                     if matches!(supply_mode, AtomicSupplyMode::Capped) && initial_mint_amount > max_supply {
                         return Err(TxRuleError::InvalidAtomicPayload(format!(
@@ -1395,7 +1396,7 @@ impl VirtualStateProcessor {
                             faster_hex::hex_string(&asset_id)
                         ))
                     })?;
-                    atomic_state.set_balance(receiver_key, receiver_after);
+                    initial_mint_balance = Some((receiver_key, receiver_after));
                     total_supply = initial_mint_amount;
                 }
                 self.insert_atomic_asset_state(
@@ -1420,6 +1421,9 @@ impl VirtualStateProcessor {
                         liquidity: None,
                     },
                 )?;
+                if let Some((receiver_key, receiver_after)) = initial_mint_balance {
+                    atomic_state.set_balance(receiver_key, receiver_after);
+                }
             }
             AtomicPayloadOp::CreateLiquidityAsset {
                 token_version,
@@ -1478,6 +1482,7 @@ impl VirtualStateProcessor {
                     initial_virtual_token_reserves_for_curve(max_supply, curve_mode, individual_virtual_token_multiplier_bps)?;
                 let mut unclaimed_fee_total_sompi = 0u64;
                 let mut total_supply = 0u128;
+                let mut launch_receiver_after: Option<(AtomicBalanceKey, u128)> = None;
 
                 if launch_buy_sompi > 0 {
                     let fee_trade = calculate_trade_fee(launch_buy_sompi, fee_bps)?;
@@ -1525,7 +1530,7 @@ impl VirtualStateProcessor {
                             faster_hex::hex_string(&asset_id)
                         ))
                     })?;
-                    atomic_state.set_balance(receiver_key, receiver_after);
+                    launch_receiver_after = Some((receiver_key, receiver_after));
                 }
 
                 let vault_outpoint = TransactionOutpoint::new(tx.tx().id(), vault_output_index);
@@ -1567,6 +1572,9 @@ impl VirtualStateProcessor {
                 };
                 self.validate_liquidity_invariants(asset_id, &asset)?;
                 self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
+                if let Some((receiver_key, receiver_after)) = launch_receiver_after {
+                    atomic_state.set_balance(receiver_key, receiver_after);
+                }
             }
             AtomicPayloadOp::Transfer { asset_id, to_owner_id, amount } => {
                 if !atomic_state.has_asset(&asset_id) {
@@ -1782,16 +1790,17 @@ impl VirtualStateProcessor {
                         faster_hex::hex_string(&asset_id)
                     ))
                 })?;
-                atomic_state.set_balance(receiver_key, receiver_after);
-                asset.total_supply = asset.total_supply.checked_add(token_out).ok_or_else(|| {
+                let new_total_supply = asset.total_supply.checked_add(token_out).ok_or_else(|| {
                     TxRuleError::InvalidAtomicPayload(format!(
                         "total_supply overflow while buying liquidity asset `{}`",
                         faster_hex::hex_string(&asset_id)
                     ))
                 })?;
+                asset.total_supply = new_total_supply;
                 asset.liquidity = Some(pool);
                 self.validate_liquidity_invariants(asset_id, &asset)?;
                 self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
+                atomic_state.set_balance(receiver_key, receiver_after);
             }
             AtomicPayloadOp::SellLiquidityExactIn {
                 asset_id,
@@ -1894,16 +1903,15 @@ impl VirtualStateProcessor {
                     .checked_add(1)
                     .ok_or_else(|| TxRuleError::InvalidAtomicPayload("pool nonce overflow".to_string()))?;
 
+                asset.total_supply = supply_after;
+                asset.liquidity = Some(pool);
+                self.validate_liquidity_invariants(asset_id, &asset)?;
+                self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
                 if sender_after == 0 {
                     atomic_state.set_balance(sender_key, 0);
                 } else {
                     atomic_state.set_balance(sender_key, sender_after);
                 }
-
-                asset.total_supply = supply_after;
-                asset.liquidity = Some(pool);
-                self.validate_liquidity_invariants(asset_id, &asset)?;
-                self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
             }
             AtomicPayloadOp::ClaimLiquidityFees {
                 asset_id,

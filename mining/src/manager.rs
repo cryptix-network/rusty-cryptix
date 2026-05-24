@@ -33,7 +33,10 @@ use cryptix_core::{debug, error, info, time::Stopwatch, warn};
 use cryptix_mining_errors::{manager::MiningManagerError, mempool::RuleError};
 use itertools::Itertools;
 use parking_lot::RwLock;
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::sync::mpsc::UnboundedSender;
 
 pub struct MiningManager {
@@ -163,45 +166,38 @@ impl MiningManager {
                     return Ok(block_template.as_ref().clone());
                 }
                 Err(BuilderError::ConsensusError(BlockRuleError::InvalidTransactionsInNewBlock(invalid_transactions))) => {
-                    let mut missing_outpoint: usize = 0;
-                    let mut invalid: usize = 0;
+                    let (missing_outpoint, removable_invalid_transactions) =
+                        classify_template_invalid_transactions(&invalid_transactions);
+                    let invalid = removable_invalid_transactions.len();
 
-                    let mut mempool_write = self.mempool.write();
-                    invalid_transactions.iter().for_each(|(x, err)| {
-                        // On missing outpoints, the most likely is that the tx was already in a block accepted by
-                        // the consensus but not yet processed by handle_new_block_transactions(). Another possibility
-                        // is a double spend. In both cases, we simply remove the transaction but keep its redeemers.
-                        // Those will either be valid in a next block template or invalidated if it's a double spend.
-                        //
-                        // If the redeemers of a transaction accepted in consensus but not yet handled in mempool were
-                        // removed, it would lead to having subsequently submitted children transactions of the removed
-                        // redeemers being unexpectedly either orphaned or rejected in case orphans are disallowed.
-                        //
-                        // For all other errors, we do remove the redeemers.
+                    if missing_outpoint > 0 {
+                        debug!(
+                            "Block template skipped {} missing-outpoint mempool transaction candidates for this template only; keeping them in mempool for orphan/reorg/parallel-template resolution",
+                            missing_outpoint
+                        );
+                        attempts = attempts.max(self.config.maximum_build_block_template_attempts.saturating_sub(1));
+                    }
 
-                        let removal_result = if *err == TxRuleError::MissingTxOutpoints {
-                            missing_outpoint += 1;
-                            mempool_write.remove_transaction(x, false, TxRemovalReason::Muted, "")
-                        } else {
-                            invalid += 1;
+                    if invalid > 0 {
+                        let mut mempool_write = self.mempool.write();
+                        removable_invalid_transactions.iter().for_each(|(x, err)| {
                             warn!("Remove per BBT invalid transaction and descendants");
-                            mempool_write.remove_transaction(
+                            let removal_result = mempool_write.remove_transaction(
                                 x,
                                 true,
                                 TxRemovalReason::InvalidInBlockTemplate,
                                 format!(" error: {}", err).as_str(),
-                            )
-                        };
-                        if let Err(err) = removal_result {
-                            // Original golang comment:
-                            // mempool.remove_transactions might return errors in situations that are perfectly fine in this context.
-                            // TODO: Once the mempool invariants are clear, this might return an error:
-                            // https://github.com/cryptix-network/cryptixd/issues/1553
-                            // NOTE: unlike golang, here we continue removing also if an error was found
-                            error!("Error from mempool.remove_transactions: {:?}", err);
-                        }
-                    });
-                    drop(mempool_write);
+                            );
+                            if let Err(err) = removal_result {
+                                // Original golang comment:
+                                // mempool.remove_transactions might return errors in situations that are perfectly fine in this context.
+                                // TODO: Once the mempool invariants are clear, this might return an error:
+                                // https://github.com/cryptix-network/cryptixd/issues/1553
+                                // NOTE: unlike golang, here we continue removing also if an error was found
+                                error!("Error from mempool.remove_transactions: {:?}", err);
+                            }
+                        });
+                    }
 
                     debug!(
                         "Building a new block template failed for {} txs missing outpoint and {} invalid txs",
@@ -972,6 +968,23 @@ impl MiningManager {
     pub(crate) fn get_estimated_size(&self) -> usize {
         self.mempool.read().get_estimated_size()
     }
+}
+
+pub(crate) fn classify_template_invalid_transactions(
+    invalid_transactions: &HashMap<TransactionId, TxRuleError>,
+) -> (usize, Vec<(TransactionId, TxRuleError)>) {
+    let mut missing_outpoint: usize = 0;
+    let mut removable_invalid_transactions = Vec::new();
+
+    for (transaction_id, err) in invalid_transactions {
+        if *err == TxRuleError::MissingTxOutpoints {
+            missing_outpoint += 1;
+        } else {
+            removable_invalid_transactions.push((*transaction_id, err.clone()));
+        }
+    }
+
+    (missing_outpoint, removable_invalid_transactions)
 }
 
 /// Async proxy for the mining manager

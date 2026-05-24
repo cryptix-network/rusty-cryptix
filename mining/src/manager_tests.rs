@@ -3,7 +3,7 @@ mod tests {
     use crate::{
         block_template::builder::BlockTemplateBuilder,
         errors::{MiningManagerError, MiningManagerResult},
-        manager::MiningManager,
+        manager::{classify_template_invalid_transactions, MiningManager},
         mempool::{
             config::{Config, DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE},
             errors::RuleError,
@@ -36,11 +36,30 @@ mod tests {
     };
     use cryptix_utils::mem_size::MemSizeEstimator;
     use itertools::Itertools;
-    use std::{iter::once, sync::Arc};
+    use std::{collections::HashMap, iter::once, sync::Arc};
     use tokio::sync::mpsc::{error::TryRecvError, unbounded_channel};
 
     const TARGET_TIME_PER_BLOCK: u64 = 1_000;
     const MAX_BLOCK_MASS: u64 = 500_000;
+
+    #[test]
+    fn test_block_template_missing_outpoints_are_not_removed_from_mempool() {
+        let missing_tx_id = TransactionId::from_bytes([1; 32]);
+        let invalid_tx_id = TransactionId::from_bytes([2; 32]);
+        let mut invalid_transactions = HashMap::new();
+        invalid_transactions.insert(missing_tx_id, TxRuleError::MissingTxOutpoints);
+        invalid_transactions.insert(invalid_tx_id, TxRuleError::InvalidAtomicPayload("stale liquidity nonce".to_string()));
+
+        let (missing_outpoint, removable_invalid_transactions) = classify_template_invalid_transactions(&invalid_transactions);
+
+        assert_eq!(missing_outpoint, 1, "missing-outpoint template candidates must be skipped, not removed");
+        assert_eq!(removable_invalid_transactions.len(), 1, "only permanent template failures should be removable");
+        assert_eq!(removable_invalid_transactions[0].0, invalid_tx_id);
+        assert!(
+            !removable_invalid_transactions.iter().any(|(tx_id, _)| *tx_id == missing_tx_id),
+            "missing-outpoint candidates must stay in the mempool"
+        );
+    }
 
     // test_validate_and_insert_transaction verifies that valid transactions were successfully inserted into the mempool.
     #[test]
