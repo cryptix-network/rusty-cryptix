@@ -41,7 +41,7 @@ use cryptix_consensus_core::{
     },
     BlockHashMap, BlockHashSet, HashMapCustomHasher,
 };
-use cryptix_core::{info, trace, warn};
+use cryptix_core::{debug, info, trace, warn};
 use cryptix_hashes::Hash;
 use cryptix_math::Uint256;
 use cryptix_muhash::MuHash;
@@ -784,7 +784,7 @@ impl VirtualStateProcessor {
             for (validated_tx, tx_idx) in validated_transactions.into_iter() {
                 let txid = validated_tx.id();
                 if accepted_txids.contains(&txid) {
-                    warn!(
+                    debug!(
                         "Consensus skipped duplicate accepted transaction before Atomic replay: txid={}, source_block={}, tx_index={}, reason=duplicate_txid_already_accepted_in_virtual_mergeset",
                         txid,
                         merged_block,

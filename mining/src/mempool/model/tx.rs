@@ -11,12 +11,13 @@ pub(crate) struct MempoolTransaction {
     pub(crate) mtx: MutableTransaction,
     pub(crate) priority: Priority,
     pub(crate) added_at_daa_score: u64,
+    pub(crate) ready_at_daa_score: u64,
 }
 
 impl MempoolTransaction {
     pub(crate) fn new(mtx: MutableTransaction, priority: Priority, added_at_daa_score: u64) -> Self {
         assert_eq!(mtx.tx.inputs.len(), mtx.entries.len());
-        Self { mtx, priority, added_at_daa_score }
+        Self { mtx, priority, added_at_daa_score, ready_at_daa_score: added_at_daa_score }
     }
 
     pub(crate) fn id(&self) -> TransactionId {

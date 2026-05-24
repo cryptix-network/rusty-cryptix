@@ -5,7 +5,8 @@ pub(crate) const DEFAULT_MEMPOOL_SIZE_LIMIT: usize = 1_000_000_000;
 pub(crate) const DEFAULT_MAXIMUM_BUILD_BLOCK_TEMPLATE_ATTEMPTS: u64 = 5;
 
 pub(crate) const DEFAULT_TRANSACTION_EXPIRE_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
-pub(crate) const DEFAULT_ATOMIC_TRANSACTION_EXPIRE_INTERVAL_DAA_SCORE: u64 = 600;
+pub(crate) const DEFAULT_ATOMIC_TRANSACTION_EXPIRE_INTERVAL_DAA_SCORE: u64 = 1_200;
+pub(crate) const DEFAULT_ATOMIC_TRANSACTION_TOTAL_EXPIRE_INTERVAL_DAA_SCORE: u64 = 86_400;
 pub(crate) const DEFAULT_TRANSACTION_EXPIRE_SCAN_INTERVAL_SECONDS: u64 = 60;
 pub(crate) const DEFAULT_ACCEPTED_TRANSACTION_EXPIRE_INTERVAL_SECONDS: u64 = 120;
 pub(crate) const DEFAULT_ACCEPTED_TRANSACTION_EXPIRE_SCAN_INTERVAL_SECONDS: u64 = 10;
@@ -36,6 +37,7 @@ pub struct Config {
     pub maximum_build_block_template_attempts: u64,
     pub transaction_expire_interval_daa_score: u64,
     pub atomic_transaction_expire_interval_daa_score: u64,
+    pub atomic_transaction_total_expire_interval_daa_score: u64,
     pub transaction_expire_scan_interval_daa_score: u64,
     pub transaction_expire_scan_interval_milliseconds: u64,
     pub accepted_transaction_expire_interval_daa_score: u64,
@@ -64,6 +66,7 @@ impl Config {
         maximum_build_block_template_attempts: u64,
         transaction_expire_interval_daa_score: u64,
         atomic_transaction_expire_interval_daa_score: u64,
+        atomic_transaction_total_expire_interval_daa_score: u64,
         transaction_expire_scan_interval_daa_score: u64,
         transaction_expire_scan_interval_milliseconds: u64,
         accepted_transaction_expire_interval_daa_score: u64,
@@ -89,6 +92,7 @@ impl Config {
             maximum_build_block_template_attempts,
             transaction_expire_interval_daa_score,
             atomic_transaction_expire_interval_daa_score,
+            atomic_transaction_total_expire_interval_daa_score,
             transaction_expire_scan_interval_daa_score,
             transaction_expire_scan_interval_milliseconds,
             accepted_transaction_expire_interval_daa_score,
@@ -119,6 +123,7 @@ impl Config {
             maximum_build_block_template_attempts: DEFAULT_MAXIMUM_BUILD_BLOCK_TEMPLATE_ATTEMPTS,
             transaction_expire_interval_daa_score: DEFAULT_TRANSACTION_EXPIRE_INTERVAL_SECONDS * 1000 / target_milliseconds_per_block,
             atomic_transaction_expire_interval_daa_score: DEFAULT_ATOMIC_TRANSACTION_EXPIRE_INTERVAL_DAA_SCORE,
+            atomic_transaction_total_expire_interval_daa_score: DEFAULT_ATOMIC_TRANSACTION_TOTAL_EXPIRE_INTERVAL_DAA_SCORE,
             transaction_expire_scan_interval_daa_score: DEFAULT_TRANSACTION_EXPIRE_SCAN_INTERVAL_SECONDS * 1000
                 / target_milliseconds_per_block,
             transaction_expire_scan_interval_milliseconds: DEFAULT_TRANSACTION_EXPIRE_SCAN_INTERVAL_SECONDS * 1000,
@@ -168,6 +173,14 @@ mod tests {
 
         assert_eq!(one_bps.atomic_transaction_expire_interval_daa_score, DEFAULT_ATOMIC_TRANSACTION_EXPIRE_INTERVAL_DAA_SCORE);
         assert_eq!(ten_bps.atomic_transaction_expire_interval_daa_score, DEFAULT_ATOMIC_TRANSACTION_EXPIRE_INTERVAL_DAA_SCORE);
+        assert_eq!(
+            one_bps.atomic_transaction_total_expire_interval_daa_score,
+            DEFAULT_ATOMIC_TRANSACTION_TOTAL_EXPIRE_INTERVAL_DAA_SCORE
+        );
+        assert_eq!(
+            ten_bps.atomic_transaction_total_expire_interval_daa_score,
+            DEFAULT_ATOMIC_TRANSACTION_TOTAL_EXPIRE_INTERVAL_DAA_SCORE
+        );
         assert_eq!(ten_bps.transaction_expire_scan_interval_daa_score, DEFAULT_TRANSACTION_EXPIRE_SCAN_INTERVAL_SECONDS * 10);
     }
 }

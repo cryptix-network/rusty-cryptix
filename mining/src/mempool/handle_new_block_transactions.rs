@@ -43,7 +43,13 @@ impl Mempool {
             // its redeemers in the orphan pool. We give those a chance to be unorphaned and included
             // in the next block template.
             if !self.orphan_pool.has(&transaction_id) {
-                self.remove_transaction(&transaction_id, false, TxRemovalReason::Accepted, "")?;
+                self.remove_transaction_with_unblocked_daa(
+                    &transaction_id,
+                    false,
+                    TxRemovalReason::Accepted,
+                    "",
+                    Some(accepting_block_daa_score),
+                )?;
             }
             self.remove_double_spends(transaction)?;
             self.remove_accepted_atomic_conflicts(transaction)?;

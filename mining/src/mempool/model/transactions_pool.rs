@@ -151,7 +151,11 @@ impl TransactionsPool {
     }
 
     /// Fully removes the transaction from all relational sets, as well as from the UTXO set
-    pub(crate) fn remove_transaction(&mut self, transaction_id: &TransactionId) -> RuleResult<MempoolTransaction> {
+    pub(crate) fn remove_transaction(
+        &mut self,
+        transaction_id: &TransactionId,
+        unblocked_at_daa_score: Option<u64>,
+    ) -> RuleResult<MempoolTransaction> {
         // Remove all bijective parent/chained relations
         if let Some(parents) = self.parent_transactions.get(transaction_id) {
             for parent in parents.iter() {
@@ -165,8 +169,14 @@ impl TransactionsPool {
                 if let Some(parents) = self.parent_transactions.get_mut(chain) {
                     parents.remove(transaction_id);
                     if parents.is_empty() {
-                        let tx = self.all_transactions.get(chain).unwrap();
-                        self.ready_transactions.insert(tx.into());
+                        let ready_key = {
+                            let tx = self.all_transactions.get_mut(chain).unwrap();
+                            if let Some(daa_score) = unblocked_at_daa_score {
+                                tx.ready_at_daa_score = daa_score;
+                            }
+                            (&*tx).into()
+                        };
+                        self.ready_transactions.insert(ready_key);
                     }
                 }
             }
@@ -392,17 +402,27 @@ impl TransactionsPool {
 
         self.last_expire_scan_daa_score = virtual_daa_score;
 
-        // Never expire high priority transactions
-        // Remove all transactions whose added_at_daa_score is older then transaction_expire_interval_daa_score
+        // High-priority non-CAT transactions do not expire. CAT transactions have a bounded ready/frontier
+        // lifetime and a longer total lifetime so token/pool slots cannot be pinned indefinitely.
         self.all_transactions
             .values()
             .filter_map(|x| {
-                let expire_interval = if is_cat_transaction(x.mtx.tx.as_ref()) {
-                    self.config.atomic_transaction_expire_interval_daa_score
-                } else {
-                    self.config.transaction_expire_interval_daa_score
-                };
-                if x.priority == Priority::Low && virtual_daa_score > x.added_at_daa_score + expire_interval {
+                let is_cat = is_cat_transaction(x.mtx.tx.as_ref());
+                if is_cat {
+                    let has_mempool_parents = self.parent_transactions.get(&x.id()).is_some_and(|parents| !parents.is_empty());
+                    let total_expired = virtual_daa_score
+                        > x.added_at_daa_score.saturating_add(self.config.atomic_transaction_total_expire_interval_daa_score);
+                    let frontier_expired = !has_mempool_parents
+                        && virtual_daa_score
+                            > x.ready_at_daa_score.saturating_add(self.config.atomic_transaction_expire_interval_daa_score);
+                    if total_expired || frontier_expired {
+                        Some(x.id())
+                    } else {
+                        None
+                    }
+                } else if x.priority == Priority::Low
+                    && virtual_daa_score > x.added_at_daa_score.saturating_add(self.config.transaction_expire_interval_daa_score)
+                {
                     Some(x.id())
                 } else {
                     None

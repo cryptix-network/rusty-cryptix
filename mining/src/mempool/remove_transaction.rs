@@ -15,6 +15,17 @@ impl Mempool {
         reason: TxRemovalReason,
         extra_info: &str,
     ) -> RuleResult<()> {
+        self.remove_transaction_with_unblocked_daa(transaction_id, remove_redeemers, reason, extra_info, None)
+    }
+
+    pub(crate) fn remove_transaction_with_unblocked_daa(
+        &mut self,
+        transaction_id: &TransactionId,
+        remove_redeemers: bool,
+        reason: TxRemovalReason,
+        extra_info: &str,
+        unblocked_at_daa_score: Option<u64>,
+    ) -> RuleResult<()> {
         if self.orphan_pool.has(transaction_id) {
             return self.orphan_pool.remove_orphan(transaction_id, true, reason, extra_info).map(|_| ());
         }
@@ -32,7 +43,7 @@ impl Mempool {
         let mut removed_orphans: Vec<TransactionId> = vec![];
         for tx_id in removed_transactions.iter() {
             // Remove the tx from the transaction pool and the UTXO set (handled within the pool)
-            let tx = self.transaction_pool.remove_transaction(tx_id)?;
+            let tx = self.transaction_pool.remove_transaction(tx_id, unblocked_at_daa_score)?;
             // Update/remove descendent orphan txs (depending on `remove_redeemers`)
             let txs = self.orphan_pool.update_orphans_after_transaction_removed(&tx, remove_redeemers)?;
             removed_orphans.extend(txs.into_iter().map(|x| x.id()));

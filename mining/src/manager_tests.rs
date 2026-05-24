@@ -613,6 +613,167 @@ mod tests {
     }
 
     #[test]
+    fn test_atomic_low_priority_expiry_removes_redeemer_chain() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.atomic_transaction_expire_interval_daa_score = 5;
+        config.transaction_expire_scan_interval_daa_score = 0;
+        config.transaction_expire_scan_interval_milliseconds = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x4c; 32];
+
+        let parent = create_cat_payload_transaction_with_utxo_entry(0, 10_000, cat_transfer_payload(1, asset_id));
+        let child_base = create_transaction(parent.tx.as_ref(), DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE);
+        let child = Transaction::new(
+            child_base.version,
+            child_base.inputs,
+            child_base.outputs,
+            child_base.lock_time,
+            SUBNETWORK_ID_PAYLOAD,
+            child_base.gas,
+            cat_transfer_payload(2, asset_id),
+        );
+        let child_id = child.id();
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), parent.clone()).unwrap();
+        mining_manager
+            .validate_and_insert_transaction(consensus.as_ref(), child, Priority::Low, Orphan::Allowed, RbfPolicy::Forbidden)
+            .expect("CAT child should validate against its pending mempool parent");
+        assert_transaction_count(&mining_manager, 2, "before Atomic parent expiry");
+
+        consensus.set_virtual_daa_score(6);
+        mining_manager.expire_low_priority_transactions(consensus.as_ref());
+
+        assert_transaction_count(&mining_manager, 0, "expired CAT parent should remove its mempool redeemer chain");
+        assert!(mining_manager.get_transaction(&parent.id(), TransactionQuery::All).is_none());
+        assert!(mining_manager.get_transaction(&child_id, TransactionQuery::All).is_none());
+    }
+
+    #[test]
+    fn test_atomic_low_priority_expiry_timer_starts_when_redeemer_becomes_ready() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.atomic_transaction_expire_interval_daa_score = 5;
+        config.transaction_expire_scan_interval_daa_score = 0;
+        config.transaction_expire_scan_interval_milliseconds = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x4d; 32];
+
+        let parent = create_cat_payload_transaction_with_utxo_entry(0, 10_000, cat_transfer_payload(1, asset_id));
+        let child_base = create_transaction(parent.tx.as_ref(), DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE);
+        let child = Transaction::new(
+            child_base.version,
+            child_base.inputs,
+            child_base.outputs,
+            child_base.lock_time,
+            SUBNETWORK_ID_PAYLOAD,
+            child_base.gas,
+            cat_transfer_payload(2, asset_id),
+        );
+        let child_id = child.id();
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), parent.clone()).unwrap();
+        mining_manager
+            .validate_and_insert_transaction(consensus.as_ref(), child, Priority::Low, Orphan::Allowed, RbfPolicy::Forbidden)
+            .expect("CAT child should validate against its pending mempool parent");
+
+        consensus.set_virtual_daa_score(6);
+        mining_manager
+            .handle_accepted_transactions(consensus.as_ref(), 6, &[parent.tx.as_ref().clone()])
+            .expect("accepted parent should unblock CAT child");
+        mining_manager.expire_low_priority_transactions(consensus.as_ref());
+        assert!(mining_manager.get_transaction(&parent.id(), TransactionQuery::All).is_none());
+        assert!(
+            mining_manager.get_transaction(&child_id, TransactionQuery::All).is_some(),
+            "CAT child should not expire immediately when it just became ready"
+        );
+
+        consensus.set_virtual_daa_score(12);
+        mining_manager.expire_low_priority_transactions(consensus.as_ref());
+        assert!(
+            mining_manager.get_transaction(&child_id, TransactionQuery::All).is_none(),
+            "CAT child should expire only after its own ready window elapsed"
+        );
+    }
+
+    #[test]
+    fn test_atomic_total_expiry_removes_non_ready_chain_after_long_cap() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.transaction_expire_interval_daa_score = 1_000;
+        config.atomic_transaction_expire_interval_daa_score = 5;
+        config.atomic_transaction_total_expire_interval_daa_score = 8;
+        config.transaction_expire_scan_interval_daa_score = 0;
+        config.transaction_expire_scan_interval_milliseconds = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x4f; 32];
+
+        let parent = create_transaction_with_utxo_entry(0, 0);
+        let child_base = create_transaction(parent.tx.as_ref(), DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE);
+        let child = Transaction::new(
+            child_base.version,
+            child_base.inputs,
+            child_base.outputs,
+            child_base.lock_time,
+            SUBNETWORK_ID_PAYLOAD,
+            child_base.gas,
+            cat_transfer_payload(2, asset_id),
+        );
+        let child_id = child.id();
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), parent.clone()).unwrap();
+        mining_manager
+            .validate_and_insert_transaction(consensus.as_ref(), child, Priority::Low, Orphan::Allowed, RbfPolicy::Forbidden)
+            .expect("CAT child should validate against its pending mempool parent");
+
+        consensus.set_virtual_daa_score(9);
+        mining_manager.expire_low_priority_transactions(consensus.as_ref());
+
+        assert!(
+            mining_manager.get_transaction(&parent.id(), TransactionQuery::All).is_some(),
+            "non-CAT parent should keep the normal expiry window"
+        );
+        assert!(
+            mining_manager.get_transaction(&child_id, TransactionQuery::All).is_none(),
+            "non-ready CAT child should still expire at the total CAT lifetime cap"
+        );
+    }
+
+    #[test]
+    fn test_atomic_high_priority_frontier_tx_expires() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.atomic_transaction_expire_interval_daa_score = 5;
+        config.transaction_expire_scan_interval_daa_score = 0;
+        config.transaction_expire_scan_interval_milliseconds = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x4e; 32];
+
+        let atomic_transaction = create_cat_payload_transaction_with_utxo_entry(0, 10_000, cat_transfer_payload(1, asset_id));
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                atomic_transaction.clone(),
+                Priority::High,
+                Orphan::Forbidden,
+                RbfPolicy::Forbidden,
+            )
+            .expect("high-priority CAT transaction should enter the mempool");
+
+        consensus.set_virtual_daa_score(6);
+        mining_manager.expire_low_priority_transactions(consensus.as_ref());
+
+        assert!(
+            mining_manager.get_transaction(&atomic_transaction.id(), TransactionQuery::All).is_none(),
+            "frontier CAT transaction should expire even when it entered through high-priority RPC"
+        );
+    }
+
+    #[test]
     fn test_atomic_mempool_count_limit_preserves_pending_nonce_chain() {
         let consensus = Arc::new(ConsensusMock::new());
         let counters = Arc::new(MiningCounters::default());
