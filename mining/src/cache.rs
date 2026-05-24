@@ -68,3 +68,60 @@ impl BlockTemplateCache {
         guard
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cryptix_consensus_core::{
+        block::MutableBlock, coinbase::MinerData, constants::BLOCK_VERSION, header::Header, tx::ScriptPublicKey,
+    };
+    use cryptix_hashes::{Hash, ZERO_HASH};
+
+    fn hash(byte: u8) -> Hash {
+        Hash::from_bytes([byte; 32])
+    }
+
+    fn state_id(parents_byte: u8, raw_utxo_byte: u8, atomic_byte: u8, accepted_byte: u8) -> VirtualStateApproxId {
+        VirtualStateApproxId::new(
+            42,
+            7.into(),
+            hash(1),
+            hash(parents_byte),
+            hash(raw_utxo_byte),
+            hash(atomic_byte),
+            hash(accepted_byte),
+        )
+    }
+
+    fn template(state_id: VirtualStateApproxId) -> BlockTemplate {
+        let header =
+            Header::new_finalized(BLOCK_VERSION, vec![], ZERO_HASH, ZERO_HASH, ZERO_HASH, 1, 0, 0, 42, 7.into(), 0, ZERO_HASH);
+        BlockTemplate::new(
+            MutableBlock::new(header, vec![]),
+            MinerData::new(ScriptPublicKey::from_vec(0, vec![]), vec![]),
+            false,
+            0,
+            0,
+            hash(1),
+            state_id,
+            vec![],
+        )
+    }
+
+    #[test]
+    fn cache_lock_expires_template_when_virtual_state_identity_changes() {
+        for changed_id in [state_id(9, 2, 3, 4), state_id(8, 9, 3, 4), state_id(8, 2, 9, 4), state_id(8, 2, 3, 9)] {
+            let cache = BlockTemplateCache::new(Some(u64::MAX / 2));
+            let original_id = state_id(8, 2, 3, 4);
+
+            {
+                let mut guard = cache.lock(original_id.clone());
+                guard.set_immutable_cached_template(template(original_id));
+                assert!(guard.get_immutable_cached_template().is_some());
+            }
+
+            let guard = cache.lock(changed_id);
+            assert!(guard.get_immutable_cached_template().is_none());
+        }
+    }
+}

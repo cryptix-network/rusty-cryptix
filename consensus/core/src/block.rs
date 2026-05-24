@@ -120,6 +120,7 @@ pub struct BlockTemplate {
     pub selected_parent_timestamp: u64,
     pub selected_parent_daa_score: u64,
     pub selected_parent_hash: Hash,
+    virtual_state_approx_id: VirtualStateApproxId,
     /// Expected length is one less than txs length due to lack of coinbase transaction
     pub calculated_fees: Vec<u64>,
 }
@@ -132,6 +133,7 @@ impl BlockTemplate {
         selected_parent_timestamp: u64,
         selected_parent_daa_score: u64,
         selected_parent_hash: Hash,
+        virtual_state_approx_id: VirtualStateApproxId,
         calculated_fees: Vec<u64>,
     ) -> Self {
         Self {
@@ -141,27 +143,40 @@ impl BlockTemplate {
             selected_parent_timestamp,
             selected_parent_daa_score,
             selected_parent_hash,
+            virtual_state_approx_id,
             calculated_fees,
         }
     }
 
     pub fn to_virtual_state_approx_id(&self) -> VirtualStateApproxId {
-        VirtualStateApproxId::new(self.block.header.daa_score, self.block.header.blue_work, self.selected_parent_hash)
+        self.virtual_state_approx_id.clone()
     }
 }
 
 /// An opaque data structure representing a unique approximate identifier for virtual state. Note that it is
 /// approximate in the sense that in rare cases a slightly different virtual state might produce the same identifier,
 /// hence it should be used for cache-like heuristics only
-#[derive(PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct VirtualStateApproxId {
     daa_score: u64,
     blue_work: BlueWorkType,
     sink: Hash,
+    parents_merkle_root: Hash,
+    raw_utxo_commitment: Hash,
+    atomic_state_hash: Hash,
+    accepted_id_merkle_root: Hash,
 }
 
 impl VirtualStateApproxId {
-    pub fn new(daa_score: u64, blue_work: BlueWorkType, sink: Hash) -> Self {
-        Self { daa_score, blue_work, sink }
+    pub fn new(
+        daa_score: u64,
+        blue_work: BlueWorkType,
+        sink: Hash,
+        parents_merkle_root: Hash,
+        raw_utxo_commitment: Hash,
+        atomic_state_hash: Hash,
+        accepted_id_merkle_root: Hash,
+    ) -> Self {
+        Self { daa_score, blue_work, sink, parents_merkle_root, raw_utxo_commitment, atomic_state_hash, accepted_id_merkle_root }
     }
 }

@@ -75,7 +75,7 @@ pub const MAX_BOOTSTRAP_REPLAY_WINDOW_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const SNAPSHOT_IMPORT_CHUNK_KEYS: usize = 4096;
 const BOOTSTRAP_STORE_MAX_SNAPSHOTS_PER_NETWORK: usize = 16;
 const ATOMIC_TEMP_DIR_MAX_AGE: Duration = Duration::from_secs(3600);
-const ATOMIC_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const ATOMIC_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(120);
 const ATOMIC_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(300);
 const ATOMIC_HEALTH_STORE_COUNT_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const ATOMIC_LONG_OPERATION_LOG_INTERVAL: Duration = Duration::from_secs(5);
@@ -471,10 +471,14 @@ impl AtomicTokenProcessor {
             self.processed_chain_blocks.fetch_add(added_count as u64, Ordering::SeqCst).saturating_add(added_count as u64);
         let now = Instant::now();
         let mut progress_log = self.progress_log.lock().expect("Atomic progress log mutex poisoned");
-        let state_changed = progress_log.last_runtime_state != Some(health.runtime_state);
+        let previous_runtime_state = progress_log.last_runtime_state;
+        let state_changed = previous_runtime_state != Some(health.runtime_state);
+        let important_state_changed = state_changed
+            && (matches!(health.runtime_state, AtomicTokenRuntimeState::Degraded | AtomicTokenRuntimeState::NotReady)
+                || matches!(previous_runtime_state, Some(AtomicTokenRuntimeState::Degraded | AtomicTokenRuntimeState::NotReady)));
         let should_log_by_time =
             progress_log.last_log.map(|last_log| now.duration_since(last_log) >= ATOMIC_PROGRESS_LOG_INTERVAL).unwrap_or(true);
-        if !state_changed && !should_log_by_time {
+        if !important_state_changed && !should_log_by_time {
             return;
         }
 

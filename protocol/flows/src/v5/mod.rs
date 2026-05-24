@@ -20,6 +20,7 @@ use self::{
 use crate::antifraud::{AntiFraudSnapshotRequestsFlow, AntiFraudSnapshotSyncFlow};
 use crate::{flow_context::FlowContext, flow_trait::Flow};
 
+use cryptix_consensus_core::blockstatus::BlockStatus;
 use cryptix_p2p_lib::{CryptixdMessagePayloadType, Router, SharedIncomingRoute};
 use cryptix_utils::channel;
 use std::sync::Arc;
@@ -41,6 +42,25 @@ pub(crate) mod request_pruning_point_and_anticone;
 pub(crate) mod request_pruning_point_utxo_set;
 pub(crate) mod strong_node_claims;
 pub(crate) mod txrelay;
+
+pub(crate) fn is_unsafe_block_status_for_network(status: BlockStatus) -> bool {
+    matches!(status, BlockStatus::StatusInvalid | BlockStatus::StatusDisqualifiedFromChain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsafe_network_statuses_include_disqualified_blocks() {
+        assert!(is_unsafe_block_status_for_network(BlockStatus::StatusInvalid));
+        assert!(is_unsafe_block_status_for_network(BlockStatus::StatusDisqualifiedFromChain));
+
+        assert!(!is_unsafe_block_status_for_network(BlockStatus::StatusUTXOValid));
+        assert!(!is_unsafe_block_status_for_network(BlockStatus::StatusUTXOPendingVerification));
+        assert!(!is_unsafe_block_status_for_network(BlockStatus::StatusHeaderOnly));
+    }
+}
 
 pub fn register(ctx: FlowContext, router: Arc<Router>, hfa_capable: bool, strong_node_claims_capable: bool) -> Vec<Box<dyn Flow>> {
     // IBD flow <-> invs flow communication uses a job channel in order to always

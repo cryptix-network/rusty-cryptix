@@ -101,7 +101,7 @@ impl MiningManager {
 
     pub fn get_block_template(&self, consensus: &dyn ConsensusApi, miner_data: &MinerData) -> MiningManagerResult<BlockTemplate> {
         let virtual_state_approx_id = consensus.get_virtual_state_approx_id();
-        let mut cache_lock = self.block_template_cache.lock(virtual_state_approx_id);
+        let mut cache_lock = self.block_template_cache.lock(virtual_state_approx_id.clone());
         let immutable_template = cache_lock.get_immutable_cached_template();
 
         // We first try and use a cached template if not expired
@@ -110,13 +110,10 @@ impl MiningManager {
             if immutable_template.miner_data == *miner_data {
                 return Ok(immutable_template.as_ref().clone());
             }
-            // Miner data is new -- make the minimum changes required
-            // Note the call returns a modified clone of the cached block template
-            let block_template = BlockTemplateBuilder::modify_block_template(consensus, miner_data, &immutable_template)?;
-
-            // No point in updating cache since we have no reason to believe this coinbase will be used more
-            // than the previous one, and we want to maintain the original template caching time
-            return Ok(block_template);
+            // Miner data is part of the coinbase transaction id and therefore part of the UTXO commitment.
+            // Rebuild instead of mutating the cached template so the header commitment is calculated from
+            // the exact coinbase that will be mined.
+            cache_lock = self.block_template_cache.lock(virtual_state_approx_id);
         }
 
         // Rust rewrite:

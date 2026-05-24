@@ -11,6 +11,7 @@ impl BlockBodyProcessor {
         Self::check_has_transactions(block)?;
         Self::check_hash_merkle_root(block, storage_mass_activated)?;
         Self::check_only_one_coinbase(block)?;
+        Self::check_transactions_sorted_by_subnetwork(block)?;
         self.check_transactions_in_isolation(block)?;
         let mass = self.check_block_mass(block, storage_mass_activated)?;
         self.check_duplicate_transactions(block)?;
@@ -45,6 +46,15 @@ impl BlockBodyProcessor {
             return Err(RuleError::MultipleCoinbases(i));
         }
 
+        Ok(())
+    }
+
+    fn check_transactions_sorted_by_subnetwork(block: &Block) -> BlockProcessResult<()> {
+        for window in block.transactions[1..].windows(2) {
+            if window[1].subnetwork_id < window[0].subnetwork_id {
+                return Err(RuleError::TransactionsNotSorted);
+            }
+        }
         Ok(())
     }
 
@@ -138,7 +148,7 @@ mod tests {
         block::MutableBlock,
         header::Header,
         merkle::calc_hash_merkle_root as calc_hash_merkle_root_with_options,
-        subnets::{SUBNETWORK_ID_COINBASE, SUBNETWORK_ID_NATIVE},
+        subnets::{SUBNETWORK_ID_COINBASE, SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PAYLOAD},
         tx::{scriptvec, ScriptPublicKey, Transaction, TransactionId, TransactionInput, TransactionOutpoint, TransactionOutput},
     };
     use cryptix_core::assert_match;
@@ -404,6 +414,13 @@ mod tests {
         );
 
         body_processor.validate_body_in_isolation(&example_block.clone().to_immutable()).unwrap();
+
+        let mut block = example_block.clone();
+        let txs = &mut block.transactions;
+        txs[1].subnetwork_id = SUBNETWORK_ID_PAYLOAD;
+        txs[2].subnetwork_id = SUBNETWORK_ID_NATIVE;
+        block.header.hash_merkle_root = calc_hash_merkle_root(txs.iter());
+        assert_match!(body_processor.validate_body_in_isolation(&block.to_immutable()), Err(RuleError::TransactionsNotSorted));
 
         let mut block = example_block.clone();
         let txs = &mut block.transactions;

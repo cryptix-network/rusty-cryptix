@@ -91,6 +91,9 @@ pub enum RuleError {
     #[error("block has second coinbase transaction as index {0}")]
     MultipleCoinbases(usize),
 
+    #[error("transactions must be sorted by subnetwork")]
+    TransactionsNotSorted,
+
     #[error("bad coinbase payload: {0}")]
     BadCoinbasePayload(CoinbaseError),
 

@@ -4820,10 +4820,8 @@ mod tests {
         let asset_id = hash_bytes(create_tx.id());
 
         let mut create_auth_inputs = HashMap::new();
-        create_auth_inputs.insert(
-            create_auth_outpoint,
-            UtxoEntry::new(20 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI, owner_script.clone(), 0, false),
-        );
+        create_auth_inputs
+            .insert(create_auth_outpoint, UtxoEntry::new(20 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI, owner_script.clone(), 0, false));
         let create_block = BlockHash::from_u64_word(7_010);
         apply_block(
             &mut state,
@@ -4838,10 +4836,9 @@ mod tests {
         assert_eq!(state.find_liquidity_asset_by_vault_outpoint(base_pool.vault_outpoint).unwrap(), Some(asset_id));
 
         let build_buy = |pool: &LiquidityPoolState, tag: u64, budget: u64| {
-            let token_out =
-                cpmm_buy(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, budget)
-                    .expect("buy quote should work")
-                    .0;
+            let token_out = cpmm_buy(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, budget)
+                .expect("buy quote should work")
+                .0;
             let buy_in_sompi = crate::liquidity_math::min_gross_input_for_token_out(
                 pool.real_token_reserves,
                 pool.virtual_cpay_reserves_sompi,
@@ -4861,21 +4858,14 @@ mod tests {
             );
             let mut auth_inputs = HashMap::new();
             auth_inputs.insert(pool.vault_outpoint, UtxoEntry::new(pool.vault_value_sompi, liquidity_vault_script(), 0, false));
-            auth_inputs.insert(
-                buy_auth_outpoint,
-                UtxoEntry::new(20 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI, owner_script.clone(), 0, false),
-            );
+            auth_inputs
+                .insert(buy_auth_outpoint, UtxoEntry::new(20 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI, owner_script.clone(), 0, false));
             (buy_tx, auth_inputs)
         };
 
         let (buy_a_tx, buy_a_auth_inputs) = build_buy(&base_pool, 7_020, 10 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI);
         let block_a = BlockHash::from_u64_word(7_030);
-        apply_block(
-            &mut state,
-            block_a,
-            vec![tx_ref(buy_a_tx.clone(), BlockHash::from_u64_word(7_029), 0, 0)],
-            &buy_a_auth_inputs,
-        );
+        apply_block(&mut state, block_a, vec![tx_ref(buy_a_tx.clone(), BlockHash::from_u64_word(7_029), 0, 0)], &buy_a_auth_inputs);
 
         let branch_a_pool = state.assets.get(&asset_id).and_then(|asset| asset.liquidity.clone()).expect("pool should exist");
         assert_eq!(branch_a_pool.pool_nonce, base_pool.pool_nonce + 1);
@@ -4895,20 +4885,10 @@ mod tests {
 
         let (buy_b_tx, buy_b_auth_inputs) = build_buy(&base_pool, 7_120, 11 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI);
         let block_b = BlockHash::from_u64_word(7_130);
-        apply_block(
-            &mut state,
-            block_b,
-            vec![tx_ref(buy_b_tx.clone(), BlockHash::from_u64_word(7_129), 0, 0)],
-            &buy_b_auth_inputs,
-        );
+        apply_block(&mut state, block_b, vec![tx_ref(buy_b_tx.clone(), BlockHash::from_u64_word(7_129), 0, 0)], &buy_b_auth_inputs);
 
         let mut fresh_branch_b = base_state;
-        apply_block(
-            &mut fresh_branch_b,
-            block_b,
-            vec![tx_ref(buy_b_tx, BlockHash::from_u64_word(7_129), 0, 0)],
-            &buy_b_auth_inputs,
-        );
+        apply_block(&mut fresh_branch_b, block_b, vec![tx_ref(buy_b_tx, BlockHash::from_u64_word(7_129), 0, 0)], &buy_b_auth_inputs);
         assert_eq!(state.compute_state_hash(), fresh_branch_b.compute_state_hash());
         assert_eq!(state.get_token_nonce(owner, asset_id), 2);
     }

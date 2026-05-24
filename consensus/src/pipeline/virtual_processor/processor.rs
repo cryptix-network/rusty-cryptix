@@ -862,7 +862,7 @@ impl VirtualStateProcessor {
             None => "unknown".to_string(),
         };
         info!(
-            "[atomic] Atomic consensus state: local_state=consistent live_correct=true reason={} daa={} hf_active={} root={} root_only={} assets={} balances={} nonces={} anchors={} vaults={} selected_parent={} parents={} utxo_add={} utxo_remove={}",
+            "[atomic] Atomic consensus state: local_state=consistent consensus_correct=true reason={} daa={} hf_active={} root={} root_only={} assets={} balances={} nonces={} anchors={} vaults={} selected_parent={} parents={} utxo_add={} utxo_remove={}",
             reason,
             virtual_state.daa_score,
             self.transaction_validator.is_payload_hf_active(virtual_state.daa_score),
@@ -1463,8 +1463,23 @@ impl VirtualStateProcessor {
         let mut ordered_indices = Self::order_atomic_indices(&atomic_items, &atomic_state);
         ordered_indices.extend(non_atomic_indices);
         if ordered_indices.len() == txs.len() {
-            let ordered = ordered_indices.into_iter().map(|idx| txs[idx].clone()).collect();
+            let mut ordered = ordered_indices.into_iter().map(|idx| txs[idx].clone()).collect();
+            Self::sort_block_template_transactions_by_subnetwork(&mut ordered);
             *txs = ordered;
+        }
+    }
+
+    fn sort_block_template_transactions_by_subnetwork(txs: &mut Vec<Transaction>) {
+        txs.sort_by(|a, b| a.subnetwork_id.cmp(&b.subnetwork_id));
+    }
+
+    fn sort_block_template_transactions_and_fees_by_subnetwork(txs: &mut Vec<Transaction>, calculated_fees: &mut Vec<u64>) {
+        debug_assert_eq!(txs.len(), calculated_fees.len());
+        let mut ordered = txs.drain(..).zip(calculated_fees.drain(..)).collect_vec();
+        ordered.sort_by(|(a, _), (b, _)| a.subnetwork_id.cmp(&b.subnetwork_id));
+        for (tx, fee) in ordered {
+            txs.push(tx);
+            calculated_fees.push(fee);
         }
     }
 
@@ -1807,6 +1822,7 @@ impl VirtualStateProcessor {
             (TemplateBuildMode::Standard, false) => return Err(RuleError::InvalidTransactionsInNewBlock(invalid_transactions)),
             (TemplateBuildMode::Standard, true) | (TemplateBuildMode::Infallible, _) => {}
         }
+        Self::sort_block_template_transactions_and_fees_by_subnetwork(&mut txs, &mut calculated_fees);
 
         // At this point we can safely drop the read lock
         drop(virtual_read);
@@ -1926,6 +1942,7 @@ impl VirtualStateProcessor {
         let selected_parent_hash = virtual_state.ghostdag_data.selected_parent;
         let selected_parent_timestamp = self.headers_store.get_timestamp(selected_parent_hash).unwrap();
         let selected_parent_daa_score = self.headers_store.get_daa_score(selected_parent_hash).unwrap();
+        let virtual_state_approx_id = virtual_state.to_virtual_state_approx_id();
         Ok(BlockTemplate::new(
             MutableBlock::new(header, txs),
             miner_data,
@@ -1933,6 +1950,7 @@ impl VirtualStateProcessor {
             selected_parent_timestamp,
             selected_parent_daa_score,
             selected_parent_hash,
+            virtual_state_approx_id,
             calculated_fees,
         ))
     }
@@ -2793,6 +2811,46 @@ impl VirtualStateProcessor {
             // (normally at least genesis should be known).
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cryptix_consensus_core::{
+        constants::{MAX_TX_IN_SEQUENCE_NUM, TX_VERSION},
+        subnets::{SubnetworkId, SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PAYLOAD},
+        tx::{ScriptPublicKey, ScriptVec, TransactionId, TransactionInput, TransactionOutpoint, TransactionOutput},
+    };
+    use itertools::Itertools;
+
+    fn tx_with_subnetwork(subnetwork_id: SubnetworkId, id_word: u64) -> Transaction {
+        let input = TransactionInput::new(
+            TransactionOutpoint::new(TransactionId::from_u64_word(id_word), 0),
+            vec![0x51],
+            MAX_TX_IN_SEQUENCE_NUM,
+            1,
+        );
+        let output = TransactionOutput::new(1, ScriptPublicKey::new(0, ScriptVec::from_slice(&[0x51])));
+        let payload = if subnetwork_id == SUBNETWORK_ID_PAYLOAD { vec![id_word as u8] } else { vec![] };
+        Transaction::new(TX_VERSION, vec![input], vec![output], 0, subnetwork_id, 0, payload)
+    }
+
+    #[test]
+    fn sort_block_template_transactions_and_fees_by_subnetwork_keeps_fees_aligned() {
+        let native = tx_with_subnetwork(SUBNETWORK_ID_NATIVE, 1);
+        let payload_a = tx_with_subnetwork(SUBNETWORK_ID_PAYLOAD, 2);
+        let payload_b = tx_with_subnetwork(SUBNETWORK_ID_PAYLOAD, 3);
+        let native_id = native.id();
+        let payload_a_id = payload_a.id();
+        let payload_b_id = payload_b.id();
+
+        let mut txs = vec![payload_a, native, payload_b];
+        let mut fees = vec![20, 10, 30];
+        VirtualStateProcessor::sort_block_template_transactions_and_fees_by_subnetwork(&mut txs, &mut fees);
+
+        assert_eq!(txs.iter().map(|tx| tx.id()).collect_vec(), vec![native_id, payload_a_id, payload_b_id]);
+        assert_eq!(fees, vec![10, 20, 30]);
     }
 }
 

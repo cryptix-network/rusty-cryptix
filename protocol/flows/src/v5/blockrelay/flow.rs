@@ -2,6 +2,7 @@ use crate::{
     flow_context::{BlockLogEvent, FlowContext, RequestScope},
     flow_trait::Flow,
     flowcontext::orphans::OrphanOutput,
+    v5::is_unsafe_block_status_for_network,
 };
 use cryptix_consensus_core::{api::BlockValidationFutures, block::Block, blockstatus::BlockStatus, errors::block::RuleError};
 use cryptix_consensusmanager::{BlockProcessingBatch, ConsensusProxy};
@@ -108,9 +109,12 @@ impl HandleRelayInvsFlow {
 
             match session.async_get_block_status(inv.hash).await {
                 None | Some(BlockStatus::StatusHeaderOnly) => {} // Continue processing this missing inv
-                Some(BlockStatus::StatusInvalid) => {
+                Some(status) if is_unsafe_block_status_for_network(status) => {
                     // Report a protocol error
-                    return Err(ProtocolError::MisbehavingPeer(format!("sent inv of an invalid block {}", inv.hash)));
+                    return Err(ProtocolError::MisbehavingPeer(format!(
+                        "sent inv of an unsafe block {} with status {:?}",
+                        inv.hash, status
+                    )));
                 }
                 _ => {
                     // Block is already known, skip to next inv

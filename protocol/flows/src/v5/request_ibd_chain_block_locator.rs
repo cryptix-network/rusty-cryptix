@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use cryptix_consensus_core::errors::{consensus::ConsensusError, sync::SyncManagerError};
+use cryptix_core::warn;
 use cryptix_p2p_lib::{
     common::ProtocolError,
     dequeue_with_request_id, make_response,
@@ -9,6 +10,8 @@ use cryptix_p2p_lib::{
 };
 
 use crate::{flow_context::FlowContext, flow_trait::Flow};
+
+use super::is_unsafe_block_status_for_network;
 
 pub struct RequestIbdChainBlockLocatorFlow {
     ctx: FlowContext,
@@ -37,19 +40,29 @@ impl RequestIbdChainBlockLocatorFlow {
             let (msg, request_id) = dequeue_with_request_id!(self.incoming_route, Payload::RequestIbdChainBlockLocator)?;
             let (low, high) = msg.try_into()?;
 
-            let locator =
-                match (self.ctx.consensus().session().await).async_create_virtual_selected_chain_block_locator(low, high).await {
-                    Ok(locator) => Ok(locator),
-                    Err(e) => {
-                        let orig = e.clone();
-                        if let ConsensusError::SyncManagerError(SyncManagerError::BlockNotInSelectedParentChain(_)) = e {
-                            // This signals a reset to the locator zoom-in process. The syncee is expected to restart the search
-                            Ok(vec![])
-                        } else {
-                            Err(orig)
-                        }
+            let session = self.ctx.consensus().session().await;
+            let locator = match session.async_create_virtual_selected_chain_block_locator(low, high).await {
+                Ok(locator) => Ok(locator),
+                Err(e) => {
+                    let orig = e.clone();
+                    if let ConsensusError::SyncManagerError(SyncManagerError::BlockNotInSelectedParentChain(_)) = e {
+                        // This signals a reset to the locator zoom-in process. The syncee is expected to restart the search
+                        Ok(vec![])
+                    } else {
+                        Err(orig)
                     }
-                }?;
+                }
+            }?;
+
+            for hash in locator.iter().copied() {
+                if let Some(status) = session.async_get_block_status(hash).await {
+                    if is_unsafe_block_status_for_network(status) {
+                        let reason = format!("refusing to serve unsafe IBD chain locator block {} with status {:?}", hash, status);
+                        warn!("{}", reason);
+                        return Err(ProtocolError::OtherOwned(reason));
+                    }
+                }
+            }
 
             self.router
                 .enqueue(make_response!(

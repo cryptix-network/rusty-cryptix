@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use cryptix_core::warn;
 use cryptix_p2p_lib::{
     common::ProtocolError,
     dequeue_with_request_id, make_response,
@@ -8,6 +9,8 @@ use cryptix_p2p_lib::{
 };
 
 use crate::{flow_context::FlowContext, flow_trait::Flow};
+
+use super::is_unsafe_block_status_for_network;
 
 pub struct RequestBlockLocatorFlow {
     ctx: FlowContext,
@@ -36,8 +39,17 @@ impl RequestBlockLocatorFlow {
             let (msg, request_id) = dequeue_with_request_id!(self.incoming_route, Payload::RequestBlockLocator)?;
             let (high, limit) = msg.try_into()?;
 
-            let locator =
-                self.ctx.consensus().session().await.async_create_block_locator_from_pruning_point(high, limit as usize).await?;
+            let session = self.ctx.consensus().session().await;
+            let locator = session.async_create_block_locator_from_pruning_point(high, limit as usize).await?;
+            for hash in locator.iter().copied() {
+                if let Some(status) = session.async_get_block_status(hash).await {
+                    if is_unsafe_block_status_for_network(status) {
+                        let reason = format!("refusing to serve unsafe block locator block {} with status {:?}", hash, status);
+                        warn!("{}", reason);
+                        return Err(ProtocolError::OtherOwned(reason));
+                    }
+                }
+            }
 
             self.router
                 .enqueue(make_response!(

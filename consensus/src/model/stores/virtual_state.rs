@@ -187,7 +187,19 @@ impl VirtualState {
     }
 
     pub fn to_virtual_state_approx_id(&self) -> VirtualStateApproxId {
-        VirtualStateApproxId::new(self.daa_score, self.ghostdag_data.blue_work, self.ghostdag_data.selected_parent)
+        let raw_utxo_commitment = self.multiset.clone().finalize();
+        let atomic_state_hash = Hash::from_bytes(self.atomic_state.canonical_hash());
+        let parents_merkle_root = cryptix_merkle::calc_merkle_root(self.parents.iter().copied());
+        let accepted_id_merkle_root = cryptix_merkle::calc_merkle_root(self.accepted_tx_ids.iter().copied());
+        VirtualStateApproxId::new(
+            self.daa_score,
+            self.ghostdag_data.blue_work,
+            self.ghostdag_data.selected_parent,
+            parents_merkle_root,
+            raw_utxo_commitment,
+            atomic_state_hash,
+            accepted_id_merkle_root,
+        )
     }
 }
 

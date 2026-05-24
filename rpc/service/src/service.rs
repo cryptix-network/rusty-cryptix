@@ -488,6 +488,53 @@ impl RpcCoreService {
         Self::ensure_token_read_ready(view)
     }
 
+    fn atomic_token_mining_not_ready_reason(health: &AtomicTokenHealth) -> Option<&'static str> {
+        if health.bootstrap_in_progress {
+            Some("Atomic bootstrap/replay is still in progress")
+        } else if health.runtime_state != AtomicTokenRuntimeState::Healthy {
+            Some("Atomic runtime is not healthy")
+        } else if health.is_degraded {
+            Some("Atomic state is degraded")
+        } else if !health.live_correct {
+            Some("Atomic live state is not correct")
+        } else if health.last_applied_block.is_none() {
+            Some("Atomic state has no applied block")
+        } else {
+            None
+        }
+    }
+
+    async fn ensure_atomic_token_mining_ready(
+        &self,
+        endpoint: &str,
+        block_daa_score: u64,
+    ) -> RpcResult<Result<(), SubmitBlockRejectReason>> {
+        if block_daa_score < self.config.params.payload_hf_activation_daa_score {
+            return Ok(Ok(()));
+        }
+
+        let health = self.atomic_token_service.get_health().await;
+        if let Some(reason) = Self::atomic_token_mining_not_ready_reason(&health) {
+            if self.should_log_get_block_template_unsynced() {
+                warn!(
+                    "Rejecting {} while Atomic token index is not mining-ready after payload HF: reason={}, block_daa_score={}, activation_daa={}, runtime={}, degraded={}, bootstrap_in_progress={}, live_correct={}, last_applied={:?}; mining from a partial Atomic/UTXO view can create blocks with invalid state commitments (warning throttled to once per 60s)",
+                    endpoint,
+                    reason,
+                    block_daa_score,
+                    self.config.params.payload_hf_activation_daa_score,
+                    health.runtime_state.as_str(),
+                    health.is_degraded,
+                    health.bootstrap_in_progress,
+                    health.live_correct,
+                    health.last_applied_block
+                );
+            }
+            return Ok(Err(SubmitBlockRejectReason::IsInIBD));
+        }
+
+        Ok(Ok(()))
+    }
+
     fn page_token_owner_balances(
         mut balances: Vec<TokenOwnerBalanceEntry>,
         offset: usize,
@@ -1447,6 +1494,10 @@ impl RpcApi for RpcCoreService {
         let block = try_block?;
         let hash = block.hash();
 
+        if let Err(reject_reason) = self.ensure_atomic_token_mining_ready("submit_block", block.header.daa_score).await? {
+            return Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(reject_reason) });
+        }
+
         if !request.allow_non_daa_blocks {
             let virtual_daa_score = session.get_virtual_daa_score();
 
@@ -1532,6 +1583,13 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                     self.config.params.payload_hf_activation_daa_score
                 );
             }
+        }
+
+        if let Err(_) = self.ensure_atomic_token_mining_ready("get_block_template", virtual_daa_score).await? {
+            return Err(RpcError::General(
+                "mining template unavailable: Atomic token index is not ready after payload hardfork; wait for Atomic catch-up before mining"
+                    .to_string(),
+            ));
         }
 
         // Build block template

@@ -2,7 +2,7 @@ use crate::{
     flow_context::FlowContext,
     v5::{
         ibd::{HeadersChunkStream, TrustedEntryStream},
-        Flow,
+        is_unsafe_block_status_for_network, Flow,
     },
 };
 use cryptix_consensus_core::{
@@ -68,6 +68,7 @@ pub enum IbdType {
 }
 
 struct QueueChunkOutput {
+    hashes: Vec<Hash>,
     jobs: Vec<BlockValidationFuture>,
     daa_score: u64,
     timestamp: u64,
@@ -142,9 +143,17 @@ impl IbdFlow {
         // Sync missing bodies in the past of syncer sink (virtual selected parent)
         self.sync_missing_block_bodies(&session, negotiation_output.syncer_virtual_selected_parent).await?;
 
-        // Relay block might be in the antipast of syncer sink, thus
-        // check its past for missing bodies as well.
-        self.sync_missing_block_bodies(&session, relay_block.hash()).await?;
+        // The relay block might be outside the syncer's selected chain. In recovery/IBD we must not
+        // chase that anticone path from a source that is only advertising its source-safe selected
+        // chain, otherwise a fresh node can ask the source for UTXO-pending or already-disqualified
+        // bodies that are irrelevant to the selected-chain sync.
+        let relay_block_hash = relay_block.hash();
+        if !session.async_is_chain_ancestor_of(relay_block_hash, negotiation_output.syncer_virtual_selected_parent).await? {
+            info!(
+                "Skipping IBD relay-block body sync for {} because it is outside the source-safe selected chain tip {}",
+                relay_block_hash, negotiation_output.syncer_virtual_selected_parent
+            );
+        }
 
         // Following IBD we revalidate orphans since many of them might have been processed during the IBD
         // or are now processable
@@ -725,25 +734,64 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
         let mut progress_reporter = ProgressReporter::new(low_header.daa_score, high_header.daa_score, "blocks");
 
         let mut iter = hashes.chunks(IBD_BATCH_SIZE);
-        let QueueChunkOutput { jobs: mut prev_jobs, daa_score: mut prev_daa_score, timestamp: mut prev_timestamp } =
-            self.queue_block_processing_chunk(consensus, iter.next().expect("hashes was non empty")).await?;
+        let QueueChunkOutput {
+            hashes: mut prev_hashes,
+            jobs: mut prev_jobs,
+            daa_score: mut prev_daa_score,
+            timestamp: mut prev_timestamp,
+        } = self.queue_block_processing_chunk(consensus, iter.next().expect("hashes was non empty")).await?;
 
         for chunk in iter {
-            let QueueChunkOutput { jobs: current_jobs, daa_score: current_daa_score, timestamp: current_timestamp } =
-                self.queue_block_processing_chunk(consensus, chunk).await?;
+            let QueueChunkOutput {
+                hashes: current_hashes,
+                jobs: current_jobs,
+                daa_score: current_daa_score,
+                timestamp: current_timestamp,
+            } = self.queue_block_processing_chunk(consensus, chunk).await?;
             let prev_chunk_len = prev_jobs.len();
             // Join the previous chunk so that we always concurrently process a chunk and receive another
-            try_join_all(prev_jobs).await?;
+            self.await_block_processing_chunk(consensus, &prev_hashes, prev_jobs).await?;
             // Log the progress
             progress_reporter.report(prev_chunk_len, prev_daa_score, prev_timestamp);
             prev_daa_score = current_daa_score;
             prev_timestamp = current_timestamp;
+            prev_hashes = current_hashes;
             prev_jobs = current_jobs;
         }
 
         let prev_chunk_len = prev_jobs.len();
-        try_join_all(prev_jobs).await?;
+        self.await_block_processing_chunk(consensus, &prev_hashes, prev_jobs).await?;
         progress_reporter.report_completion(prev_chunk_len);
+
+        Ok(())
+    }
+
+    async fn await_block_processing_chunk(
+        &self,
+        consensus: &ConsensusProxy,
+        hashes: &[Hash],
+        jobs: Vec<BlockValidationFuture>,
+    ) -> Result<(), ProtocolError> {
+        let statuses = try_join_all(jobs).await?;
+        for (&hash, status) in hashes.iter().zip(statuses.into_iter()) {
+            if is_unsafe_block_status_for_network(status) {
+                return Err(ProtocolError::OtherOwned(format!(
+                    "IBD block {} from peer {} became unsafe after virtual UTXO/Atomic validation: {:?}",
+                    hash, self.router, status
+                )));
+            }
+        }
+
+        for &hash in hashes {
+            if let Some(status) = consensus.async_get_block_status(hash).await {
+                if is_unsafe_block_status_for_network(status) {
+                    return Err(ProtocolError::OtherOwned(format!(
+                        "IBD block {} from peer {} is unsafe after virtual UTXO/Atomic validation: {:?}",
+                        hash, self.router, status
+                    )));
+                }
+            }
+        }
 
         Ok(())
     }
@@ -776,6 +824,6 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             jobs.push(consensus.validate_and_insert_block(block).virtual_state_task);
         }
 
-        Ok(QueueChunkOutput { jobs, daa_score: current_daa_score, timestamp: current_timestamp })
+        Ok(QueueChunkOutput { hashes: chunk.to_vec(), jobs, daa_score: current_daa_score, timestamp: current_timestamp })
     }
 }

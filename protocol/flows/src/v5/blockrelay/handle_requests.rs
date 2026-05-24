@@ -62,8 +62,16 @@ impl HandleRelayBlockRequests {
     }
 
     async fn send_sink(&mut self) -> Result<(), ProtocolError> {
-        let sink = self.ctx.consensus().unguarded_session().async_get_sink().await;
+        let session = self.ctx.consensus().unguarded_session();
+        let sink = session.async_get_sink().await;
         if sink == self.ctx.config.genesis.hash {
+            return Ok(());
+        }
+        if matches!(
+            session.async_get_block_status(sink).await,
+            Some(BlockStatus::StatusDisqualifiedFromChain | BlockStatus::StatusInvalid)
+        ) {
+            warn!("Not advertising sink {} to peer {} because it is not UTXO/Atomic-valid", sink, self.router);
             return Ok(());
         }
         for claim in self.ctx.block_producer_claims_for_hash(sink) {

@@ -31,6 +31,7 @@ pub(crate) struct ConsensusMock {
     transient_statuses: RwLock<HashMap<TransactionId, TxResult<()>>>,
     utxos: RwLock<UtxoCollection>,
     virtual_daa_score: RwLock<u64>,
+    block_template_builds: RwLock<u64>,
 }
 
 impl ConsensusMock {
@@ -42,6 +43,7 @@ impl ConsensusMock {
             transient_statuses: RwLock::new(HashMap::default()),
             utxos: RwLock::new(HashMap::default()),
             virtual_daa_score: RwLock::new(0),
+            block_template_builds: RwLock::new(0),
         }
     }
 
@@ -59,6 +61,10 @@ impl ConsensusMock {
 
     pub(crate) fn set_virtual_daa_score(&self, virtual_daa_score: u64) {
         *self.virtual_daa_score.write() = virtual_daa_score;
+    }
+
+    pub(crate) fn block_template_builds(&self) -> u64 {
+        *self.block_template_builds.read()
     }
 
     pub(crate) fn add_utxo(&self, outpoint: TransactionOutpoint, entry: UtxoEntry) {
@@ -152,7 +158,9 @@ impl ConsensusApi for ConsensusMock {
         mut tx_selector: Box<dyn TemplateTransactionSelector>,
         _build_mode: TemplateBuildMode,
     ) -> Result<BlockTemplate, RuleError> {
+        *self.block_template_builds.write() += 1;
         let mut txs = tx_selector.select_transactions();
+        txs.sort_by(|a, b| a.subnetwork_id.cmp(&b.subnetwork_id));
         let coinbase_manager = CoinbaseManagerMock::new();
         let coinbase = coinbase_manager.expected_coinbase_transaction(miner_data.clone());
         txs.insert(0, coinbase.tx);
@@ -174,7 +182,9 @@ impl ConsensusApi for ConsensusMock {
         );
         let mutable_block = MutableBlock::new(header, txs);
 
-        Ok(BlockTemplate::new(mutable_block, miner_data, coinbase.has_red_reward, now, 0, ZERO_HASH, vec![]))
+        let virtual_state_approx_id =
+            VirtualStateApproxId::new(self.get_virtual_daa_score(), 0.into(), ZERO_HASH, ZERO_HASH, ZERO_HASH, ZERO_HASH, ZERO_HASH);
+        Ok(BlockTemplate::new(mutable_block, miner_data, coinbase.has_red_reward, now, 0, ZERO_HASH, virtual_state_approx_id, vec![]))
     }
 
     fn validate_mempool_transaction(&self, mutable_tx: &mut MutableTransaction, _: &TransactionValidationArgs) -> TxResult<()> {
@@ -210,7 +220,7 @@ impl ConsensusApi for ConsensusMock {
     }
 
     fn get_virtual_state_approx_id(&self) -> VirtualStateApproxId {
-        VirtualStateApproxId::new(self.get_virtual_daa_score(), 0.into(), ZERO_HASH)
+        VirtualStateApproxId::new(self.get_virtual_daa_score(), 0.into(), ZERO_HASH, ZERO_HASH, ZERO_HASH, ZERO_HASH, ZERO_HASH)
     }
 
     fn modify_coinbase_payload(&self, payload: Vec<u8>, miner_data: &MinerData) -> CoinbaseResult<Vec<u8>> {

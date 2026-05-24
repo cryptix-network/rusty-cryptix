@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use super::IbdFlow;
-use cryptix_consensus_core::blockstatus::BlockStatus;
+use crate::v5::is_unsafe_block_status_for_network;
 use cryptix_consensusmanager::ConsensusProxy;
 use cryptix_core::{debug, warn};
 use cryptix_hashes::Hash;
@@ -59,8 +59,11 @@ impl IbdFlow {
                         // Log the unknown block and continue to the next iteration
                         lowest_unknown_syncer_chain_hash = Some(syncer_chain_hash);
                     }
-                    Some(BlockStatus::StatusInvalid) => {
-                        return Err(ProtocolError::OtherOwned(format!("sent invalid chain block {}", syncer_chain_hash)));
+                    Some(status) if is_unsafe_block_status_for_network(status) => {
+                        return Err(ProtocolError::OtherOwned(format!(
+                            "sent unsafe chain block {} with status {:?}",
+                            syncer_chain_hash, status
+                        )));
                     }
                     Some(_) => {
                         current_highest_known_syncer_chain_hash = Some(syncer_chain_hash);

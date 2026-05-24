@@ -61,6 +61,112 @@ mod tests {
         );
     }
 
+    #[test]
+    fn get_block_template_rebuilds_cached_template_when_miner_data_changes() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, Some(60_000), counters);
+        let miner_data_1 = generate_new_coinbase(Prefix::Testnet, OpType::True);
+        let miner_data_2 = MinerData::new(miner_data_1.script_public_key.clone(), vec![0xaa, 0xbb]);
+
+        let template_1 = mining_manager.get_block_template(consensus.as_ref(), &miner_data_1).unwrap();
+        let template_2 = mining_manager.get_block_template(consensus.as_ref(), &miner_data_2).unwrap();
+        let template_3 = mining_manager.get_block_template(consensus.as_ref(), &miner_data_2).unwrap();
+
+        assert_eq!(
+            consensus.block_template_builds(),
+            2,
+            "changing miner data must rebuild the template because coinbase tx id is part of the UTXO commitment"
+        );
+        assert_ne!(template_1.block.transactions[0].id(), template_2.block.transactions[0].id());
+        assert_eq!(template_2.block.transactions[0].id(), template_3.block.transactions[0].id());
+    }
+
+    #[test]
+    fn get_block_template_mixed_mempool_rebuilds_and_matches_cross_parity_shape() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, Some(60_000), counters);
+        let miner_data_1 = generate_new_coinbase(Prefix::Testnet, OpType::True);
+        let miner_data_2 = MinerData::new(miner_data_1.script_public_key.clone(), vec![0xaa, 0xbb, 0xcc]);
+        let asset_id = [0x42; 32];
+
+        let mut ready_transactions = Vec::new();
+        ready_transactions.extend((0..4).map(|i| create_transaction_with_utxo_entry(i, 0)));
+        ready_transactions.push(create_payload_transaction_with_utxo_entry(
+            10,
+            0,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            SUBNETWORK_ID_PAYLOAD,
+            b"MSG:alpha".to_vec(),
+        ));
+        ready_transactions.push(create_payload_transaction_with_utxo_entry(
+            11,
+            0,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            SUBNETWORK_ID_PAYLOAD,
+            b"MSG:beta".to_vec(),
+        ));
+        ready_transactions.push(create_cat_payload_transaction_with_utxo_entry(
+            20,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_create_asset_payload(1),
+        ));
+        ready_transactions.push(create_cat_payload_transaction_with_utxo_entry(
+            21,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_mint_payload(2, asset_id),
+        ));
+        ready_transactions.push(create_cat_payload_transaction_with_utxo_entry(
+            22,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_transfer_payload(3, asset_id),
+        ));
+        ready_transactions.push(create_cat_payload_transaction_with_utxo_entry(
+            23,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_buy_liquidity_payload(4, asset_id, 100),
+        ));
+        ready_transactions.push(create_cat_payload_transaction_with_utxo_entry(
+            24,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_sell_liquidity_payload(5, asset_id, 101),
+        ));
+
+        for tx in ready_transactions.iter().cloned() {
+            validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), tx).unwrap();
+        }
+
+        let mut orphan = create_cat_payload_transaction_with_utxo_entry(
+            90,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_buy_liquidity_payload(6, asset_id, 102),
+        );
+        orphan.entries[0] = None;
+        let orphan_id = orphan.id();
+        mining_manager
+            .validate_and_insert_mutable_transaction(consensus.as_ref(), orphan, Priority::Low, Orphan::Allowed, RbfPolicy::Forbidden)
+            .expect("cross-parity orphan CAT should be stored without entering the ready block-candidate set");
+
+        let (ready_pool, orphan_pool) = mining_manager.get_all_transactions(TransactionQuery::All);
+        assert_eq!(ready_transactions.len(), ready_pool.len(), "ready mixed mempool size");
+        assert_eq!(1, orphan_pool.len(), "cross-parity fixture should keep one orphan outside the template");
+
+        let template_1 = mining_manager.get_block_template(consensus.as_ref(), &miner_data_1).unwrap();
+        let template_2 = mining_manager.get_block_template(consensus.as_ref(), &miner_data_2).unwrap();
+        let template_3 = mining_manager.get_block_template(consensus.as_ref(), &miner_data_2).unwrap();
+
+        assert_eq!(
+            consensus.block_template_builds(),
+            2,
+            "mixed mempool template must rebuild when coinbase/miner data changes, then reuse only identical miner data"
+        );
+        assert_ne!(template_1.block.transactions[0].id(), template_2.block.transactions[0].id());
+        assert_eq!(template_2.block.transactions[0].id(), template_3.block.transactions[0].id());
+
+        assert_cross_parity_template_shape(&template_2.block.transactions, 4, 7, orphan_id);
+    }
+
     // test_validate_and_insert_transaction verifies that valid transactions were successfully inserted into the mempool.
     #[test]
     fn test_validate_and_insert_transaction() {
@@ -2195,12 +2301,43 @@ mod tests {
         payload
     }
 
+    fn cat_create_asset_payload(nonce: u64) -> Vec<u8> {
+        let mut payload = cat_payload_header(0, nonce);
+        payload.extend_from_slice(&[1, 0, 0]);
+        payload.extend_from_slice(&0u128.to_le_bytes());
+        payload.extend_from_slice(&[0x55; 32]);
+        payload.push(1);
+        payload.push(1);
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(b"A");
+        payload.extend_from_slice(b"A");
+        payload
+    }
+
+    fn cat_mint_payload(nonce: u64, asset_id: [u8; 32]) -> Vec<u8> {
+        let mut payload = cat_payload_header(2, nonce);
+        payload.extend_from_slice(&asset_id);
+        payload.extend_from_slice(&[0x66; 32]);
+        payload.extend_from_slice(&1u128.to_le_bytes());
+        payload
+    }
+
     fn cat_buy_liquidity_payload(nonce: u64, asset_id: [u8; 32], expected_pool_nonce: u64) -> Vec<u8> {
         let mut payload = cat_payload_header(6, nonce);
         payload.extend_from_slice(&asset_id);
         payload.extend_from_slice(&expected_pool_nonce.to_le_bytes());
         payload.extend_from_slice(&1u64.to_le_bytes());
         payload.extend_from_slice(&1u128.to_le_bytes());
+        payload
+    }
+
+    fn cat_sell_liquidity_payload(nonce: u64, asset_id: [u8; 32], expected_pool_nonce: u64) -> Vec<u8> {
+        let mut payload = cat_payload_header(7, nonce);
+        payload.extend_from_slice(&asset_id);
+        payload.extend_from_slice(&expected_pool_nonce.to_le_bytes());
+        payload.extend_from_slice(&1u128.to_le_bytes());
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&1u16.to_le_bytes());
         payload
     }
 
@@ -2326,6 +2463,38 @@ mod tests {
         let mut block_transactions = vec![get_dummy_coinbase_tx()];
         block_transactions.extend(transactions.cloned());
         block_transactions
+    }
+
+    fn assert_cross_parity_template_shape(
+        transactions: &[Transaction],
+        expected_native_non_coinbase: usize,
+        expected_payload: usize,
+        excluded_orphan_id: TransactionId,
+    ) {
+        assert_eq!(
+            1 + expected_native_non_coinbase + expected_payload,
+            transactions.len(),
+            "cross-parity mixed template transaction count"
+        );
+        assert!(transactions[0].is_coinbase(), "first template transaction must be coinbase");
+
+        let mut native_non_coinbase = 0;
+        let mut payload = 0;
+        let mut seen_payload = false;
+        for tx in transactions.iter().skip(1) {
+            assert_ne!(excluded_orphan_id, tx.id(), "orphan CAT must not enter the block template");
+            if tx.subnetwork_id == SUBNETWORK_ID_PAYLOAD {
+                seen_payload = true;
+                payload += 1;
+            } else {
+                assert_eq!(SUBNETWORK_ID_NATIVE, tx.subnetwork_id, "cross-parity fixture only uses native and payload txs");
+                assert!(!seen_payload, "native transactions must be ordered before payload/CAT transactions");
+                native_non_coinbase += 1;
+            }
+        }
+
+        assert_eq!(expected_native_non_coinbase, native_non_coinbase, "cross-parity native count");
+        assert_eq!(expected_payload, payload, "cross-parity payload/CAT count");
     }
 
     fn get_miner_data(prefix: Prefix) -> MinerData {

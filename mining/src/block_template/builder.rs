@@ -1,11 +1,14 @@
 use super::errors::BuilderResult;
+#[cfg(test)]
+use cryptix_consensus_core::tx::COINBASE_TRANSACTION_INDEX;
 use cryptix_consensus_core::{
     api::ConsensusApi,
     block::{BlockTemplate, TemplateBuildMode, TemplateTransactionSelector},
     coinbase::MinerData,
-    tx::COINBASE_TRANSACTION_INDEX,
 };
-use cryptix_core::time::{unix_now, Stopwatch};
+#[cfg(test)]
+use cryptix_core::time::unix_now;
+use cryptix_core::time::Stopwatch;
 
 pub(crate) struct BlockTemplateBuilder {}
 
@@ -88,7 +91,9 @@ impl BlockTemplateBuilder {
         Ok(consensus.build_block_template(miner_data.clone(), selector, build_mode)?)
     }
 
-    /// modify_block_template clones an existing block template, modifies it to the requested coinbase data and updates the timestamp
+    /// Test helper: modifies coinbase payload fields without rebuilding the full template.
+    /// Production mining must rebuild when miner data changes because coinbase tx id is part of the UTXO commitment.
+    #[cfg(test)]
     pub(crate) fn modify_block_template(
         consensus: &dyn ConsensusApi,
         new_miner_data: &MinerData,
