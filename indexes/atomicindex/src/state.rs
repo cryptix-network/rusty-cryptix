@@ -4784,6 +4784,136 @@ mod tests {
     }
 
     #[test]
+    fn liquidity_buy_reorg_restores_pool_vault_and_replays_alternative_branch() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let owner_script = test_script(70);
+        let owner = owner_id(&state, &owner_script);
+        let max_supply = crate::liquidity_math::LIQUIDITY_TOKEN_SUPPLY_RAW;
+        let seed_reserve_sompi = MIN_LIQUIDITY_SEED_RESERVE_SOMPI;
+        let launch_buy_budget_sompi = 10 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI;
+        let launch_token_out = cpmm_buy(
+            max_supply,
+            INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+            crate::liquidity_math::INITIAL_VIRTUAL_TOKEN_RESERVES,
+            launch_buy_budget_sompi,
+        )
+        .expect("launch quote should work")
+        .0;
+        let launch_buy_sompi = crate::liquidity_math::min_gross_input_for_token_out(
+            max_supply,
+            INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+            crate::liquidity_math::INITIAL_VIRTUAL_TOKEN_RESERVES,
+            launch_token_out,
+            0,
+        )
+        .expect("canonical launch buy should calculate");
+
+        let create_auth_outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(7_000), 0);
+        let create_tx = tx_with_inputs_outputs(
+            vec![(create_auth_outpoint, 1)],
+            vec![
+                TransactionOutput::new(seed_reserve_sompi + launch_buy_sompi, liquidity_vault_script()),
+                TransactionOutput::new(1, owner_script.clone()),
+            ],
+            payload_create_liquidity(0, 1, max_supply, seed_reserve_sompi, launch_buy_sompi, 1),
+        );
+        let asset_id = hash_bytes(create_tx.id());
+
+        let mut create_auth_inputs = HashMap::new();
+        create_auth_inputs.insert(
+            create_auth_outpoint,
+            UtxoEntry::new(20 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI, owner_script.clone(), 0, false),
+        );
+        let create_block = BlockHash::from_u64_word(7_010);
+        apply_block(
+            &mut state,
+            create_block,
+            vec![tx_ref(create_tx.clone(), BlockHash::from_u64_word(7_009), 0, 0)],
+            &create_auth_inputs,
+        );
+
+        let base_state = state.clone();
+        let base_hash = state.compute_state_hash();
+        let base_pool = state.assets.get(&asset_id).and_then(|asset| asset.liquidity.clone()).expect("pool should exist");
+        assert_eq!(state.find_liquidity_asset_by_vault_outpoint(base_pool.vault_outpoint).unwrap(), Some(asset_id));
+
+        let build_buy = |pool: &LiquidityPoolState, tag: u64, budget: u64| {
+            let token_out =
+                cpmm_buy(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, budget)
+                    .expect("buy quote should work")
+                    .0;
+            let buy_in_sompi = crate::liquidity_math::min_gross_input_for_token_out(
+                pool.real_token_reserves,
+                pool.virtual_cpay_reserves_sompi,
+                pool.virtual_token_reserves,
+                token_out,
+                pool.fee_bps,
+            )
+            .expect("canonical buy should calculate");
+            let buy_auth_outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(tag), 0);
+            let buy_tx = tx_with_inputs_outputs(
+                vec![(pool.vault_outpoint, 0), (buy_auth_outpoint, 1)],
+                vec![
+                    TransactionOutput::new(pool.vault_value_sompi + buy_in_sompi, liquidity_vault_script()),
+                    TransactionOutput::new(1, owner_script.clone()),
+                ],
+                payload_buy_liquidity(1, 1, asset_id, pool.pool_nonce, buy_in_sompi, 1),
+            );
+            let mut auth_inputs = HashMap::new();
+            auth_inputs.insert(pool.vault_outpoint, UtxoEntry::new(pool.vault_value_sompi, liquidity_vault_script(), 0, false));
+            auth_inputs.insert(
+                buy_auth_outpoint,
+                UtxoEntry::new(20 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI, owner_script.clone(), 0, false),
+            );
+            (buy_tx, auth_inputs)
+        };
+
+        let (buy_a_tx, buy_a_auth_inputs) = build_buy(&base_pool, 7_020, 10 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI);
+        let block_a = BlockHash::from_u64_word(7_030);
+        apply_block(
+            &mut state,
+            block_a,
+            vec![tx_ref(buy_a_tx.clone(), BlockHash::from_u64_word(7_029), 0, 0)],
+            &buy_a_auth_inputs,
+        );
+
+        let branch_a_pool = state.assets.get(&asset_id).and_then(|asset| asset.liquidity.clone()).expect("pool should exist");
+        assert_eq!(branch_a_pool.pool_nonce, base_pool.pool_nonce + 1);
+        assert_ne!(branch_a_pool.vault_outpoint, base_pool.vault_outpoint);
+        assert_eq!(state.find_liquidity_asset_by_vault_outpoint(branch_a_pool.vault_outpoint).unwrap(), Some(asset_id));
+
+        state.rollback_block(block_a).expect("rollback branch A buy");
+        let rolled_back_pool = state.assets.get(&asset_id).and_then(|asset| asset.liquidity.clone()).expect("pool should exist");
+        assert_eq!(rolled_back_pool.pool_nonce, base_pool.pool_nonce);
+        assert_eq!(rolled_back_pool.vault_outpoint, base_pool.vault_outpoint);
+        assert_eq!(rolled_back_pool.vault_value_sompi, base_pool.vault_value_sompi);
+        assert_eq!(rolled_back_pool.real_cpay_reserves_sompi, base_pool.real_cpay_reserves_sompi);
+        assert_eq!(rolled_back_pool.real_token_reserves, base_pool.real_token_reserves);
+        assert_eq!(state.compute_state_hash(), base_hash);
+        assert_eq!(state.find_liquidity_asset_by_vault_outpoint(base_pool.vault_outpoint).unwrap(), Some(asset_id));
+        assert_eq!(state.find_liquidity_asset_by_vault_outpoint(branch_a_pool.vault_outpoint).unwrap(), None);
+
+        let (buy_b_tx, buy_b_auth_inputs) = build_buy(&base_pool, 7_120, 11 * MIN_LIQUIDITY_SEED_RESERVE_SOMPI);
+        let block_b = BlockHash::from_u64_word(7_130);
+        apply_block(
+            &mut state,
+            block_b,
+            vec![tx_ref(buy_b_tx.clone(), BlockHash::from_u64_word(7_129), 0, 0)],
+            &buy_b_auth_inputs,
+        );
+
+        let mut fresh_branch_b = base_state;
+        apply_block(
+            &mut fresh_branch_b,
+            block_b,
+            vec![tx_ref(buy_b_tx, BlockHash::from_u64_word(7_129), 0, 0)],
+            &buy_b_auth_inputs,
+        );
+        assert_eq!(state.compute_state_hash(), fresh_branch_b.compute_state_hash());
+        assert_eq!(state.get_token_nonce(owner, asset_id), 2);
+    }
+
+    #[test]
     fn liquidity_buy_rejects_noncanonical_integer_overpay() {
         let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
         let owner_payload = vec![0x21; 32];
