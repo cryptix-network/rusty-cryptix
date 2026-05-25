@@ -2023,6 +2023,57 @@ impl DbAtomicStateStore {
         self.delta_access.delete(BatchDbWriter::new(batch), hash)
     }
 
+    pub fn delete_records_above_daa_batch<F>(
+        &self,
+        batch: &mut WriteBatch,
+        mut daa_for_hash: F,
+        target_daa: u64,
+    ) -> Result<(usize, usize), StoreError>
+    where
+        F: FnMut(Hash) -> Result<Option<u64>, StoreError>,
+    {
+        let mut to_delete = Vec::new();
+        let mut deleted_above_target = 0usize;
+        let mut deleted_orphans = 0usize;
+
+        for item in self.root_access.iterator() {
+            let (raw_key, _) =
+                item.map_err(|err| StoreError::DataInconsistency(format!("failed iterating Atomic state roots: {err}")))?;
+            if raw_key.len() != cryptix_hashes::HASH_SIZE {
+                return Err(StoreError::DataInconsistency(format!(
+                    "invalid Atomic state root key length {}; expected {}",
+                    raw_key.len(),
+                    cryptix_hashes::HASH_SIZE
+                )));
+            }
+            let hash = Hash::from_slice(&raw_key);
+            match daa_for_hash(hash)? {
+                Some(daa) if daa > target_daa => {
+                    deleted_above_target += 1;
+                    to_delete.push(hash);
+                }
+                None => {
+                    deleted_orphans += 1;
+                    to_delete.push(hash);
+                }
+                _ => {}
+            }
+        }
+
+        for hash in to_delete {
+            match self.root_access.delete(BatchDbWriter::new(batch), hash) {
+                Ok(()) | Err(StoreError::KeyNotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+            match self.delta_access.delete(BatchDbWriter::new(batch), hash) {
+                Ok(()) | Err(StoreError::KeyNotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok((deleted_above_target, deleted_orphans))
+    }
+
     pub fn get_root_record(&self, hash: Hash) -> Result<Arc<AtomicConsensusStateRootRecord>, StoreError> {
         Ok(self.root_access.read(hash)?.0)
     }
@@ -2995,6 +3046,44 @@ mod tests {
             store.insert_root_batch(&mut duplicate_batch, block_hash, [0x66; 32]),
             Err(StoreError::HashAlreadyExists(hash)) if hash == block_hash
         ));
+    }
+
+    #[test]
+    fn atomic_state_store_deletes_records_above_target_daa_and_orphans() {
+        let (_lifetime, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbAtomicStateStore::new(db.clone(), CachePolicy::Empty);
+        let keep_hash = hash(0x10);
+        let above_hash = hash(0x20);
+        let orphan_hash = hash(0x30);
+
+        let mut batch = WriteBatch::default();
+        store.insert_root_batch(&mut batch, keep_hash, [0x11; 32]).expect("keep root insert");
+        store.insert_root_batch(&mut batch, above_hash, [0x22; 32]).expect("above root insert");
+        store.insert_root_batch(&mut batch, orphan_hash, [0x33; 32]).expect("orphan root insert");
+        db.write(batch).expect("commit roots");
+
+        let mut cleanup_batch = WriteBatch::default();
+        let (deleted_above, deleted_orphans) = store
+            .delete_records_above_daa_batch(
+                &mut cleanup_batch,
+                |hash| {
+                    if hash == keep_hash {
+                        Ok(Some(10))
+                    } else if hash == above_hash {
+                        Ok(Some(11))
+                    } else {
+                        Ok(None)
+                    }
+                },
+                10,
+            )
+            .expect("cleanup scan");
+        db.write(cleanup_batch).expect("commit cleanup");
+
+        assert_eq!((deleted_above, deleted_orphans), (1, 1));
+        assert!(store.get_root_record(keep_hash).is_ok());
+        assert!(matches!(store.get_root_record(above_hash), Err(StoreError::KeyNotFound(_))));
+        assert!(matches!(store.get_root_record(orphan_hash), Err(StoreError::KeyNotFound(_))));
     }
 
     #[test]

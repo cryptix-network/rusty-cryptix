@@ -7,6 +7,7 @@ use crate::{
         selected_chain::{SelectedChainStore, SelectedChainStoreReader},
         statuses::StatusesStoreReader,
         tips::{TipsStore, TipsStoreReader},
+        virtual_state::VirtualStateStoreReader,
         DB,
     },
     pipeline::virtual_processor::VirtualStateProcessor,
@@ -40,6 +41,10 @@ struct StartupRepairPlan {
     mark_removed_disqualified: bool,
     #[serde(default = "default_true")]
     cleanup_removed_block_data: bool,
+    #[serde(default = "default_true")]
+    cleanup_atomic_above_target: bool,
+    #[serde(default)]
+    scan_body_descendants: bool,
     #[serde(default)]
     dry_run: bool,
 }
@@ -109,18 +114,41 @@ pub(super) fn apply_startup_repair_plan(
         .map_err(|err| format!("startup repair failed reading current selected tip DAA for {current_tip}: {err}"))?;
     let target = resolve_target(storage, &plan, current_index)?;
 
-    if target.index == current_index {
+    let virtual_selected_parent = storage
+        .virtual_stores
+        .read()
+        .state
+        .get()
+        .map_err(|err| format!("startup repair failed reading virtual state: {err}"))?
+        .ghostdag_data
+        .selected_parent;
+    let virtual_repair_needed = virtual_selected_parent != target.hash;
+
+    if target.index == current_index && !virtual_repair_needed {
         info!(
-            "[startup-repair] plan {} no-op: selected tip {} at DAA {} is already at requested target",
+            "[startup-repair] plan {} no-op: selected tip {} at DAA {} and virtual selected parent are already at requested target",
             plan_label(&plan, path),
             current_tip,
             current_daa
         );
+        if plan.cleanup_atomic_above_target {
+            let (deleted_above_target, deleted_orphans) = cleanup_atomic_state_above_target(db, storage, target.daa)?;
+            if deleted_above_target > 0 || deleted_orphans > 0 {
+                warn!(
+                    "[startup-repair] plan {} cleaned Atomic state snapshots above DAA {}: deleted_above_target={} deleted_orphans={}",
+                    plan_label(&plan, path),
+                    target.daa,
+                    deleted_above_target,
+                    deleted_orphans
+                );
+            }
+        }
         return Ok(());
     }
 
-    let removed = selected_chain_suffix(storage, target.index + 1, current_index)?;
-    if removed.is_empty() {
+    let removed =
+        if target.index < current_index { selected_chain_suffix(storage, target.index + 1, current_index)? } else { Vec::new() };
+    if removed.is_empty() && !virtual_repair_needed {
         info!(
             "[startup-repair] plan {} no-op: no selected-chain blocks above target {} (DAA {})",
             plan_label(&plan, path),
@@ -131,7 +159,7 @@ pub(super) fn apply_startup_repair_plan(
     }
 
     warn!(
-        "[startup-repair] plan {} rewinding selected chain from {} (DAA {}, index {}) to {} (DAA {}, index {}), removed_blocks={}, mark_disqualified={}, cleanup_block_data={}, dry_run={}",
+        "[startup-repair] plan {} rewinding selected chain from {} (DAA {}, index {}) to {} (DAA {}, index {}), removed_blocks={}, mark_disqualified={}, cleanup_block_data={}, cleanup_atomic_above_target={}, scan_body_descendants={}, dry_run={}",
         plan_label(&plan, path),
         current_tip,
         current_daa,
@@ -142,6 +170,8 @@ pub(super) fn apply_startup_repair_plan(
         removed.len(),
         plan.mark_removed_disqualified,
         plan.cleanup_removed_block_data,
+        plan.cleanup_atomic_above_target,
+        plan.scan_body_descendants,
         plan.dry_run
     );
 
@@ -149,19 +179,38 @@ pub(super) fn apply_startup_repair_plan(
         return Ok(());
     }
 
-    apply_selected_chain_rewind(db, storage, &removed, target, plan.mark_removed_disqualified)?;
-    virtual_processor.resolve_virtual();
+    apply_selected_chain_rewind(db, storage, &removed, target)?;
+    let repaired_virtual = virtual_processor.rebuild_virtual_state_for_startup_repair(target.hash, target.index)?;
 
-    if plan.cleanup_removed_block_data {
+    if plan.mark_removed_disqualified && !removed.is_empty() {
+        mark_removed_disqualified(db, storage, &removed)?;
+    }
+
+    if plan.cleanup_removed_block_data && !removed.is_empty() {
         cleanup_removed_block_data(db, storage, &removed)?;
     }
 
+    if plan.cleanup_atomic_above_target {
+        let (deleted_above_target, deleted_orphans) = cleanup_atomic_state_above_target(db, storage, target.daa)?;
+        if deleted_above_target > 0 || deleted_orphans > 0 {
+            warn!(
+                "[startup-repair] plan {} cleaned Atomic state snapshots above DAA {}: deleted_above_target={} deleted_orphans={}",
+                plan_label(&plan, path),
+                target.daa,
+                deleted_above_target,
+                deleted_orphans
+            );
+        }
+    }
+
     warn!(
-        "[startup-repair] plan {} completed: selected chain now targets {} (DAA {}, index {}), removed_blocks={}",
+        "[startup-repair] plan {} completed: selected chain and virtual state now target {} (target DAA {}, index {}, virtual DAA {}, virtual selected parent {}), removed_blocks={}",
         plan_label(&plan, path),
         target.hash,
         target.daa,
         target.index,
+        repaired_virtual.daa_score,
+        repaired_virtual.ghostdag_data.selected_parent,
         removed.len()
     );
 
@@ -244,7 +293,6 @@ fn apply_selected_chain_rewind(
     storage: &Arc<ConsensusStorage>,
     removed: &[Hash],
     target: RepairTarget,
-    mark_removed_disqualified: bool,
 ) -> RepairResult<()> {
     let mut batch = WriteBatch::default();
 
@@ -279,16 +327,19 @@ fn apply_selected_chain_rewind(
         .update_tips_batch(&mut batch, &[target.hash], &current_body_tips)
         .map_err(|err| format!("startup repair failed setting body tip to {}: {}", target.hash, err))?;
 
-    if mark_removed_disqualified {
-        let mut statuses = storage.statuses_store.write();
-        for hash in removed.iter().copied() {
-            statuses
-                .set_batch(&mut batch, hash, BlockStatus::StatusDisqualifiedFromChain)
-                .map_err(|err| format!("startup repair failed marking {hash} disqualified: {err}"))?;
-        }
-    }
-
     db.write(batch).map_err(|err| format!("startup repair failed writing selected-chain rewind: {err}"))?;
+    Ok(())
+}
+
+fn mark_removed_disqualified(db: &Arc<DB>, storage: &Arc<ConsensusStorage>, removed: &[Hash]) -> RepairResult<()> {
+    let mut batch = WriteBatch::default();
+    let mut statuses = storage.statuses_store.write();
+    for hash in removed.iter().copied() {
+        statuses
+            .set_batch(&mut batch, hash, BlockStatus::StatusDisqualifiedFromChain)
+            .map_err(|err| format!("startup repair failed marking {hash} disqualified: {err}"))?;
+    }
+    db.write(batch).map_err(|err| format!("startup repair failed writing removed-block disqualification: {err}"))?;
     Ok(())
 }
 
@@ -313,6 +364,23 @@ fn cleanup_removed_block_data(db: &Arc<DB>, storage: &Arc<ConsensusStorage>, rem
 
     db.write(batch).map_err(|err| format!("startup repair failed writing removed block cleanup: {err}"))?;
     Ok(())
+}
+
+fn cleanup_atomic_state_above_target(db: &Arc<DB>, storage: &Arc<ConsensusStorage>, target_daa: u64) -> RepairResult<(usize, usize)> {
+    let mut batch = WriteBatch::default();
+    let result = storage.atomic_state_store.delete_records_above_daa_batch(
+        &mut batch,
+        |hash| match storage.headers_store.get_daa_score(hash) {
+            Ok(daa) => Ok(Some(daa)),
+            Err(StoreError::KeyNotFound(_)) => Ok(None),
+            Err(err) => Err(err),
+        },
+        target_daa,
+    );
+    let (deleted_above_target, deleted_orphans) =
+        result.map_err(|err| format!("startup repair failed scanning Atomic state snapshots: {err}"))?;
+    db.write(batch).map_err(|err| format!("startup repair failed writing Atomic state snapshot cleanup: {err}"))?;
+    Ok((deleted_above_target, deleted_orphans))
 }
 
 fn ignore_missing(result: Result<(), StoreError>) -> Result<(), StoreError> {
@@ -348,6 +416,8 @@ mod tests {
                 "targetDaa": 100000,
                 "markRemovedDisqualified": true,
                 "cleanupRemovedBlockData": true,
+                "cleanupAtomicAboveTarget": true,
+                "scanBodyDescendants": false,
                 "dryRun": false
             }"#,
         )
@@ -357,6 +427,8 @@ mod tests {
         assert!(plan.enabled);
         assert_eq!(plan.target_daa(), Some(100000));
         assert!(plan.require_trigger_block());
+        assert!(plan.cleanup_atomic_above_target);
+        assert!(!plan.scan_body_descendants);
     }
 
     #[test]

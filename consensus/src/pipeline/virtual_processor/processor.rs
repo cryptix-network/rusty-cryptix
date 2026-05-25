@@ -793,6 +793,162 @@ impl VirtualStateProcessor {
         )))
     }
 
+    pub(crate) fn rebuild_virtual_state_for_startup_repair(
+        &self,
+        target: Hash,
+        target_index: u64,
+    ) -> Result<Arc<VirtualState>, String> {
+        let virtual_read = self.virtual_stores.upgradable_read();
+        let prev_state =
+            virtual_read.state.get().map_err(|err| format!("startup repair failed reading previous virtual state: {err}"))?;
+        let prev_sink = prev_state.ghostdag_data.selected_parent;
+
+        let mut accumulated_diff = prev_state.utxo_diff.clone().to_reversed();
+        if prev_sink != target {
+            if !self.reachability_service.is_chain_ancestor_of(target, prev_sink) {
+                return Err(format!(
+                    "startup repair target `{target}` is not a chain ancestor of previous virtual selected parent `{prev_sink}`"
+                ));
+            }
+
+            for current in self.reachability_service.default_backward_chain_iterator(prev_sink) {
+                if current == target {
+                    break;
+                }
+                let mergeset_diff = self
+                    .utxo_diffs_store
+                    .get(current)
+                    .map_err(|err| format!("startup repair failed reading UTXO diff for `{current}`: {err}"))?;
+                accumulated_diff
+                    .with_diff_in_place(&mergeset_diff.as_reversed())
+                    .map_err(|err| format!("startup repair failed rolling back UTXO diff for `{current}`: {err}"))?;
+            }
+        }
+
+        let selected_parent_atomic_state = self.atomic_state_for_selected_chain_prefix(target_index, target)?;
+        let virtual_parents = vec![target];
+        let virtual_ghostdag_data = self.ghostdag_manager.ghostdag(&virtual_parents);
+        let selected_parent_multiset = self
+            .utxo_multisets_store
+            .get(target)
+            .map_err(|err| format!("startup repair failed reading target UTXO multiset for `{target}`: {err}"))?;
+        let new_virtual_state = self
+            .calculate_virtual_state(
+                &virtual_read,
+                virtual_parents,
+                virtual_ghostdag_data,
+                selected_parent_multiset,
+                &mut accumulated_diff,
+                selected_parent_atomic_state,
+            )
+            .map_err(|err| format!("startup repair failed calculating repaired virtual state for `{target}`: {err}"))?;
+
+        self.commit_startup_repair_virtual_state(virtual_read, new_virtual_state.clone(), &accumulated_diff)?;
+        self.log_atomic_consensus_state_summary("startup_repair", &new_virtual_state);
+        Ok(new_virtual_state)
+    }
+
+    fn atomic_state_for_selected_chain_prefix(&self, target_index: u64, target: Hash) -> Result<AtomicConsensusState, String> {
+        let selected_chain_read = self.selected_chain_store.read();
+        let actual_target = selected_chain_read
+            .get_by_index(target_index)
+            .map_err(|err| format!("startup repair target selected-chain index `{target_index}` unavailable: {err}"))?;
+        if actual_target != target {
+            return Err(format!(
+                "startup repair target mismatch at selected-chain index `{target_index}`: expected `{target}`, got `{actual_target}`"
+            ));
+        }
+
+        let base_hash = selected_chain_read
+            .get_by_index(0)
+            .map_err(|err| format!("startup repair selected-chain base block unavailable: {err}"))?;
+        if base_hash != self.genesis.hash {
+            return Err(format!(
+                "startup repair Atomic replay starts at non-genesis base `{base_hash}`; import a full Atomic snapshot or rewind to an archive-backed chain before repairing"
+            ));
+        }
+
+        let mut state = AtomicConsensusState::default();
+        let mut replayed_blocks = 0u64;
+        let mut replayed_transactions = 0u64;
+        for index in 1..=target_index {
+            let block_hash = selected_chain_read
+                .get_by_index(index)
+                .map_err(|err| format!("startup repair selected-chain index `{index}` unavailable: {err}"))?;
+            match self.atomic_state_store.get_delta(block_hash) {
+                Ok(delta) => state
+                    .apply_delta_forward(delta.as_ref())
+                    .map_err(|err| format!("startup repair failed replaying Atomic delta for `{block_hash}`: {err}"))?,
+                Err(StoreError::KeyNotFound(_)) => {
+                    let pov_daa_score = self
+                        .headers_store
+                        .get_header(block_hash)
+                        .map_err(|err| format!("startup repair selected-chain block `{block_hash}` header unavailable: {err}"))?
+                        .daa_score;
+                    state.begin_delta_tracking();
+                    let accepted = self.replay_atomic_acceptance_for_block(block_hash, pov_daa_score, &mut state)?;
+                    let _ = state.take_delta();
+                    replayed_transactions += accepted;
+                }
+                Err(err) => return Err(format!("startup repair failed reading Atomic delta for `{block_hash}`: {err}")),
+            }
+            replayed_blocks += 1;
+            if replayed_blocks % 10_000 == 0 {
+                info!(
+                    "startup repair Atomic selected-chain replay progress: {}/{} block(s), {} accepted non-coinbase tx(s) replayed from local block data",
+                    replayed_blocks, target_index, replayed_transactions
+                );
+            }
+        }
+        drop(selected_chain_read);
+
+        let state_hash = state.canonical_hash();
+        match self.atomic_state_store.get_root_record(target) {
+            Ok(root) if root.state_hash != state_hash => {
+                return Err(format!(
+                    "startup repair replayed Atomic root for `{target}` does not match persisted root: replayed={}, persisted={}",
+                    faster_hex::hex_string(&state_hash),
+                    faster_hex::hex_string(&root.state_hash)
+                ));
+            }
+            Ok(_) | Err(StoreError::KeyNotFound(_)) => {}
+            Err(err) => return Err(format!("startup repair failed reading Atomic root for `{target}`: {err}")),
+        }
+
+        Ok(state)
+    }
+
+    fn commit_startup_repair_virtual_state(
+        &self,
+        virtual_read: RwLockUpgradableReadGuard<'_, VirtualStores>,
+        new_virtual_state: Arc<VirtualState>,
+        accumulated_diff: &UtxoDiff,
+    ) -> Result<(), String> {
+        let mut batch = WriteBatch::default();
+        let mut virtual_write = RwLockUpgradableReadGuard::upgrade(virtual_read);
+
+        virtual_write
+            .utxo_set
+            .write_diff_batch(&mut batch, accumulated_diff)
+            .map_err(|err| format!("startup repair failed writing repaired virtual UTXO diff: {err}"))?;
+        self.atomic_state_store
+            .replace_current_overlay_batch(&mut batch, &new_virtual_state.atomic_state)
+            .map_err(|err| format!("startup repair failed writing repaired Atomic current state: {err}"))?;
+
+        let mut compact_virtual_state = new_virtual_state.as_ref().clone();
+        compact_virtual_state.atomic_state = compact_virtual_state.atomic_state.as_virtual_root_state();
+        let compact_virtual_state = Arc::new(compact_virtual_state);
+        let new_virtual_daa_score = compact_virtual_state.daa_score;
+        virtual_write
+            .state
+            .set_batch(&mut batch, compact_virtual_state)
+            .map_err(|err| format!("startup repair failed writing repaired virtual state: {err}"))?;
+
+        self.db.write(batch).map_err(|err| format!("startup repair failed committing repaired virtual state: {err}"))?;
+        self.counters.virtual_daa_score.store(new_virtual_daa_score, Ordering::Relaxed);
+        Ok(())
+    }
+
     fn commit_virtual_state(
         &self,
         virtual_read: RwLockUpgradableReadGuard<'_, VirtualStores>,
