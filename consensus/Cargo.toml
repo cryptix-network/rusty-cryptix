@@ -40,6 +40,7 @@ rayon.workspace = true
 rocksdb.workspace = true
 secp256k1.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -52,7 +53,6 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 [dev-dependencies]
 criterion.workspace = true
 cryptix-atomicindex.workspace = true
-serde_json.workspace = true
 flate2.workspace = true
 rand_distr.workspace = true
 cryptix-txscript-errors.workspace = true
