@@ -327,7 +327,7 @@ impl VirtualStateProcessor {
         self.pruning_sender.send(PruningProcessingMessage::Exit).unwrap();
     }
 
-    fn resolve_virtual(self: &Arc<Self>) {
+    pub(crate) fn resolve_virtual(self: &Arc<Self>) {
         self.repair_anchor_only_virtual_atomic_state_if_possible();
         let pruning_point = self.pruning_point_store.read().pruning_point().unwrap();
         let virtual_read = self.virtual_stores.upgradable_read();

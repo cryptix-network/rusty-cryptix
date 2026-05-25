@@ -1,11 +1,9 @@
 use crate::{flow_context::FlowContext, flow_trait::Flow};
-use cryptix_core::{debug, warn};
+use cryptix_core::debug;
 use cryptix_p2p_lib::{
     common::ProtocolError, dequeue_with_request_id, make_response, pb::cryptixd_message::Payload, IncomingRoute, Router,
 };
 use std::sync::Arc;
-
-use super::is_unsafe_block_status_for_network;
 
 pub struct HandleIbdBlockRequests {
     ctx: FlowContext,
@@ -38,13 +36,6 @@ impl HandleIbdBlockRequests {
             let session = self.ctx.consensus().unguarded_session();
 
             for hash in hashes {
-                if let Some(status) = session.async_get_block_status(hash).await {
-                    if is_unsafe_block_status_for_network(status) {
-                        let reason = format!("refusing to serve unsafe IBD block {} with status {:?}", hash, status);
-                        warn!("{}", reason);
-                        return Err(ProtocolError::OtherOwned(reason));
-                    }
-                }
                 let block = session.async_get_block(hash).await?;
                 self.router.enqueue(make_response!(Payload::IbdBlock, (&block).into(), request_id)).await?;
             }

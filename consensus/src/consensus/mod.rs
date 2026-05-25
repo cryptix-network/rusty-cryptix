@@ -2,6 +2,7 @@ pub mod cache_policy_builder;
 pub mod ctl;
 pub mod factory;
 pub mod services;
+mod startup_repair;
 pub mod storage;
 pub mod test_consensus;
 
@@ -295,6 +296,11 @@ impl Consensus {
             header_processor.process_genesis();
             body_processor.process_genesis();
             virtual_processor.process_genesis();
+        }
+
+        if let Some(path) = config.startup_repair_plan_path.as_ref() {
+            startup_repair::apply_startup_repair_plan(&db, &storage, &virtual_processor, path)
+                .unwrap_or_else(|err| panic!("startup database repair failed: {err}"));
         }
 
         Self {

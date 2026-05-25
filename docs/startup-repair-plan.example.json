@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "enabled": true,
+  "name": "rewind-before-bad-selected-branch",
+  "triggerBlocks": [
+    "30f4243e9a14e7c6f4c74f831794e7b6e2958c84225603db79ea14182a75fd49",
+    "2520a09a4b4f066df5f01ecbcbc76caba38c1c15160f13d13ff960320fdce826"
+  ],
+  "requireTriggerBlock": true,
+  "targetDaa": 100000,
+  "markRemovedDisqualified": true,
+  "cleanupRemovedBlockData": true,
+  "dryRun": false
+}

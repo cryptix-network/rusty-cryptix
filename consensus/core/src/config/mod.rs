@@ -10,7 +10,7 @@ use crate::utxo::utxo_collection::UtxoCollection;
 #[cfg(feature = "devnet-prealloc")]
 use std::sync::Arc;
 
-use std::ops::Deref;
+use std::{ops::Deref, path::PathBuf};
 
 use {
     constants::perf::{PerfParams, PERF_PARAMS},
@@ -50,6 +50,9 @@ pub struct Config {
     /// Allow the node to accept blocks from RPC while not synced
     /// (required when initiating a new network from genesis)
     pub enable_unsynced_mining: bool,
+
+    /// Optional JSON startup database repair plan. Disabled unless explicitly configured.
+    pub startup_repair_plan_path: Option<PathBuf>,
 
     /// Allow mainnet mining. Until a stable Beta version we keep this option off by default
     pub enable_mainnet_mining: bool,
@@ -91,6 +94,7 @@ impl Config {
             atomic_unsafe_skip_snapshot_finality_check: false,
             unsafe_rpc: false,
             enable_unsynced_mining: false,
+            startup_repair_plan_path: None,
             enable_mainnet_mining: false,
             user_agent_comments: Default::default(),
             externalip: None,
