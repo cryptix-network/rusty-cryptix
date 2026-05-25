@@ -66,7 +66,7 @@ use std::{
     ops::Deref,
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
-        Arc,
+        Arc, Weak,
     },
     time::Duration,
 };
@@ -322,7 +322,7 @@ pub struct FlowContextInner {
     misbehaving_peer_scores: Mutex<HashMap<MisbehaviorIdentity, MisbehaviorRecord>>,
     inbound_connection_rate_limit: Mutex<HashMap<IpAddr, InboundConnectionRateLimitRecord>>,
     hfa_bridge: RwLock<Option<Arc<dyn HfaP2pBridge>>>,
-    atomic_state_quorum_verifier: RwLock<Option<Arc<dyn AtomicStateQuorumVerifier>>>,
+    atomic_state_quorum_verifier: RwLock<Option<Weak<dyn AtomicStateQuorumVerifier>>>,
     strong_node_claims_engine: Arc<StrongNodeClaimsEngine>,
     mining_manager: MiningManagerProxy,
     pub(crate) tick_service: Arc<TickService>,
@@ -702,11 +702,11 @@ impl FlowContext {
     }
 
     pub fn set_atomic_state_quorum_verifier(&self, verifier: Arc<dyn AtomicStateQuorumVerifier>) {
-        self.atomic_state_quorum_verifier.write().replace(verifier);
+        self.atomic_state_quorum_verifier.write().replace(Arc::downgrade(&verifier));
     }
 
     pub async fn verify_consensus_atomic_state_hash_quorum(&self, block_hash: Hash, state_hash: [u8; 32]) -> Result<(), String> {
-        let verifier = self.atomic_state_quorum_verifier.read().clone();
+        let verifier = self.atomic_state_quorum_verifier.read().as_ref().and_then(|verifier| verifier.upgrade());
         match verifier {
             Some(verifier) => verifier.verify_consensus_atomic_state_hash(block_hash, state_hash).await,
             None if self.config.net.is_mainnet() => {
@@ -718,7 +718,7 @@ impl FlowContext {
     }
 
     pub async fn local_atomic_token_state_hash_for_peer(&self, block_hash: Hash) -> Result<Option<[u8; 32]>, String> {
-        let verifier = self.atomic_state_quorum_verifier.read().clone();
+        let verifier = self.atomic_state_quorum_verifier.read().as_ref().and_then(|verifier| verifier.upgrade());
         match verifier {
             Some(verifier) => verifier.local_atomic_token_state_hash_for_peer(block_hash).await,
             None => Ok(None),
@@ -726,7 +726,7 @@ impl FlowContext {
     }
 
     pub async fn repair_atomic_index_once(&self) -> Result<bool, String> {
-        let verifier = self.atomic_state_quorum_verifier.read().clone();
+        let verifier = self.atomic_state_quorum_verifier.read().as_ref().and_then(|verifier| verifier.upgrade());
         match verifier {
             Some(verifier) => verifier.repair_atomic_index_once().await,
             None => Ok(false),
@@ -1041,6 +1041,7 @@ impl FlowContext {
             // actions such as updating the mempool. We know this will not err since `block_task` already completed w/o error
             let _ = virtual_state_task.await;
         }
+        self.mining_manager().clone().clear_block_template().await;
 
         // Broadcast unorphaned blocks only after virtual validation had a chance to disqualify invalid branches.
         let mut msgs = Vec::with_capacity(unorphaned_hashes.len());

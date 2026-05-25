@@ -5,7 +5,7 @@ mod tests {
         errors::{MiningManagerError, MiningManagerResult},
         manager::{classify_template_invalid_transactions, MiningManager},
         mempool::{
-            config::{Config, DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE},
+            config::{Config, DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE, DEFAULT_PAYLOAD_MAX_STANDARD_LEN},
             errors::RuleError,
             model::frontier::selectors::{SequenceSelectorTransaction, TakeAllSelector},
             tx::{Orphan, Priority, RbfPolicy},
@@ -80,6 +80,26 @@ mod tests {
         );
         assert_ne!(template_1.block.transactions[0].id(), template_2.block.transactions[0].id());
         assert_eq!(template_2.block.transactions[0].id(), template_3.block.transactions[0].id());
+    }
+
+    #[test]
+    fn get_block_template_retries_when_virtual_changes_during_build() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, Some(60_000), counters);
+        let miner_data = generate_new_coinbase(Prefix::Testnet, OpType::True);
+
+        consensus.set_virtual_daa_score(1);
+        consensus.set_virtual_daa_score_after_next_template_build(2);
+
+        let template = mining_manager.get_block_template(consensus.as_ref(), &miner_data).unwrap();
+
+        assert_eq!(consensus.block_template_builds(), 2, "a template built on a stale virtual state must be discarded");
+        assert_eq!(
+            template.to_virtual_state_approx_id(),
+            consensus.get_virtual_state_approx_id(),
+            "returned template must match the current virtual state identity"
+        );
     }
 
     #[test]
@@ -165,6 +185,167 @@ mod tests {
         assert_eq!(template_2.block.transactions[0].id(), template_3.block.transactions[0].id());
 
         assert_cross_parity_template_shape(&template_2.block.transactions, 4, 7, orphan_id);
+    }
+
+    #[test]
+    fn get_block_template_large_mixed_mempool_respects_block_mass_limit() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let max_block_mass = 18_000;
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, max_block_mass);
+        config.minimum_relay_transaction_fee = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let miner_data = generate_new_coinbase(Prefix::Testnet, OpType::True);
+        let asset_id = [0x52; 32];
+
+        let mut ready_transactions = Vec::new();
+        ready_transactions.extend((0..20).map(|i| create_transaction_with_utxo_entry(i, 0)));
+        ready_transactions.extend((20..40).map(|i| {
+            create_payload_transaction_with_utxo_entry(
+                i,
+                0,
+                100_000 + u64::from(i),
+                SUBNETWORK_ID_PAYLOAD,
+                vec![0xa5; DEFAULT_PAYLOAD_MAX_STANDARD_LEN],
+            )
+        }));
+        ready_transactions.extend((40..100).map(|i| {
+            create_cat_payload_transaction_with_utxo_entry(
+                i,
+                100_000 + u64::from(i),
+                cat_transfer_payload(u64::from(i - 39), asset_id),
+            )
+        }));
+
+        for tx in ready_transactions.iter().cloned() {
+            validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), tx).unwrap();
+        }
+
+        let template = mining_manager.get_block_template(consensus.as_ref(), &miner_data).unwrap();
+        let selected_non_coinbase = template.block.transactions.len().saturating_sub(1);
+
+        assert!(selected_non_coinbase > 0, "large mempool template should select at least one transaction");
+        assert!(
+            selected_non_coinbase < ready_transactions.len(),
+            "template must leave a tail when the mempool is larger than one block"
+        );
+        assert_template_subnetwork_sorted(&template.block.transactions);
+        assert_template_non_coinbase_estimated_mass_at_most(&template.block.transactions, max_block_mass);
+    }
+
+    #[test]
+    fn get_block_template_max_messenger_payloads_over_block_capacity_respects_limits() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let max_block_mass = 12_000;
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, max_block_mass);
+        config.minimum_relay_transaction_fee = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let miner_data = generate_new_coinbase(Prefix::Testnet, OpType::True);
+
+        let max_payload_txs = (0..40)
+            .map(|i| {
+                create_payload_transaction_with_utxo_entry(
+                    i,
+                    0,
+                    100_000 + u64::from(i),
+                    SUBNETWORK_ID_PAYLOAD,
+                    vec![0x6d; DEFAULT_PAYLOAD_MAX_STANDARD_LEN],
+                )
+            })
+            .collect_vec();
+
+        for tx in max_payload_txs.iter().cloned() {
+            validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), tx).unwrap();
+        }
+
+        let template = mining_manager.get_block_template(consensus.as_ref(), &miner_data).unwrap();
+        let selected = template.block.transactions.iter().skip(1).collect_vec();
+
+        assert!(!selected.is_empty(), "max-payload messenger mempool should produce non-empty templates");
+        assert!(selected.len() < max_payload_txs.len(), "one block must not absorb all max-size messenger payloads");
+        assert!(
+            selected
+                .iter()
+                .all(|tx| tx.subnetwork_id == SUBNETWORK_ID_PAYLOAD && tx.payload.len() == DEFAULT_PAYLOAD_MAX_STANDARD_LEN),
+            "selected non-coinbase transactions should be max-size messenger payloads"
+        );
+        assert_template_non_coinbase_estimated_mass_at_most(&template.block.transactions, max_block_mass);
+    }
+
+    #[test]
+    fn get_block_template_same_asset_cat_chain_over_block_capacity_keeps_tail() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let max_block_mass = 8_000;
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, max_block_mass);
+        config.minimum_relay_transaction_fee = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let miner_data = generate_new_coinbase(Prefix::Testnet, OpType::True);
+        let asset_id = [0x53; 32];
+
+        let cat_chain = (0..80)
+            .map(|i| {
+                create_cat_payload_transaction_with_utxo_entry(
+                    i,
+                    100_000 + u64::from(i),
+                    cat_transfer_payload(u64::from(i) + 1, asset_id),
+                )
+            })
+            .collect_vec();
+
+        for tx in cat_chain.iter().cloned() {
+            validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), tx).unwrap();
+        }
+
+        let template = mining_manager.get_block_template(consensus.as_ref(), &miner_data).unwrap();
+        let selected = template.block.transactions.iter().skip(1).cloned().collect_vec();
+        assert!(!selected.is_empty(), "same-asset CAT queue should produce a non-empty template");
+        assert!(selected.len() < cat_chain.len(), "one block must not absorb a long same-asset CAT queue");
+        assert_template_non_coinbase_estimated_mass_at_most(&template.block.transactions, max_block_mass);
+
+        mining_manager
+            .handle_new_block_transactions(consensus.as_ref(), 1, &template.block.transactions)
+            .expect("accepted CAT template should update mempool without dropping the whole queue");
+        let (remaining, _) = mining_manager.get_all_transactions(TransactionQuery::TransactionsOnly);
+        assert!(!remaining.is_empty(), "same-asset CAT tail should remain for later blocks");
+        for selected_tx in selected {
+            assert!(
+                mining_manager.get_transaction(&selected_tx.id(), TransactionQuery::TransactionsOnly).is_none(),
+                "accepted CAT transaction {} should be removed from mempool",
+                selected_tx.id()
+            );
+        }
+    }
+
+    #[test]
+    fn messenger_payload_standard_limit_accepts_max_and_rejects_oversize() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.minimum_relay_transaction_fee = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+
+        let max_payload = create_payload_transaction_with_utxo_entry(
+            1,
+            0,
+            100_000,
+            SUBNETWORK_ID_PAYLOAD,
+            vec![0x6d; DEFAULT_PAYLOAD_MAX_STANDARD_LEN],
+        );
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), max_payload).unwrap();
+
+        let oversized_payload = create_payload_transaction_with_utxo_entry(
+            2,
+            0,
+            100_000,
+            SUBNETWORK_ID_PAYLOAD,
+            vec![0x6d; DEFAULT_PAYLOAD_MAX_STANDARD_LEN + 1],
+        );
+        assert!(
+            validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), oversized_payload).is_err(),
+            "payloads above the standard messenger limit must not enter the mempool"
+        );
     }
 
     // test_validate_and_insert_transaction verifies that valid transactions were successfully inserted into the mempool.
@@ -2495,6 +2676,24 @@ mod tests {
 
         assert_eq!(expected_native_non_coinbase, native_non_coinbase, "cross-parity native count");
         assert_eq!(expected_payload, payload, "cross-parity payload/CAT count");
+    }
+
+    fn assert_template_subnetwork_sorted(transactions: &[Transaction]) {
+        assert!(transactions.first().is_some_and(Transaction::is_coinbase), "first template transaction must be coinbase");
+        for window in transactions.iter().skip(1).tuple_windows() {
+            let (left, right) = window;
+            assert!(
+                left.subnetwork_id <= right.subnetwork_id,
+                "template transactions must be sorted by subnetwork: {:?} before {:?}",
+                left.subnetwork_id,
+                right.subnetwork_id
+            );
+        }
+    }
+
+    fn assert_template_non_coinbase_estimated_mass_at_most(transactions: &[Transaction], max_block_mass: u64) {
+        let mass: u64 = transactions.iter().skip(1).map(transaction_estimated_serialized_size).sum();
+        assert!(mass <= max_block_mass, "template non-coinbase mass {mass} exceeds block limit {max_block_mass}");
     }
 
     fn get_miner_data(prefix: Prefix) -> MinerData {

@@ -23,7 +23,7 @@ impl Inner {
         Self { last_update_time: 0, block_template: None, cache_lifetime }
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.block_template = None;
     }
 
@@ -54,7 +54,6 @@ impl BlockTemplateCache {
         Self { inner: Mutex::new(Inner::new(cache_lifetime)) }
     }
 
-    #[cfg(test)]
     pub(crate) fn clear(&self) {
         self.inner.lock().clear();
     }

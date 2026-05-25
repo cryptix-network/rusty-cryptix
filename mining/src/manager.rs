@@ -100,22 +100,6 @@ impl MiningManager {
     }
 
     pub fn get_block_template(&self, consensus: &dyn ConsensusApi, miner_data: &MinerData) -> MiningManagerResult<BlockTemplate> {
-        let virtual_state_approx_id = consensus.get_virtual_state_approx_id();
-        let mut cache_lock = self.block_template_cache.lock(virtual_state_approx_id.clone());
-        let immutable_template = cache_lock.get_immutable_cached_template();
-
-        // We first try and use a cached template if not expired
-        if let Some(immutable_template) = immutable_template {
-            drop(cache_lock);
-            if immutable_template.miner_data == *miner_data {
-                return Ok(immutable_template.as_ref().clone());
-            }
-            // Miner data is part of the coinbase transaction id and therefore part of the UTXO commitment.
-            // Rebuild instead of mutating the cached template so the header commitment is calculated from
-            // the exact coinbase that will be mined.
-            cache_lock = self.block_template_cache.lock(virtual_state_approx_id);
-        }
-
         // Rust rewrite:
         // We avoid passing a mempool ref to blockTemplateBuilder by calling
         // mempool.BlockCandidateTransactions and mempool.RemoveTransactions here.
@@ -125,6 +109,21 @@ impl MiningManager {
         let mut attempts: u64 = 0;
         loop {
             attempts += 1;
+            let virtual_state_approx_id = consensus.get_virtual_state_approx_id();
+            let mut cache_lock = self.block_template_cache.lock(virtual_state_approx_id.clone());
+            let immutable_template = cache_lock.get_immutable_cached_template();
+
+            // We first try and use a cached template if not expired.
+            if let Some(immutable_template) = immutable_template {
+                drop(cache_lock);
+                if immutable_template.miner_data == *miner_data {
+                    return Ok(immutable_template.as_ref().clone());
+                }
+                // Miner data is part of the coinbase transaction id and therefore part of the next UTXO commitment.
+                // Rebuild instead of mutating the cached template so the header commitment is calculated from
+                // the exact coinbase that will be mined.
+                cache_lock = self.block_template_cache.lock(virtual_state_approx_id);
+            }
 
             let selector = self.build_selector();
             let block_template_builder = BlockTemplateBuilder::new();
@@ -135,6 +134,12 @@ impl MiningManager {
             };
             match block_template_builder.build_block_template(consensus, miner_data, selector, build_mode) {
                 Ok(block_template) => {
+                    let latest_virtual_state_approx_id = consensus.get_virtual_state_approx_id();
+                    if block_template.to_virtual_state_approx_id() != latest_virtual_state_approx_id {
+                        debug!("Discarded block template built on stale virtual state; retrying with the latest virtual state");
+                        cache_lock.clear();
+                        continue;
+                    }
                     let block_template = cache_lock.set_immutable_cached_template(block_template);
                     match attempts {
                         1 => {
@@ -278,8 +283,7 @@ impl MiningManager {
     }
 
     /// Clears the block template cache, forcing the next call to get_block_template to build a new block template.
-    #[cfg(test)]
-    pub(crate) fn clear_block_template(&self) {
+    pub fn clear_block_template(&self) {
         self.block_template_cache.clear();
     }
 
@@ -337,6 +341,7 @@ impl MiningManager {
             TransactionPostValidation { removed, accepted: Some(accepted_transaction) } => {
                 let unorphaned_transactions = mempool.get_unorphaned_transactions_after_accepted_transaction(&accepted_transaction);
                 drop(mempool);
+                self.clear_block_template();
 
                 // The capacity used here may be exceeded since accepted unorphaned transaction may themselves unorphan other transactions.
                 let mut accepted_transactions = Vec::with_capacity(unorphaned_transactions.len() + 1);
@@ -347,7 +352,12 @@ impl MiningManager {
 
                 Ok(TransactionInsertion::new(removed, accepted_transactions))
             }
-            TransactionPostValidation { removed, accepted: None } => Ok(TransactionInsertion::new(removed, vec![])),
+            TransactionPostValidation { removed, accepted: None } => {
+                if removed.is_some() {
+                    self.clear_block_template();
+                }
+                Ok(TransactionInsertion::new(removed, vec![]))
+            }
         }
     }
 
@@ -600,6 +610,9 @@ impl MiningManager {
             unorphaned_transactions.extend(txs);
         }
 
+        if insert_results.iter().any(|result| result.is_ok()) || !unorphaned_transactions.is_empty() {
+            self.clear_block_template();
+        }
         insert_results
             .extend(self.validate_and_insert_unorphaned_transactions(consensus, unorphaned_transactions).into_iter().map(Ok));
         insert_results
@@ -686,6 +699,8 @@ impl MiningManager {
         // TODO: avoid returning a result from this function (and the underlying function). Any possible error is a
         // problem of the internal implementation and unrelated to the caller
 
+        self.clear_block_template();
+
         // write lock on mempool
         let unorphaned_transactions = self.mempool.write().handle_new_block_transactions(block_daa_score, block_transactions)?;
 
@@ -704,6 +719,8 @@ impl MiningManager {
         if accepted_transactions.is_empty() {
             return Ok(Vec::new());
         }
+
+        self.clear_block_template();
 
         let unorphaned_transactions =
             self.mempool.write().handle_accepted_transactions(accepting_block_daa_score, accepted_transactions)?;
@@ -997,6 +1014,10 @@ impl MiningManagerProxy {
 
     pub async fn get_block_template(self, consensus: &ConsensusProxy, miner_data: MinerData) -> MiningManagerResult<BlockTemplate> {
         consensus.clone().spawn_blocking(move |c| self.inner.get_block_template(c, &miner_data)).await
+    }
+
+    pub async fn clear_block_template(self) {
+        spawn_blocking(move || self.inner.clear_block_template()).await.unwrap()
     }
 
     /// Returns realtime feerate estimations based on internal mempool state

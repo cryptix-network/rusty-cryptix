@@ -31,6 +31,7 @@ pub(crate) struct ConsensusMock {
     transient_statuses: RwLock<HashMap<TransactionId, TxResult<()>>>,
     utxos: RwLock<UtxoCollection>,
     virtual_daa_score: RwLock<u64>,
+    virtual_daa_score_after_next_template_build: RwLock<Option<u64>>,
     block_template_builds: RwLock<u64>,
 }
 
@@ -43,6 +44,7 @@ impl ConsensusMock {
             transient_statuses: RwLock::new(HashMap::default()),
             utxos: RwLock::new(HashMap::default()),
             virtual_daa_score: RwLock::new(0),
+            virtual_daa_score_after_next_template_build: RwLock::new(None),
             block_template_builds: RwLock::new(0),
         }
     }
@@ -61,6 +63,10 @@ impl ConsensusMock {
 
     pub(crate) fn set_virtual_daa_score(&self, virtual_daa_score: u64) {
         *self.virtual_daa_score.write() = virtual_daa_score;
+    }
+
+    pub(crate) fn set_virtual_daa_score_after_next_template_build(&self, virtual_daa_score: u64) {
+        *self.virtual_daa_score_after_next_template_build.write() = Some(virtual_daa_score);
     }
 
     pub(crate) fn block_template_builds(&self) -> u64 {
@@ -159,6 +165,7 @@ impl ConsensusApi for ConsensusMock {
         _build_mode: TemplateBuildMode,
     ) -> Result<BlockTemplate, RuleError> {
         *self.block_template_builds.write() += 1;
+        let virtual_daa_score = self.get_virtual_daa_score();
         let mut txs = tx_selector.select_transactions();
         txs.sort_by(|a, b| a.subnetwork_id.cmp(&b.subnetwork_id));
         let coinbase_manager = CoinbaseManagerMock::new();
@@ -183,8 +190,15 @@ impl ConsensusApi for ConsensusMock {
         let mutable_block = MutableBlock::new(header, txs);
 
         let virtual_state_approx_id =
-            VirtualStateApproxId::new(self.get_virtual_daa_score(), 0.into(), ZERO_HASH, ZERO_HASH, ZERO_HASH, ZERO_HASH, ZERO_HASH);
-        Ok(BlockTemplate::new(mutable_block, miner_data, coinbase.has_red_reward, now, 0, ZERO_HASH, virtual_state_approx_id, vec![]))
+            VirtualStateApproxId::new(virtual_daa_score, 0.into(), ZERO_HASH, ZERO_HASH, ZERO_HASH, ZERO_HASH, ZERO_HASH);
+        let template =
+            BlockTemplate::new(mutable_block, miner_data, coinbase.has_red_reward, now, 0, ZERO_HASH, virtual_state_approx_id, vec![]);
+
+        if let Some(next_virtual_daa_score) = self.virtual_daa_score_after_next_template_build.write().take() {
+            self.set_virtual_daa_score(next_virtual_daa_score);
+        }
+
+        Ok(template)
     }
 
     fn validate_mempool_transaction(&self, mutable_tx: &mut MutableTransaction, _: &TransactionValidationArgs) -> TxResult<()> {

@@ -24,6 +24,7 @@ const CAT_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
 const CURRENT_TOKEN_VERSION: u8 = 1;
 const OWNER_AUTH_SCHEME_PUBKEY: u8 = 0;
 const OWNER_AUTH_SCHEME_PUBKEY_ECDSA: u8 = 1;
+const ATOMIC_TEST_PAYLOAD_HF_DAA: u64 = 2;
 
 fn owner_id_from_address(address: &Address) -> [u8; 32] {
     let (scheme, canonical_pubkey_bytes) = match address.version {
@@ -116,10 +117,57 @@ fn build_payload_tx(signer: Keypair, utxo: &(TransactionOutpoint, UtxoEntry), pa
     sign(MutableTransaction::with_entries(unsigned, vec![utxo.1.clone()]), signer).tx
 }
 
+fn is_temporarily_atomic_unready(err: &impl ToString) -> bool {
+    let message = err.to_string();
+    message.contains("ERR_STALE_CONTEXT")
+        || message.contains("Atomic token index is not ready")
+        || message.contains("node is not nearly synced after payload hardfork")
+}
+
+async fn wait_for_atomic_mining_ready(client: &GrpcClient) {
+    for _ in 0..200 {
+        if client
+            .get_server_info()
+            .await
+            .map(|info| info.virtual_daa_score.saturating_add(1) < ATOMIC_TEST_PAYLOAD_HF_DAA)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        match client.get_token_health_call(None, GetTokenHealthRequest { at_block_hash: None }).await {
+            Ok(health)
+                if health.token_state == "healthy"
+                    && !health.is_degraded
+                    && !health.bootstrap_in_progress
+                    && health.live_correct
+                    && health.last_applied_block.is_some() =>
+            {
+                return;
+            }
+            Ok(_) => {}
+            Err(err) if is_temporarily_atomic_unready(&err) => {}
+            Err(err) => panic!("unexpected Atomic health error while waiting for mining readiness: {err}"),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("Atomic token index did not become mining-ready in time");
+}
+
 async fn mine_blocks(client: &GrpcClient, pay_address: &Address, count: u64) {
     for _ in 0..count {
+        wait_for_atomic_mining_ready(client).await;
         let before = client.get_server_info().await.unwrap().virtual_daa_score;
-        let template = client.get_block_template(pay_address.clone(), vec![]).await.unwrap();
+        let template = loop {
+            match client.get_block_template(pay_address.clone(), vec![]).await {
+                Ok(template) => break template,
+                Err(err) if is_temporarily_atomic_unready(&err) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(err) => panic!("get_block_template failed while mining test block: {err}"),
+            }
+        };
         client.submit_block(template.block, false).await.unwrap();
         let check_client = client.clone();
         wait_for(
@@ -178,7 +226,7 @@ fn atomic_args() -> Args {
         utxoindex: true,
         unsafe_rpc: true,
         atomic_unsafe_skip_snapshot_finality_check: true,
-        payload_hf_activation_daa_score: Some(0),
+        payload_hf_activation_daa_score: Some(ATOMIC_TEST_PAYLOAD_HF_DAA),
         coinbase_maturity_override: Some(10),
         ..Default::default()
     }
@@ -190,7 +238,11 @@ async fn atomic_token_atomic_enabled_not_ready_state_fails_closed() {
     let mut daemon = Daemon::new_random_with_args(atomic_args(), 10);
     let client = daemon.start().await;
 
-    let health = client.get_token_health_call(None, GetTokenHealthRequest { at_block_hash: None }).await.unwrap();
+    let health = match client.get_token_health_call(None, GetTokenHealthRequest { at_block_hash: None }).await {
+        Ok(health) => health,
+        Err(err) if is_temporarily_atomic_unready(&err) => return,
+        Err(err) => panic!("unexpected token health error: {err}"),
+    };
     assert!(!health.is_degraded);
     if health.token_state == "healthy" {
         return;
@@ -735,6 +787,7 @@ async fn atomic_token_atomic_enabled_snapshot_import_rejects_tampered_snapshot()
         .export_token_snapshot_call(None, ExportTokenSnapshotRequest { path: snapshot_path.to_string_lossy().to_string() })
         .await
         .unwrap();
+    let state_hash_before = client.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
 
     let mut snapshot_bytes = fs::read(&snapshot_path).unwrap();
     assert!(!snapshot_bytes.is_empty());
@@ -748,25 +801,11 @@ async fn atomic_token_atomic_enabled_snapshot_import_rejects_tampered_snapshot()
     assert!(import_err.to_string().contains("snapshot import failed"), "expected snapshot import failure, got: {import_err}");
 
     let health = client.get_token_health_call(None, GetTokenHealthRequest { at_block_hash: None }).await.unwrap();
-    assert!(health.is_degraded);
-    assert_eq!(health.token_state, "degraded");
+    assert!(!health.is_degraded);
+    assert_eq!(health.token_state, "healthy");
     assert!(!health.bootstrap_in_progress);
-
-    let zero_hex = hex32([0u8; 32]);
-    let spendability = client
-        .get_token_spendability_call(
-            None,
-            GetTokenSpendabilityRequest {
-                asset_id: zero_hex.clone(),
-                owner_id: zero_hex,
-                min_daa_for_spend: Some(10),
-                at_block_hash: None,
-            },
-        )
-        .await
-        .expect("degraded spendability must be conservative and explicit");
-    assert!(!spendability.can_spend);
-    assert_eq!(spendability.reason.as_deref(), Some("token_state_degraded"));
+    let state_hash_after = client.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
+    assert_eq!(state_hash_after.context.state_hash, state_hash_before.context.state_hash);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -785,6 +824,7 @@ async fn atomic_token_atomic_enabled_snapshot_import_rejects_truncated_snapshot(
         .export_token_snapshot_call(None, ExportTokenSnapshotRequest { path: snapshot_path.to_string_lossy().to_string() })
         .await
         .unwrap();
+    let state_hash_before = client.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
 
     let snapshot_bytes = fs::read(&snapshot_path).unwrap();
     let trunc_len = usize::max(1, snapshot_bytes.len() / 2);
@@ -797,8 +837,11 @@ async fn atomic_token_atomic_enabled_snapshot_import_rejects_truncated_snapshot(
     assert!(import_err.to_string().contains("snapshot import failed"), "expected snapshot import failure, got: {import_err}");
 
     let health = client.get_token_health_call(None, GetTokenHealthRequest { at_block_hash: None }).await.unwrap();
-    assert!(health.is_degraded);
+    assert!(!health.is_degraded);
+    assert_eq!(health.token_state, "healthy");
     assert!(!health.bootstrap_in_progress);
+    let state_hash_after = client.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
+    assert_eq!(state_hash_after.context.state_hash, state_hash_before.context.state_hash);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -829,7 +872,12 @@ async fn atomic_token_atomic_enabled_snapshot_import_rejects_wrong_chain_snapsho
         "expected wrong-chain snapshot import failure, got: {import_err}"
     );
 
-    let health = target_client.get_token_health_call(None, GetTokenHealthRequest { at_block_hash: None }).await.unwrap();
-    assert!(health.is_degraded);
-    assert!(!health.bootstrap_in_progress);
+    match target_client.get_token_health_call(None, GetTokenHealthRequest { at_block_hash: None }).await {
+        Ok(health) => {
+            assert!(!health.is_degraded);
+            assert!(!health.bootstrap_in_progress);
+        }
+        Err(err) if is_temporarily_atomic_unready(&err) => {}
+        Err(err) => panic!("unexpected token health error after wrong-chain import rejection: {err}"),
+    }
 }

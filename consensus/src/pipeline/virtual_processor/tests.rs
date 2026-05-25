@@ -5,6 +5,7 @@ use crate::{
         stores::{
             atomic_state::{AtomicAssetClass, AtomicBalanceKey, AtomicLiquidityPoolState, AtomicNonceKey},
             statuses::StatusesStore,
+            virtual_state::{VirtualStateStore, VirtualStateStoreReader},
         },
     },
     processes::transaction_validator::transaction_validator_populated::atomic_owner_id_from_script,
@@ -174,6 +175,13 @@ impl TestContext {
         self
     }
 
+    pub async fn validate_and_insert_utxo_valid_block(&mut self, block: Block) -> &mut Self {
+        let hash = block.hash();
+        let status = self.consensus.validate_and_insert_block(block).virtual_state_task.await.unwrap();
+        assert_eq!(status, BlockStatus::StatusUTXOValid, "block {hash} must be UTXO/Atomic valid");
+        self
+    }
+
     pub fn assert_tips(&mut self) -> &mut Self {
         assert_eq!(BlockHashSet::from_iter(self.consensus.get_tips().into_iter()), self.current_tips);
         self
@@ -330,6 +338,214 @@ async fn disqualified_only_tip_restores_last_valid_parent() {
     let valid_extension_hash = valid_extension.block.header.hash;
     ctx.validate_and_insert_block(valid_extension.block.to_immutable()).await;
     assert_eq!(ctx.consensus.get_block_status(valid_extension_hash), Some(BlockStatus::StatusUTXOValid));
+    assert_eq!(ctx.consensus.get_sink(), valid_extension_hash);
+}
+
+#[tokio::test]
+async fn disqualified_sibling_does_not_reapply_selected_parent_atomic_delta() {
+    cryptix_core::log::try_init_logger("info");
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.coinbase_maturity = 0;
+            p.payload_hf_activation_daa_score = 0;
+        })
+        .build();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    for _ in 0..3 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await.assert_valid_utxo_tip();
+    }
+
+    let (funding_outpoint, funding_entry) = find_virtual_utxo_by_script(&ctx, &owner_script);
+    let tx_fee = 10_000u64;
+    let anchor_tx = Transaction::new(
+        TX_VERSION,
+        vec![TransactionInput::new(funding_outpoint, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(funding_entry.amount - tx_fee, owner_script.clone())],
+        0,
+        SUBNETWORK_ID_NATIVE,
+        0,
+        vec![],
+    );
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let anchor_template = ctx.build_block_template_with_transactions(vec![anchor_tx], 700, ctx.simulated_time);
+    let valid_sink = anchor_template.block.header.hash;
+    ctx.validate_and_insert_utxo_valid_block(anchor_template.block.to_immutable()).await;
+    assert_eq!(ctx.consensus.get_sink(), valid_sink);
+    let expected_atomic_hash = ctx.consensus.virtual_atomic_state().canonical_hash();
+
+    for nonce in 701..704 {
+        ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+        let invalid_child = ctx.build_block_with_parents(vec![valid_sink], nonce, ctx.simulated_time);
+        let invalid_hash = invalid_child.header.hash;
+        let status = ctx.consensus.validate_and_insert_block(invalid_child.to_immutable()).virtual_state_task.await.unwrap();
+        assert_eq!(status, BlockStatus::StatusDisqualifiedFromChain);
+        assert_eq!(ctx.consensus.get_block_status(invalid_hash), Some(BlockStatus::StatusDisqualifiedFromChain));
+        assert_eq!(ctx.consensus.get_sink(), valid_sink);
+        assert_eq!(
+            ctx.consensus.virtual_atomic_state().canonical_hash(),
+            expected_atomic_hash,
+            "disqualified sibling {invalid_hash} must not reapply the selected-parent Atomic delta"
+        );
+    }
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let valid_extension = ctx.build_block_template(704, ctx.simulated_time);
+    let valid_extension_hash = valid_extension.block.header.hash;
+    ctx.validate_and_insert_utxo_valid_block(valid_extension.block.to_immutable()).await;
+    assert_eq!(ctx.consensus.get_sink(), valid_extension_hash);
+}
+
+#[tokio::test]
+async fn disqualified_cached_chain_block_does_not_advance_virtual_state() {
+    cryptix_core::log::try_init_logger("info");
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.coinbase_maturity = 0;
+            p.payload_hf_activation_daa_score = 0;
+        })
+        .build();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    for _ in 0..3 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await.assert_valid_utxo_tip();
+    }
+
+    let safe_parent = ctx.consensus.get_sink();
+    let (funding_outpoint, funding_entry) = find_virtual_utxo_by_script(&ctx, &owner_script);
+    let tx_fee = 10_000u64;
+    let anchor_tx = Transaction::new(
+        TX_VERSION,
+        vec![TransactionInput::new(funding_outpoint, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(funding_entry.amount - tx_fee, owner_script.clone())],
+        0,
+        SUBNETWORK_ID_NATIVE,
+        0,
+        vec![],
+    );
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let cached_template = ctx.build_block_template_with_transactions(vec![anchor_tx], 800, ctx.simulated_time);
+    let cached_hash = cached_template.block.header.hash;
+    ctx.validate_and_insert_utxo_valid_block(cached_template.block.to_immutable()).await;
+    assert_eq!(ctx.consensus.get_sink(), cached_hash);
+
+    ctx.consensus
+        .virtual_processor()
+        .statuses_store
+        .write()
+        .set(cached_hash, BlockStatus::StatusDisqualifiedFromChain)
+        .unwrap();
+    assert_eq!(ctx.consensus.get_block_status(cached_hash), Some(BlockStatus::StatusDisqualifiedFromChain));
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let sibling = ctx.build_utxo_valid_block_with_parents_and_transactions(vec![safe_parent], vec![], 801, ctx.simulated_time);
+    let sibling_hash = sibling.header.hash;
+    ctx.validate_and_insert_utxo_valid_block(sibling.to_immutable()).await;
+    assert_eq!(ctx.consensus.get_sink(), sibling_hash);
+    let expected_atomic_hash = ctx.consensus.virtual_atomic_state().canonical_hash();
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let child_of_disqualified = ctx.build_block_with_parents(vec![cached_hash], 802, ctx.simulated_time);
+    let child_hash = child_of_disqualified.header.hash;
+    let status = ctx.consensus.validate_and_insert_block(child_of_disqualified.to_immutable()).virtual_state_task.await.unwrap();
+
+    assert_eq!(status, BlockStatus::StatusDisqualifiedFromChain);
+    assert_eq!(ctx.consensus.get_block_status(child_hash), Some(BlockStatus::StatusDisqualifiedFromChain));
+    assert_eq!(ctx.consensus.get_sink(), sibling_hash);
+    assert_eq!(
+        ctx.consensus.virtual_atomic_state().canonical_hash(),
+        expected_atomic_hash,
+        "a disqualified selected-chain block with cached UTXO/Atomic data must not advance virtual state"
+    );
+}
+
+#[tokio::test]
+async fn missing_virtual_atomic_delta_is_recovered_before_revalidating_candidates() {
+    cryptix_core::log::try_init_logger("info");
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.coinbase_maturity = 0;
+            p.payload_hf_activation_daa_score = 0;
+        })
+        .build();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    for _ in 0..3 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await.assert_valid_utxo_tip();
+    }
+
+    let (funding_outpoint, funding_entry) = find_virtual_utxo_by_script(&ctx, &owner_script);
+    let tx_fee = 10_000u64;
+    let native_anchor_tx = Transaction::new(
+        TX_VERSION,
+        vec![TransactionInput::new(funding_outpoint, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(funding_entry.amount - tx_fee, owner_script.clone())],
+        0,
+        SUBNETWORK_ID_NATIVE,
+        0,
+        vec![],
+    );
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let anchor_template = ctx.build_block_template_with_transactions(vec![native_anchor_tx], 7_100, ctx.simulated_time);
+    let valid_sink = anchor_template.block.header.hash;
+    ctx.validate_and_insert_utxo_valid_block(anchor_template.block.to_immutable()).await;
+    assert_eq!(ctx.consensus.get_sink(), valid_sink);
+
+    {
+        let virtual_stores = ctx.consensus.virtual_stores();
+        let mut write = virtual_stores.write();
+        let mut corrupted = write.state.get().expect("virtual state").as_ref().clone();
+        assert!(!corrupted.atomic_diff.is_empty(), "test setup must have a non-empty virtual Atomic delta");
+        corrupted.atomic_diff = Default::default();
+        write.state.set(Arc::new(corrupted)).expect("corrupt virtual Atomic delta for regression test");
+    }
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let mined_template = ctx.build_block_template(7_101, ctx.simulated_time);
+    let mined_hash = mined_template.block.header.hash;
+    let mined_status = ctx.consensus.validate_and_insert_block(mined_template.block.to_immutable()).virtual_state_task.await.unwrap();
+    assert_eq!(
+        mined_status,
+        BlockStatus::StatusUTXOValid,
+        "template {mined_hash} built from a virtual state with a missing Atomic diff must still validate"
+    );
+    assert_eq!(ctx.consensus.get_sink(), mined_hash);
+    let valid_sink = mined_hash;
+    let expected_atomic_hash = ctx.consensus.virtual_atomic_state().canonical_hash();
+
+    for nonce in 7_101..7_104 {
+        ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+        let invalid_child = ctx.build_block_with_parents(vec![valid_sink], nonce, ctx.simulated_time);
+        let invalid_hash = invalid_child.header.hash;
+        let status = ctx.consensus.validate_and_insert_block(invalid_child.to_immutable()).virtual_state_task.await.unwrap();
+        assert_eq!(status, BlockStatus::StatusDisqualifiedFromChain);
+        assert_eq!(ctx.consensus.get_block_status(invalid_hash), Some(BlockStatus::StatusDisqualifiedFromChain));
+        assert_eq!(ctx.consensus.get_sink(), valid_sink);
+        assert_eq!(
+            ctx.consensus.virtual_atomic_state().canonical_hash(),
+            expected_atomic_hash,
+            "missing virtual Atomic delta must be repaired instead of reapplying the selected parent"
+        );
+    }
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let valid_extension = ctx.build_block_template(7_104, ctx.simulated_time);
+    let valid_extension_hash = valid_extension.block.header.hash;
+    ctx.validate_and_insert_utxo_valid_block(valid_extension.block.to_immutable()).await;
     assert_eq!(ctx.consensus.get_sink(), valid_extension_hash);
 }
 
@@ -1816,6 +2032,122 @@ async fn liquidity_consensus_e2e_create_buy_sell_claim_updates_vault_state() {
     assert_eq!(pool.pool_nonce, 4);
     assert_eq!(pool.vault_value_sompi, claim_vault_value);
     assert_eq!(pool.fee_recipients[0].unclaimed_sompi, unclaimed_before - claim_amount);
+}
+
+#[tokio::test]
+async fn mixed_atomic_and_native_templates_remain_utxo_valid_after_each_acceptance() {
+    let (mut ctx, fixture) = setup_dual_owner_liquidity_pool().await;
+    let (buy_tx, buy_token_out, _) = build_liquidity_buy_tx(
+        fixture.asset_id,
+        &fixture.pool,
+        fixture.owner_anchor,
+        fixture.owner_anchor_value,
+        &fixture.owner_script,
+        p2sh_signature_script(),
+        1,
+        10 * SOMPI_PER_CRYPTIX,
+        fixture.tx_fee,
+    );
+    let second_owner_change = fixture.second_owner_anchor_value - fixture.tx_fee;
+    let native_tx = Transaction::new(
+        TX_VERSION,
+        vec![TransactionInput::new(fixture.second_owner_anchor, p2sh_signature_script_for(&second_p2sh_redeem_script()), 0, 0)],
+        vec![TransactionOutput::new(second_owner_change, fixture.second_owner_script.clone())],
+        0,
+        SUBNETWORK_ID_NATIVE,
+        0,
+        vec![],
+    );
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let mixed_template = ctx.build_block_template_with_transactions(vec![native_tx, buy_tx.clone()], 400, ctx.simulated_time);
+    ctx.validate_and_insert_utxo_valid_block(mixed_template.block.to_immutable()).await;
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let empty_after_mixed = ctx.build_block_template(401, ctx.simulated_time);
+    ctx.validate_and_insert_utxo_valid_block(empty_after_mixed.block.to_immutable()).await;
+
+    let atomic = ctx.consensus.virtual_atomic_state();
+    let asset = atomic.assets.get(&fixture.asset_id).expect("liquidity asset should exist");
+    let pool = asset.liquidity.as_ref().expect("pool should exist");
+    assert_eq!(pool.pool_nonce, fixture.pool.pool_nonce + 1);
+    assert_eq!(balance_of(&atomic, fixture.asset_id, fixture.owner_id), fixture.launch_token_out + buy_token_out);
+
+    let owner_anchor = TransactionOutpoint::new(buy_tx.id(), 1);
+    let owner_anchor_value = buy_tx.outputs[1].value;
+    let token_in = 1u128;
+    let (_, cpay_out) = quote_sell(pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, token_in, 100);
+    let sell_tx = payload_tx(
+        vec![
+            TransactionInput::new(pool.vault_outpoint, vec![], 0, 0),
+            TransactionInput::new(owner_anchor, p2sh_signature_script(), 0, 0),
+        ],
+        vec![
+            TransactionOutput::new(pool.vault_value_sompi - cpay_out, liquidity_vault_script()),
+            TransactionOutput::new(cpay_out, fixture.owner_script.clone()),
+            TransactionOutput::new(owner_anchor_value - fixture.tx_fee, fixture.owner_script.clone()),
+        ],
+        payload_sell_liquidity(1, 2, fixture.asset_id, pool.pool_nonce, token_in, cpay_out, 1),
+    );
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let sell_template = ctx.build_block_template_with_transactions(vec![sell_tx], 402, ctx.simulated_time);
+    ctx.validate_and_insert_utxo_valid_block(sell_template.block.to_immutable()).await;
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let empty_after_sell = ctx.build_block_template(403, ctx.simulated_time);
+    ctx.validate_and_insert_utxo_valid_block(empty_after_sell.block.to_immutable()).await;
+}
+
+#[tokio::test]
+async fn same_pool_nonce_chain_across_successive_blocks_remains_utxo_valid() {
+    let (mut ctx, fixture) = setup_dual_owner_liquidity_pool().await;
+    let (buy_1, token_out_1, _) = build_liquidity_buy_tx(
+        fixture.asset_id,
+        &fixture.pool,
+        fixture.owner_anchor,
+        fixture.owner_anchor_value,
+        &fixture.owner_script,
+        p2sh_signature_script(),
+        1,
+        10 * SOMPI_PER_CRYPTIX,
+        fixture.tx_fee,
+    );
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let first_template = ctx.build_block_template_with_transactions(vec![buy_1], 404, ctx.simulated_time);
+    ctx.validate_and_insert_utxo_valid_block(first_template.block.to_immutable()).await;
+
+    let atomic_after_first = ctx.consensus.virtual_atomic_state();
+    let asset_after_first = atomic_after_first.assets.get(&fixture.asset_id).expect("liquidity asset should exist");
+    let pool_after_buy_1 = asset_after_first.liquidity.as_ref().expect("pool should exist").clone();
+    assert_eq!(pool_after_buy_1.pool_nonce, fixture.pool.pool_nonce + 1);
+    assert_eq!(balance_of(&atomic_after_first, fixture.asset_id, fixture.owner_id), fixture.launch_token_out + token_out_1);
+
+    let (buy_2, token_out_2, vault_value_2) = build_liquidity_buy_tx(
+        fixture.asset_id,
+        &pool_after_buy_1,
+        fixture.second_owner_anchor,
+        fixture.second_owner_anchor_value,
+        &fixture.second_owner_script,
+        p2sh_signature_script_for(&second_p2sh_redeem_script()),
+        1,
+        20 * SOMPI_PER_CRYPTIX,
+        fixture.tx_fee,
+    );
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let second_template = ctx.build_block_template_with_transactions(vec![buy_2.clone()], 405, ctx.simulated_time);
+    ctx.validate_and_insert_utxo_valid_block(second_template.block.to_immutable()).await;
+
+    let atomic = ctx.consensus.virtual_atomic_state();
+    let asset = atomic.assets.get(&fixture.asset_id).expect("liquidity asset should exist");
+    let pool = asset.liquidity.as_ref().expect("pool should exist");
+    assert_eq!(pool.pool_nonce, fixture.pool.pool_nonce + 2);
+    assert_eq!(pool.vault_outpoint, TransactionOutpoint::new(buy_2.id(), 0));
+    assert_eq!(pool.vault_value_sompi, vault_value_2);
+    assert_eq!(balance_of(&atomic, fixture.asset_id, fixture.owner_id), fixture.launch_token_out + token_out_1);
+    assert_eq!(balance_of(&atomic, fixture.asset_id, fixture.second_owner_id), token_out_2);
 }
 
 #[tokio::test]

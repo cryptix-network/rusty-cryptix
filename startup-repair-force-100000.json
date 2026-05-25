@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "enabled": true,
+  "name": "force-rewind-to-safe-daa-100000",
+  "triggerBlocks": [],
+  "requireTriggerBlock": false,
+  "targetDaa": 100000,
+  "markRemovedDisqualified": true,
+  "cleanupRemovedBlockData": true,
+  "dryRun": false
+}

@@ -534,6 +534,12 @@ impl VirtualStateProcessor {
                 continue;
             }
 
+            if self.statuses_store.read().get(current).unwrap() == StatusDisqualifiedFromChain {
+                // Disqualified blocks may still have cached UTXO/Atomic diffs from before
+                // disqualification. Never replay those caches into the live virtual state.
+                continue;
+            }
+
             let mut needs_recompute = true;
             match self.utxo_diffs_store.get(current) {
                 Ok(mergeset_diff) => match self.atomic_state_store.get_delta(current) {
@@ -555,11 +561,6 @@ impl VirtualStateProcessor {
                 Err(err) => panic!("unexpected error {err}"),
             }
             if !needs_recompute {
-                continue;
-            }
-
-            if self.statuses_store.read().get(current).unwrap() == StatusDisqualifiedFromChain {
-                // Current block is already known to be disqualified
                 continue;
             }
 

@@ -362,7 +362,7 @@ async fn daemon_cleaning_test() {
     cryptix_core::log::try_init_logger(
         "info,cryptix_grpc_core=trace,cryptix_grpc_server=trace,cryptix_grpc_client=trace,cryptix_core=trace",
     );
-    let args = Args { devnet: true, ..Default::default() };
+    let args = Args { simnet: true, disable_upnp: true, disable_dns_seeding: true, banserver: false, ..Default::default() };
     let consensus_manager;
     let async_runtime;
     let core;
@@ -380,9 +380,14 @@ async fn daemon_cleaning_test() {
         drop(rpc_client1);
         cryptixd1.shutdown();
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline
+        && (consensus_manager.strong_count() != 0 || async_runtime.strong_count() != 0 || core.strong_count() != 0)
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
-    assert_eq!(consensus_manager.strong_count(), 0);
-    assert_eq!(async_runtime.strong_count(), 0);
-    assert_eq!(core.strong_count(), 0);
+    assert_eq!(consensus_manager.strong_count(), 0, "consensus manager refs did not drain");
+    assert_eq!(async_runtime.strong_count(), 0, "async runtime refs did not drain");
+    assert_eq!(core.strong_count(), 0, "core refs did not drain");
 }
