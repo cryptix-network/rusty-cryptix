@@ -329,6 +329,7 @@ impl VirtualStateProcessor {
 
     pub(crate) fn resolve_virtual(self: &Arc<Self>) {
         self.repair_anchor_only_virtual_atomic_state_if_possible();
+        self.repair_virtual_state_from_selected_chain_if_inconsistent("virtual resolve");
         let pruning_point = self.pruning_point_store.read().pruning_point().unwrap();
         let virtual_read = self.virtual_stores.upgradable_read();
         let prev_state = virtual_read.state.get().unwrap();
@@ -377,6 +378,12 @@ impl VirtualStateProcessor {
         );
         let (virtual_parents, virtual_ghostdag_data) = self.pick_virtual_parents(new_sink, virtual_parent_candidates, pruning_point);
         assert_eq!(virtual_ghostdag_data.selected_parent, new_sink);
+
+        if new_sink == prev_sink && virtual_parents == prev_state.parents {
+            // A block can be processed and then disqualified without changing the selected
+            // virtual view. In that case, keep the previous virtual UTXO/Atomic state as-is.
+            return;
+        }
 
         let sink_multiset = self.utxo_multisets_store.get(new_sink).unwrap();
         let chain_path = self.dag_traversal_manager.calculate_chain_path(prev_sink, new_sink, None);
@@ -1318,6 +1325,118 @@ impl VirtualStateProcessor {
         }
     }
 
+    fn virtual_states_match_consensus_commitment_parts(current: &VirtualState, recalculated: &VirtualState) -> bool {
+        current.parents == recalculated.parents
+            && current.ghostdag_data.selected_parent == recalculated.ghostdag_data.selected_parent
+            && current.ghostdag_data.blue_score == recalculated.ghostdag_data.blue_score
+            && current.ghostdag_data.blue_work == recalculated.ghostdag_data.blue_work
+            && current.daa_score == recalculated.daa_score
+            && current.bits == recalculated.bits
+            && current.past_median_time == recalculated.past_median_time
+            && current.multiset.clone().finalize() == recalculated.multiset.clone().finalize()
+            && current.utxo_diff == recalculated.utxo_diff
+            && current.accepted_tx_ids == recalculated.accepted_tx_ids
+            && current.mergeset_non_daa == recalculated.mergeset_non_daa
+            && current.atomic_state.canonical_hash() == recalculated.atomic_state.canonical_hash()
+            && current.atomic_diff == recalculated.atomic_diff
+    }
+
+    fn repair_virtual_state_from_selected_chain_if_inconsistent(&self, reason: &str) {
+        let virtual_read = self.virtual_stores.upgradable_read();
+        let Ok(virtual_state) = virtual_read.state.get() else {
+            return;
+        };
+
+        let selected_parent = virtual_state.ghostdag_data.selected_parent;
+        let Ok(selected_parent_multiset) = self.utxo_multisets_store.get(selected_parent) else {
+            return;
+        };
+
+        let expected_root = virtual_state.atomic_state.root_accumulator();
+        let can_attach_current = match self.atomic_state_store.read_current_root() {
+            Ok(Some(actual)) => actual == expected_root,
+            Ok(None) => expected_root == AtomicConsensusRootAccumulator::default(),
+            Err(_) => false,
+        };
+        let self_consistent = if can_attach_current {
+            let mut rollback_diff = virtual_state.utxo_diff.clone().to_reversed();
+            let mut rollback_atomic = self.atomic_state_store.attach_virtual_state(&virtual_state.atomic_state);
+            rollback_atomic
+                .apply_delta_rollback(&virtual_state.atomic_diff)
+                .ok()
+                .and_then(|_| {
+                    self.calculate_virtual_state(
+                        &virtual_read,
+                        virtual_state.parents.clone(),
+                        virtual_state.ghostdag_data.clone(),
+                        selected_parent_multiset.clone(),
+                        &mut rollback_diff,
+                        rollback_atomic,
+                    )
+                    .ok()
+                })
+                .is_some_and(|recalculated| Self::virtual_states_match_consensus_commitment_parts(&virtual_state, &recalculated))
+        } else {
+            false
+        };
+
+        if self_consistent {
+            return;
+        }
+
+        let (tip_index, tip_hash) = match self.selected_chain_store.read().get_tip() {
+            Ok(tip) => tip,
+            Err(err) => {
+                warn!("Virtual Atomic self-repair skipped before {reason}: selected-chain tip unavailable: {err}");
+                return;
+            }
+        };
+        if tip_hash != selected_parent {
+            warn!(
+                "Virtual Atomic self-repair skipped before {reason}: selected-chain tip {} does not match virtual selected parent {}",
+                tip_hash, selected_parent
+            );
+            return;
+        }
+
+        let selected_parent_atomic_state = match self.atomic_state_for_selected_chain_prefix(tip_index, tip_hash) {
+            Ok(state) => state,
+            Err(err) => {
+                warn!("Virtual Atomic self-repair skipped before {reason}: cannot reconstruct selected-parent Atomic prefix: {err}");
+                return;
+            }
+        };
+
+        let mut accumulated_diff = virtual_state.utxo_diff.clone().to_reversed();
+        let repaired = match self.calculate_virtual_state(
+            &virtual_read,
+            virtual_state.parents.clone(),
+            virtual_state.ghostdag_data.clone(),
+            selected_parent_multiset,
+            &mut accumulated_diff,
+            selected_parent_atomic_state,
+        ) {
+            Ok(state) => state,
+            Err(err) => {
+                warn!("Virtual Atomic self-repair skipped before {reason}: recalculation failed: {err}");
+                return;
+            }
+        };
+
+        if Self::virtual_states_match_consensus_commitment_parts(&virtual_state, &repaired) {
+            return;
+        }
+
+        warn!(
+            "Repairing inconsistent virtual UTXO/Atomic state before {}: selected_parent={}, old_root={}, new_root={}",
+            reason,
+            selected_parent,
+            faster_hex::hex_string(&virtual_state.atomic_state.canonical_hash()),
+            faster_hex::hex_string(&repaired.atomic_state.canonical_hash())
+        );
+        self.commit_virtual_state(virtual_read, repaired, &accumulated_diff, &ChainPath::default());
+    }
+
     fn ensure_virtual_parents_are_template_safe(&self, virtual_state: &VirtualState) -> Result<(), RuleError> {
         let selected_parent = virtual_state.ghostdag_data.selected_parent;
         let selected_parent_status = self.statuses_store.read().get(selected_parent).unwrap();
@@ -1908,6 +2027,7 @@ impl VirtualStateProcessor {
         // We call for the initial tx batch before acquiring the virtual read lock,
         // optimizing for the common case where all txs are valid. Following selection calls
         // are called within the lock in order to preserve validness of already validated txs
+        self.repair_virtual_state_from_selected_chain_if_inconsistent("block template build");
         let mut txs = tx_selector.select_transactions();
         let mut calculated_fees = Vec::with_capacity(txs.len());
         let virtual_read = self.virtual_stores.read();

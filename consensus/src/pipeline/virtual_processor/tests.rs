@@ -2100,6 +2100,149 @@ async fn mixed_atomic_and_native_templates_remain_utxo_valid_after_each_acceptan
 }
 
 #[tokio::test]
+async fn local_miner_extends_mixed_relay_block_with_valid_empty_templates() {
+    let (mut ctx, fixture) = setup_dual_owner_liquidity_pool().await;
+    let local_miner_data = ctx.miner_data.clone();
+    let relay_miner_data = new_miner_data();
+    ctx.miner_data = relay_miner_data;
+
+    let (buy_tx, _, _) = build_liquidity_buy_tx(
+        fixture.asset_id,
+        &fixture.pool,
+        fixture.owner_anchor,
+        fixture.owner_anchor_value,
+        &fixture.owner_script,
+        p2sh_signature_script(),
+        1,
+        10 * SOMPI_PER_CRYPTIX,
+        fixture.tx_fee,
+    );
+    let native_tx = Transaction::new(
+        TX_VERSION,
+        vec![TransactionInput::new(fixture.second_owner_anchor, p2sh_signature_script_for(&second_p2sh_redeem_script()), 0, 0)],
+        vec![TransactionOutput::new(fixture.second_owner_anchor_value - fixture.tx_fee, fixture.second_owner_script.clone())],
+        0,
+        SUBNETWORK_ID_NATIVE,
+        0,
+        vec![],
+    );
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let relayed_mixed = ctx.build_block_template_with_transactions(vec![native_tx, buy_tx], 4_300, ctx.simulated_time);
+    ctx.validate_and_insert_utxo_valid_block(relayed_mixed.block.to_immutable()).await;
+
+    ctx.miner_data = local_miner_data;
+    for nonce in 4_301..4_304 {
+        ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+        let local_empty = ctx.build_block_template(nonce, ctx.simulated_time);
+        ctx.validate_and_insert_utxo_valid_block(local_empty.block.to_immutable()).await;
+    }
+}
+
+#[tokio::test]
+async fn template_build_repairs_stale_virtual_atomic_state_after_mixed_block() {
+    let (mut ctx, fixture) = setup_dual_owner_liquidity_pool().await;
+    let stale_atomic = {
+        let virtual_stores = ctx.consensus.virtual_stores();
+        let read = virtual_stores.read();
+        let state = read.state.get().expect("virtual state before mixed block");
+        (state.atomic_state.clone(), state.atomic_diff.clone())
+    };
+
+    let (buy_tx, _, _) = build_liquidity_buy_tx(
+        fixture.asset_id,
+        &fixture.pool,
+        fixture.owner_anchor,
+        fixture.owner_anchor_value,
+        &fixture.owner_script,
+        p2sh_signature_script(),
+        1,
+        10 * SOMPI_PER_CRYPTIX,
+        fixture.tx_fee,
+    );
+    let native_tx = Transaction::new(
+        TX_VERSION,
+        vec![TransactionInput::new(fixture.second_owner_anchor, p2sh_signature_script_for(&second_p2sh_redeem_script()), 0, 0)],
+        vec![TransactionOutput::new(fixture.second_owner_anchor_value - fixture.tx_fee, fixture.second_owner_script.clone())],
+        0,
+        SUBNETWORK_ID_NATIVE,
+        0,
+        vec![],
+    );
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let mixed_template = ctx.build_block_template_with_transactions(vec![native_tx, buy_tx], 4_400, ctx.simulated_time);
+    ctx.validate_and_insert_utxo_valid_block(mixed_template.block.to_immutable()).await;
+    let expected_atomic_hash = ctx.consensus.virtual_atomic_state().canonical_hash();
+
+    {
+        let virtual_stores = ctx.consensus.virtual_stores();
+        let mut write = virtual_stores.write();
+        let mut corrupted = write.state.get().expect("virtual state after mixed block").as_ref().clone();
+        corrupted.atomic_state = stale_atomic.0;
+        corrupted.atomic_diff = stale_atomic.1;
+        write.state.set(Arc::new(corrupted)).expect("corrupt virtual atomic state for regression test");
+    }
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let empty_after_corruption = ctx.build_block_template(4_401, ctx.simulated_time);
+    assert_eq!(
+        ctx.consensus.virtual_atomic_state().canonical_hash(),
+        expected_atomic_hash,
+        "template building must repair a stale virtual Atomic root before serving miners"
+    );
+    ctx.validate_and_insert_utxo_valid_block(empty_after_corruption.block.to_immutable()).await;
+}
+
+#[tokio::test]
+async fn invalid_template_shaped_child_does_not_reapply_virtual_atomic_delta() {
+    let (mut ctx, fixture) = setup_dual_owner_liquidity_pool().await;
+    let (buy_tx, _, _) = build_liquidity_buy_tx(
+        fixture.asset_id,
+        &fixture.pool,
+        fixture.owner_anchor,
+        fixture.owner_anchor_value,
+        &fixture.owner_script,
+        p2sh_signature_script(),
+        1,
+        10 * SOMPI_PER_CRYPTIX,
+        fixture.tx_fee,
+    );
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let mixed_template = ctx.build_block_template_with_transactions(vec![buy_tx], 4_500, ctx.simulated_time);
+    ctx.validate_and_insert_utxo_valid_block(mixed_template.block.to_immutable()).await;
+    let selected_parent = ctx.consensus.get_sink();
+    let expected_atomic_hash = ctx.consensus.virtual_atomic_state().canonical_hash();
+
+    for nonce in 4_501..4_504 {
+        ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+        let mut invalid_template = ctx.build_block_template(nonce, ctx.simulated_time);
+        assert_eq!(invalid_template.selected_parent_hash, selected_parent);
+        invalid_template.block.header.utxo_commitment = Hash::from_bytes([nonce as u8; 32]);
+        invalid_template.block.header.finalize();
+        let invalid_hash = invalid_template.block.header.hash;
+        let status = ctx
+            .consensus
+            .validate_and_insert_block(invalid_template.block.to_immutable())
+            .virtual_state_task
+            .await
+            .unwrap();
+        assert_eq!(status, BlockStatus::StatusDisqualifiedFromChain);
+        assert_eq!(
+            ctx.consensus.virtual_atomic_state().canonical_hash(),
+            expected_atomic_hash,
+            "disqualified template-shaped child {invalid_hash} must not advance or reapply virtual Atomic state"
+        );
+        assert_eq!(ctx.consensus.get_sink(), selected_parent);
+    }
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let valid_extension = ctx.build_block_template(4_504, ctx.simulated_time);
+    ctx.validate_and_insert_utxo_valid_block(valid_extension.block.to_immutable()).await;
+}
+
+#[tokio::test]
 async fn same_pool_nonce_chain_across_successive_blocks_remains_utxo_valid() {
     let (mut ctx, fixture) = setup_dual_owner_liquidity_pool().await;
     let (buy_1, token_out_1, _) = build_liquidity_buy_tx(
