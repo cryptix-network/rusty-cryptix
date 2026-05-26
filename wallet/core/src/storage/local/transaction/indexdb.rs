@@ -94,7 +94,7 @@ pub struct Inner {
 impl Inner {
     async fn open_db(&self, db_name: String) -> Result<IdbDatabase> {
         call_async_no_send!(async move {
-            let mut db_req: OpenDbRequest = IdbDatabase::open_u32(&db_name, 2)
+            let mut db_req: OpenDbRequest = IdbDatabase::open_u32(&db_name, 3)
                 .map_err(|err| Error::Custom(format!("Failed to open indexdb database {:?}", err)))?;
             let fix_timestamp = Arc::new(Mutex::new(false));
             let fix_timestamp_clone = fix_timestamp.clone();
@@ -102,27 +102,56 @@ impl Inner {
                 let old_version = evt.old_version();
                 if old_version < 1.0 {
                     let object_store = evt.db().create_object_store(TRANSACTIONS_STORE_NAME)?;
-                    let db_index_params = IdbIndexParameters::new();
-                    db_index_params.set_unique(true);
+
+                    let unique_index_params = IdbIndexParameters::new();
+                    unique_index_params.set_unique(true);
                     object_store.create_index_with_params(
                         TRANSACTIONS_STORE_ID_INDEX,
                         &IdbKeyPath::str(TRANSACTIONS_STORE_ID_INDEX),
-                        &db_index_params,
+                        &unique_index_params,
                     )?;
+
+                    let non_unique_index_params = IdbIndexParameters::new();
+                    non_unique_index_params.set_unique(false);
                     object_store.create_index_with_params(
                         TRANSACTIONS_STORE_TIMESTAMP_INDEX,
                         &IdbKeyPath::str(TRANSACTIONS_STORE_TIMESTAMP_INDEX),
-                        &db_index_params,
+                        &non_unique_index_params,
                     )?;
                     object_store.create_index_with_params(
                         TRANSACTIONS_STORE_DATA_INDEX,
                         &IdbKeyPath::str(TRANSACTIONS_STORE_DATA_INDEX),
-                        &db_index_params,
+                        &non_unique_index_params,
                     )?;
 
                 // these changes are not required for new db
                 } else if old_version < 2.0 {
                     *fix_timestamp_clone.lock().unwrap() = true;
+                }
+
+                if old_version >= 1.0 && old_version < 3.0 {
+                    let upgrade_tx = evt.transaction();
+                    let object_store = upgrade_tx.object_store(TRANSACTIONS_STORE_NAME)?;
+                    let index_names = object_store.index_names().collect::<Vec<_>>();
+                    if index_names.iter().any(|name| name == TRANSACTIONS_STORE_TIMESTAMP_INDEX) {
+                        object_store.delete_index(TRANSACTIONS_STORE_TIMESTAMP_INDEX)?;
+                    }
+                    if index_names.iter().any(|name| name == TRANSACTIONS_STORE_DATA_INDEX) {
+                        object_store.delete_index(TRANSACTIONS_STORE_DATA_INDEX)?;
+                    }
+
+                    let non_unique_index_params = IdbIndexParameters::new();
+                    non_unique_index_params.set_unique(false);
+                    object_store.create_index_with_params(
+                        TRANSACTIONS_STORE_TIMESTAMP_INDEX,
+                        &IdbKeyPath::str(TRANSACTIONS_STORE_TIMESTAMP_INDEX),
+                        &non_unique_index_params,
+                    )?;
+                    object_store.create_index_with_params(
+                        TRANSACTIONS_STORE_DATA_INDEX,
+                        &IdbKeyPath::str(TRANSACTIONS_STORE_DATA_INDEX),
+                        &non_unique_index_params,
+                    )?;
                 }
                 // // Check if the object store exists; create it if it doesn't
                 // if !evt.db().object_store_names().any(|n| n == TRANSACTIONS_STORE_NAME) {
