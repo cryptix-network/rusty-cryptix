@@ -125,6 +125,9 @@ pub fn validate_args(args: &Args) -> ConfigResult<()> {
     if matches!(args.atomic_bootstrap_peer_quorum_min_sources, Some(0)) {
         return Err(ConfigError::AtomicBootstrapPeerQuorumMinSourcesOutOfRange);
     }
+    if args.atomic_health_audit_interval_minutes == 0 {
+        return Err(ConfigError::AtomicHealthAuditIntervalMinutesOutOfRange);
+    }
     Ok(())
 }
 
@@ -305,6 +308,14 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     info!("Payload HF activation DAA score: {}", config.params.payload_hf_activation_daa_score);
     info!("Cryptix Atomic Token: ENABLED (storage v2)");
     info!("Cryptix Atomic bootstrap worker: ENABLED; configured peer overrides: {}", args.atomic_bootstrap_peers.len());
+    if args.disable_atomic_health_audit {
+        info!("Cryptix Atomic periodic P2P health audit: DISABLED");
+    } else {
+        info!(
+            "Cryptix Atomic periodic P2P health audit: ENABLED; interval={} minute(s), DAA rendezvous lag=60 block(s)",
+            args.atomic_health_audit_interval_minutes
+        );
+    }
     let atomic_bootstrap_seed_confirmed_non_seed_min_sources =
         args.atomic_bootstrap_peer_quorum_min_sources.unwrap_or(ATOMIC_BOOTSTRAP_DEFAULT_SEED_CONFIRMED_NON_SEED_SOURCES);
     let atomic_bootstrap_peer_only_non_seed_min_sources =
@@ -601,6 +612,8 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
             atomic_db_dir.clone(),
             args.atomic_bootstrap_allow_peer_fallback,
             args.atomic_bootstrap_peer_quorum_min_sources,
+            !args.disable_atomic_health_audit,
+            args.atomic_health_audit_interval_minutes,
         )
         .unwrap_or_else(|err| {
             eprintln!("{err}");

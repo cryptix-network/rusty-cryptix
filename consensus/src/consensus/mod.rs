@@ -776,6 +776,10 @@ impl ConsensusApi for Consensus {
         self.virtual_processor.get_atomic_state_hash(block_hash)
     }
 
+    fn get_atomic_p2p_token_audit_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {
+        self.virtual_processor.get_atomic_p2p_token_audit_hash(block_hash)
+    }
+
     fn import_pruning_point_utxo_set(&self, new_pruning_point: Hash, imported_utxo_multiset: MuHash) -> PruningImportResult<()> {
         self.virtual_processor.import_pruning_point_utxo_set(new_pruning_point, imported_utxo_multiset)
     }

@@ -3062,6 +3062,73 @@ impl VirtualStateProcessor {
         }
     }
 
+    pub fn get_atomic_p2p_token_audit_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {
+        let expected_state_hash = match self.atomic_state_store.get_root_record(block_hash) {
+            Ok(root) => root.state_hash,
+            Err(StoreError::KeyNotFound(_)) => return Ok(None),
+            Err(_) => return Err(ConsensusError::General("failed reading atomic consensus root")),
+        };
+
+        match self.materialize_selected_chain_atomic_state_at(block_hash, expected_state_hash) {
+            Ok(Some(state)) => Ok(state.p2p_token_audit_hash()),
+            Ok(None) => Ok(None),
+            Err(err) => {
+                warn!("failed materializing Atomic P2P token audit state for `{block_hash}`: {err}");
+                Err(ConsensusError::General("failed materializing atomic p2p token audit state"))
+            }
+        }
+    }
+
+    fn materialize_selected_chain_atomic_state_at(
+        &self,
+        target_hash: Hash,
+        expected_state_hash: [u8; 32],
+    ) -> Result<Option<AtomicConsensusState>, String> {
+        let virtual_state = self.virtual_stores.read().state.get().map_err(|err| format!("virtual state unavailable: {err}"))?;
+        let mut state = self
+            .atomic_state_store
+            .materialize_current_state(&virtual_state.atomic_state)
+            .map_err(|err| format!("current Atomic state unavailable: {err}"))?;
+        state
+            .apply_delta_rollback(&virtual_state.atomic_diff)
+            .map_err(|err| format!("failed rolling back virtual Atomic diff: {err}"))?;
+
+        let selected_chain_read = self.selected_chain_store.read();
+        let (tip_index, _) = selected_chain_read.get_tip().map_err(|err| format!("selected-chain tip unavailable: {err}"))?;
+        let target_index = match selected_chain_read.get_by_hash(target_hash) {
+            Ok(index) => index,
+            Err(StoreError::KeyNotFound(_)) => return Ok(None),
+            Err(err) => return Err(format!("selected-chain hash `{target_hash}` unavailable: {err}")),
+        };
+        if target_index > tip_index {
+            return Ok(None);
+        }
+
+        for index in ((target_index + 1)..=tip_index).rev() {
+            let block_hash =
+                selected_chain_read.get_by_index(index).map_err(|err| format!("selected-chain index `{index}` unavailable: {err}"))?;
+            let delta = self
+                .atomic_state_store
+                .get_delta(block_hash)
+                .map_err(|err| format!("Atomic delta for selected-chain block `{block_hash}` unavailable: {err}"))?;
+            state
+                .apply_delta_rollback(delta.as_ref())
+                .map_err(|err| format!("failed rolling back Atomic delta for selected-chain block `{block_hash}`: {err}"))?;
+        }
+        drop(selected_chain_read);
+
+        let actual_state_hash = state.canonical_hash();
+        if actual_state_hash != expected_state_hash {
+            return Err(format!(
+                "materialized Atomic root mismatch for `{target_hash}`: expected {}, got {}",
+                faster_hex::hex_string(&expected_state_hash),
+                faster_hex::hex_string(&actual_state_hash)
+            ));
+        }
+
+        Ok(Some(state))
+    }
+
     pub fn are_pruning_points_violating_finality(&self, pp_list: PruningPointsList) -> bool {
         // Ideally we would want to check if the last known pruning point has the finality point
         // in its chain, but in some cases it's impossible: let `lkp` be the last known pruning

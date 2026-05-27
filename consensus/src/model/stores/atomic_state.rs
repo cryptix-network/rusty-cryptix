@@ -34,6 +34,14 @@ const ATOMIC_ROOT_NAMESPACE_NONCE: u8 = b'n';
 const ATOMIC_ROOT_NAMESPACE_ASSET: u8 = b'a';
 const ATOMIC_ROOT_NAMESPACE_BALANCE: u8 = b'b';
 const ATOMIC_ROOT_NAMESPACE_ANCHOR: u8 = b'c';
+const ATOMIC_P2P_ROOT_BUCKETS: usize = 4096;
+const ATOMIC_P2P_ROOT_LEAF_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_V2_LEAF";
+const ATOMIC_P2P_ROOT_BUCKET_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_V2_BUCKETED_ROOT";
+const ATOMIC_P2P_ROOT_BUCKET_INDEX_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_V2_BUCKET_INDEX";
+const ATOMIC_P2P_ASSET_ROOT_V1: &[u8] = b"CAT_ASSET_P2P_AUDIT_ROOT_V1";
+const ATOMIC_P2P_LOGICAL_ASSET: u8 = 0x01;
+const ATOMIC_P2P_LOGICAL_BALANCE: u8 = 0x02;
+const ATOMIC_P2P_LOGICAL_NONCE: u8 = 0x03;
 pub const ATOMIC_CURRENT_TOKEN_VERSION: u8 = 1;
 pub const ATOMIC_CURRENT_LIQUIDITY_CURVE_VERSION: u8 = 1;
 pub const ATOMIC_LIQUIDITY_CURVE_MODE_BASIC: u8 = 0;
@@ -1097,6 +1105,13 @@ impl AtomicConsensusState {
         self.root_accumulator().hash()
     }
 
+    pub fn p2p_token_audit_hash(&self) -> Option<[u8; 32]> {
+        if self.is_root_only() || self.is_disk_backed() {
+            return None;
+        }
+        Some(compute_p2p_token_audit_hash(self))
+    }
+
     pub fn header_commitment(utxo_commitment: Hash, atomic_state_hash: [u8; 32], payload_hf_active: bool) -> Hash {
         if !payload_hf_active {
             return utxo_commitment;
@@ -1576,6 +1591,153 @@ fn hash_liquidity_pool(hasher: &mut blake2b_simd::State, pool: &AtomicLiquidityP
 fn hash_outpoint(hasher: &mut blake2b_simd::State, outpoint: TransactionOutpoint) {
     hasher.update(&outpoint.transaction_id.as_bytes());
     hash_u32(hasher, outpoint.index);
+}
+
+fn compute_p2p_token_audit_hash(state: &AtomicConsensusState) -> [u8; 32] {
+    let mut buckets = [[0u8; 32]; ATOMIC_P2P_ROOT_BUCKETS];
+
+    let mut asset_ids = state.assets.keys().copied().collect::<Vec<_>>();
+    asset_ids.sort_unstable();
+    for asset_id in asset_ids {
+        if let Some(asset) = state.assets.get(&asset_id) {
+            apply_p2p_root_leaf(&mut buckets, &p2p_logical_asset_key(&asset_id), &p2p_asset_value(&asset_id, asset));
+        }
+    }
+
+    let mut balance_keys = state.balances.keys().copied().collect::<Vec<_>>();
+    balance_keys.sort_unstable();
+    for key in balance_keys {
+        if let Some(amount) = state.balances.get(&key).copied().filter(|amount| *amount > 0) {
+            apply_p2p_root_leaf(&mut buckets, &p2p_logical_balance_key(&key), &amount.to_le_bytes());
+        }
+    }
+
+    let mut nonce_keys = state.next_nonces.keys().copied().collect::<Vec<_>>();
+    nonce_keys.sort_unstable();
+    for key in nonce_keys {
+        if let Some(nonce) = state.next_nonces.get(&key).copied().filter(|nonce| *nonce != 1) {
+            apply_p2p_root_leaf(&mut buckets, &p2p_logical_nonce_key(&key), &nonce.to_le_bytes());
+        }
+    }
+
+    p2p_root_from_buckets(&buckets)
+}
+
+fn p2p_logical_asset_key(asset_id: &[u8; 32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(33);
+    key.push(ATOMIC_P2P_LOGICAL_ASSET);
+    key.extend_from_slice(asset_id);
+    key
+}
+
+fn p2p_logical_balance_key(key: &AtomicBalanceKey) -> Vec<u8> {
+    let mut logical = Vec::with_capacity(65);
+    logical.push(ATOMIC_P2P_LOGICAL_BALANCE);
+    logical.extend_from_slice(&key.asset_id);
+    logical.extend_from_slice(&key.owner_id);
+    logical
+}
+
+fn p2p_logical_nonce_key(key: &AtomicNonceKey) -> Vec<u8> {
+    let mut logical = Vec::with_capacity(66);
+    logical.push(ATOMIC_P2P_LOGICAL_NONCE);
+    logical.extend_from_slice(&key.owner_id);
+    logical.push(key.scope_kind);
+    logical.extend_from_slice(&key.scope_id);
+    logical
+}
+
+fn p2p_asset_value(asset_id: &[u8; 32], asset: &AtomicAssetState) -> Vec<u8> {
+    let mut out = Vec::with_capacity(192 + asset.platform_tag.len());
+    out.extend_from_slice(ATOMIC_P2P_ASSET_ROOT_V1);
+    out.extend_from_slice(asset_id);
+    out.push(atomic_asset_class_to_u8(asset.asset_class));
+    out.push(asset.token_version);
+    out.extend_from_slice(&asset.mint_authority_owner_id);
+    out.push(atomic_supply_mode_to_u8(asset.supply_mode));
+    out.extend_from_slice(&asset.max_supply.to_le_bytes());
+    out.extend_from_slice(&asset.total_supply.to_le_bytes());
+    p2p_push_bytes(&mut out, &asset.platform_tag);
+    match asset.liquidity.as_ref() {
+        Some(pool) => {
+            out.push(1);
+            p2p_append_liquidity(&mut out, pool);
+        }
+        None => out.push(0),
+    }
+    out
+}
+
+fn p2p_append_liquidity(out: &mut Vec<u8>, pool: &AtomicLiquidityPoolState) {
+    out.extend_from_slice(&pool.pool_nonce.to_le_bytes());
+    out.push(pool.curve_version);
+    out.push(pool.curve_mode);
+    out.extend_from_slice(&pool.individual_virtual_cpay_reserves_sompi.to_le_bytes());
+    out.extend_from_slice(&pool.individual_virtual_token_multiplier_bps.to_le_bytes());
+    out.extend_from_slice(&pool.real_cpay_reserves_sompi.to_le_bytes());
+    out.extend_from_slice(&pool.real_token_reserves.to_le_bytes());
+    out.extend_from_slice(&pool.virtual_cpay_reserves_sompi.to_le_bytes());
+    out.extend_from_slice(&pool.virtual_token_reserves.to_le_bytes());
+    out.extend_from_slice(&pool.unclaimed_fee_total_sompi.to_le_bytes());
+    out.extend_from_slice(&pool.fee_bps.to_le_bytes());
+    out.extend_from_slice(&(pool.fee_recipients.len() as u64).to_le_bytes());
+    for recipient in pool.fee_recipients.iter() {
+        out.extend_from_slice(&recipient.owner_id);
+        out.push(recipient.address_version);
+        p2p_push_bytes(out, &recipient.address_payload);
+        out.extend_from_slice(&recipient.unclaimed_sompi.to_le_bytes());
+    }
+    out.extend_from_slice(&pool.vault_outpoint.transaction_id.as_bytes());
+    out.extend_from_slice(&pool.vault_outpoint.index.to_le_bytes());
+    out.extend_from_slice(&pool.vault_value_sompi.to_le_bytes());
+    out.extend_from_slice(&pool.unlock_target_sompi.to_le_bytes());
+    out.push(u8::from(pool.unlocked));
+}
+
+fn p2p_push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+fn apply_p2p_root_leaf(buckets: &mut [[u8; 32]; ATOMIC_P2P_ROOT_BUCKETS], logical_key: &[u8], value: &[u8]) {
+    let leaf_hash = p2p_root_leaf_hash(logical_key, value);
+    let bucket_index = p2p_root_bucket_index(logical_key);
+    xor_hash_in_place(&mut buckets[bucket_index], &leaf_hash);
+}
+
+fn p2p_root_leaf_hash(logical_key: &[u8], value: &[u8]) -> [u8; 32] {
+    let mut hasher = Blake2bParams::new().hash_length(32).to_state();
+    hasher.update(ATOMIC_P2P_ROOT_LEAF_DOMAIN);
+    hasher.update(&(logical_key.len() as u64).to_le_bytes());
+    hasher.update(logical_key);
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_bytes());
+    out
+}
+
+fn p2p_root_bucket_index(logical_key: &[u8]) -> usize {
+    let mut hasher = Blake2bParams::new().hash_length(32).to_state();
+    hasher.update(ATOMIC_P2P_ROOT_BUCKET_INDEX_DOMAIN);
+    hasher.update(logical_key);
+    let digest = hasher.finalize();
+    let bytes = digest.as_bytes();
+    (((bytes[0] as usize) << 4) | ((bytes[1] as usize) >> 4)) & (ATOMIC_P2P_ROOT_BUCKETS - 1)
+}
+
+fn p2p_root_from_buckets(buckets: &[[u8; 32]; ATOMIC_P2P_ROOT_BUCKETS]) -> [u8; 32] {
+    let mut hasher = Blake2bParams::new().hash_length(32).to_state();
+    hasher.update(ATOMIC_P2P_ROOT_BUCKET_DOMAIN);
+    hasher.update(&(ATOMIC_P2P_ROOT_BUCKETS as u64).to_le_bytes());
+    for bucket in buckets {
+        hasher.update(bucket);
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_bytes());
+    out
 }
 
 fn atomic_asset_class_to_u8(value: AtomicAssetClass) -> u8 {
@@ -2579,6 +2741,14 @@ mod tests {
         Hash::from_bytes([byte; 32])
     }
 
+    fn seq_bytes32(start: u8) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (index, byte) in out.iter_mut().enumerate() {
+            *byte = start.wrapping_add(index as u8);
+        }
+        out
+    }
+
     fn u128_from_words(hi: u64, lo: u64) -> u128 {
         ((hi as u128) << 64) | lo as u128
     }
@@ -2712,6 +2882,122 @@ mod tests {
         let commitment_b = AtomicConsensusState::header_commitment(utxo_commitment, atomic_hash_b, true);
         assert_ne!(commitment_a, utxo_commitment);
         assert_ne!(commitment_a, commitment_b);
+    }
+
+    #[test]
+    fn p2p_token_audit_hash_matches_go_complex_vector() {
+        let asset_a = seq_bytes32(0x10);
+        let asset_b = seq_bytes32(0x40);
+        let owner_a = seq_bytes32(0x70);
+        let owner_b = seq_bytes32(0x90);
+        let creator_a = seq_bytes32(0xB0);
+        let creator_b = seq_bytes32(0xC0);
+        let authority_a = seq_bytes32(0xD0);
+        let recipient_a = seq_bytes32(0xE0);
+        let recipient_b = seq_bytes32(0xF0);
+        let created_a = seq_bytes32(0x21);
+        let created_b = seq_bytes32(0x31);
+        let vault_txid = Hash::from_bytes(seq_bytes32(0x55));
+
+        let mut state = AtomicConsensusState::default();
+        state.assets.insert(
+            asset_a,
+            AtomicAssetState {
+                creator_owner_id: creator_a,
+                asset_class: AtomicAssetClass::Standard,
+                token_version: ATOMIC_CURRENT_TOKEN_VERSION,
+                mint_authority_owner_id: authority_a,
+                decimals: 8,
+                supply_mode: AtomicSupplyMode::Capped,
+                max_supply: 9_000_000,
+                total_supply: 1_234_567,
+                name: b"VectorToken".to_vec(),
+                symbol: b"VEC".to_vec(),
+                metadata: vec![0x01, 0x02, 0x03, 0x04],
+                platform_tag: b"audit-v1".to_vec(),
+                created_block_hash: Some(created_a),
+                created_daa_score: Some(12_345),
+                created_at: Some(1_779_700_001),
+                liquidity: None,
+            },
+        );
+        state.assets.insert(
+            asset_b,
+            AtomicAssetState {
+                creator_owner_id: creator_b,
+                asset_class: AtomicAssetClass::Liquidity,
+                token_version: ATOMIC_CURRENT_TOKEN_VERSION,
+                mint_authority_owner_id: [0u8; 32],
+                decimals: 6,
+                supply_mode: AtomicSupplyMode::Capped,
+                max_supply: 2_000_000,
+                total_supply: 777_000,
+                name: b"LiquidityVector".to_vec(),
+                symbol: b"LVEC".to_vec(),
+                metadata: vec![0xAA, 0xBB, 0xCC],
+                platform_tag: b"pool-v2".to_vec(),
+                created_block_hash: Some(created_b),
+                created_daa_score: Some(12_678),
+                created_at: Some(1_779_700_999),
+                liquidity: Some(AtomicLiquidityPoolState {
+                    pool_nonce: 44,
+                    curve_version: ATOMIC_CURRENT_LIQUIDITY_CURVE_VERSION,
+                    curve_mode: ATOMIC_LIQUIDITY_CURVE_MODE_INDIVIDUAL,
+                    individual_virtual_cpay_reserves_sompi: 12_000,
+                    individual_virtual_token_multiplier_bps: 150,
+                    real_cpay_reserves_sompi: 9_876_543,
+                    real_token_reserves: 123_456,
+                    virtual_cpay_reserves_sompi: 10_000_000,
+                    virtual_token_reserves: 654_321,
+                    unclaimed_fee_total_sompi: 333,
+                    fee_bps: 25,
+                    fee_recipients: vec![
+                        AtomicLiquidityFeeRecipientState {
+                            owner_id: recipient_a,
+                            address_version: 0,
+                            address_payload: vec![0x10, 0x11],
+                            unclaimed_sompi: 7,
+                        },
+                        AtomicLiquidityFeeRecipientState {
+                            owner_id: recipient_b,
+                            address_version: 1,
+                            address_payload: vec![0x20, 0x21, 0x22],
+                            unclaimed_sompi: 11,
+                        },
+                    ],
+                    vault_outpoint: TransactionOutpoint::new(vault_txid, 3),
+                    vault_value_sompi: 8_888,
+                    unlock_target_sompi: 99_999,
+                    unlocked: false,
+                }),
+            },
+        );
+        state.balances.insert(AtomicBalanceKey { asset_id: asset_a, owner_id: owner_a }, 555);
+        state.balances.insert(AtomicBalanceKey { asset_id: asset_a, owner_id: owner_b }, 777);
+        state.balances.insert(AtomicBalanceKey { asset_id: asset_b, owner_id: owner_a }, 999);
+        state.balances.insert(AtomicBalanceKey { asset_id: asset_b, owner_id: owner_b }, 0);
+        state.next_nonces.insert(AtomicNonceKey::owner(owner_a), 4);
+        state.next_nonces.insert(AtomicNonceKey::asset(owner_a, asset_a), 6);
+        state.next_nonces.insert(AtomicNonceKey::asset(owner_b, asset_b), 1);
+        state.anchor_counts.insert(owner_a, 3);
+        state.anchor_counts.insert(owner_b, 5);
+
+        let audit_root = state.p2p_token_audit_hash().expect("full state is auditable");
+        assert_eq!(faster_hex::hex_string(&audit_root), "d61e226e9ea824488ff7462e334115a9e5293b4576d58813056dfcc1159f9f92");
+
+        let mut anchor_changed = state.clone();
+        anchor_changed.anchor_counts.insert(owner_a, 99);
+        assert_eq!(anchor_changed.p2p_token_audit_hash(), Some(audit_root));
+
+        let mut metadata_changed = state.clone();
+        metadata_changed.assets.get_mut(&asset_a).expect("asset A").metadata = b"changed-but-uncommitted".to_vec();
+        metadata_changed.assets.get_mut(&asset_a).expect("asset A").name = b"OtherName".to_vec();
+        metadata_changed.assets.get_mut(&asset_a).expect("asset A").decimals = 4;
+        assert_eq!(metadata_changed.p2p_token_audit_hash(), Some(audit_root));
+
+        let mut committed_changed = state;
+        committed_changed.assets.get_mut(&asset_b).expect("asset B").total_supply += 1;
+        assert_ne!(committed_changed.p2p_token_audit_hash(), Some(audit_root));
     }
 
     #[test]

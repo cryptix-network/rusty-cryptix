@@ -48,6 +48,8 @@ const ATOMIC_ROOT_BUCKETS: usize = 4096;
 const RAW_STATE_COPY_CHUNK_KEYS: usize = 4096;
 const ROOT_LEAF_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_V2_LEAF";
 const ROOT_BUCKET_DOMAIN: &[u8] = b"CRYPTIX_ATOMIC_V2_BUCKETED_ROOT";
+const ASSET_ROOT_V5: &[u8] = b"CAT_ASSET_ROOT_V5";
+const ASSET_P2P_AUDIT_ROOT_V1: &[u8] = b"CAT_ASSET_P2P_AUDIT_ROOT_V1";
 const LOGICAL_ASSET: u8 = 0x01;
 const LOGICAL_BALANCE: u8 = 0x02;
 const LOGICAL_NONCE: u8 = 0x03;
@@ -1509,13 +1511,36 @@ pub(crate) fn compute_state_root_from_parts(
     nonces: &HashMap<NonceKey, u64>,
     anchor_counts: &HashMap<[u8; 32], u64>,
 ) -> [u8; 32] {
+    compute_state_root_from_parts_with_asset_value(assets, balances, nonces, anchor_counts, root_value_for_asset, true)
+}
+
+pub(crate) fn compute_p2p_audit_state_root_from_parts(
+    assets: &HashMap<[u8; 32], TokenAsset>,
+    balances: &HashMap<BalanceKey, u128>,
+    nonces: &HashMap<NonceKey, u64>,
+    anchor_counts: &HashMap<[u8; 32], u64>,
+) -> [u8; 32] {
+    compute_state_root_from_parts_with_asset_value(assets, balances, nonces, anchor_counts, p2p_audit_root_value_for_asset, false)
+}
+
+fn compute_state_root_from_parts_with_asset_value<F>(
+    assets: &HashMap<[u8; 32], TokenAsset>,
+    balances: &HashMap<BalanceKey, u128>,
+    nonces: &HashMap<NonceKey, u64>,
+    anchor_counts: &HashMap<[u8; 32], u64>,
+    asset_value: F,
+    include_anchor_counts: bool,
+) -> [u8; 32]
+where
+    F: Fn(&TokenAsset) -> Vec<u8>,
+{
     let mut buckets = [[0u8; 32]; ATOMIC_ROOT_BUCKETS];
 
     let mut asset_ids = assets.keys().copied().collect::<Vec<_>>();
     asset_ids.sort_unstable();
     for asset_id in asset_ids {
         if let Some(asset) = assets.get(&asset_id) {
-            apply_root_leaf(&mut buckets, &logical_asset_key(&asset_id), &root_value_for_asset(asset));
+            apply_root_leaf(&mut buckets, &logical_asset_key(&asset_id), &asset_value(asset));
         }
     }
 
@@ -1535,11 +1560,13 @@ pub(crate) fn compute_state_root_from_parts(
         }
     }
 
-    let mut anchor_count_owners = anchor_counts.keys().copied().collect::<Vec<_>>();
-    anchor_count_owners.sort_unstable();
-    for owner_id in anchor_count_owners {
-        if let Some(count) = anchor_counts.get(&owner_id).copied().filter(|count| *count > 0) {
-            apply_root_leaf(&mut buckets, &logical_anchor_count_key(&owner_id), &root_value_for_u64(count));
+    if include_anchor_counts {
+        let mut anchor_count_owners = anchor_counts.keys().copied().collect::<Vec<_>>();
+        anchor_count_owners.sort_unstable();
+        for owner_id in anchor_count_owners {
+            if let Some(count) = anchor_counts.get(&owner_id).copied().filter(|count| *count > 0) {
+                apply_root_leaf(&mut buckets, &logical_anchor_count_key(&owner_id), &root_value_for_u64(count));
+            }
         }
     }
 
@@ -1752,7 +1779,7 @@ fn push_root_option_u64(out: &mut Vec<u8>, value: Option<u64>) {
 
 fn root_value_for_asset(asset: &TokenAsset) -> Vec<u8> {
     let mut out = Vec::with_capacity(256 + asset.name.len() + asset.symbol.len() + asset.metadata.len() + asset.platform_tag.len());
-    out.extend_from_slice(b"CAT_ASSET_ROOT_V5");
+    out.extend_from_slice(ASSET_ROOT_V5);
     out.extend_from_slice(&asset.asset_id);
     out.extend_from_slice(&asset.creator_owner_id);
     out.push(token_asset_class_tag(&asset.asset_class));
@@ -1772,34 +1799,59 @@ fn root_value_for_asset(asset: &TokenAsset) -> Vec<u8> {
     match asset.liquidity.as_ref() {
         Some(pool) => {
             out.push(1);
-            out.extend_from_slice(&pool.pool_nonce.to_le_bytes());
-            out.push(pool.curve_version);
-            out.push(pool.curve_mode);
-            out.extend_from_slice(&pool.individual_virtual_cpay_reserves_sompi.to_le_bytes());
-            out.extend_from_slice(&pool.individual_virtual_token_multiplier_bps.to_le_bytes());
-            out.extend_from_slice(&pool.real_cpay_reserves_sompi.to_le_bytes());
-            out.extend_from_slice(&pool.real_token_reserves.to_le_bytes());
-            out.extend_from_slice(&pool.virtual_cpay_reserves_sompi.to_le_bytes());
-            out.extend_from_slice(&pool.virtual_token_reserves.to_le_bytes());
-            out.extend_from_slice(&pool.unclaimed_fee_total_sompi.to_le_bytes());
-            out.extend_from_slice(&pool.fee_bps.to_le_bytes());
-            out.extend_from_slice(&(pool.fee_recipients.len() as u64).to_le_bytes());
-            for recipient in pool.fee_recipients.iter() {
-                out.extend_from_slice(&recipient.owner_id);
-                out.push(recipient.address_version);
-                push_root_bytes(&mut out, &recipient.address_payload);
-                out.extend_from_slice(&recipient.unclaimed_sompi.to_le_bytes());
-            }
-            out.extend_from_slice(&pool.vault_outpoint.transaction_id.as_bytes());
-            out.extend_from_slice(&pool.vault_outpoint.index.to_le_bytes());
-            out.extend_from_slice(&pool.vault_value_sompi.to_le_bytes());
-            out.extend_from_slice(&pool.unlock_target_sompi.to_le_bytes());
-            out.push(u8::from(pool.unlocked));
+            append_root_liquidity(&mut out, pool);
         }
         None => out.push(0),
     }
 
     out
+}
+
+fn p2p_audit_root_value_for_asset(asset: &TokenAsset) -> Vec<u8> {
+    let mut out = Vec::with_capacity(192 + asset.platform_tag.len());
+    out.extend_from_slice(ASSET_P2P_AUDIT_ROOT_V1);
+    out.extend_from_slice(&asset.asset_id);
+    out.push(token_asset_class_tag(&asset.asset_class));
+    out.push(asset.token_version);
+    out.extend_from_slice(&asset.mint_authority_owner_id);
+    out.push(asset.supply_mode as u8);
+    out.extend_from_slice(&asset.max_supply.to_le_bytes());
+    out.extend_from_slice(&asset.total_supply.to_le_bytes());
+    push_root_bytes(&mut out, &asset.platform_tag);
+    match asset.liquidity.as_ref() {
+        Some(pool) => {
+            out.push(1);
+            append_root_liquidity(&mut out, pool);
+        }
+        None => out.push(0),
+    }
+    out
+}
+
+fn append_root_liquidity(out: &mut Vec<u8>, pool: &crate::state::LiquidityPoolState) {
+    out.extend_from_slice(&pool.pool_nonce.to_le_bytes());
+    out.push(pool.curve_version);
+    out.push(pool.curve_mode);
+    out.extend_from_slice(&pool.individual_virtual_cpay_reserves_sompi.to_le_bytes());
+    out.extend_from_slice(&pool.individual_virtual_token_multiplier_bps.to_le_bytes());
+    out.extend_from_slice(&pool.real_cpay_reserves_sompi.to_le_bytes());
+    out.extend_from_slice(&pool.real_token_reserves.to_le_bytes());
+    out.extend_from_slice(&pool.virtual_cpay_reserves_sompi.to_le_bytes());
+    out.extend_from_slice(&pool.virtual_token_reserves.to_le_bytes());
+    out.extend_from_slice(&pool.unclaimed_fee_total_sompi.to_le_bytes());
+    out.extend_from_slice(&pool.fee_bps.to_le_bytes());
+    out.extend_from_slice(&(pool.fee_recipients.len() as u64).to_le_bytes());
+    for recipient in pool.fee_recipients.iter() {
+        out.extend_from_slice(&recipient.owner_id);
+        out.push(recipient.address_version);
+        push_root_bytes(out, &recipient.address_payload);
+        out.extend_from_slice(&recipient.unclaimed_sompi.to_le_bytes());
+    }
+    out.extend_from_slice(&pool.vault_outpoint.transaction_id.as_bytes());
+    out.extend_from_slice(&pool.vault_outpoint.index.to_le_bytes());
+    out.extend_from_slice(&pool.vault_value_sompi.to_le_bytes());
+    out.extend_from_slice(&pool.unlock_target_sompi.to_le_bytes());
+    out.push(u8::from(pool.unlocked));
 }
 
 fn root_leaf_hash(logical_key: &[u8], value: &[u8]) -> [u8; 32] {
@@ -1931,7 +1983,7 @@ fn decode_event_key_suffix(suffix: &[u8]) -> AtomicTokenResult<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_state_root_from_parts, AtomicStorageV2};
+    use super::{compute_p2p_audit_state_root_from_parts, compute_state_root_from_parts, AtomicStorageV2};
     use crate::{
         payload::{ApplyStatus, NoopReason, SupplyMode},
         state::{
@@ -2115,6 +2167,9 @@ mod tests {
         let root = compute_state_root_from_parts(&assets, &balances, &nonces, &anchor_counts);
 
         assert_eq!(super::hex_lower(&root), "47769a46099c386e52f8f0d62a789e1b1b8453b530c6f1385fd92ca53797bd4d");
+
+        let audit_root = compute_p2p_audit_state_root_from_parts(&assets, &balances, &nonces, &anchor_counts);
+        assert_eq!(super::hex_lower(&audit_root), "d61e226e9ea824488ff7462e334115a9e5293b4576d58813056dfcc1159f9f92");
     }
 
     #[test]
@@ -2149,6 +2204,64 @@ mod tests {
         );
 
         assert_eq!(super::hex_lower(&root), "3ad3d91ea19241c69d6a5ab618798ba3086f20b66b38cc329fd913ce42efd8e9");
+    }
+
+    #[test]
+    fn p2p_audit_root_ignores_uncommitted_permanent_metadata() {
+        let asset_id = seq_bytes32(0x10);
+        let owner_id = seq_bytes32(0x40);
+        let mut asset = TokenAsset {
+            asset_id,
+            creator_owner_id: seq_bytes32(0xA0),
+            asset_class: TokenAssetClass::Standard,
+            token_version: 1,
+            mint_authority_owner_id: seq_bytes32(0xB0),
+            decimals: 2,
+            supply_mode: SupplyMode::Capped,
+            max_supply: 1_000_000,
+            total_supply: 500,
+            name: b"Token A".to_vec(),
+            symbol: b"TKA".to_vec(),
+            metadata: b"metadata-a".to_vec(),
+            platform_tag: b"wallet-v1".to_vec(),
+            created_block_hash: Some(BlockHash::from_bytes(seq_bytes32(0x70))),
+            created_daa_score: Some(123),
+            created_at: Some(456),
+            liquidity: None,
+        };
+        let assets = [(asset_id, asset.clone())].into_iter().collect::<HashMap<_, _>>();
+        let balances = [(BalanceKey { asset_id, owner_id }, 500u128)].into_iter().collect::<HashMap<_, _>>();
+        let nonces = [(NonceKey::asset(owner_id, asset_id), 2u64)].into_iter().collect::<HashMap<_, _>>();
+        let anchor_counts = [(owner_id, 1u64)].into_iter().collect::<HashMap<_, _>>();
+
+        let base_full_root = compute_state_root_from_parts(&assets, &balances, &nonces, &anchor_counts);
+        let base_audit_root = compute_p2p_audit_state_root_from_parts(&assets, &balances, &nonces, &anchor_counts);
+
+        asset.creator_owner_id = seq_bytes32(0xA1);
+        asset.decimals = 8;
+        asset.name = b"Token B".to_vec();
+        asset.symbol = b"TKB".to_vec();
+        asset.metadata = b"metadata-b".to_vec();
+        asset.created_block_hash = Some(BlockHash::from_bytes(seq_bytes32(0x71)));
+        asset.created_daa_score = Some(124);
+        asset.created_at = Some(789);
+        let changed_assets = [(asset_id, asset.clone())].into_iter().collect::<HashMap<_, _>>();
+
+        let changed_full_root = compute_state_root_from_parts(&changed_assets, &balances, &nonces, &anchor_counts);
+        let changed_audit_root = compute_p2p_audit_state_root_from_parts(&changed_assets, &balances, &nonces, &anchor_counts);
+        assert_ne!(base_full_root, changed_full_root, "full token root should still detect permanent metadata");
+        assert_eq!(base_audit_root, changed_audit_root, "P2P token audit root must ignore uncommitted permanent metadata");
+
+        let changed_anchor_counts = [(owner_id, 999u64), ([0x66; 32], 123u64)].into_iter().collect::<HashMap<_, _>>();
+        let changed_anchor_full_root = compute_state_root_from_parts(&assets, &balances, &nonces, &changed_anchor_counts);
+        assert_ne!(base_full_root, changed_anchor_full_root, "full token root must detect anchor-count differences");
+        let changed_anchor_audit_root = compute_p2p_audit_state_root_from_parts(&assets, &balances, &nonces, &changed_anchor_counts);
+        assert_eq!(base_audit_root, changed_anchor_audit_root, "P2P token audit root must ignore token-index anchor counts");
+
+        asset.total_supply = 501;
+        let committed_assets = [(asset_id, asset)].into_iter().collect::<HashMap<_, _>>();
+        let committed_audit_root = compute_p2p_audit_state_root_from_parts(&committed_assets, &balances, &nonces, &anchor_counts);
+        assert_ne!(base_audit_root, committed_audit_root, "P2P token audit root must detect committed token-state fields");
     }
 
     #[test]

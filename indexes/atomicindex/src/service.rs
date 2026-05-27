@@ -6,7 +6,10 @@ use crate::{
         AtomicTokenStateFootprint, BalanceKey, LiquidityHolderAddressState, NonceKey, ProcessedOp, TokenAsset, TokenEvent,
         TokenHolderEntry, TokenOwnerBalanceEntry,
     },
-    storage_v2::{debug_state_root_report_from_parts, AtomicStorageSnapshotCounts, AtomicStorageV2, ATOMIC_REVALIDATION_VERSION},
+    storage_v2::{
+        compute_p2p_audit_state_root_from_parts, debug_state_root_report_from_parts, AtomicStorageSnapshotCounts, AtomicStorageV2,
+        ATOMIC_REVALIDATION_VERSION,
+    },
     IDENT,
 };
 use async_channel::Receiver;
@@ -1304,12 +1307,14 @@ impl AtomicTokenService {
             );
             return Ok(());
         };
+        let p2p_audit_hash = compute_p2p_audit_state_root_from_parts(&view.assets, &view.balances, &view.nonces, &view.anchor_counts);
         let report = debug_state_root_report_from_parts(&view.assets, &view.balances, &view.nonces, &view.anchor_counts, 4);
         info!(
-            "[{IDENT}] local Atomic token index debug at DAA-rendezvous block {}: checkpoint_hash={}, recomputed_view_hash={}\n{}",
+            "[{IDENT}] local Atomic token index debug at DAA-rendezvous block {}: checkpoint_hash={}, recomputed_view_hash={}, p2p_audit_hash={}\n{}",
             at_block_hash,
             checkpoint_hash.map(|hash| short_hex_for_log(&hash)).unwrap_or_else(|| "<missing>".to_string()),
             short_hex_for_log(&view.state_hash),
+            short_hex_for_log(&p2p_audit_hash),
             report
         );
         Ok(())
@@ -1329,7 +1334,12 @@ impl AtomicTokenService {
         if state.degraded || !state.live_correct || !state.has_verified_state() {
             return Ok(None);
         }
-        Ok(state.materialize_context_at_block(at_block_hash, state.runtime_state(false)))
+        let Some(view) = state.materialize_view_at_block(at_block_hash) else {
+            return Ok(None);
+        };
+        let mut context = view.context();
+        context.state_hash = compute_p2p_audit_state_root_from_parts(&view.assets, &view.balances, &view.nonces, &view.anchor_counts);
+        Ok(Some(context))
     }
 
     pub async fn mark_degraded_and_persist(&self, reason: &str) -> AtomicTokenResult<()> {

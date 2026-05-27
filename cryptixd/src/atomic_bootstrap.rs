@@ -28,7 +28,8 @@ use cryptix_utils::triggers::SingleTrigger;
 use futures_util::future::join_all;
 use hex::{decode as hex_decode, encode as hex_encode};
 use std::{
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, HashMap},
+    hash::{Hash, Hasher},
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -36,7 +37,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::Mutex,
@@ -63,7 +64,6 @@ const MAX_ALLOWED_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
 const MAX_SNAPSHOT_FILE_SIZE_BYTES: u64 = MAX_BOOTSTRAP_SNAPSHOT_FILE_SIZE_BYTES;
 const MAX_REPLAY_FILE_SIZE_BYTES: u64 = MAX_BOOTSTRAP_REPLAY_WINDOW_SIZE_BYTES;
 const MAX_TOTAL_CHUNKS: usize = 65_536;
-const HEALTH_AUDIT_INTERVAL: Duration = Duration::from_secs(60);
 const PENDING_AUDIT_LOG_INTERVAL: Duration = Duration::from_secs(300);
 #[allow(dead_code)]
 #[derive(Clone, Debug, BorshDeserialize)]
@@ -162,6 +162,8 @@ pub struct AtomicBootstrapService {
     disable_dns_seed_sources: bool,
     atomic_data_dir: PathBuf,
     retry_interval: Duration,
+    health_audit_enabled: bool,
+    health_audit_interval: Duration,
     last_health_audit: Mutex<Option<Instant>>,
     last_pending_audit_logs: Mutex<HashMap<&'static str, Instant>>,
     bootstrap_attempt_lock: Mutex<()>,
@@ -183,8 +185,15 @@ impl AtomicBootstrapService {
         atomic_data_dir: PathBuf,
         allow_peer_majority_fallback_override: bool,
         peer_majority_min_sources_override: Option<usize>,
+        health_audit_enabled: bool,
+        health_audit_interval_minutes: u64,
     ) -> Result<Self, String> {
         let retry_interval_sec = retry_interval_sec.max(5);
+        let health_audit_interval = Duration::from_secs(health_audit_interval_minutes.max(1).saturating_mul(60));
+        let initial_health_audit_delay = health_audit_initial_delay(health_audit_interval, &atomic_data_dir);
+        let initial_last_health_audit = Instant::now()
+            .checked_sub(health_audit_interval.checked_sub(initial_health_audit_delay).unwrap_or_default())
+            .unwrap_or_else(Instant::now);
         let peer_majority_min_sources =
             peer_majority_min_sources_override.unwrap_or(ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES);
         let seed_confirmed_min_non_seed_sources =
@@ -216,6 +225,15 @@ impl AtomicBootstrapService {
                 ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES
             );
         }
+        if health_audit_enabled {
+            info!(
+                "[atomic-bootstrap:p2p] periodic healthy-state audit enabled: interval={} minute(s), first-check-stagger={}s",
+                health_audit_interval.as_secs() / 60,
+                initial_health_audit_delay.as_secs()
+            );
+        } else {
+            info!("[atomic-bootstrap:p2p] periodic healthy-state audit disabled by operator");
+        }
         Ok(Self {
             atomic_token_service,
             flow_context,
@@ -223,7 +241,9 @@ impl AtomicBootstrapService {
             disable_dns_seed_sources,
             atomic_data_dir,
             retry_interval: Duration::from_secs(retry_interval_sec),
-            last_health_audit: Default::default(),
+            health_audit_enabled,
+            health_audit_interval,
+            last_health_audit: Mutex::new(Some(initial_last_health_audit)),
             last_pending_audit_logs: Default::default(),
             bootstrap_attempt_lock: Default::default(),
             audit_context_revalidation_attempted: AtomicBool::new(false),
@@ -270,10 +290,13 @@ impl AtomicBootstrapService {
     }
 
     async fn should_run_health_audit(&self) -> bool {
+        if !self.health_audit_enabled {
+            return false;
+        }
         let now = Instant::now();
         let mut guard = self.last_health_audit.lock().await;
         if let Some(last) = *guard {
-            if now.duration_since(last) < HEALTH_AUDIT_INTERVAL {
+            if now.duration_since(last) < self.health_audit_interval {
                 return false;
             }
         }
@@ -955,7 +978,17 @@ impl AtomicBootstrapService {
             }
         };
         let anchor_hash = context.at_block_hash;
-        let local_state_hash = context.state_hash;
+        let Some(local_state_hash) = self.local_consensus_p2p_token_audit_hash(anchor_hash).await? else {
+            self.log_pending_audit(
+                "local_consensus_token_audit_hash_unavailable",
+                format!(
+                    "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=local_consensus_token_audit_hash_unavailable anchor={} daa={} action=run_consensus_only_audit token_verified=false",
+                    anchor_hash, anchor_daa_score
+                ),
+            )
+            .await;
+            return self.audit_healthy_consensus_state_with_p2p(anchor_hash, anchor_daa_score).await;
+        };
         let local_state_hash_hex = hex_encode(local_state_hash);
 
         let min_sources = self.p2p_atomic_quorum_min_sources()?;
@@ -1004,6 +1037,15 @@ impl AtomicBootstrapService {
         }
 
         self.audit_healthy_consensus_state_with_p2p(anchor_hash, anchor_daa_score).await
+    }
+
+    async fn local_consensus_p2p_token_audit_hash(&self, block_hash: BlockHash) -> Result<Option<[u8; 32]>, String> {
+        let consensus = self.flow_context.consensus();
+        let session = consensus.session().await;
+        session
+            .async_get_atomic_p2p_token_audit_hash(block_hash)
+            .await
+            .map_err(|err| format!("local consensus Atomic P2P token audit hash unavailable for `{block_hash}`: {err}"))
     }
 
     async fn audit_healthy_consensus_state_with_p2p(&self, anchor_hash: BlockHash, anchor_daa_score: u64) -> Result<bool, String> {
@@ -2064,7 +2106,7 @@ impl AtomicStateQuorumVerifier for AtomicBootstrapService {
     }
 
     async fn local_atomic_token_state_hash_for_peer(&self, block_hash: BlockHash) -> Result<Option<[u8; 32]>, String> {
-        Ok(self.atomic_token_service.get_p2p_audit_state_hash_at_block(block_hash).await)
+        self.local_consensus_p2p_token_audit_hash(block_hash).await
     }
 
     async fn repair_atomic_index_once(&self) -> Result<bool, String> {
@@ -2120,6 +2162,19 @@ fn merge_source_kind(existing: SourceKind, incoming: SourceKind) -> SourceKind {
     } else {
         SourceKind::Peer
     }
+}
+
+fn health_audit_initial_delay(interval: Duration, atomic_data_dir: &Path) -> Duration {
+    let max_jitter_secs = interval.as_secs().min(60);
+    if max_jitter_secs == 0 {
+        return Duration::ZERO;
+    }
+
+    let mut hasher = DefaultHasher::new();
+    atomic_data_dir.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos().hash(&mut hasher);
+    Duration::from_secs(hasher.finish() % max_jitter_secs)
 }
 
 fn p2p_audit_sample_score(block_hash: BlockHash, source_identity: &str) -> [u8; 32] {

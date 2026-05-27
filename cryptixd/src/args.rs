@@ -59,6 +59,8 @@ pub struct Args {
     pub atomic_bootstrap_peers: Vec<ContextualNetAddress>,
     pub atomic_bootstrap_allow_peer_fallback: bool,
     pub atomic_bootstrap_peer_quorum_min_sources: Option<usize>,
+    pub disable_atomic_health_audit: bool,
+    pub atomic_health_audit_interval_minutes: u64,
     pub reset_db: bool,
     #[serde(rename = "outpeers")]
     pub outbound_target: usize,
@@ -124,6 +126,8 @@ impl Default for Args {
             atomic_bootstrap_peers: vec![],
             atomic_bootstrap_allow_peer_fallback: false,
             atomic_bootstrap_peer_quorum_min_sources: None,
+            disable_atomic_health_audit: false,
+            atomic_health_audit_interval_minutes: 3,
             reset_db: false,
             outbound_target: 8,
             inbound_limit: 128,
@@ -410,6 +414,24 @@ pub fn cli() -> Command {
                 .help("Override the minimum independent non-seed/P2P sources required for Atomic quorum. On mainnet this applies to seed-confirmed quorum as >=1 seed + >=N peers and to peer-only fallback as >=N peers with majority. Values below 3 are intended for private/testing networks."),
         )
         .arg(
+            Arg::new("disable-atomic-health-audit")
+                .long("disable-atomic-health-audit")
+                .visible_alias("atomic-health-audit-disable")
+                .action(ArgAction::SetTrue)
+                .help("Disable the periodic Atomic P2P healthy-state/token audit while keeping normal Atomic indexing and P2P sync enabled."),
+        )
+        .arg(
+            Arg::new("atomic-health-audit-interval-minutes")
+                .long("atomic-health-audit-interval-minutes")
+                .value_name("MINUTES")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(u64))
+                .help(format!(
+                    "Set the periodic Atomic P2P healthy-state/token audit interval in minutes (default: {}).",
+                    defaults.atomic_health_audit_interval_minutes
+                )),
+        )
+        .arg(
             Arg::new("max-tracked-addresses")
                 .long("max-tracked-addresses")
                 .require_equals(true)
@@ -640,6 +662,16 @@ impl Args {
                 .get_one::<usize>("atomic-bootstrap-peer-quorum-min-sources")
                 .copied()
                 .or(defaults.atomic_bootstrap_peer_quorum_min_sources),
+            disable_atomic_health_audit: arg_match_unwrap_or::<bool>(
+                &m,
+                "disable-atomic-health-audit",
+                defaults.disable_atomic_health_audit,
+            ),
+            atomic_health_audit_interval_minutes: arg_match_unwrap_or::<u64>(
+                &m,
+                "atomic-health-audit-interval-minutes",
+                defaults.atomic_health_audit_interval_minutes,
+            ),
             testnet: arg_match_unwrap_or::<bool>(&m, "testnet", defaults.testnet),
             testnet_suffix: defaults.testnet_suffix,
             devnet: arg_match_unwrap_or::<bool>(&m, "devnet", defaults.devnet),
@@ -744,6 +776,21 @@ mod tests {
     fn atomic_bootstrap_peer_quorum_alias_parses() {
         let args = Args::parse(["cryptixd", "--atomic-bootstrap-peer-quorum=2"]).expect("quorum alias args should parse");
         assert_eq!(args.atomic_bootstrap_peer_quorum_min_sources, Some(2));
+    }
+
+    #[test]
+    fn atomic_health_audit_defaults_to_three_minutes() {
+        let args = Args::parse(["cryptixd"]).expect("default args should parse");
+        assert!(!args.disable_atomic_health_audit);
+        assert_eq!(args.atomic_health_audit_interval_minutes, 3);
+    }
+
+    #[test]
+    fn atomic_health_audit_flags_parse() {
+        let args = Args::parse(["cryptixd", "--disable-atomic-health-audit", "--atomic-health-audit-interval-minutes=7"])
+            .expect("health audit args should parse");
+        assert!(args.disable_atomic_health_audit);
+        assert_eq!(args.atomic_health_audit_interval_minutes, 7);
     }
 
     #[test]
