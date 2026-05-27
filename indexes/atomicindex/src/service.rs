@@ -2246,23 +2246,30 @@ impl AtomicTokenService {
     }
 
     async fn current_p2p_audit_anchor(&self) -> AtomicTokenResult<(BlockHash, u64)> {
-        let (mut anchor_hash, fp_daa_score) = self.current_snapshot_anchor().await?;
-        let target_daa_score = fp_daa_score.saturating_sub(P2P_AUDIT_RENDEZVOUS_DAA_LAG);
-
+        self.ensure_bootstrap_serving_ready().await?;
         let consensus = self.processor.consensus_manager.consensus();
         let session = consensus.session().await;
-        let mut anchor_header = session.async_get_header(anchor_hash).await?;
-        while anchor_header.daa_score > target_daa_score && anchor_hash != self.genesis_hash {
-            let ghostdag = session.async_get_ghostdag_data(anchor_hash).await?;
-            let selected_parent = ghostdag.selected_parent;
-            if selected_parent == anchor_hash {
-                break;
+
+        let retained_chain = {
+            let state = self.processor.state.read().await;
+            state.applied_chain_order.iter().copied().filter(|hash| state.state_hash_by_block.contains_key(hash)).collect::<Vec<_>>()
+        };
+        let Some(latest_hash) = retained_chain.last().copied() else {
+            return Err(AtomicTokenError::Processing(
+                "P2P token audit anchor unavailable: no retained Atomic token checkpoints".to_string(),
+            ));
+        };
+        let latest_header = session.async_get_header(latest_hash).await?;
+        let target_daa_score = latest_header.daa_score.saturating_sub(P2P_AUDIT_RENDEZVOUS_DAA_LAG);
+
+        for anchor_hash in retained_chain.iter().rev().copied() {
+            let anchor_header = session.async_get_header(anchor_hash).await?;
+            if anchor_header.daa_score <= target_daa_score {
+                return Ok((anchor_hash, anchor_header.daa_score));
             }
-            anchor_hash = selected_parent;
-            anchor_header = session.async_get_header(anchor_hash).await?;
         }
 
-        Ok((anchor_hash, anchor_header.daa_score))
+        Ok((latest_hash, latest_header.daa_score))
     }
 
     fn prune_bootstrap_snapshot_store(&self) -> AtomicTokenResult<()> {

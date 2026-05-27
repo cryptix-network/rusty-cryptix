@@ -342,10 +342,7 @@ impl TransactionRecordStore for TransactionStore {
             let transaction_record = transaction_record_from_js_value(&js_value, None)
                 .map_err(|err| Error::Custom(format!("Failed to deserialize transaction record from indexdb {:?}", err)))?;
             drop(store);
-            idb_tx
-                .await
-                .into_result()
-                .map_err(|err| Error::Custom(format!("Failed to finish indexdb read transaction {:?}", err)))?;
+            idb_tx.await.into_result().map_err(|err| Error::Custom(format!("Failed to finish indexdb read transaction {:?}", err)))?;
 
             Ok(Arc::new(transaction_record))
         })
@@ -393,10 +390,7 @@ impl TransactionRecordStore for TransactionStore {
                 transaction_records.push(Arc::new(transaction_record));
             }
             drop(store);
-            idb_tx
-                .await
-                .into_result()
-                .map_err(|err| Error::Custom(format!("Failed to finish indexdb read transaction {:?}", err)))?;
+            idb_tx.await.into_result().map_err(|err| Error::Custom(format!("Failed to finish indexdb read transaction {:?}", err)))?;
 
             Ok(transaction_records)
         })
@@ -486,10 +480,7 @@ impl TransactionRecordStore for TransactionStore {
                 .collect::<Vec<_>>();
             drop(binding);
             drop(store);
-            idb_tx
-                .await
-                .into_result()
-                .map_err(|err| Error::Custom(format!("Failed to finish indexdb read transaction {:?}", err)))?;
+            idb_tx.await.into_result().map_err(|err| Error::Custom(format!("Failed to finish indexdb read transaction {:?}", err)))?;
 
             Ok(TransactionRangeResult { transactions, total: total.into() })
         })
@@ -632,10 +623,7 @@ impl TransactionRecordStore for TransactionStore {
                 .put_key_val_owned(id_str.as_str(), &new_js_value)
                 .map_err(|_err| Error::Custom("Failed to update transaction record in indexdb object store".to_string()))?;
             drop(store);
-            idb_tx
-                .await
-                .into_result()
-                .map_err(|err| Error::Custom(format!("Failed to finish indexdb note transaction {:?}", err)))?;
+            idb_tx.await.into_result().map_err(|err| Error::Custom(format!("Failed to finish indexdb note transaction {:?}", err)))?;
 
             Ok(())
         })

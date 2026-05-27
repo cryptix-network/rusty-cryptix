@@ -121,6 +121,7 @@ struct SourcePenalty {
 #[derive(Clone, Debug)]
 struct SnapshotSupportEvidence {
     source_identity: String,
+    source_label: String,
     snapshot_id: String,
     kind: SourceKind,
     at_daa_score: u64,
@@ -290,10 +291,6 @@ impl AtomicBootstrapService {
         } else {
             trace!("{message}");
         }
-    }
-
-    async fn defer_next_health_audit(&self) {
-        *self.last_health_audit.lock().await = Some(Instant::now());
     }
 
     async fn collect_compatible_sources(&self, protocol_version: u32, network_id: &str) -> Vec<SourceClient> {
@@ -478,6 +475,7 @@ impl AtomicBootstrapService {
                     Some(state_hash_hex) => match decode_hash32_hex(&state_hash_hex) {
                         Ok(state_hash) => evidence.push(SnapshotSupportEvidence {
                             source_identity,
+                            source_label: endpoint.clone(),
                             snapshot_id: hex_encode(state_hash),
                             kind,
                             at_daa_score,
@@ -585,23 +583,6 @@ impl AtomicBootstrapService {
         })
     }
 
-    async fn select_p2p_atomic_token_state_hash_quorum(
-        &self,
-        block_hash: BlockHash,
-        anchor_daa_score: u64,
-    ) -> Result<SnapshotQuorumDecision, String> {
-        let min_sources = self.p2p_atomic_quorum_min_sources()?;
-        let sample_limit = Self::p2p_audit_sample_limit(min_sources);
-        let evidence = self.collect_p2p_atomic_token_state_hash_evidence(block_hash, anchor_daa_score, sample_limit).await;
-        if evidence.is_empty() {
-            return Err(format!("no healthy P2P peer reported Atomic token state for `{block_hash}` at daa {anchor_daa_score}"));
-        }
-
-        select_snapshot_quorum(evidence, true, false, min_sources, min_sources).map_err(|err| {
-            format!("P2P Atomic token state hash quorum unavailable for `{block_hash}` at daa {anchor_daa_score}: {err}")
-        })
-    }
-
     fn p2p_atomic_quorum_min_sources(&self) -> Result<usize, String> {
         if self.disable_dns_seed_sources && !self.allow_peer_majority_fallback_override {
             return Err("P2P peer-only Atomic quorum disabled by policy: --nodnsseed requires --atomic-bootstrap-allow-peer-fallback"
@@ -671,6 +652,7 @@ impl AtomicBootstrapService {
             match result {
                 Ok(Some(state_hash)) => evidence.push(SnapshotSupportEvidence {
                     source_identity,
+                    source_label: router_label,
                     snapshot_id: hex_encode(state_hash),
                     kind: SourceKind::Peer,
                     at_daa_score: anchor_daa_score,
@@ -728,6 +710,7 @@ impl AtomicBootstrapService {
             match result {
                 Ok(Some(state_hash)) => evidence.push(SnapshotSupportEvidence {
                     source_identity,
+                    source_label: router_label,
                     snapshot_id: hex_encode(state_hash),
                     kind: SourceKind::Peer,
                     at_daa_score: anchor_daa_score,
@@ -973,92 +956,54 @@ impl AtomicBootstrapService {
         };
         let anchor_hash = context.at_block_hash;
         let local_state_hash = context.state_hash;
-        let decision = match self.select_p2p_atomic_token_state_hash_quorum(anchor_hash, anchor_daa_score).await {
-            Ok(decision) => decision,
-            Err(err) => {
-                self.log_pending_audit(
-                    "peer_token_checkpoint_unavailable",
-                    format!(
-                        "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=peer_token_checkpoint_unavailable anchor={} daa={} action=run_consensus_only_audit token_verified=false detail=\"{}\"",
-                        anchor_hash,
-                        anchor_daa_score,
-                        err
-                    ),
-                )
-                .await;
-                return self.audit_healthy_consensus_state_with_p2p(anchor_hash, anchor_daa_score).await;
-            }
-        };
-
         let local_state_hash_hex = hex_encode(local_state_hash);
-        if decision.snapshot_id == local_state_hash_hex {
+
+        let min_sources = self.p2p_atomic_quorum_min_sources()?;
+        let sample_limit = Self::p2p_audit_sample_limit(min_sources);
+        let evidence = self.collect_p2p_atomic_token_state_hash_evidence(anchor_hash, anchor_daa_score, sample_limit).await;
+        let matching_local_sources = evidence.iter().filter(|entry| entry.snapshot_id == local_state_hash_hex).count();
+        let evidence_summary = snapshot_evidence_summary(&evidence);
+        if matching_local_sources >= min_sources {
             info!(
-                "[atomic-bootstrap:p2p] audit result: status=passed scope=token reason=token_checkpoint_matched anchor={} daa={} local_hash={} policy=\"{}\" runtime={} active_peers={}",
+                "[atomic-bootstrap:p2p] audit result: status=passed scope=token reason=token_checkpoint_matched anchor={} daa={} local_hash={} policy=\"local-token-root confirmed by independent peers (minimum independent non-seed sources: {}, matching local sources: {}, total peer responses: {})\" runtime={} active_peers={} evidence={}",
                 anchor_hash,
                 anchor_daa_score,
                 local_state_hash_hex,
-                decision.policy_description,
+                min_sources,
+                matching_local_sources,
+                evidence.len(),
                 health.runtime_state.as_str(),
-                active_peer_count
+                active_peer_count,
+                evidence_summary
             );
             return Ok(true);
         }
 
-        let reason = format!(
-            "audit result: status=failed scope=token reason=token_checkpoint_mismatch anchor={} daa={} local_hash={} quorum_hash={} policy=\"{}\"",
-            anchor_hash, anchor_daa_score, local_state_hash_hex, decision.snapshot_id, decision.policy_description
-        );
+        self.log_pending_audit(
+            "peer_token_checkpoint_unavailable",
+            format!(
+                "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=local_token_checkpoint_not_confirmed anchor={} daa={} local_hash={} matching_local_sources={} required_sources={} total_peer_responses={} action=run_consensus_only_audit token_verified=false evidence={}",
+                anchor_hash,
+                anchor_daa_score,
+                local_state_hash_hex,
+                matching_local_sources,
+                min_sources,
+                evidence.len(),
+                evidence_summary
+            ),
+        )
+        .await;
 
-        match self.audit_healthy_consensus_state_with_p2p(anchor_hash, anchor_daa_score).await {
-            Ok(true) => {
+        if matching_local_sources == 0 {
+            if let Err(err) = self.atomic_token_service.log_p2p_audit_debug_at_block(anchor_hash).await {
                 info!(
-                    "[atomic-bootstrap:p2p] audit result: status=failed scope=token reason=token_checkpoint_mismatch_consensus_only_passed local_hash={} peer_hash={} policy=\"{}\" token_verified=false action=repair_or_revalidate_atomic_index",
-                    local_state_hash_hex,
-                    decision.snapshot_id,
-                    decision.policy_description
-                );
-            }
-            Ok(false) => {}
-            Err(err) => {
-                info!(
-                    "[atomic-bootstrap:p2p] audit result: status=skipped scope=consensus_only reason=unavailable_after_token_failure anchor={} daa={} token_verified=false detail=\"{}\"",
+                    "[atomic-bootstrap:p2p] local Atomic token index debug unavailable at DAA-rendezvous block {} (daa={}): {}",
                     anchor_hash, anchor_daa_score, err
                 );
             }
         }
 
-        if let Err(err) = self.atomic_token_service.log_p2p_audit_debug_at_block(anchor_hash).await {
-            info!(
-                "[atomic-bootstrap:p2p] local Atomic token index debug unavailable at DAA-rendezvous block {} (daa={}): {}",
-                anchor_hash, anchor_daa_score, err
-            );
-        }
-
-        warn!("[atomic-bootstrap:p2p] {reason}");
-
-        match self.atomic_token_service.revalidate_retained_state_for_audit_once().await {
-            Ok(true) => {
-                info!("[atomic-bootstrap:p2p] local retained-chain repair completed after P2P audit mismatch");
-                self.defer_next_health_audit().await;
-                return Ok(false);
-            }
-            Ok(false) => {
-                warn!(
-                    "[atomic-bootstrap:p2p] local retained-chain audit revalidation found no local repair to apply; keeping local state live and retrying peer audit later"
-                );
-                self.defer_next_health_audit().await;
-                return Ok(false);
-            }
-            Err(err) => {
-                warn!("[atomic-bootstrap:p2p] local retained-chain repair failed after P2P audit mismatch: {err}");
-            }
-        }
-
-        self.atomic_token_service
-            .mark_degraded_and_persist(&reason)
-            .await
-            .map_err(|err| format!("{reason}; failed marking Atomic degraded: {err}"))?;
-        Err(reason)
+        self.audit_healthy_consensus_state_with_p2p(anchor_hash, anchor_daa_score).await
     }
 
     async fn audit_healthy_consensus_state_with_p2p(&self, anchor_hash: BlockHash, anchor_daa_score: u64) -> Result<bool, String> {
@@ -1552,6 +1497,7 @@ impl AtomicBootstrapService {
             .iter()
             .map(|source| SnapshotSupportEvidence {
                 source_identity: source.source_identity.clone(),
+                source_label: source.endpoint.clone(),
                 snapshot_id: source.head.snapshot_id.to_ascii_lowercase(),
                 kind: source.kind,
                 at_daa_score: source.head.at_daa_score,
@@ -2213,6 +2159,29 @@ fn source_preferred_over(candidate: &SourceClient, current: &SourceClient) -> bo
         > (current.head.at_daa_score, current.head.at_block_hash.to_string())
 }
 
+fn snapshot_evidence_summary(evidence: &[SnapshotSupportEvidence]) -> String {
+    if evidence.is_empty() {
+        return "[]".to_string();
+    }
+
+    let mut rows = evidence
+        .iter()
+        .map(|source| {
+            format!(
+                "{{label={}, identity={}, kind={:?}, hash={}, daa={}, block={}}}",
+                source.source_label,
+                source.source_identity,
+                source.kind,
+                source.snapshot_id,
+                source.at_daa_score,
+                source.at_block_hash
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    format!("[{}]", rows.join(", "))
+}
+
 fn snapshot_quorum_policy_for_network(
     is_mainnet: bool,
     _disable_dns_seed_sources: bool,
@@ -2246,6 +2215,8 @@ fn select_snapshot_quorum(
     seed_confirmed_min_non_seed_sources: usize,
     peer_majority_min_sources: usize,
 ) -> Result<SnapshotQuorumDecision, String> {
+    let evidence_summary = snapshot_evidence_summary(&evidence);
+
     #[derive(Clone, Debug)]
     struct SnapshotCandidate {
         snapshot_id: String,
@@ -2304,7 +2275,7 @@ fn select_snapshot_quorum(
         .collect::<Vec<_>>();
 
     if candidates.is_empty() {
-        return Err("no snapshot candidates available after grouping".to_string());
+        return Err(format!("no snapshot candidates available after grouping; evidence={evidence_summary}"));
     }
 
     candidates.sort_by(|a, b| {
@@ -2357,7 +2328,7 @@ fn select_snapshot_quorum(
     let peer_majority_min_sources = peer_majority_min_sources.max(1);
     if total_non_seed_sources < peer_majority_min_sources {
         let fallback_err = format!(
-            "peer-majority bootstrap unavailable: only {total_non_seed_sources} independent non-seed source(s) available (minimum required: {peer_majority_min_sources})"
+            "peer-majority bootstrap unavailable: only {total_non_seed_sources} independent non-seed source(s) available (minimum required: {peer_majority_min_sources}); evidence={evidence_summary}"
         );
         return Err(match seed_quorum_failure {
             Some(seed_err) => format!("{seed_err}; {fallback_err}"),
@@ -2365,7 +2336,8 @@ fn select_snapshot_quorum(
         });
     }
 
-    let required_votes = (total_non_seed_sources / 2) + 1;
+    let majority_votes = (total_non_seed_sources / 2) + 1;
+    let required_votes = majority_votes.max(peer_majority_min_sources);
     let selected = candidates
         .iter()
         .max_by(|a, b| {
@@ -2379,7 +2351,7 @@ fn select_snapshot_quorum(
         .ok_or_else(|| "peer-majority bootstrap unavailable: no snapshot candidates after non-seed grouping".to_string())?;
     if selected.non_seed_support < required_votes {
         let fallback_err = format!(
-            "peer-majority bootstrap quorum not reached for `{}` (required votes: {required_votes}, matching non-seed sources: {}, total non-seed sources: {total_non_seed_sources})",
+            "peer-majority bootstrap quorum not reached for `{}` (required votes: {required_votes}, matching non-seed sources: {}, total non-seed sources: {total_non_seed_sources}); evidence={evidence_summary}",
             selected.snapshot_id, selected.non_seed_support
         );
         return Err(match seed_quorum_failure {
@@ -2522,6 +2494,7 @@ mod tests {
     ) -> SnapshotSupportEvidence {
         SnapshotSupportEvidence {
             source_identity: source_identity.to_string(),
+            source_label: source_identity.to_string(),
             snapshot_id: snapshot_id.to_string(),
             kind,
             at_daa_score,
@@ -2699,8 +2672,8 @@ mod tests {
     }
 
     #[test]
-    fn quorum_policy_peer_majority_without_seed_accepts_three_sources() {
-        let decision = select_snapshot_quorum(
+    fn quorum_policy_peer_majority_without_seed_requires_configured_matching_sources() {
+        let err = select_snapshot_quorum(
             vec![
                 evidence("peer-1", "snapshot-x", SourceKind::Peer, 220, "xxxx"),
                 evidence("peer-2", "snapshot-x", SourceKind::Configured, 220, "xxxx"),
@@ -2711,10 +2684,28 @@ mod tests {
             ATOMIC_BOOTSTRAP_DEFAULT_SEED_CONFIRMED_NON_SEED_SOURCES,
             ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES,
         )
-        .expect("2 of 3 non-seed sources should satisfy peer-majority quorum");
+        .expect_err("2 of 3 non-seed sources must not satisfy a 3-source peer quorum");
+
+        assert!(err.contains("required votes: 3"), "unexpected error message: {err}");
+    }
+
+    #[test]
+    fn quorum_policy_peer_majority_without_seed_accepts_three_matching_sources() {
+        let decision = select_snapshot_quorum(
+            vec![
+                evidence("peer-1", "snapshot-x", SourceKind::Peer, 220, "xxxx"),
+                evidence("peer-2", "snapshot-x", SourceKind::Configured, 220, "xxxx"),
+                evidence("peer-3", "snapshot-x", SourceKind::Peer, 219, "xxxx"),
+            ],
+            true,
+            true,
+            ATOMIC_BOOTSTRAP_DEFAULT_SEED_CONFIRMED_NON_SEED_SOURCES,
+            ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES,
+        )
+        .expect("3 matching non-seed sources should satisfy a 3-source peer quorum");
 
         assert_eq!(decision.snapshot_id, "snapshot-x");
-        assert_eq!(decision.required_votes, 2);
+        assert_eq!(decision.required_votes, ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES);
         assert!(decision.policy_description.contains("peer-majority quorum"));
     }
 

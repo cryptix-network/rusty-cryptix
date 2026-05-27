@@ -13,7 +13,7 @@ use std::{
 };
 
 pub const ATOMIC_DB_SCHEMA_VERSION: u16 = 2;
-pub const ATOMIC_REVALIDATION_VERSION: u16 = 19;
+pub const ATOMIC_REVALIDATION_VERSION: u16 = 20;
 
 const META_SCHEMA_VERSION: &[u8] = b"meta/atomic_schema_version";
 const META_PROTOCOL_VERSION: &[u8] = b"meta/atomic_protocol_version";
@@ -1931,12 +1931,12 @@ fn decode_event_key_suffix(suffix: &[u8]) -> AtomicTokenResult<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::AtomicStorageV2;
+    use super::{compute_state_root_from_parts, AtomicStorageV2};
     use crate::{
         payload::{ApplyStatus, NoopReason, SupplyMode},
         state::{
-            AtomicTokenState, BalanceKey, BlockJournal, LiquidityHolderAddressState, LiquidityPoolState, NonceKey, ProcessedOp,
-            TokenAsset, TokenAssetClass,
+            AtomicTokenState, BalanceKey, BlockJournal, LiquidityFeeRecipientState, LiquidityHolderAddressState, LiquidityPoolState,
+            NonceKey, ProcessedOp, TokenAsset, TokenAssetClass,
         },
     };
     use cryptix_consensus_core::{tx::TransactionOutpoint, Hash as BlockHash};
@@ -1954,6 +1954,14 @@ mod tests {
 
     fn holder_address(marker: u8) -> LiquidityHolderAddressState {
         LiquidityHolderAddressState { address_version: 0, address_payload: vec![marker; 32] }
+    }
+
+    fn seq_bytes32(start: u8) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (index, byte) in out.iter_mut().enumerate() {
+            *byte = start.wrapping_add(index as u8);
+        }
+        out
     }
 
     fn liquidity_asset(asset_id: [u8; 32], holders: Vec<([u8; 32], LiquidityHolderAddressState)>) -> TokenAsset {
@@ -1994,6 +2002,153 @@ mod tests {
                 holder_addresses: holders.into_iter().collect::<HashMap<_, _>>(),
             }),
         }
+    }
+
+    #[test]
+    fn token_index_root_matches_go_complex_audit_vector() {
+        let asset_a = seq_bytes32(0x10);
+        let asset_b = seq_bytes32(0x40);
+        let owner_a = seq_bytes32(0x70);
+        let owner_b = seq_bytes32(0x90);
+        let creator_a = seq_bytes32(0xB0);
+        let creator_b = seq_bytes32(0xC0);
+        let authority_a = seq_bytes32(0xD0);
+        let recipient_a = seq_bytes32(0xE0);
+        let recipient_b = seq_bytes32(0xF0);
+        let created_a = BlockHash::from_bytes(seq_bytes32(0x21));
+        let created_b = BlockHash::from_bytes(seq_bytes32(0x31));
+        let vault_txid = BlockHash::from_bytes(seq_bytes32(0x55));
+
+        let assets = [
+            (
+                asset_a,
+                TokenAsset {
+                    asset_id: asset_a,
+                    creator_owner_id: creator_a,
+                    asset_class: TokenAssetClass::Standard,
+                    token_version: 1,
+                    mint_authority_owner_id: authority_a,
+                    decimals: 8,
+                    supply_mode: SupplyMode::Capped,
+                    max_supply: 9_000_000,
+                    total_supply: 1_234_567,
+                    name: b"VectorToken".to_vec(),
+                    symbol: b"VEC".to_vec(),
+                    metadata: vec![0x01, 0x02, 0x03, 0x04],
+                    platform_tag: b"audit-v1".to_vec(),
+                    created_block_hash: Some(created_a),
+                    created_daa_score: Some(12_345),
+                    created_at: Some(1_779_700_001),
+                    liquidity: None,
+                },
+            ),
+            (
+                asset_b,
+                TokenAsset {
+                    asset_id: asset_b,
+                    creator_owner_id: creator_b,
+                    asset_class: TokenAssetClass::Liquidity,
+                    token_version: 1,
+                    mint_authority_owner_id: [0u8; 32],
+                    decimals: 6,
+                    supply_mode: SupplyMode::Capped,
+                    max_supply: 2_000_000,
+                    total_supply: 777_000,
+                    name: b"LiquidityVector".to_vec(),
+                    symbol: b"LVEC".to_vec(),
+                    metadata: vec![0xAA, 0xBB, 0xCC],
+                    platform_tag: b"pool-v2".to_vec(),
+                    created_block_hash: Some(created_b),
+                    created_daa_score: Some(12_678),
+                    created_at: Some(1_779_700_999),
+                    liquidity: Some(LiquidityPoolState {
+                        pool_nonce: 44,
+                        curve_version: 1,
+                        curve_mode: 2,
+                        individual_virtual_cpay_reserves_sompi: 12_000,
+                        individual_virtual_token_multiplier_bps: 150,
+                        real_cpay_reserves_sompi: 9_876_543,
+                        real_token_reserves: 123_456,
+                        virtual_cpay_reserves_sompi: 10_000_000,
+                        virtual_token_reserves: 654_321,
+                        unclaimed_fee_total_sompi: 333,
+                        fee_bps: 25,
+                        fee_recipients: vec![
+                            LiquidityFeeRecipientState {
+                                owner_id: recipient_a,
+                                address_version: 0,
+                                address_payload: vec![0x10, 0x11],
+                                unclaimed_sompi: 7,
+                            },
+                            LiquidityFeeRecipientState {
+                                owner_id: recipient_b,
+                                address_version: 1,
+                                address_payload: vec![0x20, 0x21, 0x22],
+                                unclaimed_sompi: 11,
+                            },
+                        ],
+                        vault_outpoint: TransactionOutpoint { transaction_id: vault_txid, index: 3 },
+                        vault_value_sompi: 8_888,
+                        unlock_target_sompi: 99_999,
+                        unlocked: false,
+                        holder_addresses: HashMap::new(),
+                    }),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+        let balances = [
+            (BalanceKey { asset_id: asset_a, owner_id: owner_a }, 555u128),
+            (BalanceKey { asset_id: asset_a, owner_id: owner_b }, 777u128),
+            (BalanceKey { asset_id: asset_b, owner_id: owner_a }, 999u128),
+            (BalanceKey { asset_id: asset_b, owner_id: owner_b }, 0u128),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+        let nonces =
+            [(NonceKey::owner(owner_a), 4u64), (NonceKey::asset(owner_a, asset_a), 6u64), (NonceKey::asset(owner_b, asset_b), 1u64)]
+                .into_iter()
+                .collect::<HashMap<_, _>>();
+        let anchor_counts = [(owner_a, 3u64), (owner_b, 5u64)].into_iter().collect::<HashMap<_, _>>();
+
+        let root = compute_state_root_from_parts(&assets, &balances, &nonces, &anchor_counts);
+
+        assert_eq!(super::hex_lower(&root), "47769a46099c386e52f8f0d62a789e1b1b8453b530c6f1385fd92ca53797bd4d");
+    }
+
+    #[test]
+    fn token_index_root_matches_go_golden_vector() {
+        let asset_id = [0x11; 32];
+        let owner_id = [0x22; 32];
+        let asset = TokenAsset {
+            asset_id,
+            creator_owner_id: [0x33; 32],
+            asset_class: TokenAssetClass::Standard,
+            token_version: 1,
+            mint_authority_owner_id: [0x44; 32],
+            decimals: 8,
+            supply_mode: SupplyMode::Uncapped,
+            max_supply: 0,
+            total_supply: 900,
+            name: b"Atomic".to_vec(),
+            symbol: b"ATM".to_vec(),
+            metadata: vec![0xA1, 0xB2],
+            platform_tag: Vec::new(),
+            created_block_hash: None,
+            created_daa_score: None,
+            created_at: None,
+            liquidity: None,
+        };
+
+        let root = compute_state_root_from_parts(
+            &[(asset_id, asset)].into_iter().collect(),
+            &[(BalanceKey { asset_id, owner_id }, 900u128)].into_iter().collect(),
+            &[(NonceKey::owner(owner_id), 7u64)].into_iter().collect(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(super::hex_lower(&root), "3ad3d91ea19241c69d6a5ab618798ba3086f20b66b38cc329fd913ce42efd8e9");
     }
 
     #[test]

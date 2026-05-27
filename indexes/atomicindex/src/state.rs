@@ -1646,6 +1646,9 @@ impl AtomicTokenState {
         journal: &mut JournalBuilder,
     ) -> bool {
         let tx = &tx_ref.tx;
+        if tx.is_coinbase() {
+            return false;
+        }
         if accepting_block_daa_score < self.payload_hf_activation_daa_score {
             return true;
         }
@@ -4173,7 +4176,7 @@ mod tests {
     use crate::payload::TokenOpCode;
     use cryptix_consensus_core::{
         constants::TX_VERSION,
-        subnets::SUBNETWORK_ID_PAYLOAD,
+        subnets::{SUBNETWORK_ID_COINBASE, SUBNETWORK_ID_PAYLOAD},
         tx::{ScriptVec, TransactionInput, TransactionOutput},
     };
     use std::{
@@ -4309,6 +4312,13 @@ mod tests {
         let input = TransactionInput::new(previous_outpoint, vec![], 0, 1);
         let output = TransactionOutput::new(1, output_script);
         let mut tx = Transaction::new(TX_VERSION, vec![input], vec![output], 0, SUBNETWORK_ID_PAYLOAD, 0, payload);
+        tx.finalize();
+        tx
+    }
+
+    fn coinbase_tx(output_script: ScriptPublicKey) -> Transaction {
+        let output = TransactionOutput::new(1, output_script);
+        let mut tx = Transaction::new(TX_VERSION, vec![], vec![output], 0, SUBNETWORK_ID_COINBASE, 0, vec![0u8; 20]);
         tx.finalize();
         tx
     }
@@ -4474,6 +4484,28 @@ mod tests {
 
         assert!(!state.processed_ops.contains_key(&txid));
         assert!(!state.assets.contains_key(&hash_bytes(txid)));
+        assert_eq!(state.next_event_sequence, 0);
+    }
+
+    #[test]
+    fn accepted_coinbase_does_not_mutate_token_anchor_counts() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        state.set_payload_hf_activation_daa_score(0);
+
+        let owner_script = test_script(0xC1);
+        let owner_id = owner_id(&state, &owner_script);
+        let before = state.compute_state_hash();
+        let tx = coinbase_tx(owner_script);
+
+        apply_block(
+            &mut state,
+            BlockHash::from_u64_word(8101),
+            vec![tx_ref(tx, BlockHash::from_u64_word(8100), 0, 0)],
+            &HashMap::new(),
+        );
+
+        assert_eq!(state.get_anchor_count(owner_id), 0, "coinbase outputs must not become CAT anchor counts");
+        assert_eq!(state.compute_state_hash(), before, "coinbase-only acceptance must not change token checkpoint hash");
         assert_eq!(state.next_event_sequence, 0);
     }
 

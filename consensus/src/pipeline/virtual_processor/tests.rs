@@ -439,12 +439,7 @@ async fn disqualified_cached_chain_block_does_not_advance_virtual_state() {
     ctx.validate_and_insert_utxo_valid_block(cached_template.block.to_immutable()).await;
     assert_eq!(ctx.consensus.get_sink(), cached_hash);
 
-    ctx.consensus
-        .virtual_processor()
-        .statuses_store
-        .write()
-        .set(cached_hash, BlockStatus::StatusDisqualifiedFromChain)
-        .unwrap();
+    ctx.consensus.virtual_processor().statuses_store.write().set(cached_hash, BlockStatus::StatusDisqualifiedFromChain).unwrap();
     assert_eq!(ctx.consensus.get_block_status(cached_hash), Some(BlockStatus::StatusDisqualifiedFromChain));
 
     ctx.simulated_time += ctx.consensus.params().target_time_per_block;
@@ -2222,12 +2217,7 @@ async fn invalid_template_shaped_child_does_not_reapply_virtual_atomic_delta() {
         invalid_template.block.header.utxo_commitment = Hash::from_bytes([nonce as u8; 32]);
         invalid_template.block.header.finalize();
         let invalid_hash = invalid_template.block.header.hash;
-        let status = ctx
-            .consensus
-            .validate_and_insert_block(invalid_template.block.to_immutable())
-            .virtual_state_task
-            .await
-            .unwrap();
+        let status = ctx.consensus.validate_and_insert_block(invalid_template.block.to_immutable()).virtual_state_task.await.unwrap();
         assert_eq!(status, BlockStatus::StatusDisqualifiedFromChain);
         assert_eq!(
             ctx.consensus.virtual_atomic_state().canonical_hash(),
