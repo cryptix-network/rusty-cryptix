@@ -29,12 +29,15 @@ Feedback and contributions are always welcome.
 | `--maxinpeers=<N>` | integer | `128` | Maximum inbound peer count. |
 | `--rpcmaxclients=<N>` | integer | `128` | Maximum standard RPC clients. |
 | `--reset-db` | switch | `false` | Reset local database before startup. |
+| `--startup-repair-plan=<JSON>` | path | none | Apply a JSON startup database repair plan before networking starts. |
 | `--enable-unsynced-mining` | switch | `false` | Accept RPC block submits while unsynced (testing-oriented). |
 | `--enable-mainnet-mining` | switch | `true` (deprecated flag) | Backward-compatible flag; mainnet mining is enabled by default. |
 | `--utxoindex` | switch | `false` | Enable UTXO index. |
 | `--atomic-bootstrap-peer=<IP[:PORT]>` | address (repeatable) | empty | Optional gRPC Atomic snapshot endpoint. Normal P2P sync, local Atomic replay, and local selected-chain backfill do not require this. |
 | `--atomic-bootstrap-allow-peer-fallback` | switch | `false` | On mainnet, allow optional configured-peer Atomic snapshot fallback when no seed source is reachable. This must be set explicitly; `--nodnsseed` disables seed discovery but does not by itself lower the mainnet bootstrap safety policy. |
 | `--atomic-bootstrap-peer-quorum-min-sources=<N>` | integer | seed-confirmed: `2`, configured-peer fallback: `3` | Override the minimum independent non-seed sources required for optional Atomic snapshot quorum. On mainnet the default seed-confirmed policy requires `>=1` seed source plus `>=2` independent non-seed sources with the same finality-safe snapshot; configured-peer fallback defaults to `>=3` independent non-seed sources. Alias: `--atomic-bootstrap-peer-quorum=<N>`. Values below `3` are intended only for private/testing networks. |
+| `--disable-atomic-health-audit` | switch | `false` | Disable the periodic Atomic P2P healthy-state/token audit. Alias: `--atomic-health-audit-disable`. |
+| `--atomic-health-audit-interval-minutes=<MINUTES>` | integer | `3` | Set the periodic Atomic P2P healthy-state/token audit interval. The audit uses a DAA-rendezvous anchor behind the local selected-parent tip so peers can be checked against a stable block hash/DAA pair. |
 | `--max-tracked-addresses=<N>` | integer | `0` | Preallocated max addresses for UTXO change tracking. |
 | `--testnet` | switch | `false` | Use testnet. |
 | `--netsuffix=<N>` | integer | none | Optional testnet suffix (for dedicated parallel testnet variants). |
