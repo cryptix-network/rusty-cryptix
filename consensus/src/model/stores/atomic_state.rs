@@ -3000,6 +3000,157 @@ mod tests {
         assert_ne!(committed_changed.p2p_token_audit_hash(), Some(audit_root));
     }
 
+    fn atomic_stress_interop_vector_state(reverse_insert_order: bool) -> AtomicConsensusState {
+        let owner_main = seq_bytes32(0x11);
+        let owner_receiver = seq_bytes32(0x31);
+        let owner_creator_b = seq_bytes32(0x51);
+        let liquidity_creator = seq_bytes32(0x71);
+        let mint_authority = seq_bytes32(0x91);
+        let fee_payload_a = vec![0x0A; 32];
+        let fee_payload_b = vec![0x0B; 32];
+        let fee_owner_a = atomic_owner_id_from_address_components(0, &fee_payload_a).expect("valid fee owner A");
+        let fee_owner_b = atomic_owner_id_from_address_components(0, &fee_payload_b).expect("valid fee owner B");
+
+        let mut state = AtomicConsensusState::default();
+        let mut asset_indices: Vec<u8> = (0u8..20u8).collect();
+        if reverse_insert_order {
+            asset_indices.reverse();
+        }
+
+        for i in asset_indices {
+            let asset_id = seq_bytes32(0x40u8.wrapping_add(i.wrapping_mul(2)));
+            let initial_supply = 1_000u128 + u128::from(i) * 13;
+            let minted = if i < 12 { 500u128 + u128::from(i) } else { 0 };
+            let burned = if i < 12 { 20u128 + u128::from(i) } else { 0 };
+            let transferred = if i < 12 { 30u128 + u128::from(i) } else { 0 };
+            let total_supply = initial_supply + minted - burned;
+            let owner_balance = total_supply - transferred;
+
+            state.assets.insert(
+                asset_id,
+                AtomicAssetState {
+                    creator_owner_id: if i % 3 == 0 { owner_creator_b } else { owner_main },
+                    asset_class: AtomicAssetClass::Standard,
+                    token_version: ATOMIC_CURRENT_TOKEN_VERSION,
+                    mint_authority_owner_id: mint_authority,
+                    decimals: i % 9,
+                    supply_mode: AtomicSupplyMode::Capped,
+                    max_supply: 1_000_000u128 + u128::from(i) * 1_000,
+                    total_supply,
+                    name: format!("Stress Token {i:02}").into_bytes(),
+                    symbol: format!("ST{i:02}").into_bytes(),
+                    metadata: format!("stress-metadata-{i:02}").into_bytes(),
+                    platform_tag: b"stress-vector-v1".to_vec(),
+                    created_block_hash: Some(seq_bytes32(0x90u8.wrapping_add(i))),
+                    created_daa_score: Some(200_000 + u64::from(i)),
+                    created_at: Some(1_779_900_000_000 + u64::from(i)),
+                    liquidity: None,
+                },
+            );
+            state.balances.insert(AtomicBalanceKey { asset_id, owner_id: owner_main }, owner_balance);
+            if transferred > 0 {
+                state.balances.insert(AtomicBalanceKey { asset_id, owner_id: owner_receiver }, transferred);
+            }
+            state.next_nonces.insert(AtomicNonceKey::asset(owner_main, asset_id), if i < 12 { 5 } else { 2 });
+        }
+
+        let liquidity_asset_id = seq_bytes32(0xE0);
+        let liquidity_total = 221_320u128;
+        let liquidity_remaining = 778_680u128;
+        let unclaimed_fee_total = 12_345_678u64;
+        let real_cpay = 53_415_169_749_573u64;
+        let vault_txid = Hash::from_bytes(seq_bytes32(0x22));
+        state.assets.insert(
+            liquidity_asset_id,
+            AtomicAssetState {
+                creator_owner_id: liquidity_creator,
+                asset_class: AtomicAssetClass::Liquidity,
+                token_version: ATOMIC_CURRENT_TOKEN_VERSION,
+                mint_authority_owner_id: [0; 32],
+                decimals: 0,
+                supply_mode: AtomicSupplyMode::Capped,
+                max_supply: liquidity_total + liquidity_remaining,
+                total_supply: liquidity_total,
+                name: b"Stress Liquidity Token".to_vec(),
+                symbol: b"SLP".to_vec(),
+                metadata: b"liquidity-stress-vector".to_vec(),
+                platform_tag: b"stress-vector-v1".to_vec(),
+                created_block_hash: Some(seq_bytes32(0xA8)),
+                created_daa_score: Some(200_777),
+                created_at: Some(1_779_900_777_000),
+                liquidity: Some(AtomicLiquidityPoolState {
+                    pool_nonce: 187,
+                    curve_version: ATOMIC_CURRENT_LIQUIDITY_CURVE_VERSION,
+                    curve_mode: ATOMIC_LIQUIDITY_CURVE_MODE_AGGRESSIVE,
+                    individual_virtual_cpay_reserves_sompi: 0,
+                    individual_virtual_token_multiplier_bps: 0,
+                    real_cpay_reserves_sompi: real_cpay,
+                    real_token_reserves: liquidity_remaining,
+                    virtual_cpay_reserves_sompi: 253_415_069_749_573,
+                    virtual_token_reserves: 828_680,
+                    unclaimed_fee_total_sompi: unclaimed_fee_total,
+                    fee_bps: 25,
+                    fee_recipients: vec![
+                        AtomicLiquidityFeeRecipientState {
+                            owner_id: fee_owner_a,
+                            address_version: 0,
+                            address_payload: fee_payload_a,
+                            unclaimed_sompi: 5_000_000,
+                        },
+                        AtomicLiquidityFeeRecipientState {
+                            owner_id: fee_owner_b,
+                            address_version: 0,
+                            address_payload: fee_payload_b,
+                            unclaimed_sompi: 7_345_678,
+                        },
+                    ],
+                    vault_outpoint: TransactionOutpoint::new(vault_txid, 7),
+                    vault_value_sompi: real_cpay + unclaimed_fee_total,
+                    unlock_target_sompi: 900_000_000_000,
+                    unlocked: true,
+                }),
+            },
+        );
+        state.balances.insert(AtomicBalanceKey { asset_id: liquidity_asset_id, owner_id: owner_main }, liquidity_total);
+        state.next_nonces.insert(AtomicNonceKey::owner(owner_main), 23);
+        state.next_nonces.insert(AtomicNonceKey::asset(owner_main, liquidity_asset_id), 6);
+
+        let anchors: [([u8; 32], u64); 9] = [
+            (owner_main, 97),
+            (owner_receiver, 44),
+            (owner_creator_b, 13),
+            (liquidity_creator, 8),
+            (fee_owner_a, 5),
+            (fee_owner_b, 7),
+            (seq_bytes32(0xC0), 19),
+            (seq_bytes32(0xD0), 23),
+            (seq_bytes32(0xF0), 29),
+        ];
+        let anchor_iter: Box<dyn Iterator<Item = ([u8; 32], u64)>> =
+            if reverse_insert_order { Box::new(anchors.into_iter().rev()) } else { Box::new(anchors.into_iter()) };
+        for (owner_id, count) in anchor_iter {
+            state.anchor_counts.insert(owner_id, count);
+        }
+        state.rebuild_liquidity_vault_outpoint_index();
+        state
+    }
+
+    #[test]
+    fn token_stress_interop_vector_matches_go_hashes() {
+        let state = atomic_stress_interop_vector_state(false);
+        state.validate_normalized().expect("stress interop vector must be normalized");
+        let reversed = atomic_stress_interop_vector_state(true);
+        reversed.validate_normalized().expect("reversed stress interop vector must be normalized");
+
+        let canonical_hash = state.canonical_hash();
+        let p2p_audit_hash = state.p2p_token_audit_hash().expect("stress vector must be auditable");
+        assert_eq!(reversed.canonical_hash(), canonical_hash);
+        assert_eq!(reversed.p2p_token_audit_hash(), Some(p2p_audit_hash));
+
+        assert_eq!(faster_hex::hex_string(&canonical_hash), "9c4cfb9daca1ec54a69f478e4088223a6132229db4423bc5239e0027c98b9905");
+        assert_eq!(faster_hex::hex_string(&p2p_audit_hash), "ee4a1f9d29209eead50a53a81a116c59f0f0c178e14d09b3de32fee8524a6332");
+    }
+
     #[test]
     fn canonical_atomic_state_hash_is_order_independent() {
         let asset_a = [0xA0; 32];

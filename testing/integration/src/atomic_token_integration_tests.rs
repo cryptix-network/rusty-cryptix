@@ -142,10 +142,64 @@ fn payload_create_asset_with_mint(
     payload
 }
 
-fn payload_create_liquidity(
+fn payload_buy_liquidity(
+    auth_input_index: u16,
+    nonce: u64,
+    asset_id: [u8; 32],
+    expected_pool_nonce: u64,
+    cpay_in_sompi: u64,
+    min_token_out: u128,
+) -> Vec<u8> {
+    let mut payload = base_header(6, auth_input_index, nonce);
+    payload.extend_from_slice(&asset_id);
+    payload.extend_from_slice(&expected_pool_nonce.to_le_bytes());
+    payload.extend_from_slice(&cpay_in_sompi.to_le_bytes());
+    payload.extend_from_slice(&min_token_out.to_le_bytes());
+    payload
+}
+
+fn payload_sell_liquidity(
+    auth_input_index: u16,
+    nonce: u64,
+    asset_id: [u8; 32],
+    expected_pool_nonce: u64,
+    token_in: u128,
+    min_cpay_out_sompi: u64,
+    cpay_receive_output_index: u16,
+) -> Vec<u8> {
+    let mut payload = base_header(7, auth_input_index, nonce);
+    payload.extend_from_slice(&asset_id);
+    payload.extend_from_slice(&expected_pool_nonce.to_le_bytes());
+    payload.extend_from_slice(&token_in.to_le_bytes());
+    payload.extend_from_slice(&min_cpay_out_sompi.to_le_bytes());
+    payload.extend_from_slice(&cpay_receive_output_index.to_le_bytes());
+    payload
+}
+
+fn payload_claim_liquidity(
+    auth_input_index: u16,
+    nonce: u64,
+    asset_id: [u8; 32],
+    expected_pool_nonce: u64,
+    recipient_index: u8,
+    claim_amount_sompi: u64,
+    claim_receive_output_index: u16,
+) -> Vec<u8> {
+    let mut payload = base_header(8, auth_input_index, nonce);
+    payload.extend_from_slice(&asset_id);
+    payload.extend_from_slice(&expected_pool_nonce.to_le_bytes());
+    payload.push(recipient_index);
+    payload.extend_from_slice(&claim_amount_sompi.to_le_bytes());
+    payload.extend_from_slice(&claim_receive_output_index.to_le_bytes());
+    payload
+}
+
+fn payload_create_liquidity_with_fee_recipient(
     auth_input_index: u16,
     nonce: u64,
     max_supply: u128,
+    fee_bps: u16,
+    recipient_address: &Address,
     launch_buy_sompi: u64,
     launch_buy_min_token_out: u128,
     name: &[u8],
@@ -162,26 +216,17 @@ fn payload_create_liquidity(
     payload.extend_from_slice(name);
     payload.extend_from_slice(symbol);
     payload.extend_from_slice(&MIN_LIQUIDITY_SEED_RESERVE_SOMPI.to_le_bytes());
-    payload.extend_from_slice(&0u16.to_le_bytes());
-    payload.push(0);
+    payload.extend_from_slice(&fee_bps.to_le_bytes());
+    payload.push(1);
+    let recipient_version = match recipient_address.version {
+        Version::PubKey => 0,
+        Version::PubKeyECDSA => 1,
+        other => panic!("unsupported liquidity fee recipient version for tests: {other:?}"),
+    };
+    payload.push(recipient_version);
+    payload.extend_from_slice(recipient_address.payload.as_slice());
     payload.extend_from_slice(&launch_buy_sompi.to_le_bytes());
     payload.extend_from_slice(&launch_buy_min_token_out.to_le_bytes());
-    payload
-}
-
-fn payload_buy_liquidity(
-    auth_input_index: u16,
-    nonce: u64,
-    asset_id: [u8; 32],
-    expected_pool_nonce: u64,
-    cpay_in_sompi: u64,
-    min_token_out: u128,
-) -> Vec<u8> {
-    let mut payload = base_header(6, auth_input_index, nonce);
-    payload.extend_from_slice(&asset_id);
-    payload.extend_from_slice(&expected_pool_nonce.to_le_bytes());
-    payload.extend_from_slice(&cpay_in_sompi.to_le_bytes());
-    payload.extend_from_slice(&min_token_out.to_le_bytes());
     payload
 }
 
@@ -327,6 +372,27 @@ async fn submit_and_wait_indexed(client: &GrpcClient, tx: &Transaction, pay_addr
         }
     }
     panic!("token status was not indexed in time for tx {}", tx.id());
+}
+
+async fn submit_transaction_and_assert_mempool(client: &GrpcClient, label: &str, tx: &Transaction) {
+    let txid = tx.id();
+    client.submit_transaction(tx.into(), false).await.unwrap_or_else(|err| panic!("submit {label} failed: {err}"));
+    client.get_mempool_entry(txid, false, false).await.unwrap_or_else(|err| panic!("missing mempool entry for {label}: {err}"));
+}
+
+async fn submit_transactions_parallel_owned(client: GrpcClient, txs: Vec<(String, Transaction)>, parallelism: usize) {
+    for chunk in txs.chunks(parallelism.max(1)) {
+        let mut handles = Vec::with_capacity(chunk.len());
+        for (label, tx) in chunk.iter().cloned() {
+            let client = client.clone();
+            handles.push(tokio::spawn(async move {
+                submit_transaction_and_assert_mempool(&client, &label, &tx).await;
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("parallel submit task panicked");
+        }
+    }
 }
 
 fn atomic_args() -> Args {
@@ -591,7 +657,7 @@ async fn atomic_token_atomic_enabled_e2e_transfer_mint_burn_snapshot() {
     assert!(health.live_correct);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn atomic_token_atomic_enabled_mixed_mempool_stress_drains_deterministically() {
     cryptix_core::log::try_init_logger("INFO");
     let mut daemon = Daemon::new_random_with_args(atomic_args(), 10);
@@ -608,8 +674,8 @@ async fn atomic_token_atomic_enabled_mixed_mempool_stress_drains_deterministical
     let owner_keypair = || Keypair::from_secret_key(secp256k1::SECP256K1, &owner_sk);
     let coinbase_maturity = daemon.args.read().coinbase_maturity_override.unwrap_or(SIMNET_PARAMS.coinbase_maturity);
 
-    let mut utxos = mine_until_spendable_utxos(&client, &owner_address, coinbase_maturity, 70).await;
-    utxos.truncate(70);
+    let mut utxos = mine_until_spendable_utxos(&client, &owner_address, coinbase_maturity, 115).await;
+    utxos.truncate(115);
 
     let base_create_tx = build_payload_tx(
         owner_keypair(),
@@ -625,6 +691,7 @@ async fn atomic_token_atomic_enabled_mixed_mempool_stress_drains_deterministical
     let liquidity_fee = required_fee(1, 2);
     assert!(utxos[1].1.amount > liquidity_vault_value + liquidity_fee);
     let liquidity_change = utxos[1].1.amount - liquidity_vault_value - liquidity_fee;
+    let liquidity_fee_bps = 100u16;
     let liquidity_create_tx = build_payload_tx_with_outputs(
         &owner_sk,
         vec![(utxos[1].0, utxos[1].1.clone(), 1)],
@@ -632,31 +699,42 @@ async fn atomic_token_atomic_enabled_mixed_mempool_stress_drains_deterministical
             TransactionOutput { value: liquidity_vault_value, script_public_key: liquidity_vault_script() },
             TransactionOutput { value: liquidity_change, script_public_key: pay_to_address_script(&owner_address) },
         ],
-        payload_create_liquidity(0, 2, LIQUIDITY_TOKEN_SUPPLY_RAW, 0, 0, b"StressPool", b"STP"),
+        payload_create_liquidity_with_fee_recipient(
+            0,
+            2,
+            LIQUIDITY_TOKEN_SUPPLY_RAW,
+            liquidity_fee_bps,
+            &owner_address,
+            0,
+            0,
+            b"StressPool",
+            b"STP",
+        ),
     );
     submit_and_wait_indexed(&client, &liquidity_create_tx, &owner_address).await;
     let liquidity_asset_id = liquidity_create_tx.id().to_string();
     let liquidity_asset_bytes = liquidity_create_tx.id().as_bytes();
 
-    let mut queued = Vec::new();
+    let mut parallel_queued = Vec::new();
+    let mut ordered_queued = Vec::new();
     let mut token_txids = Vec::new();
     let mut next_utxo = 2usize;
     let mut asset_nonce = 1u64;
     let mut owner_nonce = 3u64;
 
-    for i in 0..12 {
+    for i in 0..20 {
         let native_tx = build_native_tx(owner_keypair(), &utxos[next_utxo], &owner_address);
         next_utxo += 1;
-        queued.push((format!("native-{i}"), native_tx, false));
+        parallel_queued.push((format!("native-{i}"), native_tx));
 
         let messenger_tx = build_payload_tx(
             owner_keypair(),
             &utxos[next_utxo],
             &owner_address,
-            format!("MSG:atomic-stress:{i}:{}", "x".repeat(128)).into_bytes(),
+            format!("MSG:atomic-stress:{i}:{}", "x".repeat(256)).into_bytes(),
         );
         next_utxo += 1;
-        queued.push((format!("messenger-{i}"), messenger_tx, false));
+        parallel_queued.push((format!("messenger-{i}"), messenger_tx));
 
         let create_tx = build_payload_tx(
             owner_keypair(),
@@ -678,9 +756,9 @@ async fn atomic_token_atomic_enabled_mixed_mempool_stress_drains_deterministical
         owner_nonce += 1;
         next_utxo += 1;
         token_txids.push((format!("create-{i}"), create_tx.id()));
-        queued.push((format!("create-{i}"), create_tx, true));
+        ordered_queued.push((format!("create-{i}"), create_tx));
 
-        if i < 8 {
+        if i < 12 {
             let mint_tx = build_payload_tx(
                 owner_keypair(),
                 &utxos[next_utxo],
@@ -689,7 +767,7 @@ async fn atomic_token_atomic_enabled_mixed_mempool_stress_drains_deterministical
             );
             next_utxo += 1;
             token_txids.push((format!("mint-{i}"), mint_tx.id()));
-            queued.push((format!("mint-{i}"), mint_tx, true));
+            ordered_queued.push((format!("mint-{i}"), mint_tx));
             asset_nonce += 1;
 
             let transfer_tx = build_payload_tx(
@@ -700,7 +778,7 @@ async fn atomic_token_atomic_enabled_mixed_mempool_stress_drains_deterministical
             );
             next_utxo += 1;
             token_txids.push((format!("transfer-{i}"), transfer_tx.id()));
-            queued.push((format!("transfer-{i}"), transfer_tx, true));
+            ordered_queued.push((format!("transfer-{i}"), transfer_tx));
             asset_nonce += 1;
 
             let burn_tx = build_payload_tx(
@@ -711,7 +789,7 @@ async fn atomic_token_atomic_enabled_mixed_mempool_stress_drains_deterministical
             );
             next_utxo += 1;
             token_txids.push((format!("burn-{i}"), burn_tx.id()));
-            queued.push((format!("burn-{i}"), burn_tx, true));
+            ordered_queued.push((format!("burn-{i}"), burn_tx));
             asset_nonce += 1;
         }
     }
@@ -726,7 +804,20 @@ async fn atomic_token_atomic_enabled_mixed_mempool_stress_drains_deterministical
         .pool
         .expect("liquidity pool must exist before queued buy");
     let pool_vault_value = pool_before.vault_value_sompi.parse::<u64>().unwrap();
-    let buy_in_sompi = 833_336_112;
+    let buy_quote = client
+        .get_liquidity_quote_call(
+            None,
+            GetLiquidityQuoteRequest {
+                asset_id: liquidity_asset_id.clone(),
+                side: 0,
+                exact_in_amount: "2000000000".to_string(),
+                at_block_hash: None,
+            },
+        )
+        .await
+        .unwrap();
+    let buy_in_sompi = buy_quote.exact_in_amount.parse::<u64>().unwrap();
+    let buy_min_token_out = buy_quote.amount_out.parse::<u128>().unwrap();
     let buy_fee = required_fee(2, 2);
     assert!(utxos[next_utxo].1.amount > buy_in_sompi + buy_fee);
     let buy_change = utxos[next_utxo].1.amount - buy_in_sompi - buy_fee;
@@ -744,23 +835,26 @@ async fn atomic_token_atomic_enabled_mixed_mempool_stress_drains_deterministical
             TransactionOutput { value: pool_vault_value + buy_in_sompi, script_public_key: liquidity_vault_script() },
             TransactionOutput { value: buy_change, script_public_key: pay_to_address_script(&owner_address) },
         ],
-        payload_buy_liquidity(1, 1, liquidity_asset_bytes, pool_before.pool_nonce, buy_in_sompi, 1),
+        payload_buy_liquidity(1, 1, liquidity_asset_bytes, pool_before.pool_nonce, buy_in_sompi, buy_min_token_out),
     );
     token_txids.push(("liquidity-buy-0".to_string(), buy_tx.id()));
-    queued.push(("liquidity-buy-0".to_string(), buy_tx, true));
+    ordered_queued.push(("liquidity-buy-0".to_string(), buy_tx));
 
-    for (label, tx, _) in &queued {
-        client.submit_transaction(tx.into(), false).await.unwrap_or_else(|err| panic!("submit {label} failed: {err}"));
-        client.get_mempool_entry(tx.id(), false, false).await.unwrap_or_else(|err| panic!("missing mempool entry for {label}: {err}"));
+    let phase_one_queued = parallel_queued.len() + ordered_queued.len();
+    let parallel_submit = tokio::spawn(submit_transactions_parallel_owned(client.clone(), parallel_queued, 16));
+    for (label, tx) in &ordered_queued {
+        submit_transaction_and_assert_mempool(&client, label, tx).await;
     }
+    parallel_submit.await.expect("parallel stress submit task panicked");
     let mempool_entries = client.get_mempool_entries(false, false).await.unwrap();
     assert!(
-        mempool_entries.len() >= queued.len(),
+        mempool_entries.len() >= phase_one_queued,
         "mempool did not retain queued stress load: queued={} entries={}",
-        queued.len(),
+        phase_one_queued,
         mempool_entries.len()
     );
 
+    mine_blocks(&client, &owner_address, 1).await;
     for _ in 0..160 {
         let remaining = client.get_mempool_entries(false, false).await.unwrap();
         let mut token_done = true;
@@ -778,7 +872,7 @@ async fn atomic_token_atomic_enabled_mixed_mempool_stress_drains_deterministical
     }
 
     let remaining = client.get_mempool_entries(false, false).await.unwrap();
-    assert!(remaining.is_empty(), "mempool did not drain after stress mining: remaining={}", remaining.len());
+    assert!(remaining.is_empty(), "phase-one mempool did not drain after stress mining: remaining={}", remaining.len());
 
     for (label, txid) in &token_txids {
         let status =
@@ -792,6 +886,125 @@ async fn atomic_token_atomic_enabled_mixed_mempool_stress_drains_deterministical
         );
     }
 
+    let pool_after_buy = client
+        .get_liquidity_pool_state_call(
+            None,
+            GetLiquidityPoolStateRequest { asset_id: liquidity_asset_id.clone(), at_block_hash: None },
+        )
+        .await
+        .unwrap()
+        .pool
+        .expect("liquidity pool must exist after queued buy");
+    assert_eq!(pool_after_buy.pool_nonce, pool_before.pool_nonce + 1);
+    let unclaimed_after_buy = pool_after_buy.unclaimed_fee_total_sompi.parse::<u64>().unwrap();
+    assert!(unclaimed_after_buy > 0);
+
+    let sell_token_in = 2u128;
+    let sell_quote = client
+        .get_liquidity_quote_call(
+            None,
+            GetLiquidityQuoteRequest {
+                asset_id: liquidity_asset_id.clone(),
+                side: 1,
+                exact_in_amount: sell_token_in.to_string(),
+                at_block_hash: None,
+            },
+        )
+        .await
+        .unwrap();
+    let sell_cpay_out = sell_quote.amount_out.parse::<u64>().unwrap();
+    let sell_fee = required_fee(2, 3);
+    assert!(buy_change > sell_fee);
+    let sell_change = buy_change - sell_fee;
+    let sell_vault_value = pool_after_buy.vault_value_sompi.parse::<u64>().unwrap() - sell_cpay_out;
+    let sell_tx = build_payload_tx_with_outputs(
+        &owner_sk,
+        vec![
+            (
+                TransactionOutpoint::new(pool_after_buy.vault_txid, pool_after_buy.vault_output_index),
+                UtxoEntry::new(pool_after_buy.vault_value_sompi.parse::<u64>().unwrap(), liquidity_vault_script(), 0, false),
+                0,
+            ),
+            (
+                TransactionOutpoint::new(token_txids.last().unwrap().1, 1),
+                UtxoEntry::new(buy_change, pay_to_address_script(&owner_address), 0, false),
+                1,
+            ),
+        ],
+        vec![
+            TransactionOutput { value: sell_vault_value, script_public_key: liquidity_vault_script() },
+            TransactionOutput { value: sell_cpay_out, script_public_key: pay_to_address_script(&owner_address) },
+            TransactionOutput { value: sell_change, script_public_key: pay_to_address_script(&owner_address) },
+        ],
+        payload_sell_liquidity(1, 2, liquidity_asset_bytes, pool_after_buy.pool_nonce, sell_token_in, sell_cpay_out, 1),
+    );
+    let sell_txid = sell_tx.id();
+    let claim_amount = 12_000_000u64;
+    assert!(
+        unclaimed_after_buy >= claim_amount,
+        "liquidity buy did not accrue enough claimable fees for a non-dust claim: accrued={unclaimed_after_buy} claim={claim_amount}"
+    );
+    let claim_fee = required_fee(2, 3);
+    assert!(sell_change > claim_fee);
+    let claim_change = sell_change - claim_fee;
+    let claim_vault_value = sell_vault_value - claim_amount;
+    let claim_tx = build_payload_tx_with_outputs(
+        &owner_sk,
+        vec![
+            (TransactionOutpoint::new(sell_txid, 0), UtxoEntry::new(sell_vault_value, liquidity_vault_script(), 0, false), 0),
+            (TransactionOutpoint::new(sell_txid, 2), UtxoEntry::new(sell_change, pay_to_address_script(&owner_address), 0, false), 1),
+        ],
+        vec![
+            TransactionOutput { value: claim_vault_value, script_public_key: liquidity_vault_script() },
+            TransactionOutput { value: claim_amount, script_public_key: pay_to_address_script(&owner_address) },
+            TransactionOutput { value: claim_change, script_public_key: pay_to_address_script(&owner_address) },
+        ],
+        payload_claim_liquidity(1, 3, liquidity_asset_bytes, pool_after_buy.pool_nonce + 1, 0, claim_amount, 1),
+    );
+    let pool_chain_txs = vec![("liquidity-sell-0".to_string(), sell_tx), ("liquidity-claim-0".to_string(), claim_tx)];
+    for (label, tx) in &pool_chain_txs {
+        token_txids.push((label.clone(), tx.id()));
+        submit_transaction_and_assert_mempool(&client, label, tx).await;
+    }
+    let phase_two_mempool = client.get_mempool_entries(false, false).await.unwrap();
+    assert!(
+        phase_two_mempool.len() >= pool_chain_txs.len(),
+        "pool sell/claim chain was not retained in mempool: queued={} entries={}",
+        pool_chain_txs.len(),
+        phase_two_mempool.len()
+    );
+
+    mine_blocks(&client, &owner_address, 1).await;
+    for _ in 0..80 {
+        let remaining = client.get_mempool_entries(false, false).await.unwrap();
+        let mut pool_chain_done = true;
+        for (_, txid) in pool_chain_txs.iter().map(|(label, tx)| (label, tx.id())) {
+            match client.get_token_op_status_call(None, GetTokenOpStatusRequest { txid, at_block_hash: None }).await {
+                Ok(status) if status.apply_status.is_some() => {}
+                Ok(_) => pool_chain_done = false,
+                Err(_) => pool_chain_done = false,
+            }
+        }
+        if remaining.is_empty() && pool_chain_done {
+            break;
+        }
+        mine_blocks(&client, &owner_address, 1).await;
+    }
+    let remaining = client.get_mempool_entries(false, false).await.unwrap();
+    assert!(remaining.is_empty(), "phase-two mempool did not drain after sell/claim mining: remaining={}", remaining.len());
+
+    for (label, txid) in &token_txids {
+        let status =
+            client.get_token_op_status_call(None, GetTokenOpStatusRequest { txid: *txid, at_block_hash: None }).await.unwrap();
+        assert_eq!(
+            status.apply_status,
+            Some(0),
+            "unexpected token apply status after pool-chain phase for {label} tx {txid}: apply_status={:?} noop_reason={:?}",
+            status.apply_status,
+            status.noop_reason
+        );
+    }
+
     let owner_balance = client
         .get_token_balance_call(
             None,
@@ -799,7 +1012,7 @@ async fn atomic_token_atomic_enabled_mixed_mempool_stress_drains_deterministical
         )
         .await
         .unwrap();
-    assert_eq!(owner_balance.balance, "20480");
+    assert_eq!(owner_balance.balance, "20720");
     let receiver_balance = client
         .get_token_balance_call(
             None,
@@ -807,7 +1020,7 @@ async fn atomic_token_atomic_enabled_mixed_mempool_stress_drains_deterministical
         )
         .await
         .unwrap();
-    assert_eq!(receiver_balance.balance, "240");
+    assert_eq!(receiver_balance.balance, "360");
 
     let base_asset = client
         .get_token_asset_call(None, GetTokenAssetRequest { asset_id: base_asset_id.clone(), at_block_hash: None })
@@ -815,7 +1028,7 @@ async fn atomic_token_atomic_enabled_mixed_mempool_stress_drains_deterministical
         .unwrap()
         .asset
         .expect("base asset must exist after stress run");
-    assert_eq!(base_asset.total_supply, "20720");
+    assert_eq!(base_asset.total_supply, "21080");
 
     let owner_nonce_after = client
         .get_token_nonce_call(None, GetTokenNonceRequest { owner_id: owner_id_hex.clone(), asset_id: None, at_block_hash: None })
@@ -837,13 +1050,13 @@ async fn atomic_token_atomic_enabled_mixed_mempool_stress_drains_deterministical
         )
         .await
         .unwrap();
-    assert_eq!(liquidity_asset_nonce_after.expected_next_nonce, 2);
+    assert_eq!(liquidity_asset_nonce_after.expected_next_nonce, 4);
 
     let assets = client
         .get_token_assets_call(None, GetTokenAssetsRequest { offset: 0, limit: 100, query: None, at_block_hash: None })
         .await
         .unwrap();
-    assert!(assets.total >= 14, "expected stress run to create at least 14 token assets, got {}", assets.total);
+    assert!(assets.total >= 22, "expected stress run to create at least 22 token assets, got {}", assets.total);
 
     let pool_after = client
         .get_liquidity_pool_state_call(
@@ -854,8 +1067,13 @@ async fn atomic_token_atomic_enabled_mixed_mempool_stress_drains_deterministical
         .unwrap()
         .pool
         .expect("liquidity pool must exist after queued buy");
-    assert_eq!(pool_after.pool_nonce, pool_before.pool_nonce + 1);
+    assert_eq!(pool_after.pool_nonce, pool_before.pool_nonce + 3);
     assert!(pool_after.total_supply.parse::<u128>().unwrap() > 0);
+    let unclaimed_after_claim = pool_after.unclaimed_fee_total_sompi.parse::<u64>().unwrap();
+    assert!(
+        unclaimed_after_claim + claim_amount >= unclaimed_after_buy,
+        "claim should only reduce available fees by the claimed amount plus/minus later trade fees: after_buy={unclaimed_after_buy} after_claim={unclaimed_after_claim}"
+    );
     let liquidity_holders = client
         .get_liquidity_holders_call(
             None,
