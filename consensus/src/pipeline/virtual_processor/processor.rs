@@ -3258,6 +3258,11 @@ impl VirtualStateProcessor {
         target_hash: Hash,
         expected_state_hash: [u8; 32],
     ) -> Result<Option<AtomicConsensusState>, String> {
+        let empty_state = AtomicConsensusState::default();
+        if expected_state_hash == empty_state.canonical_hash() {
+            return Ok(Some(empty_state));
+        }
+
         let virtual_read = self.virtual_stores.read();
         let virtual_state = virtual_read.state.get().map_err(|err| format!("virtual state unavailable: {err}"))?;
         let mut state = self

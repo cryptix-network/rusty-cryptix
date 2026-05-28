@@ -3,7 +3,7 @@ use crate::{
     model::{
         services::reachability::ReachabilityService,
         stores::{
-            atomic_state::{AtomicAssetClass, AtomicBalanceKey, AtomicLiquidityPoolState, AtomicNonceKey},
+            atomic_state::{AtomicAssetClass, AtomicBalanceKey, AtomicConsensusState, AtomicLiquidityPoolState, AtomicNonceKey},
             statuses::StatusesStore,
             virtual_state::{VirtualStateStore, VirtualStateStoreReader},
         },
@@ -19,10 +19,11 @@ use cryptix_consensus_core::{
     blockhash,
     blockstatus::BlockStatus,
     coinbase::MinerData,
-    config::{params::MAINNET_PARAMS, ConfigBuilder},
+    config::{params::MAINNET_PARAMS, Config, ConfigBuilder},
     constants::{SOMPI_PER_CRYPTIX, TX_VERSION, UNACCEPTED_DAA_SCORE},
     errors::block::RuleError,
     subnets::{SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PAYLOAD},
+    trusted::TrustedBlock,
     tx::{
         MutableTransaction, ScriptPublicKey, ScriptVec, Transaction, TransactionInput, TransactionOutpoint, TransactionOutput,
         UtxoEntry,
@@ -30,7 +31,8 @@ use cryptix_consensus_core::{
     BlockHashSet,
 };
 use cryptix_hashes::Hash;
-use std::{collections::VecDeque, sync::Arc, thread::JoinHandle};
+use cryptix_muhash::MuHash;
+use std::{collections::VecDeque, sync::Arc, thread::JoinHandle, time::Duration};
 
 struct OnetimeTxSelector {
     txs: Option<Vec<Transaction>>,
@@ -989,6 +991,216 @@ fn liquidity_test_context() -> TestContext {
     TestContext::new(TestConsensus::new(&config))
 }
 
+const ATOMIC_PRUNING_FINALITY_DEPTH: u64 = 4;
+const ATOMIC_PRUNING_DEPTH: u64 = 8;
+const ATOMIC_PRUNING_PROOF_M: u64 = 2;
+
+fn atomic_pruning_config(payload_hf_activation_daa_score: u64, process_genesis: bool) -> Config {
+    let builder = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().enable_sanity_checks().edit_consensus_params(|p| {
+        p.coinbase_maturity = 0;
+        p.payload_hf_activation_daa_score = payload_hf_activation_daa_score;
+        p.finality_depth = ATOMIC_PRUNING_FINALITY_DEPTH;
+        p.pruning_depth = ATOMIC_PRUNING_DEPTH;
+        p.pruning_proof_m = ATOMIC_PRUNING_PROOF_M;
+        p.merge_depth = ATOMIC_PRUNING_FINALITY_DEPTH;
+        p.mergeset_size_limit = 10;
+        p.max_block_parents = 4;
+    });
+
+    if process_genesis {
+        builder.build()
+    } else {
+        builder.skip_adding_genesis().build()
+    }
+}
+
+async fn mine_empty_blocks(ctx: &mut TestContext, count: usize, nonce_base: u64) -> Hash {
+    for offset in 0..count {
+        ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+        let template = ctx.build_block_template(nonce_base + offset as u64, ctx.simulated_time);
+        ctx.validate_and_insert_utxo_valid_block(template.block.to_immutable()).await;
+    }
+    ctx.consensus.get_sink()
+}
+
+async fn mine_asset_create_block(
+    ctx: &mut TestContext,
+    owner_script: &ScriptPublicKey,
+    owner_id: [u8; 32],
+    nonce: u64,
+    name: &[u8],
+    symbol: &[u8],
+    amount: u128,
+) -> ([u8; 32], Hash) {
+    let (funding_outpoint, funding_entry) = find_virtual_utxo_by_script(ctx, owner_script);
+    let tx_fee = 10_000u64;
+    let create_tx = payload_tx(
+        vec![TransactionInput::new(funding_outpoint, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(funding_entry.amount - tx_fee, owner_script.clone())],
+        payload_create_asset_with_mint(0, 1, owner_id, name, symbol, amount, owner_id),
+    );
+    let asset_id = create_tx.id().as_bytes();
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let template = ctx.build_block_template_with_transactions(vec![create_tx], nonce, ctx.simulated_time);
+    let block_hash = template.block.header.hash;
+    ctx.validate_and_insert_utxo_valid_block(template.block.to_immutable()).await;
+    (asset_id, block_hash)
+}
+
+async fn wait_for_pruning_point_at_or_after_blue_score(ctx: &TestContext, min_blue_score: u64) -> Hash {
+    let genesis = ctx.consensus.params().genesis.hash;
+    for _ in 0..200 {
+        let pruning_point = ctx.consensus.pruning_point();
+        let blue_score = ctx.consensus.get_header(pruning_point).unwrap().blue_score;
+        if pruning_point != genesis && blue_score >= min_blue_score {
+            return pruning_point;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let pruning_point = ctx.consensus.pruning_point();
+    let blue_score = ctx.consensus.get_header(pruning_point).unwrap().blue_score;
+    panic!(
+        "pruning point did not advance to blue_score >= {min_blue_score}; current pruning_point={pruning_point}, blue_score={blue_score}"
+    );
+}
+
+async fn wait_for_pruning_point_to_stabilize(ctx: &TestContext) -> Hash {
+    let mut previous = ctx.consensus.pruning_point();
+    let mut stable_samples = 0usize;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let current = ctx.consensus.pruning_point();
+        if current == previous {
+            stable_samples += 1;
+            if stable_samples >= 3 {
+                return current;
+            }
+        } else {
+            previous = current;
+            stable_samples = 0;
+        }
+    }
+
+    previous
+}
+
+fn assert_pruning_point_atomic_state(
+    ctx: &TestContext,
+    pruning_point: Hash,
+    expected_asset_id: [u8; 32],
+    expected_owner_id: [u8; 32],
+    expected_balance: u128,
+) -> ([u8; 32], [u8; 32]) {
+    let root = ctx.consensus.get_atomic_state_hash(pruning_point).unwrap().expect("pruning point must have an Atomic root record");
+    let audit_hash = ctx
+        .consensus
+        .get_atomic_p2p_token_audit_hash(pruning_point)
+        .unwrap()
+        .expect("pruning point Atomic state must be materializable for P2P audit");
+    let trusted_data = ctx.consensus.get_pruning_point_anticone_and_trusted_data().unwrap();
+    let atomic_state = trusted_data.atomic_state.as_ref().expect("trusted pruning data must carry Atomic state");
+    assert_eq!(atomic_state.state_hash, root);
+
+    let state_bytes = atomic_state.state_bytes.as_deref().expect("trusted pruning data must carry full Atomic state bytes");
+    let imported_state =
+        AtomicConsensusState::try_from_canonical_bytes(state_bytes).expect("trusted pruning Atomic bytes must decode");
+    assert_eq!(imported_state.canonical_hash(), root);
+    assert!(imported_state.assets.contains_key(&expected_asset_id));
+    assert_eq!(balance_of(&imported_state, expected_asset_id, expected_owner_id), expected_balance);
+    assert_ne!(audit_hash, [0; 32], "token audit hash must be available for materialized pruning point state");
+    (root, audit_hash)
+}
+
+fn assert_empty_pruning_point_atomic_state(ctx: &TestContext, pruning_point: Hash) {
+    let empty_state = AtomicConsensusState::default();
+    let empty_root = empty_state.canonical_hash();
+    let root =
+        ctx.consensus.get_atomic_state_hash(pruning_point).unwrap().expect("post-HF pruning point must have an Atomic root record");
+    assert_eq!(root, empty_root);
+
+    let audit_hash = ctx
+        .consensus
+        .get_atomic_p2p_token_audit_hash(pruning_point)
+        .unwrap()
+        .expect("empty pruning point Atomic state must be materializable for P2P audit");
+    assert_eq!(Some(audit_hash), empty_state.p2p_token_audit_hash());
+
+    let trusted_data = ctx.consensus.get_pruning_point_anticone_and_trusted_data().unwrap();
+    let atomic_state = trusted_data.atomic_state.as_ref().expect("trusted pruning data must carry empty Atomic state");
+    assert_eq!(atomic_state.state_hash, root);
+    let state_bytes = atomic_state.state_bytes.as_deref().expect("trusted pruning data must carry full empty Atomic state bytes");
+    let imported_state = AtomicConsensusState::try_from_canonical_bytes(state_bytes).expect("trusted empty Atomic bytes must decode");
+    assert_eq!(imported_state.canonical_hash(), empty_root);
+    assert!(imported_state.assets.is_empty());
+    assert!(imported_state.balances.is_empty());
+    assert!(imported_state.next_nonces.is_empty());
+    assert!(imported_state.anchor_counts.is_empty());
+}
+
+async fn import_pruned_consensus_from_source(source: &TestContext, target_config: &Config) -> TestContext {
+    let pruning_point = source.consensus.pruning_point();
+    let proof = source.consensus.get_pruning_point_proof().as_ref().clone();
+    let pruning_point_headers = source.consensus.pruning_point_headers();
+    let trusted_data = source.consensus.get_pruning_point_anticone_and_trusted_data().unwrap();
+    let trusted_blocks: Vec<_> = trusted_data
+        .anticone
+        .iter()
+        .copied()
+        .map(|hash| {
+            let block = source.consensus.get_block(hash).expect("source must retain pruning-point anticone block bodies");
+            let ghostdag = source.consensus.get_ghostdag_data(hash).expect("source must retain pruning-point anticone ghostdag");
+            TrustedBlock::new(block, ghostdag)
+        })
+        .collect();
+
+    let mut target = TestContext::new(TestConsensus::new(target_config));
+    target.simulated_time = source.simulated_time;
+    target.consensus.apply_pruning_proof(proof, &trusted_blocks).expect("target must accept pruning proof");
+    target.consensus.import_pruning_points(pruning_point_headers);
+
+    for trusted_block in trusted_blocks {
+        target
+            .consensus
+            .validate_and_insert_trusted_block(trusted_block)
+            .virtual_state_task
+            .await
+            .expect("target must accept trusted pruning anticone block");
+    }
+
+    let atomic_state = trusted_data.atomic_state.clone().expect("source pruning trusted data must include Atomic state");
+    target
+        .consensus
+        .import_pruning_point_atomic_state(pruning_point, atomic_state)
+        .expect("target must import pruning-point Atomic state before UTXO set");
+
+    let mut imported_multiset = MuHash::new();
+    let mut from_outpoint = None;
+    let mut skip_first = false;
+    loop {
+        let chunk = source
+            .consensus
+            .get_pruning_point_utxos(pruning_point, from_outpoint, 128, skip_first)
+            .expect("source pruning-point UTXOs must be available");
+        if chunk.is_empty() {
+            break;
+        }
+        from_outpoint = chunk.last().map(|(outpoint, _)| *outpoint);
+        skip_first = true;
+        target.consensus.append_imported_pruning_point_utxos(&chunk, &mut imported_multiset);
+        if chunk.len() < 128 {
+            break;
+        }
+    }
+    target
+        .consensus
+        .import_pruning_point_utxo_set(pruning_point, imported_multiset)
+        .expect("target must accept pruning-point UTXO set with imported Atomic state");
+
+    target
+}
+
 async fn setup_dual_owner_liquidity_pool() -> (TestContext, DualOwnerLiquidityFixture) {
     let mut ctx = liquidity_test_context();
     let owner_redeem_script = p2sh_redeem_script();
@@ -1166,6 +1378,106 @@ async fn payload_hf_activation_switches_live_without_restart() {
     let repaired_atomic = ctx.consensus.virtual_atomic_state();
     assert!(repaired_atomic.assets.contains_key(&asset_id));
     assert_eq!(balance_of(&repaired_atomic, asset_id, owner_id), 100);
+}
+
+#[tokio::test]
+async fn atomic_pruning_post_hf_first_pruning_keeps_full_atomic_state() {
+    cryptix_core::log::try_init_logger("info");
+    let config = atomic_pruning_config(0, true);
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    mine_empty_blocks(&mut ctx, 12, 10).await;
+    let first_pruning_point = wait_for_pruning_point_at_or_after_blue_score(&ctx, ATOMIC_PRUNING_FINALITY_DEPTH).await;
+    assert_empty_pruning_point_atomic_state(&ctx, first_pruning_point);
+
+    let initial_supply = 1_234u128;
+    let (asset_id, create_block_hash) =
+        mine_asset_create_block(&mut ctx, &owner_script, owner_id, 100, b"PruneHF", b"PHF", initial_supply).await;
+    let create_blue_score = ctx.consensus.get_header(create_block_hash).unwrap().blue_score;
+
+    mine_empty_blocks(&mut ctx, 24, 200).await;
+    let pruning_point = wait_for_pruning_point_at_or_after_blue_score(&ctx, create_blue_score).await;
+    assert_pruning_point_atomic_state(&ctx, pruning_point, asset_id, owner_id, initial_supply);
+    ctx.consensus.validate_pruning_points().expect("pruning point chain must remain valid");
+}
+
+#[tokio::test]
+async fn atomic_pruning_survives_prunings_before_hf_then_post_hf_pruning() {
+    cryptix_core::log::try_init_logger("info");
+    let activation_daa = 20;
+    let config = atomic_pruning_config(activation_daa, true);
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    mine_empty_blocks(&mut ctx, 18, 300).await;
+    let pre_hf_pruning_point = wait_for_pruning_point_at_or_after_blue_score(&ctx, ATOMIC_PRUNING_FINALITY_DEPTH).await;
+    assert!(
+        ctx.consensus.get_header(pre_hf_pruning_point).unwrap().daa_score < activation_daa,
+        "test setup must move at least one pruning point before payload HF activation"
+    );
+
+    while ctx.consensus.get_virtual_daa_score() < activation_daa {
+        let nonce = 400 + ctx.consensus.get_virtual_daa_score();
+        mine_empty_blocks(&mut ctx, 1, nonce).await;
+    }
+
+    let initial_supply = 4_321u128;
+    let (asset_id, create_block_hash) =
+        mine_asset_create_block(&mut ctx, &owner_script, owner_id, 500, b"PostPruneHF", b"PPH", initial_supply).await;
+    let create_blue_score = ctx.consensus.get_header(create_block_hash).unwrap().blue_score;
+
+    mine_empty_blocks(&mut ctx, 24, 600).await;
+    let post_hf_pruning_point = wait_for_pruning_point_at_or_after_blue_score(&ctx, create_blue_score).await;
+    assert_ne!(post_hf_pruning_point, pre_hf_pruning_point);
+    assert_pruning_point_atomic_state(&ctx, post_hf_pruning_point, asset_id, owner_id, initial_supply);
+    ctx.consensus.validate_pruning_points().expect("mixed pre/post-HF pruning point chain must remain valid");
+}
+
+#[tokio::test]
+async fn atomic_pruning_sync_imports_full_atomic_state_from_pruned_peer() {
+    cryptix_core::log::try_init_logger("info");
+    let source_config = atomic_pruning_config(0, true);
+    let mut source = TestContext::new(TestConsensus::new(&source_config));
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    source.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    mine_empty_blocks(&mut source, 3, 700).await;
+    let initial_supply = 7_777u128;
+    let (asset_id, create_block_hash) =
+        mine_asset_create_block(&mut source, &owner_script, owner_id, 800, b"SyncPrune", b"SPN", initial_supply).await;
+    let create_blue_score = source.consensus.get_header(create_block_hash).unwrap().blue_score;
+
+    mine_empty_blocks(&mut source, 24, 900).await;
+    wait_for_pruning_point_at_or_after_blue_score(&source, create_blue_score).await;
+    let source_pruning_point = wait_for_pruning_point_to_stabilize(&source).await;
+    assert!(
+        source.consensus.get_header(source_pruning_point).unwrap().blue_score >= create_blue_score,
+        "stable source pruning point must include the Atomic create block"
+    );
+    let (source_root, source_token_audit_hash) =
+        assert_pruning_point_atomic_state(&source, source_pruning_point, asset_id, owner_id, initial_supply);
+
+    let target_config = atomic_pruning_config(0, false);
+    let mut target = import_pruned_consensus_from_source(&source, &target_config).await;
+    assert_eq!(target.consensus.pruning_point(), source_pruning_point);
+    assert_eq!(target.consensus.get_atomic_state_hash(source_pruning_point).unwrap().unwrap(), source_root);
+    assert_eq!(target.consensus.get_atomic_p2p_token_audit_hash(source_pruning_point).unwrap().unwrap(), source_token_audit_hash);
+
+    let imported_atomic = target.consensus.virtual_atomic_state();
+    assert_eq!(imported_atomic.canonical_hash(), source_root);
+    assert!(imported_atomic.assets.contains_key(&asset_id));
+    assert_eq!(balance_of(&imported_atomic, asset_id, owner_id), initial_supply);
+
+    mine_empty_blocks(&mut target, 1, 1_000).await;
+    let extended_atomic = target.consensus.virtual_atomic_state();
+    assert!(extended_atomic.assets.contains_key(&asset_id));
+    assert_eq!(balance_of(&extended_atomic, asset_id, owner_id), initial_supply);
 }
 
 #[tokio::test]

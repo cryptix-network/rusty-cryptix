@@ -942,6 +942,11 @@ impl PruningProofManager {
         target_hash: Hash,
         expected_state_hash: [u8; 32],
     ) -> Result<Option<AtomicConsensusState>, String> {
+        let empty_state = AtomicConsensusState::default();
+        if expected_state_hash == empty_state.canonical_hash() {
+            return Ok(Some(empty_state));
+        }
+
         let virtual_read = self.virtual_stores.read();
         let virtual_state = virtual_read.state.get().map_err(|err| format!("virtual state unavailable: {err}"))?;
         let mut state = self
@@ -954,18 +959,14 @@ impl PruningProofManager {
 
         let selected_chain_read = self.selected_chain_store.read();
         let (tip_index, _) = selected_chain_read.get_tip().map_err(|err| format!("selected-chain tip unavailable: {err}"))?;
-        let mut target_index = None;
-        for index in 0..=tip_index {
-            let hash =
-                selected_chain_read.get_by_index(index).map_err(|err| format!("selected-chain index `{index}` unavailable: {err}"))?;
-            if hash == target_hash {
-                target_index = Some(index);
-                break;
-            }
-        }
-        let Some(target_index) = target_index else {
-            return Ok(None);
+        let target_index = match selected_chain_read.get_by_hash(target_hash) {
+            Ok(index) => index,
+            Err(StoreError::KeyNotFound(_)) => return Ok(None),
+            Err(err) => return Err(format!("selected-chain hash `{target_hash}` unavailable: {err}")),
         };
+        if target_index > tip_index {
+            return Ok(None);
+        }
 
         for index in ((target_index + 1)..=tip_index).rev() {
             let block_hash =
