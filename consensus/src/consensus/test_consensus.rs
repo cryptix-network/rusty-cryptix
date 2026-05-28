@@ -12,6 +12,8 @@ use cryptix_database::utils::DbLifetime;
 use cryptix_hashes::Hash;
 use cryptix_notify::subscription::context::SubscriptionContext;
 use parking_lot::RwLock;
+#[cfg(test)]
+use rocksdb::WriteBatch;
 
 use cryptix_database::create_temp_db;
 use cryptix_database::prelude::ConnBuilder;
@@ -19,7 +21,9 @@ use std::future::Future;
 use std::{sync::Arc, thread::JoinHandle};
 
 #[cfg(test)]
-use crate::model::stores::atomic_state::AtomicConsensusState;
+use crate::model::stores::atomic_state::{AtomicConsensusState, AtomicConsensusStateDelta};
+#[cfg(test)]
+use crate::model::stores::selected_chain::SelectedChainStoreReader;
 #[cfg(test)]
 use crate::model::stores::virtual_state::VirtualStateStoreReader;
 use crate::pipeline::virtual_processor::test_block_builder::TestBlockBuilder;
@@ -134,6 +138,45 @@ impl TestConsensus {
     #[cfg(test)]
     pub fn delete_atomic_state_record_for_tests(&self, hash: Hash) {
         self.consensus.atomic_state_store.delete(hash).expect("delete Atomic state record for test");
+    }
+
+    #[cfg(test)]
+    pub fn overwrite_atomic_delta_with_empty_for_tests(&self, hash: Hash) {
+        let root = self.consensus.atomic_state_store.get_root_record(hash).expect("Atomic root record for test");
+        let mut batch = WriteBatch::default();
+        self.consensus
+            .atomic_state_store
+            .repair_batch_with_delta(&mut batch, hash, root.state_hash, Arc::new(AtomicConsensusStateDelta::default()))
+            .expect("overwrite Atomic delta for test");
+        self.consensus.db.write(batch).expect("commit overwritten Atomic delta for test");
+    }
+
+    #[cfg(test)]
+    pub fn overwrite_atomic_root_with_hash_for_tests(&self, hash: Hash, state_hash: [u8; 32]) {
+        let mut batch = WriteBatch::default();
+        self.consensus
+            .atomic_state_store
+            .repair_batch_with_delta(&mut batch, hash, state_hash, Arc::new(AtomicConsensusStateDelta::default()))
+            .expect("overwrite Atomic root for test");
+        self.consensus.db.write(batch).expect("commit overwritten Atomic root for test");
+    }
+
+    #[cfg(test)]
+    pub fn selected_chain_atomic_hash_from_deltas_for_tests(&self, target: Hash) -> [u8; 32] {
+        let selected_chain_read = self.consensus.selected_chain_store.read();
+        let target_index = selected_chain_read.get_by_hash(target).expect("target in selected chain");
+        let mut state = AtomicConsensusState::default();
+        for index in 1..=target_index {
+            let block_hash = selected_chain_read.get_by_index(index).expect("selected-chain block by index");
+            let delta = self.consensus.atomic_state_store.get_delta(block_hash).expect("selected-chain Atomic delta");
+            state.apply_delta_forward(delta.as_ref()).expect("selected-chain Atomic delta applies");
+        }
+        state.canonical_hash()
+    }
+
+    #[cfg(test)]
+    pub fn atomic_root_record_hash_for_tests(&self, hash: Hash) -> [u8; 32] {
+        self.consensus.atomic_state_store.get_root_record(hash).expect("Atomic root record for test").state_hash
     }
 
     pub fn build_header_with_parents(&self, hash: Hash, parents: Vec<Hash>) -> Header {

@@ -1,5 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
+use cryptix_core::warn;
 use cryptix_p2p_lib::{
     common::ProtocolError,
     dequeue_with_request_id, make_response,
@@ -47,7 +48,10 @@ impl Flow for RequestAtomicTokenStateHashFlow {
                             Ok(Some(state_hash)) => break Some(state_hash),
                             Ok(None) => {}
                             Err(err) => {
-                                return Err(ProtocolError::OtherOwned(format!("Atomic token state hash response unavailable: {err}")));
+                                warn!(
+                                    "Atomic token state hash response unavailable for `{block_hash}`; replying without token state: {err}"
+                                );
+                                break None;
                             }
                         }
                     }

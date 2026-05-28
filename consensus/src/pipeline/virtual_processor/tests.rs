@@ -21,6 +21,7 @@ use cryptix_consensus_core::{
     coinbase::MinerData,
     config::{params::MAINNET_PARAMS, ConfigBuilder},
     constants::{SOMPI_PER_CRYPTIX, TX_VERSION, UNACCEPTED_DAA_SCORE},
+    errors::block::RuleError,
     subnets::{SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PAYLOAD},
     tx::{
         MutableTransaction, ScriptPublicKey, ScriptVec, Transaction, TransactionInput, TransactionOutpoint, TransactionOutput,
@@ -2187,6 +2188,213 @@ async fn template_build_repairs_stale_virtual_atomic_state_after_mixed_block() {
         "template building must repair a stale virtual Atomic root before serving miners"
     );
     ctx.validate_and_insert_utxo_valid_block(empty_after_corruption.block.to_immutable()).await;
+}
+
+#[tokio::test]
+async fn template_build_repairs_corrupt_atomic_deltas_from_block_data() {
+    let (mut ctx, fixture) = setup_dual_owner_liquidity_pool().await;
+
+    let (buy_tx, _, _) = build_liquidity_buy_tx(
+        fixture.asset_id,
+        &fixture.pool,
+        fixture.owner_anchor,
+        fixture.owner_anchor_value,
+        &fixture.owner_script,
+        p2sh_signature_script(),
+        1,
+        10 * SOMPI_PER_CRYPTIX,
+        fixture.tx_fee,
+    );
+    let native_tx = Transaction::new(
+        TX_VERSION,
+        vec![TransactionInput::new(fixture.second_owner_anchor, p2sh_signature_script_for(&second_p2sh_redeem_script()), 0, 0)],
+        vec![TransactionOutput::new(fixture.second_owner_anchor_value - fixture.tx_fee, fixture.second_owner_script.clone())],
+        0,
+        SUBNETWORK_ID_NATIVE,
+        0,
+        vec![],
+    );
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let mixed_template = ctx.build_block_template_with_transactions(vec![native_tx, buy_tx], 4_450, ctx.simulated_time);
+    ctx.validate_and_insert_utxo_valid_block(mixed_template.block.to_immutable()).await;
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let accepting_template = ctx.build_block_template(4_451, ctx.simulated_time);
+    ctx.validate_and_insert_utxo_valid_block(accepting_template.block.to_immutable()).await;
+
+    let selected_parent = ctx.consensus.get_sink();
+    let expected_atomic_hash = ctx.consensus.virtual_atomic_state().canonical_hash();
+    ctx.consensus.clear_atomic_current_store_for_tests();
+    ctx.consensus.overwrite_atomic_delta_with_empty_for_tests(selected_parent);
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let repaired_template = ctx.build_block_template(4_452, ctx.simulated_time);
+    assert_eq!(
+        ctx.consensus.virtual_atomic_state().canonical_hash(),
+        expected_atomic_hash,
+        "template building must rebuild bad selected-chain Atomic deltas from local acceptance/block data"
+    );
+    assert_eq!(
+        ctx.consensus.selected_chain_atomic_hash_from_deltas_for_tests(selected_parent),
+        expected_atomic_hash,
+        "repaired selected-chain Atomic deltas must replay to the same root without another block-data rebuild"
+    );
+    ctx.validate_and_insert_utxo_valid_block(repaired_template.block.to_immutable()).await;
+}
+
+#[tokio::test]
+async fn template_repair_replays_utxos_created_and_spent_inside_same_acceptance_diff() {
+    let mut ctx = liquidity_test_context();
+    let owner_redeem_script = p2sh_redeem_script();
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&owner_redeem_script);
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    for _ in 0..4 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let fork_base = ctx.consensus.get_sink();
+    let (funding_outpoint, funding_entry) = find_virtual_utxo_by_script(&ctx, &owner_script);
+    let tx_fee = 10_000u64;
+    let create_change_value = funding_entry.amount - tx_fee;
+    let create_tx = payload_tx(
+        vec![TransactionInput::new(funding_outpoint, p2sh_signature_script_for(&owner_redeem_script), 0, 0)],
+        vec![TransactionOutput::new(create_change_value, owner_script.clone())],
+        payload_create_asset(0, 1, owner_id, b"ReplayLocal", b"RPL"),
+    );
+    let create_change_outpoint = TransactionOutpoint::new(create_tx.id(), 0);
+    let mut spend_created_output_tx = Transaction::new(
+        TX_VERSION,
+        vec![TransactionInput::new(create_change_outpoint, p2sh_signature_script_for(&owner_redeem_script), 0, 0)],
+        vec![TransactionOutput::new(create_change_value - tx_fee, owner_script.clone())],
+        0,
+        SUBNETWORK_ID_NATIVE,
+        0,
+        vec![],
+    );
+    spend_created_output_tx.finalize();
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let side_create =
+        ctx.build_utxo_valid_block_with_parents_and_transactions(vec![fork_base], vec![create_tx.clone()], 5_000, ctx.simulated_time);
+    let side_create_hash = side_create.header.hash;
+    ctx.validate_and_insert_block(side_create.to_immutable()).await;
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let side_spend = ctx.build_utxo_valid_block_with_parents_and_transactions(
+        vec![side_create_hash],
+        vec![spend_created_output_tx.clone()],
+        5_001,
+        ctx.simulated_time,
+    );
+    let side_spend_hash = side_spend.header.hash;
+    ctx.validate_and_insert_block(side_spend.to_immutable()).await;
+
+    let mut selected_tip = fork_base;
+    for nonce in 5_010..5_016 {
+        ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+        let extension =
+            ctx.build_utxo_valid_block_with_parents_and_transactions(vec![selected_tip], vec![], nonce, ctx.simulated_time);
+        selected_tip = extension.header.hash;
+        ctx.validate_and_insert_block(extension.to_immutable()).await;
+    }
+    assert_eq!(ctx.consensus.get_sink(), selected_tip, "test setup must keep the plain selected chain ahead of the side branch");
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let merge_side_branch = ctx.build_utxo_valid_block_with_parents_and_transactions(
+        vec![selected_tip, side_spend_hash],
+        vec![],
+        5_020,
+        ctx.simulated_time,
+    );
+    let merge_hash = merge_side_branch.header.hash;
+    ctx.validate_and_insert_utxo_valid_block(merge_side_branch.to_immutable()).await;
+    assert_eq!(ctx.consensus.get_sink(), merge_hash, "merge block must be the selected parent for this repair regression");
+
+    let acceptance_data = ctx.consensus.get_block_acceptance_data(merge_hash).expect("merge acceptance data should exist");
+    let accepted_txids: Vec<_> = acceptance_data
+        .iter()
+        .flat_map(|block_acceptance| block_acceptance.accepted_transactions.iter())
+        .map(|tx| tx.transaction_id)
+        .collect();
+    assert!(accepted_txids.contains(&create_tx.id()), "merge block must accept the CAT create tx from the side branch");
+    assert!(
+        accepted_txids.contains(&spend_created_output_tx.id()),
+        "merge block must accept the tx spending a UTXO created earlier in the same acceptance diff"
+    );
+
+    let selected_parent = ctx.consensus.get_sink();
+    let expected_atomic_hash = ctx.consensus.virtual_atomic_state().canonical_hash();
+    assert_eq!(
+        ctx.consensus.atomic_root_record_hash_for_tests(selected_parent),
+        expected_atomic_hash,
+        "test setup must start from a selected-parent Atomic root record that matches live virtual state"
+    );
+    ctx.consensus.clear_atomic_current_store_for_tests();
+    ctx.consensus.overwrite_atomic_delta_with_empty_for_tests(selected_parent);
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let repaired_template = ctx.build_block_template(5_021, ctx.simulated_time);
+    assert_eq!(
+        ctx.consensus.selected_chain_atomic_hash_from_deltas_for_tests(selected_parent),
+        expected_atomic_hash,
+        "block-data repair must persist deltas that replay through intra-acceptance UTXO create/spend chains"
+    );
+    ctx.validate_and_insert_utxo_valid_block(repaired_template.block.to_immutable()).await;
+}
+
+#[tokio::test]
+async fn template_build_refuses_unrepairable_atomic_commitment_base() {
+    let (mut ctx, fixture) = setup_dual_owner_liquidity_pool().await;
+
+    let (buy_tx, _, _) = build_liquidity_buy_tx(
+        fixture.asset_id,
+        &fixture.pool,
+        fixture.owner_anchor,
+        fixture.owner_anchor_value,
+        &fixture.owner_script,
+        p2sh_signature_script(),
+        1,
+        10 * SOMPI_PER_CRYPTIX,
+        fixture.tx_fee,
+    );
+    let native_tx = Transaction::new(
+        TX_VERSION,
+        vec![TransactionInput::new(fixture.second_owner_anchor, p2sh_signature_script_for(&second_p2sh_redeem_script()), 0, 0)],
+        vec![TransactionOutput::new(fixture.second_owner_anchor_value - fixture.tx_fee, fixture.second_owner_script.clone())],
+        0,
+        SUBNETWORK_ID_NATIVE,
+        0,
+        vec![],
+    );
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let mixed_template = ctx.build_block_template_with_transactions(vec![native_tx, buy_tx], 4_470, ctx.simulated_time);
+    ctx.validate_and_insert_utxo_valid_block(mixed_template.block.to_immutable()).await;
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let accepting_template = ctx.build_block_template(4_471, ctx.simulated_time);
+    ctx.validate_and_insert_utxo_valid_block(accepting_template.block.to_immutable()).await;
+
+    let selected_parent = ctx.consensus.get_sink();
+    let actual_root = ctx.consensus.virtual_atomic_state().canonical_hash();
+    let mut bogus_root = [0x42u8; 32];
+    if bogus_root == actual_root {
+        bogus_root[0] ^= 0x01;
+    }
+    ctx.consensus.clear_atomic_current_store_for_tests();
+    ctx.consensus.overwrite_atomic_root_with_hash_for_tests(selected_parent, bogus_root);
+
+    let result = ctx.consensus.build_block_template(
+        ctx.miner_data.clone(),
+        Box::new(OnetimeTxSelector::new(Default::default())),
+        TemplateBuildMode::Standard,
+    );
+    assert!(
+        matches!(result, Err(RuleError::KnownInvalid)),
+        "template building must refuse mining when the selected-parent Atomic prefix cannot be reconstructed"
+    );
 }
 
 #[tokio::test]

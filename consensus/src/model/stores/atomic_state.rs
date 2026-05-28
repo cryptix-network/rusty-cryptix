@@ -474,20 +474,20 @@ where
     K: Eq + std::hash::Hash,
     V: Clone + Eq,
 {
-    if old_value == new_value {
-        map.remove(&key);
-        return;
-    }
-
     match map.entry(key) {
         std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if old_value == new_value {
+                return;
+            }
             entry.get_mut().new_value = new_value;
             if entry.get().old_value == entry.get().new_value {
                 entry.remove();
             }
         }
         std::collections::hash_map::Entry::Vacant(entry) => {
-            entry.insert(DeltaValue { old_value, new_value });
+            if old_value != new_value {
+                entry.insert(DeltaValue { old_value, new_value });
+            }
         }
     }
 }
@@ -3138,6 +3138,24 @@ mod tests {
         assert_eq!(delta.anchor_count_changes.len(), 1);
         assert_eq!(delta.anchor_count_changes[0].old_value, None);
         assert_eq!(delta.anchor_count_changes[0].new_value, Some(1));
+    }
+
+    #[test]
+    fn atomic_consensus_state_delta_preserves_prior_change_when_later_set_is_noop() {
+        let owner_id = owner(0xCE);
+        let mut state = AtomicConsensusState::default();
+        state.begin_delta_tracking();
+        state.set_anchor_count(owner_id, 1);
+        state.set_anchor_count(owner_id, 1);
+
+        let delta = state.take_delta();
+        assert_eq!(delta.anchor_count_changes.len(), 1);
+        assert_eq!(delta.anchor_count_changes[0].old_value, None);
+        assert_eq!(delta.anchor_count_changes[0].new_value, Some(1));
+
+        let mut replayed = AtomicConsensusState::default();
+        replayed.apply_delta_forward(&delta).expect("forward delta applies");
+        assert_eq!(replayed.canonical_hash(), state.canonical_hash());
     }
 
     #[test]
