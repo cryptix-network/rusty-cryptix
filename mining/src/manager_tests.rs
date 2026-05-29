@@ -584,6 +584,46 @@ mod tests {
     }
 
     #[test]
+    fn test_mempool_parent_output_index_out_of_bounds_is_rejected_without_panic() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+
+        let parent_transaction = create_transaction_with_utxo_entry(0, 0);
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                parent_transaction.clone(),
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("parent transaction should enter the mempool");
+
+        let mut child_transaction = create_transaction_with_utxo_entry(1, 0);
+        let invalid_parent_outpoint = TransactionOutpoint::new(parent_transaction.id(), parent_transaction.tx.outputs.len() as u32);
+        let child_tx = Arc::make_mut(&mut child_transaction.tx);
+        child_tx.inputs[0].previous_outpoint = invalid_parent_outpoint;
+        child_tx.finalize();
+        child_transaction.entries[0] = None;
+        let child_id = child_transaction.id();
+
+        let result = into_mempool_result(mining_manager.validate_and_insert_mutable_transaction(
+            consensus.as_ref(),
+            child_transaction,
+            Priority::Low,
+            Orphan::Forbidden,
+            RbfPolicy::Forbidden,
+        ));
+
+        match result {
+            Err(RuleError::RejectDisallowedOrphan(transaction_id)) => assert_eq!(transaction_id, child_id),
+            other => panic!("expected out-of-bounds parent output to be rejected as a missing outpoint, got {other:?}"),
+        }
+        assert_transaction_count(&mining_manager, 1, "invalid child rejection");
+    }
+
+    #[test]
     fn test_atomic_liquidity_vault_submit_can_use_pending_mempool_context() {
         let consensus = Arc::new(ConsensusMock::new());
         let counters = Arc::new(MiningCounters::default());
