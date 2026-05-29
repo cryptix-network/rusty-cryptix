@@ -3172,6 +3172,18 @@ impl VirtualStateProcessor {
         imported_atomic_state: PruningPointAtomicState,
     ) -> PruningImportResult<()> {
         let expected_hash = imported_atomic_state.state_hash;
+        let new_pruning_point_header = self.headers_store.get_header(new_pruning_point).map_err(|err| {
+            PruningImportError::AtomicStateStoreError(format!(
+                "failed reading pruning-point header for `{new_pruning_point}` before importing Atomic state: {err}"
+            ))
+        })?;
+        if self.transaction_validator.is_payload_hf_active(new_pruning_point_header.daa_score)
+            && imported_atomic_state.state_bytes.is_none()
+        {
+            return Err(PruningImportError::AtomicStateStoreError(format!(
+                "post-HF pruning point `{new_pruning_point}` requires full Atomic state bytes, got root-only metadata"
+            )));
+        }
         let full_state = match imported_atomic_state.state_bytes.as_deref() {
             Some(bytes) => {
                 let actual_hash = AtomicConsensusState::canonical_hash_from_canonical_bytes(bytes).map_err(|err| {

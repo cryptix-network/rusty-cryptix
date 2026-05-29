@@ -51,7 +51,7 @@ impl ProgressReporter {
         if percent > self.last_reported_percent {
             let date = match Local.timestamp_opt(current_timestamp as i64 / 1000, 1000 * (current_timestamp as u32 % 1000)) {
                 LocalResult::None | LocalResult::Ambiguous(_, _) => "cannot parse date".into(),
-                LocalResult::Single(date) => date.format("%Y-%m-%d %H:%M:%S.%3f:%z").to_string(),
+                LocalResult::Single(date) => date.format("%m/%d/%Y %I:%M:%S.%3f %p %:z").to_string(),
             };
             info!("IBD: Processed {} {} ({}%) last block timestamp: {}", self.processed, self.object_name, percent, date);
             self.last_reported_percent = percent;

@@ -85,7 +85,9 @@ impl PruningPointAndItsAnticoneRequestsFlow {
                 atomic_consensus_state_chunk_count,
             ) = match atomic_state {
                 Some(state) => {
-                    let state_bytes = state.state_bytes.clone().unwrap_or_default();
+                    let state_bytes = state.state_bytes.clone().ok_or(ProtocolError::Other(
+                        "cannot serve post-HF pruning-point data without full atomic consensus state bytes",
+                    ))?;
                     let byte_length = state_bytes.len() as u64;
                     let chunk_count = trusted_atomic_state_chunk_count(byte_length);
                     (state.state_hash.to_vec(), state_bytes, byte_length, chunk_count)

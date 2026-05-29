@@ -425,6 +425,11 @@ impl IbdFlow {
             if inline_state.state_hash != state_hash {
                 return Err(ProtocolError::Other("inline pruning-point atomic state hash metadata mismatch"));
             }
+            if inline_state.state_bytes.is_none() {
+                return Err(ProtocolError::Other(
+                    "post-HF pruning-point trusted data carries only an atomic root; full atomic state bytes are required",
+                ));
+            }
             return Ok(Some(inline_state));
         }
 
@@ -435,7 +440,7 @@ impl IbdFlow {
             return Ok(Some(cryptix_consensus_core::pruning::PruningPointAtomicState { state_hash, state_bytes: Some(state_bytes) }));
         }
 
-        Ok(Some(cryptix_consensus_core::pruning::PruningPointAtomicState { state_hash, state_bytes: None }))
+        Err(ProtocolError::Other("post-HF pruning-point trusted data is missing full atomic consensus state bytes"))
     }
 
     fn should_warn_pruning_point_atomic_quorum_check_error(err: &str) -> bool {
