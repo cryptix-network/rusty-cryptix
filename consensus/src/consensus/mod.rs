@@ -160,6 +160,7 @@ impl Consensus {
         counters: Arc<ProcessingCounters>,
         tx_script_cache_counters: Arc<TxScriptCacheCounters>,
         creation_timestamp: u64,
+        enable_periodic_atomic_consensus_log: bool,
     ) -> Self {
         let params = &config.params;
         let perf_params = &config.perf;
@@ -274,6 +275,7 @@ impl Consensus {
             pruning_lock.clone(),
             notification_root.clone(),
             counters.clone(),
+            enable_periodic_atomic_consensus_log,
         ));
 
         let pruning_processor = Arc::new(PruningProcessor::new(
@@ -774,6 +776,10 @@ impl ConsensusApi for Consensus {
 
     fn get_atomic_state_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {
         self.virtual_processor.get_atomic_state_hash(block_hash)
+    }
+
+    fn get_atomic_state_bytes(&self, block_hash: Hash) -> ConsensusResult<Option<Vec<u8>>> {
+        self.virtual_processor.get_atomic_state_bytes(block_hash)
     }
 
     fn get_atomic_p2p_token_audit_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {

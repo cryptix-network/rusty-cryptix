@@ -466,7 +466,25 @@ impl AtomicBootstrapService {
         block_hash: BlockHash,
         expected_state_hash: [u8; 32],
     ) -> Result<(), String> {
-        let p2p_result = self.verify_consensus_atomic_state_hash_p2p_quorum(block_hash, expected_state_hash).await;
+        self.verify_consensus_atomic_state_hash_quorum_with_anchor(block_hash, expected_state_hash, None).await
+    }
+
+    async fn verify_consensus_atomic_state_hash_quorum_at_daa(
+        &self,
+        block_hash: BlockHash,
+        expected_state_hash: [u8; 32],
+        anchor_daa_score: u64,
+    ) -> Result<(), String> {
+        self.verify_consensus_atomic_state_hash_quorum_with_anchor(block_hash, expected_state_hash, Some(anchor_daa_score)).await
+    }
+
+    async fn verify_consensus_atomic_state_hash_quorum_with_anchor(
+        &self,
+        block_hash: BlockHash,
+        expected_state_hash: [u8; 32],
+        anchor_daa_score: Option<u64>,
+    ) -> Result<(), String> {
+        let p2p_result = self.verify_consensus_atomic_state_hash_p2p_quorum(block_hash, expected_state_hash, anchor_daa_score).await;
         match p2p_result {
             Ok(()) => return Ok(()),
             Err(err) if self.configured_rpc_peers.is_empty() => return Err(err),
@@ -565,14 +583,20 @@ impl AtomicBootstrapService {
         &self,
         block_hash: BlockHash,
         expected_state_hash: [u8; 32],
+        anchor_daa_score: Option<u64>,
     ) -> Result<(), String> {
-        let consensus = self.flow_context.consensus();
-        let session = consensus.session().await;
-        let anchor_daa_score = session
-            .async_get_header(block_hash)
-            .await
-            .map_err(|err| format!("local header unavailable for P2P Atomic state hash quorum `{block_hash}`: {err}"))?
-            .daa_score;
+        let anchor_daa_score = match anchor_daa_score {
+            Some(anchor_daa_score) => anchor_daa_score,
+            None => {
+                let consensus = self.flow_context.consensus();
+                let session = consensus.session().await;
+                session
+                    .async_get_header(block_hash)
+                    .await
+                    .map_err(|err| format!("local header unavailable for P2P Atomic state hash quorum `{block_hash}`: {err}"))?
+                    .daa_score
+            }
+        };
         let decision = self.select_p2p_atomic_state_hash_quorum(block_hash, anchor_daa_score).await?;
         let expected_state_hash_hex = hex_encode(expected_state_hash);
         if decision.snapshot_id != expected_state_hash_hex {
@@ -2103,6 +2127,15 @@ impl AtomicBootstrapService {
 impl AtomicStateQuorumVerifier for AtomicBootstrapService {
     async fn verify_consensus_atomic_state_hash(&self, block_hash: BlockHash, state_hash: [u8; 32]) -> Result<(), String> {
         self.verify_consensus_atomic_state_hash_quorum(block_hash, state_hash).await
+    }
+
+    async fn verify_consensus_atomic_state_hash_at_daa(
+        &self,
+        block_hash: BlockHash,
+        state_hash: [u8; 32],
+        anchor_daa_score: u64,
+    ) -> Result<(), String> {
+        self.verify_consensus_atomic_state_hash_quorum_at_daa(block_hash, state_hash, anchor_daa_score).await
     }
 
     async fn local_atomic_token_state_hash_for_peer(&self, block_hash: BlockHash) -> Result<Option<[u8; 32]>, String> {

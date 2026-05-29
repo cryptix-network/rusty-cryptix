@@ -308,6 +308,7 @@ impl ConsensusFactory for Factory {
             self.counters.clone(),
             self.tx_script_cache_counters.clone(),
             entry.creation_timestamp,
+            true,
         ));
 
         // We write the new active entry only once the instance was created successfully.
@@ -342,6 +343,7 @@ impl ConsensusFactory for Factory {
             self.counters.clone(),
             self.tx_script_cache_counters.clone(),
             entry.creation_timestamp,
+            false,
         ));
 
         (ConsensusInstance::new(session_lock, consensus.clone()), Arc::new(Ctl::new(self.management_store.clone(), db, consensus)))

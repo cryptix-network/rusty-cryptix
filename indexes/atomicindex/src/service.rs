@@ -1,4 +1,5 @@
 use crate::{
+    consensus_state_import::token_state_from_consensus_canonical_bytes,
     error::{AtomicTokenError, AtomicTokenResult},
     payload::TokenOp,
     state::{
@@ -1478,9 +1479,139 @@ impl AtomicTokenService {
         let has_verified_state = { self.processor.state.read().await.has_verified_state() };
         if has_verified_state {
             self.revalidate_retained_state_once().await
+        } else if self.bootstrap_from_consensus_pruning_point_state_once().await? {
+            self.catch_up_loaded_state_to_consensus_sink().await?;
+            Ok(true)
         } else {
             self.backfill_empty_state_from_local_selected_chain().await
         }
+    }
+
+    async fn local_history_requires_pruning_point_seed(&self) -> AtomicTokenResult<bool> {
+        let consensus = self.processor.consensus_manager.consensus();
+        let session = consensus.session().await;
+        let sink = session.async_get_sink().await;
+        let sink_header = session.async_get_header(sink).await?;
+        if sink_header.daa_score < self.payload_hf_activation_daa_score {
+            return Ok(false);
+        }
+
+        let pruning_point = session.async_pruning_point().await;
+        if pruning_point == self.genesis_hash {
+            return Ok(false);
+        }
+        let pruning_point_header = session.async_get_header(pruning_point).await?;
+        Ok(pruning_point_header.daa_score >= self.payload_hf_activation_daa_score)
+    }
+
+    async fn bootstrap_from_consensus_pruning_point_state_once(&self) -> AtomicTokenResult<bool> {
+        let _operation_guard = self.processor.operation_lock.lock().await;
+        {
+            let state = self.processor.state.read().await;
+            if state.has_verified_state() {
+                return Ok(false);
+            }
+        }
+
+        let consensus = self.processor.consensus_manager.consensus();
+        let session = consensus.session().await;
+        let sink = session.async_get_sink().await;
+        let sink_header = session.async_get_header(sink).await?;
+        if sink_header.daa_score < self.payload_hf_activation_daa_score {
+            return Ok(false);
+        }
+
+        let pruning_point = session.async_pruning_point().await;
+        if pruning_point == self.genesis_hash {
+            return Ok(false);
+        }
+        let pruning_point_header = session.async_get_header(pruning_point).await?;
+        if pruning_point_header.daa_score < self.payload_hf_activation_daa_score {
+            return Ok(false);
+        }
+
+        let Some(state_bytes) = session.async_get_atomic_state_bytes(pruning_point).await? else {
+            debug!(
+                "[{IDENT}] consensus pruning-point Atomic state bytes are not available yet for {}; deferring token index replay",
+                pruning_point
+            );
+            return Ok(false);
+        };
+        let expected_p2p_audit_hash = session.async_get_atomic_p2p_token_audit_hash(pruning_point).await?;
+        let mut imported_state =
+            token_state_from_consensus_canonical_bytes(&state_bytes, self.protocol_version, self.network_id.clone())?;
+        imported_state.set_payload_hf_activation_daa_score(self.payload_hf_activation_daa_score);
+        imported_state.degraded = false;
+        imported_state.live_correct = true;
+        imported_state.block_journals.clear();
+        imported_state.processed_ops.clear();
+        imported_state.events.clear();
+        imported_state.next_event_sequence = 0;
+        imported_state.applied_chain_order.clear();
+        imported_state.state_hash_by_block.clear();
+        imported_state.event_sequence_by_block.clear();
+        imported_state.rebuild_runtime_caches();
+
+        let actual_p2p_audit_hash = compute_p2p_audit_state_root_from_parts(
+            &imported_state.assets,
+            &imported_state.balances,
+            &imported_state.nonces,
+            &imported_state.anchor_counts,
+        );
+        if let Some(expected_p2p_audit_hash) = expected_p2p_audit_hash {
+            if actual_p2p_audit_hash != expected_p2p_audit_hash {
+                return Err(AtomicTokenError::Processing(format!(
+                    "consensus pruning-point Atomic token audit root mismatch for {}: expected {}, decoded {}",
+                    pruning_point,
+                    hex_encode(expected_p2p_audit_hash),
+                    hex_encode(actual_p2p_audit_hash)
+                )));
+            }
+        }
+
+        let token_state_hash = imported_state.compute_state_hash();
+        imported_state.applied_chain_order.push(pruning_point);
+        imported_state.state_hash_by_block.insert(pruning_point, token_state_hash);
+        imported_state.event_sequence_by_block.insert(pruning_point, 0);
+        imported_state.attach_state_store(self.processor.state_store.clone());
+        self.processor.state_store.persist_state(&imported_state)?;
+        self.processor.state_store.persist_revalidation_version(ATOMIC_REVALIDATION_VERSION)?;
+        let footprint = imported_state.footprint();
+
+        {
+            let mut live_state = self.processor.state.write().await;
+            *live_state = imported_state;
+        }
+        self.processor.notify_state_progress();
+        info!(
+            "[{IDENT}] Cryptix Atomic seeded token index from consensus pruning-point state {} (DAA {}, assets={}, balances={}, nonces={}, anchors={}, token_root={}, p2p_audit_root={})",
+            pruning_point,
+            pruning_point_header.daa_score,
+            footprint.assets,
+            footprint.balances,
+            footprint.nonces,
+            footprint.anchor_counts,
+            hex_encode(token_state_hash),
+            hex_encode(actual_p2p_audit_hash)
+        );
+        Ok(true)
+    }
+
+    async fn prepare_for_virtual_chain_notification(&self, _msg: &VirtualChainChangedNotification) -> AtomicTokenResult<bool> {
+        {
+            let state = self.processor.state.read().await;
+            if state.has_verified_state() {
+                return Ok(true);
+            }
+        }
+        if !self.local_history_requires_pruning_point_seed().await? {
+            return Ok(true);
+        }
+
+        if self.bootstrap_from_consensus_pruning_point_state_once().await? {
+            self.catch_up_loaded_state_to_consensus_sink().await?;
+        }
+        Ok(false)
     }
 
     fn prune_stale_state_hash_checkpoints(&self, state: &mut AtomicTokenState) -> AtomicTokenResult<usize> {
@@ -1772,9 +1903,8 @@ impl AtomicTokenService {
 
             if refreshed_retained_hashes.is_empty() {
                 let mut state = self.processor.state.write().await;
-                if !state.degraded {
-                    state.live_correct = true;
-                }
+                state.degraded = false;
+                state.live_correct = true;
                 self.processor.state_store.persist_runtime_flags(
                     state.applied_chain_order.last().copied(),
                     state.applied_chain_order.len() as u64,
@@ -2764,17 +2894,28 @@ impl AsyncService for AtomicTokenService {
                                 info!("[{IDENT}] Cryptix Atomic startup state revalidation completed successfully");
                                 local_state_ready = true;
                             }
-                            Ok(false) => match self.backfill_empty_state_from_local_selected_chain().await {
+                            Ok(false) => match self.bootstrap_from_consensus_pruning_point_state_once().await {
                                 Ok(true) => {
                                     local_state_ready = true;
                                 }
-                                Ok(false) => info!(
-                                    "[{IDENT}] Cryptix Atomic startup state has no retained verified chain state yet; indexing will build from local virtual-chain updates"
-                                ),
+                                Ok(false) => match self.backfill_empty_state_from_local_selected_chain().await {
+                                    Ok(true) => {
+                                        local_state_ready = true;
+                                    }
+                                    Ok(false) => info!(
+                                        "[{IDENT}] Cryptix Atomic startup state has no retained verified chain state yet; indexing will build from local virtual-chain updates"
+                                    ),
+                                    Err(err) => {
+                                        warn!("[{IDENT}] Cryptix Atomic local selected-chain backfill failed: {err}");
+                                        self.processor
+                                            .mark_degraded_best_effort(&format!("local selected-chain backfill failed: {err}"))
+                                            .await;
+                                    }
+                                },
                                 Err(err) => {
-                                    warn!("[{IDENT}] Cryptix Atomic local selected-chain backfill failed: {err}");
+                                    warn!("[{IDENT}] Cryptix Atomic consensus pruning-point state bootstrap failed: {err}");
                                     self.processor
-                                        .mark_degraded_best_effort(&format!("local selected-chain backfill failed: {err}"))
+                                        .mark_degraded_best_effort(&format!("consensus pruning-point state bootstrap failed: {err}"))
                                         .await;
                                 }
                             },
@@ -2814,8 +2955,25 @@ impl AsyncService for AtomicTokenService {
                     notification = self.recv_channel.recv() => {
                         match notification {
                             Ok(notification) => {
-                                if let Err(err) = self.processor.process(notification).await {
-                                    warn!("[{IDENT}] Cryptix Atomic processor error: {err}");
+                                let should_process = match &notification {
+                                    ConsensusNotification::VirtualChainChanged(msg) => {
+                                        match self.prepare_for_virtual_chain_notification(msg).await {
+                                            Ok(should_process) => should_process,
+                                            Err(err) => {
+                                                warn!("[{IDENT}] Cryptix Atomic pruning-point state preparation failed: {err}");
+                                                self.processor
+                                                    .mark_degraded_best_effort(&format!("pruning-point state preparation failed: {err}"))
+                                                    .await;
+                                                false
+                                            }
+                                        }
+                                    }
+                                    _ => true,
+                                };
+                                if should_process {
+                                    if let Err(err) = self.processor.process(notification).await {
+                                        warn!("[{IDENT}] Cryptix Atomic processor error: {err}");
+                                    }
                                 }
                             }
                             Err(_) => {

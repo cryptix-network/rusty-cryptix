@@ -108,6 +108,15 @@ fn is_transport_payload_hf_active(params: &Params, virtual_daa_score: u64) -> bo
 pub trait AtomicStateQuorumVerifier: Send + Sync {
     async fn verify_consensus_atomic_state_hash(&self, block_hash: Hash, state_hash: [u8; 32]) -> Result<(), String>;
 
+    async fn verify_consensus_atomic_state_hash_at_daa(
+        &self,
+        block_hash: Hash,
+        state_hash: [u8; 32],
+        _anchor_daa_score: u64,
+    ) -> Result<(), String> {
+        self.verify_consensus_atomic_state_hash(block_hash, state_hash).await
+    }
+
     async fn local_atomic_token_state_hash_for_peer(&self, _block_hash: Hash) -> Result<Option<[u8; 32]>, String> {
         Ok(None)
     }
@@ -709,6 +718,23 @@ impl FlowContext {
         let verifier = self.atomic_state_quorum_verifier.read().as_ref().and_then(|verifier| verifier.upgrade());
         match verifier {
             Some(verifier) => verifier.verify_consensus_atomic_state_hash(block_hash, state_hash).await,
+            None if self.config.net.is_mainnet() => {
+                Err("atomic consensus state quorum verifier is not configured; refusing mainnet pruning-point atomic state import"
+                    .to_string())
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub async fn verify_consensus_atomic_state_hash_quorum_at_daa(
+        &self,
+        block_hash: Hash,
+        state_hash: [u8; 32],
+        anchor_daa_score: u64,
+    ) -> Result<(), String> {
+        let verifier = self.atomic_state_quorum_verifier.read().as_ref().and_then(|verifier| verifier.upgrade());
+        match verifier {
+            Some(verifier) => verifier.verify_consensus_atomic_state_hash_at_daa(block_hash, state_hash, anchor_daa_score).await,
             None if self.config.net.is_mainnet() => {
                 Err("atomic consensus state quorum verifier is not configured; refusing mainnet pruning-point atomic state import"
                     .to_string())

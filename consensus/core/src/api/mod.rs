@@ -232,6 +232,10 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    fn get_atomic_state_bytes(&self, block_hash: Hash) -> ConsensusResult<Option<Vec<u8>>> {
+        unimplemented!()
+    }
+
     fn get_atomic_p2p_token_audit_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {
         unimplemented!()
     }

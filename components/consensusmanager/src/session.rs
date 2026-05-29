@@ -358,6 +358,10 @@ impl ConsensusSessionOwned {
         self.clone().spawn_blocking(move |c| c.get_atomic_state_hash(block_hash)).await
     }
 
+    pub async fn async_get_atomic_state_bytes(&self, block_hash: Hash) -> ConsensusResult<Option<Vec<u8>>> {
+        self.clone().spawn_blocking(move |c| c.get_atomic_state_bytes(block_hash)).await
+    }
+
     pub async fn async_get_atomic_p2p_token_audit_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {
         self.clone().spawn_blocking(move |c| c.get_atomic_p2p_token_audit_hash(block_hash)).await
     }

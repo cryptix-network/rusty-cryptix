@@ -404,11 +404,21 @@ impl IbdFlow {
             return Err(ProtocolError::Other("post-HF pruning-point trusted data is missing atomic consensus state hash"));
         };
 
-        if let Err(err) = self.ctx.verify_consensus_atomic_state_hash_quorum(proof_pruning_point, state_hash).await {
-            warn!(
+        // Use the DAA from the validated proof header; the pruning-point header may not be in the local store yet during IBD.
+        if let Err(err) = self
+            .ctx
+            .verify_consensus_atomic_state_hash_quorum_at_daa(proof_pruning_point, state_hash, proof_pruning_point_daa_score)
+            .await
+        {
+            let message = format!(
                 "P2P pruning-point atomic root quorum check unavailable for {} from peer {}; continuing with trusted-data root and validating it against the pruning-point commitment ({})",
                 proof_pruning_point, self.router, err
             );
+            if Self::should_warn_pruning_point_atomic_quorum_check_error(&err) {
+                warn!("{message}");
+            } else {
+                debug!("{message}");
+            }
         }
 
         if let Some(inline_state) = pkg.atomic_state.take() {
@@ -426,6 +436,10 @@ impl IbdFlow {
         }
 
         Ok(Some(cryptix_consensus_core::pruning::PruningPointAtomicState { state_hash, state_bytes: None }))
+    }
+
+    fn should_warn_pruning_point_atomic_quorum_check_error(err: &str) -> bool {
+        err.contains("quorum selected") || err.contains("refusing mainnet")
     }
 
     async fn receive_trusted_atomic_state_chunks(

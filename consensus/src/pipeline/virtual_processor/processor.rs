@@ -208,6 +208,7 @@ pub struct VirtualStateProcessor {
     // Counters
     counters: Arc<ProcessingCounters>,
     atomic_consensus_log_state: Mutex<AtomicConsensusLogState>,
+    enable_periodic_atomic_consensus_log: bool,
 
     // Storage mass hardfork DAA score
     pub(crate) storage_mass_activation_daa_score: u64,
@@ -233,6 +234,7 @@ impl VirtualStateProcessor {
         pruning_lock: SessionLock,
         notification_root: Arc<ConsensusNotificationRoot>,
         counters: Arc<ProcessingCounters>,
+        enable_periodic_atomic_consensus_log: bool,
     ) -> Self {
         Self {
             receiver,
@@ -279,6 +281,7 @@ impl VirtualStateProcessor {
             notification_root,
             counters,
             atomic_consensus_log_state: Mutex::new(AtomicConsensusLogState::default()),
+            enable_periodic_atomic_consensus_log,
             storage_mass_activation_daa_score: params.storage_mass_activation_daa_score,
             atomic_max_new_assets_per_block: params.atomic_max_new_assets_per_block,
             atomic_max_new_balance_keys_per_block: params.atomic_max_new_balance_keys_per_block,
@@ -293,7 +296,9 @@ impl VirtualStateProcessor {
             let msg = match self.receiver.recv_timeout(ATOMIC_CONSENSUS_LOG_INTERVAL) {
                 Ok(msg) => msg,
                 Err(RecvTimeoutError::Timeout) => {
-                    self.log_current_atomic_consensus_state("periodic");
+                    if self.enable_periodic_atomic_consensus_log {
+                        self.log_current_atomic_consensus_state("periodic");
+                    }
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -1195,6 +1200,7 @@ impl VirtualStateProcessor {
         let virtual_read = self.virtual_stores.read();
         match virtual_read.state.get() {
             Ok(virtual_state) => self.log_atomic_consensus_state_summary(reason, &virtual_state),
+            Err(StoreError::KeyNotFound(_)) => debug!("skipping Atomic consensus status log: virtual state is not initialized yet"),
             Err(err) => warn!("failed reading virtual state for Atomic consensus status log: {err}"),
         }
     }
@@ -3233,6 +3239,23 @@ impl VirtualStateProcessor {
             Ok(root) => Ok(Some(root.state_hash)),
             Err(StoreError::KeyNotFound(_)) => Ok(None),
             Err(_) => Err(ConsensusError::General("failed reading atomic consensus root")),
+        }
+    }
+
+    pub fn get_atomic_state_bytes(&self, block_hash: Hash) -> ConsensusResult<Option<Vec<u8>>> {
+        let expected_state_hash = match self.atomic_state_store.get_root_record(block_hash) {
+            Ok(root) => root.state_hash,
+            Err(StoreError::KeyNotFound(_)) => return Ok(None),
+            Err(_) => return Err(ConsensusError::General("failed reading atomic consensus root")),
+        };
+
+        match self.materialize_selected_chain_atomic_state_at(block_hash, expected_state_hash) {
+            Ok(Some(state)) => Ok(Some(state.canonical_bytes())),
+            Ok(None) => Ok(None),
+            Err(err) => {
+                warn!("failed materializing full Atomic consensus state for `{block_hash}`: {err}");
+                Ok(None)
+            }
         }
     }
 

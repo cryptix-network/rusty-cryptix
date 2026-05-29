@@ -68,6 +68,7 @@ impl TestConsensus {
             counters,
             tx_script_cache_counters,
             0,
+            true,
         ));
         let block_builder = TestBlockBuilder::new(consensus.virtual_processor.clone());
 
@@ -88,6 +89,7 @@ impl TestConsensus {
             counters,
             tx_script_cache_counters,
             0,
+            true,
         ));
         let block_builder = TestBlockBuilder::new(consensus.virtual_processor.clone());
 
@@ -109,6 +111,7 @@ impl TestConsensus {
             counters,
             tx_script_cache_counters,
             0,
+            true,
         ));
         let block_builder = TestBlockBuilder::new(consensus.virtual_processor.clone());
 
