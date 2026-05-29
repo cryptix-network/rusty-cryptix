@@ -56,7 +56,7 @@ pub enum RpcError {
     #[error("Transaction {0} not found")]
     TransactionNotFound(TransactionId),
 
-    #[error("Method unavailable. Run the node with the --utxoindex argument.")]
+    #[error("Method unavailable. Enable the UTXO index for this node.")]
     NoUtxoIndex,
 
     #[error("ERR_STALE_CONTEXT")]

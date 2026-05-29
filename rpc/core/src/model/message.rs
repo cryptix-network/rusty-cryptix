@@ -5492,7 +5492,7 @@ impl Deserializer for FinalityConflictResolvedNotification {
 //
 // If `addresses` is empty, the notifications will start or stop for all addresses.
 //
-// This call is only available when this cryptixd was started with `--utxoindex`
+// This call is only available when this cryptixd has the UTXO index enabled.
 //
 // See: UtxosChangedNotification
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -709,7 +709,7 @@ pub trait RpcApi: Sync + Send + AnySync {
 
     /// Returns the total balance in unspent transactions towards a given address.
     ///
-    /// This call is only available when this node was started with `--utxoindex`.
+    /// This call is only available when this node has the UTXO index enabled.
     async fn get_balance_by_address(&self, address: RpcAddress) -> RpcResult<u64> {
         Ok(self.get_balance_by_address_call(None, GetBalanceByAddressRequest::new(address)).await?.balance)
     }
@@ -731,7 +731,7 @@ pub trait RpcApi: Sync + Send + AnySync {
 
     /// Requests all current UTXOs for the given node addresses.
     ///
-    /// This call is only available when this node was started with `--utxoindex`.
+    /// This call is only available when this node has the UTXO index enabled.
     async fn get_utxos_by_addresses(&self, addresses: Vec<RpcAddress>) -> RpcResult<Vec<RpcUtxosByAddressesEntry>> {
         Ok(self.get_utxos_by_addresses_call(None, GetUtxosByAddressesRequest::new(addresses)).await?.entries)
     }

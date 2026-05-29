@@ -121,7 +121,7 @@ impl Default for Args {
             rpclisten_json: None,
             unsafe_rpc: false,
             async_threads: num_cpus::get(),
-            utxoindex: false,
+            utxoindex: true,
             atomic_unsafe_skip_snapshot_finality_check: false,
             atomic_bootstrap_peers: vec![],
             atomic_bootstrap_allow_peer_fallback: false,
@@ -388,7 +388,14 @@ pub fn cli() -> Command {
                 .hide(true)
                 .help("Testing override for consensus coinbase maturity."),
         )
-        .arg(arg!(--utxoindex "Enable the UTXO index"))
+        .arg(arg!(--utxoindex "Enable the UTXO index (default)"))
+        .arg(
+            Arg::new("no-utxoindex")
+                .long("no-utxoindex")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("utxoindex")
+                .help("Disable the UTXO index."),
+        )
         .arg(
             Arg::new("atomic-bootstrap-peer")
                 .long("atomic-bootstrap-peer")
@@ -619,6 +626,13 @@ impl Args {
         } else {
             defaults.banserver
         };
+        let utxoindex_enabled = if arg_match_unwrap_or::<bool>(&m, "utxoindex", false) {
+            true
+        } else if arg_match_unwrap_or::<bool>(&m, "no-utxoindex", false) {
+            false
+        } else {
+            defaults.utxoindex
+        };
 
         let args = Args {
             appdir: m.get_one::<String>("appdir").cloned().or(defaults.appdir),
@@ -642,7 +656,7 @@ impl Args {
             enable_unsynced_mining: arg_match_unwrap_or::<bool>(&m, "enable-unsynced-mining", defaults.enable_unsynced_mining),
             startup_repair_plan: m.get_one::<String>("startup-repair-plan").cloned().or(defaults.startup_repair_plan),
             enable_mainnet_mining: arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", defaults.enable_mainnet_mining),
-            utxoindex: arg_match_unwrap_or::<bool>(&m, "utxoindex", defaults.utxoindex),
+            utxoindex: utxoindex_enabled,
             atomic_unsafe_skip_snapshot_finality_check: arg_match_unwrap_or::<bool>(
                 &m,
                 "atomic-unsafe-skip-snapshot-finality-check",
@@ -770,6 +784,18 @@ mod tests {
         let args =
             Args::parse(["cryptixd", "--atomic-bootstrap-peer-quorum-min-sources=1"]).expect("quorum override args should parse");
         assert_eq!(args.atomic_bootstrap_peer_quorum_min_sources, Some(1));
+    }
+
+    #[test]
+    fn utxoindex_is_enabled_by_default() {
+        let args = Args::parse(["cryptixd"]).expect("default args should parse");
+        assert!(args.utxoindex);
+    }
+
+    #[test]
+    fn no_utxoindex_flag_disables_index() {
+        let args = Args::parse(["cryptixd", "--no-utxoindex"]).expect("flag args should parse");
+        assert!(!args.utxoindex);
     }
 
     #[test]

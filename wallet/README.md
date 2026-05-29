@@ -32,7 +32,7 @@ Type `help` for additional help or `exit` to quit the application.
 
 (this section will be updated later, it is intended for development)
 
-After starting the wallet shell (native of WASM) and starting a local rusty-cryptix Cryptixd node (with `--testnet` and `--utxoindex`), you should perform the following actions:
+After starting the wallet shell (native of WASM) and starting a local rusty-cryptix Cryptixd node (for example with `--testnet`; the UTXO index is enabled by default), you should perform the following actions:
 ```
 network testnet
 server localhost
