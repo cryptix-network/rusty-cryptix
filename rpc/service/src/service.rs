@@ -579,6 +579,10 @@ impl RpcCoreService {
         RpcError::General(format!("liquidity pool state is not submit-ready: {}", detail.as_ref()))
     }
 
+    fn should_warn_atomic_submit_read_not_ready(context: &AtomicTokenReadContext) -> bool {
+        context.is_degraded || context.runtime_state != AtomicTokenRuntimeState::Healthy
+    }
+
     async fn consensus_atomic_state_hash(&self, block_hash: BlockHash) -> RpcResult<Option<[u8; 32]>> {
         let session = self.consensus_manager.consensus().session().await;
         session
@@ -618,7 +622,7 @@ impl RpcCoreService {
                 let session = self.consensus_manager.consensus().session().await;
                 let current_sink = session.async_get_sink().await;
                 let virtual_daa = session.get_virtual_daa_score();
-                warn!(
+                let message = format!(
                     "{} latest liquidity pool read is not submit-ready because Atomic pool vault is not spendable in virtual UTXO: asset_id={} pool_nonce={} pool_vault={} pool_vault_value_sompi={} atomic_block={} current_sink={} virtual_daa={} atomic_state_hash={} runtime={} degraded={} event_seq={}",
                     endpoint,
                     asset_id.as_slice().to_hex(),
@@ -633,6 +637,11 @@ impl RpcCoreService {
                     context.is_degraded,
                     context.event_sequence_cutoff
                 );
+                if Self::should_warn_atomic_submit_read_not_ready(context) {
+                    warn!("{message}");
+                } else {
+                    debug!("{message}");
+                }
             }
             return Ok(Err(detail));
         };
@@ -646,7 +655,7 @@ impl RpcCoreService {
                 let session = self.consensus_manager.consensus().session().await;
                 let current_sink = session.async_get_sink().await;
                 let virtual_daa = session.get_virtual_daa_score();
-                warn!(
+                let message = format!(
                     "{} latest liquidity pool read is not submit-ready because Atomic pool vault does not match virtual UTXO entry: asset_id={} pool_nonce={} pool_vault={} pool_vault_value_sompi={} utxo_amount={} utxo_script_class={:?} atomic_block={} current_sink={} virtual_daa={} atomic_state_hash={} runtime={} degraded={} event_seq={}",
                     endpoint,
                     asset_id.as_slice().to_hex(),
@@ -663,6 +672,11 @@ impl RpcCoreService {
                     context.is_degraded,
                     context.event_sequence_cutoff
                 );
+                if Self::should_warn_atomic_submit_read_not_ready(context) {
+                    warn!("{message}");
+                } else {
+                    debug!("{message}");
+                }
             }
             return Ok(Err(detail));
         }
@@ -931,6 +945,7 @@ impl RpcCoreService {
         let mut pool_vault_value_sompi = "none".to_string();
         let mut pool_vault_virtual_utxo = "not_checked".to_string();
         let mut consensus_atomic_root_hash = "not_checked".to_string();
+        let mut should_warn = effective_allow_orphan;
 
         if let Some(asset_id) = asset_id {
             match self.atomic_service() {
@@ -955,6 +970,7 @@ impl RpcCoreService {
                             context.state_hash.as_slice().to_hex(),
                             context.event_sequence_cutoff
                         );
+                        should_warn |= Self::should_warn_atomic_submit_read_not_ready(&context);
                         if let Some(pool) = asset.and_then(|asset| asset.liquidity) {
                             let vault_outpoint = pool.vault_outpoint;
                             pool_exists = true;
@@ -982,7 +998,7 @@ impl RpcCoreService {
             }
         }
 
-        warn!(
+        let message = format!(
             "RPC SubmitTransaction disallowed orphan diagnostics: tx={} requested_allow_orphan={} effective_allow_orphan={} op={} asset_id={} expected_pool_nonce={} inputs={} first_inputs=[{}] atomic_context=\"{}\" consensus_atomic_root_hash={} pool_exists={} pool_nonce={} pool_vault={} pool_vault_in_tx_inputs={} pool_vault_value_sompi={} pool_vault_virtual_utxo=\"{}\" error=\"{}\"",
             transaction_id,
             requested_allow_orphan,
@@ -1002,6 +1018,11 @@ impl RpcCoreService {
             pool_vault_virtual_utxo,
             error_message
         );
+        if should_warn {
+            warn!("{message}");
+        } else {
+            debug!("{message}");
+        }
     }
 
     fn liquidity_claim_preview_status(pool: &LiquidityPoolState, claimable_sompi: u64) -> (bool, Option<String>) {

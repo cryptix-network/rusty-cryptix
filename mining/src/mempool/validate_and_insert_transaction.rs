@@ -62,7 +62,7 @@ impl Mempool {
                     let missing_outpoints = transaction.missing_outpoints().collect::<Vec<_>>();
                     let first_missing =
                         missing_outpoints.iter().take(8).map(|outpoint| outpoint.to_string()).collect::<Vec<_>>().join(",");
-                    warn!(
+                    let message = format!(
                         "Rejecting transaction as disallowed orphan: tx={} {} priority={:?} rbf_policy={:?} virtual_daa={} inputs={} missing_outpoints={} first_missing=[{}]",
                         transaction_id,
                         atomic_mempool_debug_summary(transaction.tx.as_ref()),
@@ -73,6 +73,11 @@ impl Mempool {
                         missing_outpoints.len(),
                         first_missing
                     );
+                    if is_cat_transaction(transaction.tx.as_ref()) {
+                        debug!("{message}");
+                    } else {
+                        warn!("{message}");
+                    }
                     return Err(RuleError::RejectDisallowedOrphan(transaction_id));
                 }
                 let _ = self.get_replace_by_fee_constraint(&transaction, rbf_policy)?;
