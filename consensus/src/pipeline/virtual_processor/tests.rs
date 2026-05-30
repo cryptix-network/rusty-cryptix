@@ -804,6 +804,12 @@ fn payload_tx(inputs: Vec<TransactionInput>, outputs: Vec<TransactionOutput>, pa
     tx
 }
 
+fn native_tx(inputs: Vec<TransactionInput>, outputs: Vec<TransactionOutput>) -> Transaction {
+    let mut tx = Transaction::new(TX_VERSION, inputs, outputs, 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+    tx.finalize();
+    tx
+}
+
 fn find_virtual_utxo_by_script(
     ctx: &TestContext,
     script_public_key: &ScriptPublicKey,
@@ -991,11 +997,105 @@ fn liquidity_test_context() -> TestContext {
     TestContext::new(TestConsensus::new(&config))
 }
 
+#[tokio::test]
+async fn native_block_template_rejects_same_utxo_double_spend_before_state() {
+    let mut ctx = liquidity_test_context();
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let second_owner_script = cryptix_txscript::pay_to_script_hash_script(&second_p2sh_redeem_script());
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    for _ in 0..4 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let (funding_outpoint, funding_entry) = find_virtual_utxo_by_script(&ctx, &owner_script);
+    let tx_fee = 10_000u64;
+    let first = native_tx(
+        vec![TransactionInput::new(funding_outpoint, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(funding_entry.amount - tx_fee, owner_script.clone())],
+    );
+    let second = native_tx(
+        vec![TransactionInput::new(funding_outpoint, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(funding_entry.amount - tx_fee, second_owner_script)],
+    );
+
+    let result = ctx.consensus.build_block_template(
+        ctx.miner_data.clone(),
+        Box::new(OnetimeTxSelector::new(vec![first, second])),
+        TemplateBuildMode::Standard,
+    );
+
+    assert!(result.is_err(), "same-UTXO native double spend must not be mined into a template");
+    assert!(format!("{result:?}").contains("MissingTxOutpoints"), "template rejection should report the UTXO conflict: {result:?}");
+}
+
+#[tokio::test]
+async fn native_parallel_same_utxo_blocks_accept_spend_once_in_virtual_mergeset() {
+    let mut ctx = liquidity_test_context();
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let second_owner_script = cryptix_txscript::pay_to_script_hash_script(&second_p2sh_redeem_script());
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    for _ in 0..4 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let fork_parent = ctx.consensus.get_sink();
+    let (funding_outpoint, funding_entry) = find_virtual_utxo_by_script(&ctx, &owner_script);
+    let tx_fee = 10_000u64;
+    let first = native_tx(
+        vec![TransactionInput::new(funding_outpoint, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(funding_entry.amount - tx_fee, owner_script)],
+    );
+    let second = native_tx(
+        vec![TransactionInput::new(funding_outpoint, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(funding_entry.amount - tx_fee, second_owner_script)],
+    );
+    let first_txid = first.id();
+    let second_txid = second.id();
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let first_block =
+        ctx.build_utxo_valid_block_with_parents_and_transactions(vec![fork_parent], vec![first], 7_000, ctx.simulated_time);
+    let first_block_hash = first_block.header.hash;
+    ctx.validate_and_insert_block(first_block.to_immutable()).await;
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let second_block =
+        ctx.build_utxo_valid_block_with_parents_and_transactions(vec![fork_parent], vec![second], 7_001, ctx.simulated_time);
+    let second_block_hash = second_block.header.hash;
+    ctx.validate_and_insert_block(second_block.to_immutable()).await;
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let merge_block = ctx.build_utxo_valid_block_with_parents_and_transactions(
+        vec![first_block_hash, second_block_hash],
+        vec![],
+        7_002,
+        ctx.simulated_time,
+    );
+    let merge_hash = merge_block.header.hash;
+    ctx.validate_and_insert_utxo_valid_block(merge_block.to_immutable()).await;
+
+    let acceptance_data = ctx.consensus.get_block_acceptance_data(merge_hash).expect("merge acceptance data should exist");
+    let accepted_txids: Vec<_> = acceptance_data
+        .iter()
+        .flat_map(|block_acceptance| block_acceptance.accepted_transactions.iter())
+        .map(|tx| tx.transaction_id)
+        .collect();
+    let accepted_conflicts = accepted_txids.iter().filter(|txid| **txid == first_txid || **txid == second_txid).count();
+    assert_eq!(accepted_conflicts, 1, "only one parallel spend of the same UTXO may be accepted: {accepted_txids:?}");
+
+    let virtual_utxos = ctx.consensus.get_virtual_utxos(None, 10_000, false);
+    let original_still_unspent = virtual_utxos.iter().any(|(outpoint, _)| *outpoint == funding_outpoint);
+    let first_output_exists = virtual_utxos.iter().any(|(outpoint, _)| *outpoint == TransactionOutpoint::new(first_txid, 0));
+    let second_output_exists = virtual_utxos.iter().any(|(outpoint, _)| *outpoint == TransactionOutpoint::new(second_txid, 0));
+    assert!(!original_still_unspent, "accepted parallel conflict must consume the original UTXO exactly once");
+    assert_ne!(first_output_exists, second_output_exists, "exactly one conflicting output may enter the virtual UTXO set");
+}
+
 const ATOMIC_PRUNING_FINALITY_DEPTH: u64 = 4;
 const ATOMIC_PRUNING_DEPTH: u64 = 8;
 const ATOMIC_PRUNING_PROOF_M: u64 = 2;
 
-fn atomic_pruning_config(payload_hf_activation_daa_score: u64, process_genesis: bool) -> Config {
+fn atomic_pruning_config_builder(payload_hf_activation_daa_score: u64, process_genesis: bool) -> ConfigBuilder {
     let builder = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().enable_sanity_checks().edit_consensus_params(|p| {
         p.coinbase_maturity = 0;
         p.payload_hf_activation_daa_score = payload_hf_activation_daa_score;
@@ -1008,10 +1108,18 @@ fn atomic_pruning_config(payload_hf_activation_daa_score: u64, process_genesis: 
     });
 
     if process_genesis {
-        builder.build()
+        builder
     } else {
-        builder.skip_adding_genesis().build()
+        builder.skip_adding_genesis()
     }
+}
+
+fn atomic_pruning_config(payload_hf_activation_daa_score: u64, process_genesis: bool) -> Config {
+    atomic_pruning_config_builder(payload_hf_activation_daa_score, process_genesis).build()
+}
+
+fn atomic_pruning_archival_config(payload_hf_activation_daa_score: u64, process_genesis: bool) -> Config {
+    atomic_pruning_config_builder(payload_hf_activation_daa_score, process_genesis).set_archival().build()
 }
 
 async fn mine_empty_blocks(ctx: &mut TestContext, count: usize, nonce_base: u64) -> Hash {
@@ -1046,6 +1154,30 @@ async fn mine_asset_create_block(
     let block_hash = template.block.header.hash;
     ctx.validate_and_insert_utxo_valid_block(template.block.to_immutable()).await;
     (asset_id, block_hash)
+}
+
+async fn mine_token_transfer_block(
+    ctx: &mut TestContext,
+    owner_script: &ScriptPublicKey,
+    asset_id: [u8; 32],
+    receiver_id: [u8; 32],
+    asset_nonce: u64,
+    amount: u128,
+    block_nonce: u64,
+) -> Hash {
+    let (funding_outpoint, funding_entry) = find_virtual_utxo_by_script(ctx, owner_script);
+    let tx_fee = 10_000u64;
+    let transfer_tx = payload_tx(
+        vec![TransactionInput::new(funding_outpoint, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(funding_entry.amount - tx_fee, owner_script.clone())],
+        payload_transfer(0, asset_nonce, asset_id, receiver_id, amount),
+    );
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let template = ctx.build_block_template_with_transactions(vec![transfer_tx], block_nonce, ctx.simulated_time);
+    let block_hash = template.block.header.hash;
+    ctx.validate_and_insert_utxo_valid_block(template.block.to_immutable()).await;
+    block_hash
 }
 
 async fn wait_for_pruning_point_at_or_after_blue_score(ctx: &TestContext, min_blue_score: u64) -> Hash {
@@ -1084,6 +1216,25 @@ async fn wait_for_pruning_point_to_stabilize(ctx: &TestContext) -> Hash {
     }
 
     previous
+}
+
+async fn sync_selected_chain_from_source(source: &TestContext, target: &mut TestContext, low: Hash) -> Hash {
+    let chain_path = source.consensus.get_virtual_chain_from_block(low, None).expect("source selected-chain path");
+    assert!(chain_path.removed.is_empty(), "sync low point must be on the source selected chain");
+    for block_hash in chain_path.added {
+        let block = source.consensus.get_block(block_hash).expect("source must retain selected-chain block body");
+        target.validate_and_insert_utxo_valid_block(block).await;
+    }
+    target.consensus.get_sink()
+}
+
+fn materialized_pruning_atomic_state(ctx: &TestContext) -> AtomicConsensusState {
+    let trusted_data = ctx.consensus.get_pruning_point_anticone_and_trusted_data().unwrap();
+    let atomic_state = trusted_data.atomic_state.as_ref().expect("trusted pruning data must carry Atomic state");
+    let state_bytes = atomic_state.state_bytes.as_deref().expect("trusted pruning data must carry full Atomic state bytes");
+    let state = AtomicConsensusState::try_from_canonical_bytes(state_bytes).expect("trusted pruning Atomic bytes must decode");
+    assert_eq!(state.canonical_hash(), atomic_state.state_hash);
+    state
 }
 
 fn assert_pruning_point_atomic_state(
@@ -1474,10 +1625,155 @@ async fn atomic_pruning_sync_imports_full_atomic_state_from_pruned_peer() {
     assert!(imported_atomic.assets.contains_key(&asset_id));
     assert_eq!(balance_of(&imported_atomic, asset_id, owner_id), initial_supply);
 
-    mine_empty_blocks(&mut target, 1, 1_000).await;
+    target.miner_data = MinerData::new(owner_script.clone(), vec![]);
+    let receiver_script = cryptix_txscript::pay_to_script_hash_script(&second_p2sh_redeem_script());
+    let receiver_id = atomic_owner_id_from_script(&receiver_script).expect("receiver id should derive from P2SH");
+    let (transfer_funding_outpoint, transfer_funding_entry) = find_virtual_utxo_by_script(&target, &owner_script);
+    let tx_fee = 10_000u64;
+    let transfer_amount = 777u128;
+    let transfer_tx = payload_tx(
+        vec![TransactionInput::new(transfer_funding_outpoint, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(transfer_funding_entry.amount - tx_fee, owner_script.clone())],
+        payload_transfer(0, 1, asset_id, receiver_id, transfer_amount),
+    );
+    target.simulated_time += target.consensus.params().target_time_per_block;
+    let transfer_template = target.build_block_template_with_transactions(vec![transfer_tx], 1_000, target.simulated_time);
+    target.validate_and_insert_utxo_valid_block(transfer_template.block.to_immutable()).await;
+
+    let post_sync_atomic = target.consensus.virtual_atomic_state();
+    assert_eq!(balance_of(&post_sync_atomic, asset_id, owner_id), initial_supply - transfer_amount);
+    assert_eq!(balance_of(&post_sync_atomic, asset_id, receiver_id), transfer_amount);
+
+    mine_empty_blocks(&mut target, 1, 1_001).await;
     let extended_atomic = target.consensus.virtual_atomic_state();
     assert!(extended_atomic.assets.contains_key(&asset_id));
-    assert_eq!(balance_of(&extended_atomic, asset_id, owner_id), initial_supply);
+    assert_eq!(balance_of(&extended_atomic, asset_id, owner_id), initial_supply - transfer_amount);
+    assert_eq!(balance_of(&extended_atomic, asset_id, receiver_id), transfer_amount);
+}
+
+#[tokio::test]
+async fn atomic_pruning_sync_after_pre_and_post_hf_prunings_accepts_live_token_blocks() {
+    cryptix_core::log::try_init_logger("info");
+    let activation_daa = 36;
+    let source_config = atomic_pruning_config(activation_daa, true);
+    let mut source = TestContext::new(TestConsensus::new(&source_config));
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let receiver_script = cryptix_txscript::pay_to_script_hash_script(&second_p2sh_redeem_script());
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    let receiver_id = atomic_owner_id_from_script(&receiver_script).expect("receiver id should derive from P2SH");
+    source.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    mine_empty_blocks(&mut source, 18, 1_100).await;
+    let first_pre_hf_pruning_point = wait_for_pruning_point_at_or_after_blue_score(&source, ATOMIC_PRUNING_FINALITY_DEPTH).await;
+    assert!(source.consensus.get_header(first_pre_hf_pruning_point).unwrap().daa_score < activation_daa);
+    mine_empty_blocks(&mut source, 12, 1_200).await;
+    let second_pre_hf_pruning_point = wait_for_pruning_point_at_or_after_blue_score(&source, ATOMIC_PRUNING_FINALITY_DEPTH + 8).await;
+    assert_ne!(first_pre_hf_pruning_point, second_pre_hf_pruning_point);
+    assert!(source.consensus.get_header(second_pre_hf_pruning_point).unwrap().daa_score < activation_daa);
+
+    while source.consensus.get_virtual_daa_score() < activation_daa {
+        let nonce = 1_300 + source.consensus.get_virtual_daa_score();
+        mine_empty_blocks(&mut source, 1, nonce).await;
+    }
+
+    let initial_supply = 10_000u128;
+    let (asset_id, create_block_hash) =
+        mine_asset_create_block(&mut source, &owner_script, owner_id, 1_400, b"LongPruneSync", b"LPS", initial_supply).await;
+    let create_blue_score = source.consensus.get_header(create_block_hash).unwrap().blue_score;
+    let mut owner_expected = initial_supply;
+    let mut receiver_expected = 0u128;
+    let mut last_token_blue_score = create_blue_score;
+
+    for (idx, amount) in [101u128, 202, 303, 404].into_iter().enumerate() {
+        let block_hash =
+            mine_token_transfer_block(&mut source, &owner_script, asset_id, receiver_id, idx as u64 + 1, amount, 1_500 + idx as u64)
+                .await;
+        owner_expected -= amount;
+        receiver_expected += amount;
+        last_token_blue_score = source.consensus.get_header(block_hash).unwrap().blue_score;
+    }
+
+    mine_empty_blocks(&mut source, 24, 1_600).await;
+    wait_for_pruning_point_at_or_after_blue_score(&source, last_token_blue_score).await;
+    let source_pruning_point = wait_for_pruning_point_to_stabilize(&source).await;
+    assert!(source.consensus.get_header(source_pruning_point).unwrap().blue_score >= last_token_blue_score);
+    let source_pruning_atomic = materialized_pruning_atomic_state(&source);
+    assert!(source_pruning_atomic.assets.contains_key(&asset_id));
+    assert_eq!(balance_of(&source_pruning_atomic, asset_id, owner_id), owner_expected);
+    assert_eq!(balance_of(&source_pruning_atomic, asset_id, receiver_id), receiver_expected);
+
+    let target_config = atomic_pruning_config(activation_daa, false);
+    let mut target = import_pruned_consensus_from_source(&source, &target_config).await;
+    assert_eq!(target.consensus.pruning_point(), source_pruning_point);
+    assert_eq!(target.consensus.virtual_atomic_state().canonical_hash(), source_pruning_atomic.canonical_hash());
+
+    let synced_sink = sync_selected_chain_from_source(&source, &mut target, source_pruning_point).await;
+    assert_eq!(synced_sink, source.consensus.get_sink());
+    assert_eq!(target.consensus.virtual_atomic_state().canonical_hash(), source.consensus.virtual_atomic_state().canonical_hash());
+
+    let live_sync_low = synced_sink;
+    for (idx, amount) in [11u128, 12, 13, 14, 15, 16].into_iter().enumerate() {
+        let asset_nonce = 5 + idx as u64;
+        mine_token_transfer_block(&mut source, &owner_script, asset_id, receiver_id, asset_nonce, amount, 1_700 + idx as u64).await;
+        owner_expected -= amount;
+        receiver_expected += amount;
+        if idx % 2 == 0 {
+            mine_empty_blocks(&mut source, 1, 1_800 + idx as u64).await;
+        }
+    }
+
+    let live_synced_sink = sync_selected_chain_from_source(&source, &mut target, live_sync_low).await;
+    assert_eq!(live_synced_sink, source.consensus.get_sink());
+    let target_atomic = target.consensus.virtual_atomic_state();
+    assert_eq!(target_atomic.canonical_hash(), source.consensus.virtual_atomic_state().canonical_hash());
+    assert_eq!(balance_of(&target_atomic, asset_id, owner_id), owner_expected);
+    assert_eq!(balance_of(&target_atomic, asset_id, receiver_id), receiver_expected);
+
+    mine_empty_blocks(&mut source, 24, 1_900).await;
+    wait_for_pruning_point_at_or_after_blue_score(&source, source.consensus.get_header(live_synced_sink).unwrap().blue_score).await;
+    let late_source_pruning_point = wait_for_pruning_point_to_stabilize(&source).await;
+
+    let mut late_target = import_pruned_consensus_from_source(&source, &target_config).await;
+    let late_pruning_atomic = materialized_pruning_atomic_state(&source);
+    assert_eq!(late_target.consensus.virtual_atomic_state().canonical_hash(), late_pruning_atomic.canonical_hash());
+    sync_selected_chain_from_source(&source, &mut late_target, late_source_pruning_point).await;
+    assert_eq!(
+        late_target.consensus.virtual_atomic_state().canonical_hash(),
+        source.consensus.virtual_atomic_state().canonical_hash()
+    );
+}
+
+#[tokio::test]
+async fn atomic_archival_peer_provides_full_atomic_pruning_state_for_pruned_sync() {
+    cryptix_core::log::try_init_logger("info");
+    let source_config = atomic_pruning_archival_config(0, true);
+    let mut source = TestContext::new(TestConsensus::new(&source_config));
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    source.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    mine_empty_blocks(&mut source, 3, 2_100).await;
+    let initial_supply = 8_888u128;
+    let (asset_id, create_block_hash) =
+        mine_asset_create_block(&mut source, &owner_script, owner_id, 2_200, b"ArchiveSync", b"ARS", initial_supply).await;
+    let create_blue_score = source.consensus.get_header(create_block_hash).unwrap().blue_score;
+
+    mine_empty_blocks(&mut source, 28, 2_300).await;
+    wait_for_pruning_point_at_or_after_blue_score(&source, create_blue_score).await;
+    let source_pruning_point = wait_for_pruning_point_to_stabilize(&source).await;
+    assert!(source.consensus.get_header(source_pruning_point).unwrap().blue_score >= create_blue_score);
+    assert_pruning_point_atomic_state(&source, source_pruning_point, asset_id, owner_id, initial_supply);
+    assert!(
+        source.consensus.get_block(create_block_hash).is_ok(),
+        "archival source must retain old block bodies after pruning-point movement"
+    );
+
+    let target_config = atomic_pruning_config(0, false);
+    let mut target = import_pruned_consensus_from_source(&source, &target_config).await;
+    assert_eq!(target.consensus.pruning_point(), source_pruning_point);
+    assert_eq!(target.consensus.virtual_atomic_state().canonical_hash(), materialized_pruning_atomic_state(&source).canonical_hash());
+    sync_selected_chain_from_source(&source, &mut target, source_pruning_point).await;
+    assert_eq!(target.consensus.virtual_atomic_state().canonical_hash(), source.consensus.virtual_atomic_state().canonical_hash());
 }
 
 #[tokio::test]
@@ -1687,6 +1983,86 @@ async fn atomic_batch_invalid_tx_does_not_poison_valid_nonce_chain() {
 }
 
 #[tokio::test]
+async fn atomic_mempool_pressure_orders_mixed_payload_and_native_batch() {
+    let mut ctx = liquidity_test_context();
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let receiver_script = cryptix_txscript::pay_to_script_hash_script(&second_p2sh_redeem_script());
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    let receiver_id = atomic_owner_id_from_script(&receiver_script).expect("receiver id should derive from P2SH");
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    let transfer_count = 48usize;
+    let messenger_count = 12usize;
+    let native_count = 12usize;
+    let funding_count = 1 + transfer_count + messenger_count + native_count;
+    for _ in 0..(funding_count + 4) {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let utxos = find_virtual_utxos_by_script(&ctx, &owner_script, funding_count);
+    let tx_fee = 10_000u64;
+    let minted = 10_000u128;
+
+    let create = payload_tx(
+        vec![TransactionInput::new(utxos[0].0, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(utxos[0].1.amount - tx_fee, owner_script.clone())],
+        payload_create_asset_with_mint(0, 1, owner_id, b"Pressure", b"PRS", minted, owner_id),
+    );
+    let asset_id = create.id().as_bytes();
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let create_template = ctx.build_block_template_with_transactions(vec![create], 9_000, ctx.simulated_time);
+    ctx.validate_and_insert_utxo_valid_block(create_template.block.to_immutable()).await;
+
+    let atomic_before = ctx.consensus.virtual_atomic_state();
+    let root_before = atomic_before.canonical_hash();
+    assert_eq!(balance_of(&atomic_before, asset_id, owner_id), minted);
+    assert_eq!(balance_of(&atomic_before, asset_id, receiver_id), 0);
+
+    let mut batch = Vec::new();
+    let mut expected_transfer_total = 0u128;
+    for i in 0..transfer_count {
+        let nonce = (transfer_count - i) as u64;
+        let amount = 1 + u128::from(nonce % 5);
+        expected_transfer_total += amount;
+        let utxo = &utxos[1 + i];
+        let tx = payload_tx(
+            vec![TransactionInput::new(utxo.0, p2sh_signature_script(), 0, 0)],
+            vec![TransactionOutput::new(utxo.1.amount - tx_fee, owner_script.clone())],
+            payload_transfer(0, nonce, asset_id, receiver_id, amount),
+        );
+        batch.push(MutableTransaction::from_tx(tx));
+    }
+    for i in 0..messenger_count {
+        let utxo = &utxos[1 + transfer_count + i];
+        let payload = format!("MSG:pressure:{i}:{}", "x".repeat(192)).into_bytes();
+        let tx = payload_tx(
+            vec![TransactionInput::new(utxo.0, p2sh_signature_script(), 0, 0)],
+            vec![TransactionOutput::new(utxo.1.amount - tx_fee, owner_script.clone())],
+            payload,
+        );
+        batch.push(MutableTransaction::from_tx(tx));
+    }
+    for i in 0..native_count {
+        let utxo = &utxos[1 + transfer_count + messenger_count + i];
+        let tx = native_tx(
+            vec![TransactionInput::new(utxo.0, p2sh_signature_script(), 0, 0)],
+            vec![TransactionOutput::new(utxo.1.amount - tx_fee, owner_script.clone())],
+        );
+        batch.push(MutableTransaction::from_tx(tx));
+    }
+
+    let populate_results = ctx.consensus.populate_mempool_transactions_in_parallel(&mut batch);
+    assert!(populate_results.iter().all(Result::is_ok), "pressure batch UTXO population failed: {populate_results:?}");
+    let results = ctx.consensus.validate_mempool_transactions_in_parallel(&mut batch, &TransactionValidationBatchArgs::default());
+    assert!(results.iter().all(Result::is_ok), "pressure batch should validate deterministically: {results:?}");
+    assert!(expected_transfer_total < minted);
+
+    let atomic_after = ctx.consensus.virtual_atomic_state();
+    assert_eq!(atomic_after.canonical_hash(), root_before, "mempool pressure validation must not mutate virtual Atomic state");
+    assert_eq!(balance_of(&atomic_after, asset_id, owner_id), minted);
+    assert_eq!(balance_of(&atomic_after, asset_id, receiver_id), 0);
+}
+
+#[tokio::test]
 async fn atomic_same_owner_nonce_conflict_in_parallel_blocks_applies_once() {
     let mut ctx = liquidity_test_context();
     let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
@@ -1839,6 +2215,48 @@ async fn atomic_mempool_batch_rejects_duplicate_txid_before_atomic_state() {
 }
 
 #[tokio::test]
+async fn atomic_mempool_batch_rejects_same_utxo_double_spend_before_atomic_state() {
+    let mut ctx = liquidity_test_context();
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    for _ in 0..4 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let utxos = find_virtual_utxos_by_script(&ctx, &owner_script, 1);
+    let tx_fee = 10_000u64;
+    let first = payload_tx(
+        vec![TransactionInput::new(utxos[0].0, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(utxos[0].1.amount - tx_fee, owner_script.clone())],
+        payload_create_asset(0, 1, owner_id, b"DoubleSpendA", b"DSA"),
+    );
+    let second = payload_tx(
+        vec![TransactionInput::new(utxos[0].0, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(utxos[0].1.amount - tx_fee, owner_script)],
+        payload_create_asset(0, 2, owner_id, b"DoubleSpendB", b"DSB"),
+    );
+
+    let first_asset = first.id().as_bytes();
+    let second_asset = second.id().as_bytes();
+    let mut batch = vec![
+        MutableTransaction::with_entries(Arc::new(first), vec![utxos[0].1.clone()]),
+        MutableTransaction::with_entries(Arc::new(second), vec![utxos[0].1.clone()]),
+    ];
+    let results = ctx.consensus.validate_mempool_transactions_in_parallel(&mut batch, &TransactionValidationBatchArgs::default());
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1, "one same-UTXO candidate may validate: {results:?}");
+    assert_eq!(
+        results.iter().filter(|result| format!("{:?}", result).contains("MissingTxOutpoints")).count(),
+        1,
+        "one same-UTXO candidate must be rejected before Atomic state: {results:?}"
+    );
+    let atomic = ctx.consensus.virtual_atomic_state();
+    assert!(!atomic.assets.contains_key(&first_asset));
+    assert!(!atomic.assets.contains_key(&second_asset));
+}
+
+#[tokio::test]
 async fn atomic_nonce_conflict_reorg_prefers_selected_branch_state() {
     let mut ctx = liquidity_test_context();
     let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
@@ -1976,12 +2394,42 @@ async fn atomic_reorg_removes_losing_branch_state_and_accepts_new_atomic_block()
     assert_eq!(balance_of(&atomic_after_reorg, winning_branch_asset, owner_id), 1_000);
     assert_eq!(atomic_after_reorg.next_nonces.get(&AtomicNonceKey::owner(owner_id)), Some(&2));
 
+    let post_reorg_utxos = find_virtual_utxos_by_script(&ctx, &owner_script, 3);
+    let stale_create_after_reorg = payload_tx(
+        vec![TransactionInput::new(post_reorg_utxos[0].0, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(post_reorg_utxos[0].1.amount - tx_fee, owner_script.clone())],
+        payload_create_asset(0, 1, owner_id, b"StaleAfterReorg", b"STA"),
+    );
+    let stale_transfer_from_removed_asset = payload_tx(
+        vec![TransactionInput::new(post_reorg_utxos[1].0, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(post_reorg_utxos[1].1.amount - tx_fee, owner_script.clone())],
+        payload_transfer(0, 1, old_branch_asset, receiver_id, 1),
+    );
     let create_after_reorg = payload_tx(
-        vec![TransactionInput::new(utxos[3].0, p2sh_signature_script(), 0, 0)],
-        vec![TransactionOutput::new(utxos[3].1.amount - tx_fee, owner_script.clone())],
+        vec![TransactionInput::new(post_reorg_utxos[2].0, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(post_reorg_utxos[2].1.amount - tx_fee, owner_script.clone())],
         payload_create_asset(0, 2, owner_id, b"AfterReorg", b"AFT"),
     );
     let after_reorg_asset = create_after_reorg.id().as_bytes();
+
+    let mut reorg_mempool_batch = vec![
+        MutableTransaction::with_entries(Arc::new(stale_create_after_reorg), vec![post_reorg_utxos[0].1.clone()]),
+        MutableTransaction::with_entries(Arc::new(stale_transfer_from_removed_asset), vec![post_reorg_utxos[1].1.clone()]),
+        MutableTransaction::with_entries(Arc::new(create_after_reorg.clone()), vec![post_reorg_utxos[2].1.clone()]),
+    ];
+    let reorg_mempool_results =
+        ctx.consensus.validate_mempool_transactions_in_parallel(&mut reorg_mempool_batch, &TransactionValidationBatchArgs::default());
+    assert!(reorg_mempool_results[0].is_err(), "stale owner nonce from losing branch must be rejected after reorg");
+    assert!(reorg_mempool_results[1].is_err(), "transfer referencing an asset removed by reorg must be rejected after reorg");
+    assert!(
+        reorg_mempool_results[2].is_ok(),
+        "fresh nonce on the winning branch must remain valid after rejecting stale reorg transactions: {reorg_mempool_results:?}"
+    );
+    assert!(
+        !ctx.consensus.virtual_atomic_state().assets.contains_key(&after_reorg_asset),
+        "mempool validation must not mutate virtual Atomic state"
+    );
+
     ctx.simulated_time += ctx.consensus.params().target_time_per_block;
     let after_reorg = ctx.build_utxo_valid_block_with_parents_and_transactions(
         vec![ctx.consensus.get_sink()],
@@ -2458,6 +2906,96 @@ async fn liquidity_consensus_e2e_create_buy_sell_claim_updates_vault_state() {
     assert_eq!(pool.pool_nonce, 4);
     assert_eq!(pool.vault_value_sompi, claim_vault_value);
     assert_eq!(pool.fee_recipients[0].unclaimed_sompi, unclaimed_before - claim_amount);
+}
+
+#[tokio::test]
+async fn liquidity_serial_buy_sell_pressure_preserves_vault_accounting_and_roots() {
+    let (mut ctx, fixture) = setup_dual_owner_liquidity_pool().await;
+    let owner_redeem_script = p2sh_redeem_script();
+    let mut owner_anchor = fixture.owner_anchor;
+    let mut owner_anchor_value = fixture.owner_anchor_value;
+    let mut expected_balance = fixture.launch_token_out;
+
+    for step in 0..20u64 {
+        let atomic_before = ctx.consensus.virtual_atomic_state();
+        let pool = atomic_before
+            .assets
+            .get(&fixture.asset_id)
+            .and_then(|asset| asset.liquidity.as_ref())
+            .expect("pool must exist before pressure step")
+            .clone();
+        let auth_nonce = step + 1;
+        let tx = if step % 2 == 0 {
+            let (buy_tx, token_out, vault_value) = build_liquidity_buy_tx(
+                fixture.asset_id,
+                &pool,
+                owner_anchor,
+                owner_anchor_value,
+                &fixture.owner_script,
+                p2sh_signature_script_for(&owner_redeem_script),
+                auth_nonce,
+                3 * SOMPI_PER_CRYPTIX,
+                fixture.tx_fee,
+            );
+            let buy_in = vault_value - pool.vault_value_sompi;
+            owner_anchor_value = owner_anchor_value.checked_sub(buy_in + fixture.tx_fee).expect("anchor should fund buy pressure");
+            owner_anchor = TransactionOutpoint::new(buy_tx.id(), 1);
+            expected_balance += token_out;
+            buy_tx
+        } else {
+            let token_in = 1u128;
+            let (_, cpay_out) = quote_sell(pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, token_in, pool.fee_bps);
+            assert!(cpay_out > 0, "pressure sell must produce a payout at step {step}");
+            let sell_vault_value = pool.vault_value_sompi - cpay_out;
+            owner_anchor_value = owner_anchor_value.checked_sub(fixture.tx_fee).expect("anchor should fund sell pressure");
+            let sell_tx = payload_tx(
+                vec![
+                    TransactionInput::new(pool.vault_outpoint, vec![], 0, 0),
+                    TransactionInput::new(owner_anchor, p2sh_signature_script_for(&owner_redeem_script), 0, 0),
+                ],
+                vec![
+                    TransactionOutput::new(sell_vault_value, liquidity_vault_script()),
+                    TransactionOutput::new(cpay_out, fixture.owner_script.clone()),
+                    TransactionOutput::new(owner_anchor_value, fixture.owner_script.clone()),
+                ],
+                payload_sell_liquidity(1, auth_nonce, fixture.asset_id, pool.pool_nonce, token_in, cpay_out, 1),
+            );
+            owner_anchor = TransactionOutpoint::new(sell_tx.id(), 2);
+            expected_balance -= token_in;
+            sell_tx
+        };
+
+        ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+        let template = ctx.build_block_template_with_transactions(vec![tx], 9_100 + step, ctx.simulated_time);
+        ctx.validate_and_insert_utxo_valid_block(template.block.to_immutable()).await;
+
+        ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+        let settle_template = ctx.build_block_template(9_500 + step, ctx.simulated_time);
+        ctx.validate_and_insert_utxo_valid_block(settle_template.block.to_immutable()).await;
+
+        let atomic_after = ctx.consensus.virtual_atomic_state();
+        let pool_after = atomic_after
+            .assets
+            .get(&fixture.asset_id)
+            .and_then(|asset| asset.liquidity.as_ref())
+            .expect("pool must exist after pressure step");
+        assert_eq!(pool_after.pool_nonce, fixture.pool.pool_nonce + step + 1);
+        assert_eq!(pool_after.vault_value_sompi, pool_after.real_cpay_reserves_sompi + pool_after.unclaimed_fee_total_sompi);
+        assert_eq!(balance_of(&atomic_after, fixture.asset_id, fixture.owner_id), expected_balance);
+
+        let sink = ctx.consensus.get_sink();
+        let expected_root = atomic_after.canonical_hash();
+        assert_eq!(
+            ctx.consensus.selected_chain_atomic_hash_from_deltas_for_tests(sink),
+            expected_root,
+            "selected-chain Atomic deltas must replay to live state after pressure step {step}"
+        );
+        assert_eq!(
+            ctx.consensus.atomic_root_record_hash_for_tests(sink),
+            expected_root,
+            "stored Atomic root must match live state after pressure step {step}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3080,14 +3618,14 @@ async fn liquidity_reorg_switches_to_winning_conflicting_vault_branch() {
     ctx.simulated_time += ctx.consensus.params().target_time_per_block;
     let owner_buy_block = ctx.build_utxo_valid_block_with_parents_and_transactions(
         vec![fixture.create_block_hash],
-        vec![owner_buy_tx],
+        vec![owner_buy_tx.clone()],
         300,
         ctx.simulated_time,
     );
     ctx.simulated_time += ctx.consensus.params().target_time_per_block;
     let second_buy_block = ctx.build_utxo_valid_block_with_parents_and_transactions(
         vec![fixture.create_block_hash],
-        vec![second_buy_tx],
+        vec![second_buy_tx.clone()],
         301,
         ctx.simulated_time,
     );
@@ -3115,6 +3653,42 @@ async fn liquidity_reorg_switches_to_winning_conflicting_vault_branch() {
     assert_eq!(pool.vault_value_sompi, second_vault_value);
     assert_eq!(balance_of(&atomic, fixture.asset_id, fixture.owner_id), fixture.launch_token_out);
     assert_eq!(balance_of(&atomic, fixture.asset_id, fixture.second_owner_id), second_token_out);
+
+    let winning_pool = pool.clone();
+    let initial_vault_entry = UtxoEntry::new(fixture.pool.vault_value_sompi, liquidity_vault_script(), UNACCEPTED_DAA_SCORE, false);
+    let winning_vault_entry = UtxoEntry::new(winning_pool.vault_value_sompi, liquidity_vault_script(), UNACCEPTED_DAA_SCORE, false);
+    let owner_anchor_entry = UtxoEntry::new(fixture.owner_anchor_value, fixture.owner_script.clone(), UNACCEPTED_DAA_SCORE, false);
+
+    let mut stale_losing_branch_buy =
+        MutableTransaction::with_entries(Arc::new(owner_buy_tx), vec![initial_vault_entry, owner_anchor_entry.clone()]);
+    ctx.consensus
+        .validate_mempool_transaction(&mut stale_losing_branch_buy, &TransactionValidationArgs::default())
+        .expect_err("losing-branch vault spend must be rejected after the liquidity reorg");
+
+    let (fresh_owner_buy_tx, _, _) = build_liquidity_buy_tx(
+        fixture.asset_id,
+        &winning_pool,
+        fixture.owner_anchor,
+        fixture.owner_anchor_value,
+        &fixture.owner_script,
+        p2sh_signature_script(),
+        1,
+        5 * SOMPI_PER_CRYPTIX,
+        fixture.tx_fee,
+    );
+    let mut fresh_winning_branch_buy =
+        MutableTransaction::with_entries(Arc::new(fresh_owner_buy_tx), vec![winning_vault_entry, owner_anchor_entry]);
+    ctx.consensus
+        .validate_mempool_transaction(&mut fresh_winning_branch_buy, &TransactionValidationArgs::default())
+        .expect("fresh buy against the winning vault state must validate after the liquidity reorg");
+
+    let atomic_after_mempool = ctx.consensus.virtual_atomic_state();
+    let pool_after_mempool =
+        atomic_after_mempool.assets.get(&fixture.asset_id).and_then(|asset| asset.liquidity.as_ref()).expect("pool should exist");
+    assert_eq!(pool_after_mempool.pool_nonce, winning_pool.pool_nonce);
+    assert_eq!(pool_after_mempool.vault_outpoint, winning_pool.vault_outpoint);
+    assert_eq!(balance_of(&atomic_after_mempool, fixture.asset_id, fixture.owner_id), fixture.launch_token_out);
+    assert_eq!(balance_of(&atomic_after_mempool, fixture.asset_id, fixture.second_owner_id), second_token_out);
 }
 
 fn new_miner_data() -> MinerData {

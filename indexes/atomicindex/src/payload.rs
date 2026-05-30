@@ -806,6 +806,55 @@ mod tests {
         payload
     }
 
+    fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn payload_golden_vectors_lock_cli_wasm_byte_layout() {
+        let create_asset = build_create_asset_payload();
+        assert_eq!(
+            to_hex(&create_asset),
+            "4341540100000300070000000000000001080164000000000000000000000000000000070707070707070707070707070707070707070707070707070707070707070704030500476f6c64474c4468656c6c6f"
+        );
+        assert!(matches!(parse_atomic_token_payload(&create_asset).unwrap().unwrap().op, TokenOp::CreateAsset(_)));
+
+        let mut buy = build_header(TokenOpCode::BuyLiquidityExactIn as u8, 1, 9);
+        buy.extend_from_slice(&[0x11; 32]);
+        buy.extend_from_slice(&2u64.to_le_bytes());
+        buy.extend_from_slice(&123_456_789u64.to_le_bytes());
+        buy.extend_from_slice(&987_654_321u128.to_le_bytes());
+        assert_eq!(
+            to_hex(&buy),
+            "434154010600010009000000000000001111111111111111111111111111111111111111111111111111111111111111020000000000000015cd5b0700000000b168de3a000000000000000000000000"
+        );
+        assert!(matches!(parse_atomic_token_payload(&buy).unwrap().unwrap().op, TokenOp::BuyLiquidityExactIn(_)));
+
+        let mut sell = build_header(TokenOpCode::SellLiquidityExactIn as u8, 2, 10);
+        sell.extend_from_slice(&[0x22; 32]);
+        sell.extend_from_slice(&3u64.to_le_bytes());
+        sell.extend_from_slice(&555u128.to_le_bytes());
+        sell.extend_from_slice(&4_444u64.to_le_bytes());
+        sell.extend_from_slice(&1u16.to_le_bytes());
+        assert_eq!(
+            to_hex(&sell),
+            "43415401070002000a00000000000000222222222222222222222222222222222222222222222222222222222222222203000000000000002b0200000000000000000000000000005c110000000000000100"
+        );
+        assert!(matches!(parse_atomic_token_payload(&sell).unwrap().unwrap().op, TokenOp::SellLiquidityExactIn(_)));
+
+        let mut claim = build_header(TokenOpCode::ClaimLiquidityFees as u8, 3, 11);
+        claim.extend_from_slice(&[0x33; 32]);
+        claim.extend_from_slice(&4u64.to_le_bytes());
+        claim.push(1);
+        claim.extend_from_slice(&777u64.to_le_bytes());
+        claim.extend_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            to_hex(&claim),
+            "43415401080003000b00000000000000333333333333333333333333333333333333333333333333333333333333333304000000000000000109030000000000000200"
+        );
+        assert!(matches!(parse_atomic_token_payload(&claim).unwrap().unwrap().op, TokenOp::ClaimLiquidityFees(_)));
+    }
+
     #[test]
     fn parse_create_asset_ok() {
         let payload = build_create_asset_payload();

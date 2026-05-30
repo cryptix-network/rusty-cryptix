@@ -2675,19 +2675,23 @@ impl AtomicTokenState {
         if fee_trade == 0 {
             return Ok(());
         }
-        *unclaimed_fee_total_sompi = unclaimed_fee_total_sompi.checked_add(fee_trade).ok_or(NoopReason::SupplyOverflow)?;
+        let next_total = unclaimed_fee_total_sompi.checked_add(fee_trade).ok_or(NoopReason::SupplyOverflow)?;
         match recipients.len() {
             0 => Err(NoopReason::BadLiquidityRecipientCount),
             1 => {
-                recipients[0].unclaimed_sompi =
-                    recipients[0].unclaimed_sompi.checked_add(fee_trade).ok_or(NoopReason::SupplyOverflow)?;
+                let next_recipient = recipients[0].unclaimed_sompi.checked_add(fee_trade).ok_or(NoopReason::SupplyOverflow)?;
+                *unclaimed_fee_total_sompi = next_total;
+                recipients[0].unclaimed_sompi = next_recipient;
                 Ok(())
             }
             2 => {
                 let fee0 = fee_trade / 2;
                 let fee1 = fee_trade - fee0;
-                recipients[0].unclaimed_sompi = recipients[0].unclaimed_sompi.checked_add(fee0).ok_or(NoopReason::SupplyOverflow)?;
-                recipients[1].unclaimed_sompi = recipients[1].unclaimed_sompi.checked_add(fee1).ok_or(NoopReason::SupplyOverflow)?;
+                let next_recipient0 = recipients[0].unclaimed_sompi.checked_add(fee0).ok_or(NoopReason::SupplyOverflow)?;
+                let next_recipient1 = recipients[1].unclaimed_sompi.checked_add(fee1).ok_or(NoopReason::SupplyOverflow)?;
+                *unclaimed_fee_total_sompi = next_total;
+                recipients[0].unclaimed_sompi = next_recipient0;
+                recipients[1].unclaimed_sompi = next_recipient1;
                 Ok(())
             }
             _ => Err(NoopReason::BadLiquidityRecipientCount),
@@ -4204,6 +4208,14 @@ mod tests {
         state.owner_id_from_script(script).expect("owner id should derive")
     }
 
+    fn fee_recipient(seed: u8, unclaimed_sompi: u64) -> LiquidityFeeRecipientState {
+        LiquidityFeeRecipientState { owner_id: [seed; 32], address_version: 0, address_payload: vec![seed; 32], unclaimed_sompi }
+    }
+
+    fn fee_recipient_amounts(recipients: &[LiquidityFeeRecipientState]) -> Vec<u64> {
+        recipients.iter().map(|recipient| recipient.unclaimed_sompi).collect()
+    }
+
     fn base_header(op: TokenOpCode, auth_input_index: u16, nonce: u64) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(b"CAT");
@@ -4402,6 +4414,61 @@ mod tests {
         state.applied_chain_order.push(accepting_block_hash);
     }
 
+    fn build_transfer_stress_refs(
+        asset_id: [u8; 32],
+        owner_ids: &[[u8; 32]],
+        scripts: &[ScriptPublicKey],
+        balances: &mut [u128],
+        token_nonces: &mut [u64],
+        auth_inputs: &mut HashMap<TransactionOutpoint, UtxoEntry>,
+        next_outpoint_tag: &mut u64,
+        seed: &mut u64,
+        source_block_tag: u64,
+        count: usize,
+    ) -> Vec<CanonicalTxRef> {
+        assert_eq!(owner_ids.len(), scripts.len());
+        assert_eq!(owner_ids.len(), balances.len());
+        assert_eq!(owner_ids.len(), token_nonces.len());
+
+        let mut refs = Vec::with_capacity(count);
+        for index in 0..count {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let mut sender = (*seed as usize) % owner_ids.len();
+            for _ in 0..owner_ids.len() {
+                if balances[sender] > 0 {
+                    break;
+                }
+                sender = (sender + 1) % owner_ids.len();
+            }
+            assert!(balances[sender] > 0, "stress model must retain spendable balances");
+
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let mut recipient = (*seed as usize) % owner_ids.len();
+            if recipient == sender {
+                recipient = (recipient + 1) % owner_ids.len();
+            }
+
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let max_amount = balances[sender].min(37);
+            let amount = 1 + (u128::from(*seed) % max_amount);
+            let outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(*next_outpoint_tag), 0);
+            *next_outpoint_tag += 1;
+            auth_inputs.insert(outpoint, UtxoEntry::new(10_000, scripts[sender].clone(), 0, false));
+
+            let tx = token_tx(
+                outpoint,
+                scripts[sender].clone(),
+                payload_transfer(0, token_nonces[sender], asset_id, owner_ids[recipient], amount),
+            );
+            balances[sender] -= amount;
+            balances[recipient] += amount;
+            token_nonces[sender] += 1;
+            refs.push(tx_ref(tx, BlockHash::from_u64_word(source_block_tag + index as u64), index as u32, 0));
+        }
+
+        refs
+    }
+
     fn unique_temp_dir(name: &str) -> PathBuf {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("cryptix-atomic-state-{name}-{}-{nonce}", std::process::id()))
@@ -4507,6 +4574,42 @@ mod tests {
         assert_eq!(state.get_anchor_count(owner_id), 0, "coinbase outputs must not become CAT anchor counts");
         assert_eq!(state.compute_state_hash(), before, "coinbase-only acceptance must not change token checkpoint hash");
         assert_eq!(state.next_event_sequence, 0);
+    }
+
+    #[test]
+    fn liquidity_fee_split_rejects_invalid_recipient_counts_without_mutation() {
+        let state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        for count in [0usize, 3, 5] {
+            let mut recipients = (0..count).map(|i| fee_recipient(i as u8, 10 + i as u64)).collect::<Vec<_>>();
+            let before_recipients = fee_recipient_amounts(&recipients);
+            let mut total = 123u64;
+
+            assert_eq!(
+                state.apply_fee_to_pool(&mut recipients, &mut total, 333),
+                Err(NoopReason::BadLiquidityRecipientCount),
+                "recipient count {count} must be rejected"
+            );
+
+            assert_eq!(total, 123, "recipient count {count}: total must not mutate on error");
+            assert_eq!(
+                fee_recipient_amounts(&recipients),
+                before_recipients,
+                "recipient count {count}: recipients must not mutate on error"
+            );
+        }
+    }
+
+    #[test]
+    fn liquidity_fee_split_overflow_is_side_effect_free() {
+        let state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let mut recipients = vec![fee_recipient(0, u64::MAX), fee_recipient(1, u64::MAX)];
+        let before_recipients = fee_recipient_amounts(&recipients);
+        let mut total = 42u64;
+
+        assert_eq!(state.apply_fee_to_pool(&mut recipients, &mut total, 3), Err(NoopReason::SupplyOverflow));
+
+        assert_eq!(total, 42, "total must not mutate when a recipient overflows");
+        assert_eq!(fee_recipient_amounts(&recipients), before_recipients, "recipients must not partially mutate on overflow");
     }
 
     #[test]
@@ -6218,6 +6321,111 @@ mod tests {
             let unique_event_ids = recovered.events.iter().map(|event| event.event_id).collect::<std::collections::HashSet<_>>();
             assert_eq!(unique_event_ids.len(), recovered.events.len(), "rollback+replay must not duplicate event ids");
         }
+    }
+
+    #[test]
+    fn large_transfer_reorg_stress_matches_fresh_replay() {
+        let network = "cryptix-simnet".to_string();
+        let scripts = vec![test_script(61), test_script(62), test_script(63), test_script(64), test_script(65)];
+        let owner_ids: Vec<_> = scripts.iter().map(|script| owner_id(&AtomicTokenState::new(1, network.clone()), script)).collect();
+        let mut state = AtomicTokenState::new(1, network.clone());
+        let mut auth_inputs = HashMap::new();
+        let mut next_outpoint_tag = 20_000u64;
+        let mut make_tx = |script: &ScriptPublicKey, payload: Vec<u8>| {
+            let outpoint = TransactionOutpoint::new(BlockHash::from_u64_word(next_outpoint_tag), 0);
+            next_outpoint_tag += 1;
+            auth_inputs.insert(outpoint, UtxoEntry::new(10_000, script.clone(), 0, false));
+            token_tx(outpoint, script.clone(), payload)
+        };
+
+        let create_tx = make_tx(&scripts[0], payload_create_asset(0, 1, 8, owner_ids[0], b"StressBulk", b"SBK", b""));
+        let asset_id = hash_bytes(create_tx.id());
+        let mint_tx = make_tx(&scripts[0], payload_mint(0, 1, asset_id, owner_ids[0], 1_000_000));
+        let genesis_block = BlockHash::from_u64_word(30_000);
+        let genesis_refs =
+            vec![tx_ref(create_tx, BlockHash::from_u64_word(30_100), 0, 0), tx_ref(mint_tx, BlockHash::from_u64_word(30_100), 1, 0)];
+        apply_block(&mut state, genesis_block, genesis_refs.clone(), &auth_inputs);
+
+        let mut history = vec![(genesis_block, genesis_refs)];
+        let mut balances = vec![1_000_000u128, 0, 0, 0, 0];
+        let mut token_nonces = vec![2u64, 1, 1, 1, 1];
+        let mut seed = 0x5EED_F00D_CAFE_BABEu64;
+
+        for round in 0..20u64 {
+            let block = BlockHash::from_u64_word(31_000 + round);
+            let refs = build_transfer_stress_refs(
+                asset_id,
+                &owner_ids,
+                &scripts,
+                &mut balances,
+                &mut token_nonces,
+                &mut auth_inputs,
+                &mut next_outpoint_tag,
+                &mut seed,
+                40_000 + round * 100,
+                40,
+            );
+            apply_block(&mut state, block, refs.clone(), &auth_inputs);
+            history.push((block, refs));
+
+            let base_hash = state.compute_state_hash();
+            let mut branch_balances = balances.clone();
+            let mut branch_nonces = token_nonces.clone();
+            let branch_a_block = BlockHash::from_u64_word(32_000 + round);
+            let branch_a_refs = build_transfer_stress_refs(
+                asset_id,
+                &owner_ids,
+                &scripts,
+                &mut branch_balances,
+                &mut branch_nonces,
+                &mut auth_inputs,
+                &mut next_outpoint_tag,
+                &mut seed,
+                50_000 + round * 100,
+                10,
+            );
+            let branch_a_txids: Vec<_> = branch_a_refs.iter().map(|tx_ref| tx_ref.txid).collect();
+            apply_block(&mut state, branch_a_block, branch_a_refs, &auth_inputs);
+            assert!(!state.degraded);
+            state.rollback_block(branch_a_block).expect("stress branch rollback must succeed");
+            assert_eq!(state.compute_state_hash(), base_hash, "rollback must restore the pre-branch state hash");
+            assert!(!state.block_journals.contains_key(&branch_a_block), "rolled-back branch journal must be removed");
+            assert!(!state.state_hash_by_block.contains_key(&branch_a_block), "rolled-back branch state hash must be removed");
+            for txid in branch_a_txids {
+                assert!(!state.processed_ops.contains_key(&txid), "rolled-back branch tx guard must be removed");
+            }
+
+            let branch_b_block = BlockHash::from_u64_word(33_000 + round);
+            let branch_b_refs = build_transfer_stress_refs(
+                asset_id,
+                &owner_ids,
+                &scripts,
+                &mut balances,
+                &mut token_nonces,
+                &mut auth_inputs,
+                &mut next_outpoint_tag,
+                &mut seed,
+                60_000 + round * 100,
+                10,
+            );
+            apply_block(&mut state, branch_b_block, branch_b_refs.clone(), &auth_inputs);
+            history.push((branch_b_block, branch_b_refs));
+        }
+
+        assert!(!state.degraded);
+        assert_eq!(balances.iter().sum::<u128>(), 1_000_000);
+        for (owner, expected_balance) in owner_ids.iter().zip(balances.iter().copied()) {
+            assert_eq!(state.get_balance(asset_id, *owner), expected_balance);
+        }
+        for (owner, expected_nonce) in owner_ids.iter().zip(token_nonces.iter().copied()) {
+            assert_eq!(state.get_token_nonce(*owner, asset_id), expected_nonce);
+        }
+
+        let mut fresh = AtomicTokenState::new(1, network);
+        for (block_hash, refs) in history {
+            apply_block(&mut fresh, block_hash, refs, &auth_inputs);
+        }
+        assert_eq!(state.compute_state_hash(), fresh.compute_state_hash());
     }
 
     #[test]
