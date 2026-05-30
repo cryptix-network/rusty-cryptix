@@ -1885,6 +1885,124 @@ async fn atomic_nonce_conflict_reorg_prefers_selected_branch_state() {
 }
 
 #[tokio::test]
+async fn atomic_reorg_removes_losing_branch_state_and_accepts_new_atomic_block() {
+    let mut ctx = liquidity_test_context();
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let receiver_script = cryptix_txscript::pay_to_script_hash_script(&second_p2sh_redeem_script());
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    let receiver_id = atomic_owner_id_from_script(&receiver_script).expect("receiver id should derive from P2SH");
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    for _ in 0..6 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let utxos = find_virtual_utxos_by_script(&ctx, &owner_script, 4);
+    let tx_fee = 10_000u64;
+    let fork_parent = ctx.consensus.get_sink();
+
+    let create_old_branch = payload_tx(
+        vec![TransactionInput::new(utxos[0].0, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(utxos[0].1.amount - tx_fee, owner_script.clone())],
+        payload_create_asset_with_mint(0, 1, owner_id, b"OldBranch", b"OLD", 1_000, owner_id),
+    );
+    let old_branch_asset = create_old_branch.id().as_bytes();
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let old_branch = ctx.build_utxo_valid_block_with_parents_and_transactions(
+        vec![fork_parent],
+        vec![create_old_branch],
+        6_101,
+        ctx.simulated_time,
+    );
+    let old_branch_hash = old_branch.header.hash;
+    ctx.validate_and_insert_utxo_valid_block(old_branch.to_immutable()).await;
+
+    let transfer_from_old_branch_asset = payload_tx(
+        vec![TransactionInput::new(utxos[1].0, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(utxos[1].1.amount - tx_fee, owner_script.clone())],
+        payload_transfer(0, 1, old_branch_asset, receiver_id, 100),
+    );
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let local_child = ctx.build_utxo_valid_block_with_parents_and_transactions(
+        vec![old_branch_hash],
+        vec![transfer_from_old_branch_asset],
+        6_102,
+        ctx.simulated_time,
+    );
+    ctx.validate_and_insert_utxo_valid_block(local_child.to_immutable()).await;
+
+    let atomic_before_reorg = ctx.consensus.virtual_atomic_state();
+    assert!(atomic_before_reorg.assets.contains_key(&old_branch_asset));
+    assert_eq!(balance_of(&atomic_before_reorg, old_branch_asset, owner_id), 900);
+    assert_eq!(balance_of(&atomic_before_reorg, old_branch_asset, receiver_id), 100);
+    assert_eq!(atomic_before_reorg.next_nonces.get(&AtomicNonceKey::owner(owner_id)), Some(&2));
+    assert_eq!(atomic_before_reorg.next_nonces.get(&AtomicNonceKey::asset(owner_id, old_branch_asset)), Some(&2));
+
+    let create_winning_branch = payload_tx(
+        vec![TransactionInput::new(utxos[2].0, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(utxos[2].1.amount - tx_fee, owner_script.clone())],
+        payload_create_asset_with_mint(0, 1, owner_id, b"Winner", b"WIN", 1_000, owner_id),
+    );
+    let winning_branch_asset = create_winning_branch.id().as_bytes();
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let winning_branch = ctx.build_utxo_valid_block_with_parents_and_transactions(
+        vec![fork_parent],
+        vec![create_winning_branch],
+        6_201,
+        ctx.simulated_time,
+    );
+    let mut winning_tip = winning_branch.header.hash;
+    ctx.validate_and_insert_block(winning_branch.to_immutable()).await;
+
+    for nonce in 6_202..6_206 {
+        ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+        let extension = ctx.build_utxo_valid_block_with_parents_and_transactions(vec![winning_tip], vec![], nonce, ctx.simulated_time);
+        winning_tip = extension.header.hash;
+        ctx.validate_and_insert_block(extension.to_immutable()).await;
+    }
+    assert!(ctx.consensus.reachability_service().is_chain_ancestor_of(winning_tip, ctx.consensus.get_sink()));
+
+    let atomic_after_reorg = ctx.consensus.virtual_atomic_state();
+    assert!(
+        !atomic_after_reorg.assets.contains_key(&old_branch_asset),
+        "Atomic asset from the losing branch must not remain in virtual state after reorg"
+    );
+    assert_eq!(balance_of(&atomic_after_reorg, old_branch_asset, owner_id), 0);
+    assert_eq!(balance_of(&atomic_after_reorg, old_branch_asset, receiver_id), 0);
+    assert!(!atomic_after_reorg.next_nonces.contains_key(&AtomicNonceKey::asset(owner_id, old_branch_asset)));
+    assert!(
+        atomic_after_reorg.assets.contains_key(&winning_branch_asset),
+        "Atomic asset from the selected winning branch must be present after reorg"
+    );
+    assert_eq!(balance_of(&atomic_after_reorg, winning_branch_asset, owner_id), 1_000);
+    assert_eq!(atomic_after_reorg.next_nonces.get(&AtomicNonceKey::owner(owner_id)), Some(&2));
+
+    let create_after_reorg = payload_tx(
+        vec![TransactionInput::new(utxos[3].0, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(utxos[3].1.amount - tx_fee, owner_script.clone())],
+        payload_create_asset(0, 2, owner_id, b"AfterReorg", b"AFT"),
+    );
+    let after_reorg_asset = create_after_reorg.id().as_bytes();
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let after_reorg = ctx.build_utxo_valid_block_with_parents_and_transactions(
+        vec![ctx.consensus.get_sink()],
+        vec![create_after_reorg],
+        6_301,
+        ctx.simulated_time,
+    );
+    ctx.validate_and_insert_utxo_valid_block(after_reorg.to_immutable()).await;
+
+    let atomic_final = ctx.consensus.virtual_atomic_state();
+    assert!(!atomic_final.assets.contains_key(&old_branch_asset));
+    assert_eq!(balance_of(&atomic_final, old_branch_asset, owner_id), 0);
+    assert_eq!(balance_of(&atomic_final, old_branch_asset, receiver_id), 0);
+    assert!(!atomic_final.next_nonces.contains_key(&AtomicNonceKey::asset(owner_id, old_branch_asset)));
+    assert!(atomic_final.assets.contains_key(&winning_branch_asset));
+    assert_eq!(balance_of(&atomic_final, winning_branch_asset, owner_id), 1_000);
+    assert!(atomic_final.assets.contains_key(&after_reorg_asset));
+    assert_eq!(atomic_final.next_nonces.get(&AtomicNonceKey::owner(owner_id)), Some(&3));
+}
+
+#[tokio::test]
 async fn liquidity_different_pools_can_advance_in_same_block() {
     let mut ctx = liquidity_test_context();
     let owner_redeem_script = p2sh_redeem_script();
