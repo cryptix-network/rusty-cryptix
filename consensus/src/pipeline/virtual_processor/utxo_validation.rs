@@ -156,13 +156,14 @@ mod tests {
     use super::{
         apply_fee_to_pool, atomic_op_allows_liquidity_vault_output, calculate_trade_fee, cpmm_buy, cpmm_sell,
         initial_virtual_cpay_reserves_sompi_for_curve, initial_virtual_token_reserves_for_curve, min_gross_input_for_token_out,
-        validate_liquidity_claim_authorization, validate_liquidity_creation_parameters, AtomicBlockStateGrowth, AtomicPayloadOp,
-        AtomicStateGrowth, AtomicStateGrowthLimits, DEFAULT_LIQUIDITY_CURVE_MODE, INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI,
+        validate_liquidity_claim_authorization, validate_liquidity_creation_parameters, validate_liquidity_curve_parameters,
+        AtomicBlockStateGrowth, AtomicPayloadOp, AtomicStateGrowth, AtomicStateGrowthLimits,
+        AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI, DEFAULT_LIQUIDITY_CURVE_MODE, INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI,
         INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS, INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
         INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS, INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI, INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS,
         INITIAL_REAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_TOKEN_RESERVES,
         LIQUIDITY_CURVE_MODE_AGGRESSIVE, LIQUIDITY_CURVE_MODE_BASIC, LIQUIDITY_CURVE_MODE_INDIVIDUAL, LIQUIDITY_TOKEN_SUPPLY_RAW,
-        MAX_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SUPPLY_RAW,
+        MAX_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SUPPLY_RAW, VIRTUAL_TOKEN_MULTIPLIER_BPS_DENOMINATOR,
     };
     use crate::model::stores::atomic_state::AtomicLiquidityFeeRecipientState;
 
@@ -294,6 +295,341 @@ mod tests {
         assert!(validate_liquidity_creation_parameters(0, MIN_LIQUIDITY_SUPPLY_RAW - 1, INITIAL_REAL_CPAY_RESERVES_SOMPI).is_err());
         assert!(validate_liquidity_creation_parameters(0, MAX_LIQUIDITY_SUPPLY_RAW + 1, INITIAL_REAL_CPAY_RESERVES_SOMPI).is_err());
         assert!(validate_liquidity_creation_parameters(0, LIQUIDITY_TOKEN_SUPPLY_RAW, INITIAL_REAL_CPAY_RESERVES_SOMPI - 1).is_err());
+    }
+
+    #[test]
+    fn liquidity_curve_modes_have_exact_integer_initial_reserves() {
+        let cases = [
+            (
+                "basic min supply",
+                LIQUIDITY_CURVE_MODE_BASIC,
+                MIN_LIQUIDITY_SUPPLY_RAW,
+                INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                120_000u128,
+            ),
+            (
+                "basic default supply",
+                LIQUIDITY_CURVE_MODE_BASIC,
+                LIQUIDITY_TOKEN_SUPPLY_RAW,
+                INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                1_200_000u128,
+            ),
+            (
+                "basic max supply",
+                LIQUIDITY_CURVE_MODE_BASIC,
+                MAX_LIQUIDITY_SUPPLY_RAW,
+                INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                12_000_000u128,
+            ),
+            (
+                "aggressive min supply",
+                LIQUIDITY_CURVE_MODE_AGGRESSIVE,
+                MIN_LIQUIDITY_SUPPLY_RAW,
+                AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                105_000u128,
+            ),
+            (
+                "aggressive default supply",
+                LIQUIDITY_CURVE_MODE_AGGRESSIVE,
+                LIQUIDITY_TOKEN_SUPPLY_RAW,
+                AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                1_050_000u128,
+            ),
+            (
+                "aggressive max supply",
+                LIQUIDITY_CURVE_MODE_AGGRESSIVE,
+                MAX_LIQUIDITY_SUPPLY_RAW,
+                AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                10_500_000u128,
+            ),
+        ];
+
+        for (name, mode, max_supply, expected_cpay, expected_tokens) in cases {
+            assert_eq!(initial_virtual_cpay_reserves_sompi_for_curve(mode, 0).unwrap(), expected_cpay, "{name}: cpay");
+            assert_eq!(initial_virtual_token_reserves_for_curve(max_supply, mode, 0).unwrap(), expected_tokens, "{name}: tokens");
+        }
+    }
+
+    #[test]
+    fn individual_curve_rejects_ambiguous_non_grid_values() {
+        assert!(validate_liquidity_curve_parameters(LIQUIDITY_CURVE_MODE_BASIC, 0, 0).is_ok());
+        assert!(validate_liquidity_curve_parameters(LIQUIDITY_CURVE_MODE_AGGRESSIVE, 0, 0).is_ok());
+        assert!(validate_liquidity_curve_parameters(
+            LIQUIDITY_CURVE_MODE_INDIVIDUAL,
+            INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
+            INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS,
+        )
+        .is_ok());
+
+        assert!(validate_liquidity_curve_parameters(
+            LIQUIDITY_CURVE_MODE_BASIC,
+            INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
+            INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS,
+        )
+        .is_err());
+        assert!(validate_liquidity_curve_parameters(
+            LIQUIDITY_CURVE_MODE_AGGRESSIVE,
+            INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
+            INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS,
+        )
+        .is_err());
+
+        let invalid_fixed_cpay = [
+            INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI - 1,
+            INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI + 1,
+            INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI + INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI,
+        ];
+        for fixed_cpay in invalid_fixed_cpay {
+            assert!(
+                validate_liquidity_curve_parameters(
+                    LIQUIDITY_CURVE_MODE_INDIVIDUAL,
+                    fixed_cpay,
+                    INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS,
+                )
+                .is_err(),
+                "fixed CPAY {fixed_cpay} must be rejected"
+            );
+            assert!(
+                initial_virtual_cpay_reserves_sompi_for_curve(LIQUIDITY_CURVE_MODE_INDIVIDUAL, fixed_cpay).is_err(),
+                "fixed CPAY {fixed_cpay} must not produce reserves"
+            );
+        }
+
+        let invalid_multipliers = [
+            INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS - 1,
+            INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS + 1,
+            INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS + INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS,
+        ];
+        for multiplier_bps in invalid_multipliers {
+            assert!(
+                validate_liquidity_curve_parameters(
+                    LIQUIDITY_CURVE_MODE_INDIVIDUAL,
+                    INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
+                    multiplier_bps,
+                )
+                .is_err(),
+                "multiplier {multiplier_bps} must be rejected"
+            );
+            assert!(
+                initial_virtual_token_reserves_for_curve(LIQUIDITY_TOKEN_SUPPLY_RAW, LIQUIDITY_CURVE_MODE_INDIVIDUAL, multiplier_bps,)
+                    .is_err(),
+                "multiplier {multiplier_bps} must not produce reserves"
+            );
+        }
+    }
+
+    #[test]
+    fn individual_curve_full_parameter_grid_is_exact_and_matches_index() {
+        use cryptix_atomicindex::liquidity_math as index_math;
+
+        let supplies = [MIN_LIQUIDITY_SUPPLY_RAW, LIQUIDITY_TOKEN_SUPPLY_RAW, MAX_LIQUIDITY_SUPPLY_RAW];
+        let mut fixed_cpay = INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI;
+        loop {
+            let mut multiplier_bps = INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS;
+            loop {
+                assert!(
+                    validate_liquidity_curve_parameters(LIQUIDITY_CURVE_MODE_INDIVIDUAL, fixed_cpay, multiplier_bps).is_ok(),
+                    "valid grid point rejected: fixed_cpay={fixed_cpay} multiplier_bps={multiplier_bps}"
+                );
+
+                let consensus_cpay =
+                    initial_virtual_cpay_reserves_sompi_for_curve(LIQUIDITY_CURVE_MODE_INDIVIDUAL, fixed_cpay).unwrap();
+                let index_cpay =
+                    index_math::initial_virtual_cpay_reserves_sompi_for_curve(LIQUIDITY_CURVE_MODE_INDIVIDUAL, fixed_cpay).unwrap();
+                assert_eq!(consensus_cpay, fixed_cpay, "consensus fixed CPAY drift");
+                assert_eq!(index_cpay, fixed_cpay, "index fixed CPAY drift");
+
+                for max_supply in supplies {
+                    let expected_tokens =
+                        max_supply * u128::from(multiplier_bps) / u128::from(VIRTUAL_TOKEN_MULTIPLIER_BPS_DENOMINATOR);
+                    let consensus_tokens =
+                        initial_virtual_token_reserves_for_curve(max_supply, LIQUIDITY_CURVE_MODE_INDIVIDUAL, multiplier_bps).unwrap();
+                    let index_tokens = index_math::initial_virtual_token_reserves_for_curve(
+                        max_supply,
+                        LIQUIDITY_CURVE_MODE_INDIVIDUAL,
+                        multiplier_bps,
+                    )
+                    .unwrap();
+                    assert_eq!(consensus_tokens, expected_tokens, "consensus token reserve drift");
+                    assert_eq!(index_tokens, expected_tokens, "index token reserve drift");
+                }
+
+                if multiplier_bps == INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS {
+                    break;
+                }
+                multiplier_bps += INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS;
+            }
+
+            if fixed_cpay == INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI {
+                break;
+            }
+            fixed_cpay += INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI;
+        }
+    }
+
+    #[test]
+    fn individual_curve_trade_vectors_are_exact_in_consensus() {
+        let buy_cases = [
+            (
+                "individual_min_buy_1000_cpay_100bps",
+                LIQUIDITY_TOKEN_SUPPLY_RAW,
+                INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
+                10_100,
+                1_000 * cryptix_consensus_core::constants::SOMPI_PER_CRYPTIX,
+                100,
+                1_000_000_000,
+                99_000_000_000,
+                998u128,
+                999_002u128,
+                100_099_000_000_000,
+                1_009_002u128,
+            ),
+            (
+                "individual_default_buy_1000_cpay_100bps",
+                LIQUIDITY_TOKEN_SUPPLY_RAW,
+                AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                10_500,
+                1_000 * cryptix_consensus_core::constants::SOMPI_PER_CRYPTIX,
+                100,
+                1_000_000_000,
+                99_000_000_000,
+                519u128,
+                999_481u128,
+                200_099_000_000_000,
+                1_049_481u128,
+            ),
+            (
+                "individual_max_buy_1000_cpay_100bps",
+                LIQUIDITY_TOKEN_SUPPLY_RAW,
+                INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI,
+                20_000,
+                1_000 * cryptix_consensus_core::constants::SOMPI_PER_CRYPTIX,
+                100,
+                1_000_000_000,
+                99_000_000_000,
+                247u128,
+                999_753u128,
+                800_099_000_000_000,
+                1_999_753u128,
+            ),
+            (
+                "individual_custom_buy_12345_cpay_40bps",
+                5_000_000,
+                330_000_000_000_000,
+                14_600,
+                12_345 * cryptix_consensus_core::constants::SOMPI_PER_CRYPTIX,
+                40,
+                4_938_000_000,
+                1_229_562_000_000,
+                27_098u128,
+                4_972_902u128,
+                331_229_562_000_000,
+                7_272_902u128,
+            ),
+        ];
+
+        for (
+            name,
+            max_supply,
+            fixed_cpay,
+            multiplier_bps,
+            gross_in,
+            fee_bps,
+            expected_fee,
+            expected_net,
+            expected_token_out,
+            expected_real_token_reserves,
+            expected_virtual_cpay,
+            expected_virtual_tokens,
+        ) in buy_cases
+        {
+            let virtual_cpay = initial_virtual_cpay_reserves_sompi_for_curve(LIQUIDITY_CURVE_MODE_INDIVIDUAL, fixed_cpay).unwrap();
+            let virtual_tokens =
+                initial_virtual_token_reserves_for_curve(max_supply, LIQUIDITY_CURVE_MODE_INDIVIDUAL, multiplier_bps).unwrap();
+            let fee = calculate_trade_fee(gross_in, fee_bps).unwrap();
+            let net = gross_in - fee;
+            let (token_out, real_token_reserves, new_virtual_cpay, new_virtual_tokens) =
+                cpmm_buy(max_supply, virtual_cpay, virtual_tokens, net).unwrap();
+
+            assert_eq!(fee, expected_fee, "{name}: fee");
+            assert_eq!(net, expected_net, "{name}: net");
+            assert_eq!(token_out, expected_token_out, "{name}: token_out");
+            assert_eq!(real_token_reserves, expected_real_token_reserves, "{name}: real_token_reserves");
+            assert_eq!(new_virtual_cpay, expected_virtual_cpay, "{name}: virtual_cpay");
+            assert_eq!(new_virtual_tokens, expected_virtual_tokens, "{name}: virtual_tokens");
+        }
+
+        let sell_cases = [
+            (
+                "individual_min_sell_250_tokens_100bps",
+                99_100_000_000,
+                100_099_000_000_000,
+                1_009_002u128,
+                250u128,
+                100,
+                24_795_343_482,
+                247_953_434,
+                24_547_390_048,
+                74_304_656_518,
+                100_074_204_656_518,
+                1_009_252u128,
+            ),
+            (
+                "individual_max_sell_247_tokens_100bps",
+                99_100_000_000,
+                800_099_000_000_000,
+                1_999_753u128,
+                247u128,
+                100,
+                98_812_226_500,
+                988_122_265,
+                97_824_104_235,
+                287_773_500,
+                800_000_187_773_500,
+                2_000_000u128,
+            ),
+            (
+                "individual_custom_sell_7777_tokens_40bps",
+                1_229_662_000_000,
+                331_229_562_000_000,
+                7_272_902u128,
+                7_777u128,
+                40,
+                353_809_349_879,
+                1_415_237_399,
+                352_394_112_480,
+                875_852_650_121,
+                330_875_752_650_121,
+                7_280_679u128,
+            ),
+        ];
+
+        for (
+            name,
+            real_cpay,
+            virtual_cpay,
+            virtual_tokens,
+            token_in,
+            fee_bps,
+            expected_gross_out,
+            expected_fee,
+            expected_cpay_out,
+            expected_real_cpay,
+            expected_virtual_cpay,
+            expected_virtual_tokens,
+        ) in sell_cases
+        {
+            let (gross_out, new_real_cpay, new_virtual_cpay, new_virtual_tokens) =
+                cpmm_sell(real_cpay, virtual_cpay, virtual_tokens, token_in).unwrap();
+            let fee = calculate_trade_fee(gross_out, fee_bps).unwrap();
+
+            assert_eq!(gross_out, expected_gross_out, "{name}: gross_out");
+            assert_eq!(fee, expected_fee, "{name}: fee");
+            assert_eq!(gross_out - fee, expected_cpay_out, "{name}: cpay_out");
+            assert_eq!(new_real_cpay, expected_real_cpay, "{name}: real_cpay");
+            assert_eq!(new_virtual_cpay, expected_virtual_cpay, "{name}: virtual_cpay");
+            assert_eq!(new_virtual_tokens, expected_virtual_tokens, "{name}: virtual_tokens");
+        }
     }
 
     #[test]
