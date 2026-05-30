@@ -275,6 +275,41 @@ mod tests {
         assert_eq!(total, expected0 + expected1);
     }
 
+    #[test]
+    fn liquidity_fee_split_rejects_invalid_recipient_counts_without_mutation() {
+        for count in [0usize, 3, 5] {
+            let mut recipients = dummy_fee_recipients(count);
+            for (i, recipient) in recipients.iter_mut().enumerate() {
+                recipient.unclaimed_sompi = 10 + i as u64;
+            }
+            let before_recipients = fee_recipient_amounts(&recipients);
+            let mut total = 123u64;
+
+            assert!(apply_fee_to_pool(&mut recipients, &mut total, 333).is_err(), "recipient count {count} must be rejected");
+
+            assert_eq!(total, 123, "recipient count {count}: total must not mutate on error");
+            assert_eq!(
+                fee_recipient_amounts(&recipients),
+                before_recipients,
+                "recipient count {count}: recipients must not mutate on error"
+            );
+        }
+    }
+
+    #[test]
+    fn liquidity_fee_split_overflow_is_side_effect_free() {
+        let mut recipients = dummy_fee_recipients(2);
+        recipients[0].unclaimed_sompi = u64::MAX;
+        recipients[1].unclaimed_sompi = u64::MAX;
+        let before_recipients = fee_recipient_amounts(&recipients);
+        let mut total = 42u64;
+
+        assert!(apply_fee_to_pool(&mut recipients, &mut total, 3).is_err());
+
+        assert_eq!(total, 42, "total must not mutate when a recipient overflows");
+        assert_eq!(fee_recipient_amounts(&recipients), before_recipients, "recipients must not partially mutate on overflow");
+    }
+
     fn dummy_fee_recipients(count: usize) -> Vec<AtomicLiquidityFeeRecipientState> {
         (0..count)
             .map(|i| AtomicLiquidityFeeRecipientState {
@@ -284,6 +319,10 @@ mod tests {
                 unclaimed_sompi: 0,
             })
             .collect()
+    }
+
+    fn fee_recipient_amounts(recipients: &[AtomicLiquidityFeeRecipientState]) -> Vec<u64> {
+        recipients.iter().map(|recipient| recipient.unclaimed_sompi).collect()
     }
 
     #[test]
@@ -754,29 +793,34 @@ fn apply_fee_to_pool(
     if fee_trade == 0 {
         return Ok(());
     }
-    *unclaimed_fee_total_sompi = unclaimed_fee_total_sompi
+    let next_total = unclaimed_fee_total_sompi
         .checked_add(fee_trade)
         .ok_or_else(|| TxRuleError::InvalidAtomicPayload("unclaimed_fee_total overflow".to_string()))?;
     match recipients.len() {
         0 => Err(TxRuleError::InvalidAtomicPayload("fee_trade > 0 but no fee recipients are configured".to_string())),
         1 => {
-            recipients[0].unclaimed_sompi = recipients[0]
+            let next_recipient = recipients[0]
                 .unclaimed_sompi
                 .checked_add(fee_trade)
                 .ok_or_else(|| TxRuleError::InvalidAtomicPayload("recipient fee overflow".to_string()))?;
+            *unclaimed_fee_total_sompi = next_total;
+            recipients[0].unclaimed_sompi = next_recipient;
             Ok(())
         }
         2 => {
             let fee0 = fee_trade / 2;
             let fee1 = fee_trade - fee0;
-            recipients[0].unclaimed_sompi = recipients[0]
+            let next_recipient0 = recipients[0]
                 .unclaimed_sompi
                 .checked_add(fee0)
                 .ok_or_else(|| TxRuleError::InvalidAtomicPayload("recipient0 fee overflow".to_string()))?;
-            recipients[1].unclaimed_sompi = recipients[1]
+            let next_recipient1 = recipients[1]
                 .unclaimed_sompi
                 .checked_add(fee1)
                 .ok_or_else(|| TxRuleError::InvalidAtomicPayload("recipient1 fee overflow".to_string()))?;
+            *unclaimed_fee_total_sompi = next_total;
+            recipients[0].unclaimed_sompi = next_recipient0;
+            recipients[1].unclaimed_sompi = next_recipient1;
             Ok(())
         }
         _ => Err(TxRuleError::InvalidAtomicPayload("invalid recipient count in liquidity pool state".to_string())),
