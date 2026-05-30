@@ -154,7 +154,7 @@ impl AtomicBlockStateGrowth {
 #[cfg(test)]
 mod tests {
     use super::{
-        atomic_op_allows_liquidity_vault_output, calculate_trade_fee, cpmm_buy, cpmm_sell,
+        apply_fee_to_pool, atomic_op_allows_liquidity_vault_output, calculate_trade_fee, cpmm_buy, cpmm_sell,
         initial_virtual_cpay_reserves_sompi_for_curve, initial_virtual_token_reserves_for_curve, min_gross_input_for_token_out,
         validate_liquidity_claim_authorization, validate_liquidity_creation_parameters, AtomicBlockStateGrowth, AtomicPayloadOp,
         AtomicStateGrowth, AtomicStateGrowthLimits, DEFAULT_LIQUIDITY_CURVE_MODE, INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI,
@@ -164,6 +164,7 @@ mod tests {
         LIQUIDITY_CURVE_MODE_AGGRESSIVE, LIQUIDITY_CURVE_MODE_BASIC, LIQUIDITY_CURVE_MODE_INDIVIDUAL, LIQUIDITY_TOKEN_SUPPLY_RAW,
         MAX_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SUPPLY_RAW,
     };
+    use crate::model::stores::atomic_state::AtomicLiquidityFeeRecipientState;
 
     #[test]
     fn atomic_state_growth_limits_reject_block_state_spam() {
@@ -194,6 +195,94 @@ mod tests {
     fn liquidity_claims_require_matching_recipient_owner() {
         assert!(validate_liquidity_claim_authorization([0x22; 32], [0x22; 32]).is_ok());
         assert!(validate_liquidity_claim_authorization([0x22; 32], [0x33; 32]).is_err());
+    }
+
+    #[test]
+    fn liquidity_trade_fee_uses_deterministic_integer_floor() {
+        let cases = [
+            ("one sompi rounds to zero", 1u64, 1_000u16, 0u64),
+            ("three point three three percent small odd fee", 100, 333, 3),
+            ("three point three three percent below denominator", 9_999, 333, 332),
+            ("three point three three percent above denominator", 10_001, 333, 333),
+            ("three point three three percent common trade", 1_000_000, 333, 33_300),
+            ("three point three three percent uneven decimal", 12_345_678, 333, 411_111),
+            ("max amount ten percent", u64::MAX, 1_000, 1_844_674_407_370_955_161),
+            ("max amount three point three three percent", u64::MAX, 333, 614_276_577_654_528_068),
+        ];
+
+        for (name, amount, fee_bps, expected) in cases {
+            let fee = calculate_trade_fee(amount, fee_bps).unwrap_or_else(|err| panic!("{name}: unexpected error {err}"));
+            assert_eq!(fee, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn liquidity_fee_split_is_deterministic_for_one_and_two_recipients() {
+        let cases = [
+            ("zero fee leaves one recipient unchanged", 1usize, 0u64, 0u64, 0u64, 0u64),
+            ("one recipient receives all", 1, 333, 333, 333, 0),
+            ("two recipients split even fee equally", 2, 33_300, 33_300, 16_650, 16_650),
+            ("two recipients put odd remainder on canonical second recipient", 2, 333, 333, 166, 167),
+            ("two recipients tiny odd fee", 2, 3, 3, 1, 2),
+            (
+                "two recipients max rounded fee stays exact",
+                2,
+                1_844_674_407_370_955_161,
+                1_844_674_407_370_955_161,
+                922_337_203_685_477_580,
+                922_337_203_685_477_581,
+            ),
+        ];
+
+        for (name, recipient_count, fee_trade, expected_total, expected0, expected1) in cases {
+            let mut recipients = dummy_fee_recipients(recipient_count);
+            let mut total = 0u64;
+
+            apply_fee_to_pool(&mut recipients, &mut total, fee_trade).unwrap_or_else(|err| panic!("{name}: unexpected error {err}"));
+
+            assert_eq!(total, expected_total, "{name}: total");
+            if recipient_count > 0 {
+                assert_eq!(recipients[0].unclaimed_sompi, expected0, "{name}: recipient0");
+            }
+            if recipient_count > 1 {
+                assert_eq!(recipients[1].unclaimed_sompi, expected1, "{name}: recipient1");
+                assert_eq!(recipients[0].unclaimed_sompi + recipients[1].unclaimed_sompi, total, "{name}: recipient sum");
+            }
+        }
+    }
+
+    #[test]
+    fn liquidity_fee_split_repeated_rounding_is_stable() {
+        let fees = [0u64, 1, 3, 332, 333, 999, 33_300, 411_111, 614_276_577_654_528_068];
+        let mut recipients = dummy_fee_recipients(2);
+        let mut total = 0u64;
+        let mut expected0 = 0u64;
+        let mut expected1 = 0u64;
+
+        for fee_trade in fees {
+            apply_fee_to_pool(&mut recipients, &mut total, fee_trade)
+                .unwrap_or_else(|err| panic!("fee {fee_trade}: unexpected error {err}"));
+            if fee_trade == 0 {
+                continue;
+            }
+            expected0 += fee_trade / 2;
+            expected1 += fee_trade - fee_trade / 2;
+        }
+
+        assert_eq!(recipients[0].unclaimed_sompi, expected0);
+        assert_eq!(recipients[1].unclaimed_sompi, expected1);
+        assert_eq!(total, expected0 + expected1);
+    }
+
+    fn dummy_fee_recipients(count: usize) -> Vec<AtomicLiquidityFeeRecipientState> {
+        (0..count)
+            .map(|i| AtomicLiquidityFeeRecipientState {
+                owner_id: [i as u8; 32],
+                address_version: 0,
+                address_payload: vec![i as u8; 32],
+                unclaimed_sompi: 0,
+            })
+            .collect()
     }
 
     #[test]
@@ -319,6 +408,43 @@ fn calculate_trade_fee(amount: u64, fee_bps: u16) -> TxResult<u64> {
         .ok_or_else(|| TxRuleError::InvalidAtomicPayload("fee multiplication overflow".to_string()))?
         / 10_000u128;
     u64::try_from(fee).map_err(|_| TxRuleError::InvalidAtomicPayload("fee does not fit into u64".to_string()))
+}
+
+fn apply_fee_to_pool(
+    recipients: &mut [AtomicLiquidityFeeRecipientState],
+    unclaimed_fee_total_sompi: &mut u64,
+    fee_trade: u64,
+) -> TxResult<()> {
+    if fee_trade == 0 {
+        return Ok(());
+    }
+    *unclaimed_fee_total_sompi = unclaimed_fee_total_sompi
+        .checked_add(fee_trade)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("unclaimed_fee_total overflow".to_string()))?;
+    match recipients.len() {
+        0 => Err(TxRuleError::InvalidAtomicPayload("fee_trade > 0 but no fee recipients are configured".to_string())),
+        1 => {
+            recipients[0].unclaimed_sompi = recipients[0]
+                .unclaimed_sompi
+                .checked_add(fee_trade)
+                .ok_or_else(|| TxRuleError::InvalidAtomicPayload("recipient fee overflow".to_string()))?;
+            Ok(())
+        }
+        2 => {
+            let fee0 = fee_trade / 2;
+            let fee1 = fee_trade - fee0;
+            recipients[0].unclaimed_sompi = recipients[0]
+                .unclaimed_sompi
+                .checked_add(fee0)
+                .ok_or_else(|| TxRuleError::InvalidAtomicPayload("recipient0 fee overflow".to_string()))?;
+            recipients[1].unclaimed_sompi = recipients[1]
+                .unclaimed_sompi
+                .checked_add(fee1)
+                .ok_or_else(|| TxRuleError::InvalidAtomicPayload("recipient1 fee overflow".to_string()))?;
+            Ok(())
+        }
+        _ => Err(TxRuleError::InvalidAtomicPayload("invalid recipient count in liquidity pool state".to_string())),
+    }
 }
 
 fn min_gross_input_for_net_input(net_in: u64, fee_bps: u16) -> TxResult<u64> {
@@ -1519,7 +1645,7 @@ impl VirtualStateProcessor {
                     real_token_reserves = new_real_token_reserves;
                     virtual_cpay_reserves_sompi = new_virtual_cpay_reserves_sompi;
                     virtual_token_reserves = new_virtual_token_reserves;
-                    self.apply_fee_to_pool(&mut fee_recipients, &mut unclaimed_fee_total_sompi, fee_trade)?;
+                    apply_fee_to_pool(&mut fee_recipients, &mut unclaimed_fee_total_sompi, fee_trade)?;
                     total_supply = token_out;
 
                     let receiver_key = AtomicBalanceKey { asset_id, owner_id };
@@ -1774,7 +1900,7 @@ impl VirtualStateProcessor {
                 if pool.unlock_target_sompi > 0 && pool.real_cpay_reserves_sompi >= pool.unlock_target_sompi {
                     pool.unlocked = true;
                 }
-                self.apply_fee_to_pool(&mut pool.fee_recipients, &mut pool.unclaimed_fee_total_sompi, fee_trade)?;
+                apply_fee_to_pool(&mut pool.fee_recipients, &mut pool.unclaimed_fee_total_sompi, fee_trade)?;
                 pool.vault_outpoint = TransactionOutpoint::new(tx.tx().id(), vault_transition.output_index);
                 pool.vault_value_sompi = vault_transition.output_value;
                 pool.pool_nonce = pool
@@ -1895,7 +2021,7 @@ impl VirtualStateProcessor {
                     .ok_or_else(|| TxRuleError::InvalidAtomicPayload("sell real token reserve overflow".to_string()))?;
                 pool.virtual_cpay_reserves_sompi = new_virtual_cpay_reserves_sompi;
                 pool.virtual_token_reserves = new_virtual_token_reserves;
-                self.apply_fee_to_pool(&mut pool.fee_recipients, &mut pool.unclaimed_fee_total_sompi, fee_trade)?;
+                apply_fee_to_pool(&mut pool.fee_recipients, &mut pool.unclaimed_fee_total_sompi, fee_trade)?;
                 pool.vault_outpoint = TransactionOutpoint::new(tx.tx().id(), vault_transition.output_index);
                 pool.vault_value_sompi = vault_transition.output_value;
                 pool.pool_nonce = pool
@@ -2134,44 +2260,6 @@ impl VirtualStateProcessor {
             });
         }
         Ok(out)
-    }
-
-    fn apply_fee_to_pool(
-        &self,
-        recipients: &mut [AtomicLiquidityFeeRecipientState],
-        unclaimed_fee_total_sompi: &mut u64,
-        fee_trade: u64,
-    ) -> TxResult<()> {
-        if fee_trade == 0 {
-            return Ok(());
-        }
-        *unclaimed_fee_total_sompi = unclaimed_fee_total_sompi
-            .checked_add(fee_trade)
-            .ok_or_else(|| TxRuleError::InvalidAtomicPayload("unclaimed_fee_total overflow".to_string()))?;
-        match recipients.len() {
-            0 => Err(TxRuleError::InvalidAtomicPayload("fee_trade > 0 but no fee recipients are configured".to_string())),
-            1 => {
-                recipients[0].unclaimed_sompi = recipients[0]
-                    .unclaimed_sompi
-                    .checked_add(fee_trade)
-                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("recipient fee overflow".to_string()))?;
-                Ok(())
-            }
-            2 => {
-                let fee0 = fee_trade / 2;
-                let fee1 = fee_trade - fee0;
-                recipients[0].unclaimed_sompi = recipients[0]
-                    .unclaimed_sompi
-                    .checked_add(fee0)
-                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("recipient0 fee overflow".to_string()))?;
-                recipients[1].unclaimed_sompi = recipients[1]
-                    .unclaimed_sompi
-                    .checked_add(fee1)
-                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("recipient1 fee overflow".to_string()))?;
-                Ok(())
-            }
-            _ => Err(TxRuleError::InvalidAtomicPayload("invalid recipient count in liquidity pool state".to_string())),
-        }
     }
 
     fn validate_liquidity_invariants(&self, asset_id: [u8; 32], asset: &AtomicAssetState) -> TxResult<()> {
