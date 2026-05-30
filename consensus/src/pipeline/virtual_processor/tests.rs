@@ -734,6 +734,21 @@ fn payload_create_asset(auth_input_index: u16, nonce: u64, mint_authority_owner_
     payload
 }
 
+fn payload_mint(auth_input_index: u16, nonce: u64, asset_id: [u8; 32], to_owner_id: [u8; 32], amount: u128) -> Vec<u8> {
+    let mut payload = cat_header(2, auth_input_index, nonce);
+    payload.extend_from_slice(&asset_id);
+    payload.extend_from_slice(&to_owner_id);
+    payload.extend_from_slice(&amount.to_le_bytes());
+    payload
+}
+
+fn payload_burn(auth_input_index: u16, nonce: u64, asset_id: [u8; 32], amount: u128) -> Vec<u8> {
+    let mut payload = cat_header(3, auth_input_index, nonce);
+    payload.extend_from_slice(&asset_id);
+    payload.extend_from_slice(&amount.to_le_bytes());
+    payload
+}
+
 fn payload_transfer(auth_input_index: u16, nonce: u64, asset_id: [u8; 32], to_owner_id: [u8; 32], amount: u128) -> Vec<u8> {
     let mut payload = cat_header(1, auth_input_index, nonce);
     payload.extend_from_slice(&asset_id);
@@ -2060,6 +2075,234 @@ async fn atomic_mempool_pressure_orders_mixed_payload_and_native_batch() {
     assert_eq!(atomic_after.canonical_hash(), root_before, "mempool pressure validation must not mutate virtual Atomic state");
     assert_eq!(balance_of(&atomic_after, asset_id, owner_id), minted);
     assert_eq!(balance_of(&atomic_after, asset_id, receiver_id), 0);
+}
+
+#[tokio::test]
+async fn atomic_uncapped_mint_overflow_is_rejected_without_state_mutation() {
+    let mut ctx = liquidity_test_context();
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    for _ in 0..5 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let tx_fee = 10_000u64;
+    let (create_outpoint, create_entry) = find_virtual_utxo_by_script(&ctx, &owner_script);
+    let create_tx = payload_tx(
+        vec![TransactionInput::new(create_outpoint, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(create_entry.amount - tx_fee, owner_script.clone())],
+        payload_create_asset_with_mint(0, 1, owner_id, b"UncappedMax", b"UMX", u128::MAX, owner_id),
+    );
+    let asset_id = create_tx.id().as_bytes();
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let create_template = ctx.build_block_template_with_transactions(vec![create_tx], 9_200, ctx.simulated_time);
+    ctx.validate_and_insert_utxo_valid_block(create_template.block.to_immutable()).await;
+
+    let atomic_before = ctx.consensus.virtual_atomic_state();
+    let root_before = atomic_before.canonical_hash();
+    assert_eq!(balance_of(&atomic_before, asset_id, owner_id), u128::MAX);
+    assert_eq!(atomic_before.assets.get(&asset_id).expect("asset should exist").total_supply, u128::MAX);
+
+    let (mint_outpoint, mint_entry) = find_virtual_utxo_by_script(&ctx, &owner_script);
+    let overflow_mint_tx = payload_tx(
+        vec![TransactionInput::new(mint_outpoint, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(mint_entry.amount - tx_fee, owner_script.clone())],
+        payload_mint(0, 1, asset_id, owner_id, 1),
+    );
+
+    let mut mempool_tx = MutableTransaction::from_tx(overflow_mint_tx.clone());
+    let mempool_err = ctx
+        .consensus
+        .validate_mempool_transaction(&mut mempool_tx, &TransactionValidationArgs::default())
+        .expect_err("uncapped mint above u128::MAX must be rejected by mempool validation");
+    assert!(format!("{mempool_err:?}").contains("supply overflow"), "unexpected mempool error: {mempool_err:?}");
+    assert_eq!(ctx.consensus.virtual_atomic_state().canonical_hash(), root_before);
+
+    let template_result = ctx.consensus.build_block_template(
+        ctx.miner_data.clone(),
+        Box::new(OnetimeTxSelector::new(vec![overflow_mint_tx])),
+        TemplateBuildMode::Standard,
+    );
+    assert!(template_result.is_err(), "uncapped mint overflow must not be mineable into a block template");
+
+    let atomic_after = ctx.consensus.virtual_atomic_state();
+    assert_eq!(atomic_after.canonical_hash(), root_before);
+    assert_eq!(balance_of(&atomic_after, asset_id, owner_id), u128::MAX);
+    assert_eq!(atomic_after.assets.get(&asset_id).expect("asset should still exist").total_supply, u128::MAX);
+}
+
+#[tokio::test]
+async fn atomic_standard_token_auth_rejects_fake_owner_transfer_burn_and_mint() {
+    let mut ctx = liquidity_test_context();
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let second_owner_script = cryptix_txscript::pay_to_script_hash_script(&second_p2sh_redeem_script());
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    let second_owner_id = atomic_owner_id_from_script(&second_owner_script).expect("second owner id should derive from P2SH");
+    ctx.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    for _ in 0..4 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let tx_fee = 10_000u64;
+    let (create_outpoint, create_entry) = find_virtual_utxo_by_script(&ctx, &owner_script);
+    let second_owner_anchor_value = SOMPI_PER_CRYPTIX;
+    let create_change_value = create_entry
+        .amount
+        .checked_sub(tx_fee + 3 * second_owner_anchor_value)
+        .expect("create input should fund owner change and fake-owner anchors");
+    let create_tx = payload_tx(
+        vec![TransactionInput::new(create_outpoint, p2sh_signature_script(), 0, 0)],
+        vec![
+            TransactionOutput::new(create_change_value, owner_script.clone()),
+            TransactionOutput::new(second_owner_anchor_value, second_owner_script.clone()),
+            TransactionOutput::new(second_owner_anchor_value, second_owner_script.clone()),
+            TransactionOutput::new(second_owner_anchor_value, second_owner_script.clone()),
+        ],
+        payload_create_asset_with_mint(0, 1, owner_id, b"AuthToken", b"AUTH", 1_000, owner_id),
+    );
+    let asset_id = create_tx.id().as_bytes();
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block;
+    let create_template = ctx.build_block_template_with_transactions(vec![create_tx], 9_300, ctx.simulated_time);
+    ctx.validate_and_insert_utxo_valid_block(create_template.block.to_immutable()).await;
+
+    let second_utxos = find_virtual_utxos_by_script(&ctx, &second_owner_script, 3);
+
+    let atomic_before = ctx.consensus.virtual_atomic_state();
+    let root_before = atomic_before.canonical_hash();
+    assert_eq!(balance_of(&atomic_before, asset_id, owner_id), 1_000);
+    assert_eq!(balance_of(&atomic_before, asset_id, second_owner_id), 0);
+
+    let build_second_owner_tx = |utxo: &(TransactionOutpoint, UtxoEntry), payload| -> Transaction {
+        payload_tx(
+            vec![TransactionInput::new(utxo.0, p2sh_signature_script_for(&second_p2sh_redeem_script()), 0, 0)],
+            vec![TransactionOutput::new(utxo.1.amount - tx_fee, second_owner_script.clone())],
+            payload,
+        )
+    };
+
+    let fake_transfer = build_second_owner_tx(&second_utxos[0], payload_transfer(0, 1, asset_id, owner_id, 1));
+    let mut fake_transfer_mtx = MutableTransaction::from_tx(fake_transfer);
+    let transfer_err = ctx
+        .consensus
+        .validate_mempool_transaction(&mut fake_transfer_mtx, &TransactionValidationArgs::default())
+        .expect_err("non-owner must not transfer another owner's token balance");
+    assert!(format!("{transfer_err:?}").contains("insufficient balance"), "unexpected transfer error: {transfer_err:?}");
+    assert_eq!(ctx.consensus.virtual_atomic_state().canonical_hash(), root_before);
+
+    let fake_burn = build_second_owner_tx(&second_utxos[1], payload_burn(0, 1, asset_id, 1));
+    let mut fake_burn_mtx = MutableTransaction::from_tx(fake_burn);
+    let burn_err = ctx
+        .consensus
+        .validate_mempool_transaction(&mut fake_burn_mtx, &TransactionValidationArgs::default())
+        .expect_err("non-owner must not burn another owner's token balance");
+    assert!(format!("{burn_err:?}").contains("insufficient balance"), "unexpected burn error: {burn_err:?}");
+    assert_eq!(ctx.consensus.virtual_atomic_state().canonical_hash(), root_before);
+
+    let fake_mint = build_second_owner_tx(&second_utxos[2], payload_mint(0, 1, asset_id, second_owner_id, 1));
+    let mut fake_mint_mtx = MutableTransaction::from_tx(fake_mint);
+    let mint_err = ctx
+        .consensus
+        .validate_mempool_transaction(&mut fake_mint_mtx, &TransactionValidationArgs::default())
+        .expect_err("non-authority must not mint a standard token");
+    assert!(format!("{mint_err:?}").contains("not mint authority"), "unexpected mint error: {mint_err:?}");
+
+    let atomic_after = ctx.consensus.virtual_atomic_state();
+    assert_eq!(atomic_after.canonical_hash(), root_before);
+    assert_eq!(balance_of(&atomic_after, asset_id, owner_id), 1_000);
+    assert_eq!(balance_of(&atomic_after, asset_id, second_owner_id), 0);
+    assert_eq!(atomic_after.assets.get(&asset_id).expect("asset should exist").total_supply, 1_000);
+}
+
+#[tokio::test]
+async fn atomic_liquidity_token_rejects_decimals_mint_and_burn_but_allows_transfer() {
+    let (ctx, fixture) = setup_dual_owner_liquidity_pool().await;
+
+    let atomic_before = ctx.consensus.virtual_atomic_state();
+    let root_before = atomic_before.canonical_hash();
+    let asset = atomic_before.assets.get(&fixture.asset_id).expect("liquidity asset should exist");
+    assert_eq!(asset.asset_class, AtomicAssetClass::Liquidity);
+    assert_eq!(asset.decimals, 0);
+    assert_eq!(asset.mint_authority_owner_id, [0u8; 32]);
+    assert_eq!(balance_of(&atomic_before, fixture.asset_id, fixture.owner_id), fixture.launch_token_out);
+    assert_eq!(balance_of(&atomic_before, fixture.asset_id, fixture.second_owner_id), 0);
+
+    let recipient_payload = fixture.owner_script.script()[2..34].to_vec();
+    let max_supply = 1_000_000u128;
+    let seed_reserve = SOMPI_PER_CRYPTIX;
+    let fee_bps = 100u16;
+    let launch_buy_budget = 10 * SOMPI_PER_CRYPTIX;
+    let (launch_buy, _) = canonical_buy_from_budget(
+        max_supply,
+        INITIAL_LIQUIDITY_VIRTUAL_CPAY_RESERVES_SOMPI,
+        initial_liquidity_virtual_token_reserves(max_supply),
+        launch_buy_budget,
+        fee_bps,
+    );
+    let create_vault_value = seed_reserve + launch_buy;
+    let mut bad_decimals_payload =
+        payload_create_liquidity(0, 2, max_supply, seed_reserve, fee_bps, &recipient_payload, launch_buy, 1);
+    bad_decimals_payload[18] = 1;
+    let bad_decimals_create = payload_tx(
+        vec![TransactionInput::new(fixture.owner_anchor, p2sh_signature_script(), 0, 0)],
+        vec![
+            TransactionOutput::new(create_vault_value, liquidity_vault_script()),
+            TransactionOutput::new(fixture.owner_anchor_value - create_vault_value - fixture.tx_fee, fixture.owner_script.clone()),
+        ],
+        bad_decimals_payload,
+    );
+    let mut bad_decimals_mtx = MutableTransaction::from_tx(bad_decimals_create);
+    let bad_decimals_err = ctx
+        .consensus
+        .validate_mempool_transaction(&mut bad_decimals_mtx, &TransactionValidationArgs::default())
+        .expect_err("liquidity assets must reject non-zero decimals");
+    assert!(
+        format!("{bad_decimals_err:?}").contains("liquidity asset decimals must be `0`"),
+        "unexpected liquidity decimals error: {bad_decimals_err:?}"
+    );
+
+    let build_owner_tx = |payload| -> Transaction {
+        payload_tx(
+            vec![TransactionInput::new(fixture.owner_anchor, p2sh_signature_script(), 0, 0)],
+            vec![TransactionOutput::new(fixture.owner_anchor_value - fixture.tx_fee, fixture.owner_script.clone())],
+            payload,
+        )
+    };
+
+    let legacy_mint = build_owner_tx(payload_mint(0, 1, fixture.asset_id, fixture.owner_id, 1));
+    let mut legacy_mint_mtx = MutableTransaction::from_tx(legacy_mint);
+    let mint_err = ctx
+        .consensus
+        .validate_mempool_transaction(&mut legacy_mint_mtx, &TransactionValidationArgs::default())
+        .expect_err("liquidity token must not be mintable through the legacy mint op");
+    assert!(
+        format!("{mint_err:?}").contains("legacy mint is invalid for liquidity asset"),
+        "unexpected liquidity mint error: {mint_err:?}"
+    );
+
+    let legacy_burn = build_owner_tx(payload_burn(0, 1, fixture.asset_id, 1));
+    let mut legacy_burn_mtx = MutableTransaction::from_tx(legacy_burn);
+    let burn_err = ctx
+        .consensus
+        .validate_mempool_transaction(&mut legacy_burn_mtx, &TransactionValidationArgs::default())
+        .expect_err("liquidity token must not be burnable through the legacy burn op");
+    assert!(
+        format!("{burn_err:?}").contains("legacy burn is invalid for liquidity asset"),
+        "unexpected liquidity burn error: {burn_err:?}"
+    );
+
+    let transfer = build_owner_tx(payload_transfer(0, 1, fixture.asset_id, fixture.second_owner_id, 1));
+    let mut transfer_mtx = MutableTransaction::from_tx(transfer);
+    ctx.consensus
+        .validate_mempool_transaction(&mut transfer_mtx, &TransactionValidationArgs::default())
+        .expect("holders should be able to transfer liquidity tokens normally");
+
+    let atomic_after = ctx.consensus.virtual_atomic_state();
+    assert_eq!(atomic_after.canonical_hash(), root_before);
+    assert_eq!(balance_of(&atomic_after, fixture.asset_id, fixture.owner_id), fixture.launch_token_out);
+    assert_eq!(balance_of(&atomic_after, fixture.asset_id, fixture.second_owner_id), 0);
 }
 
 #[tokio::test]

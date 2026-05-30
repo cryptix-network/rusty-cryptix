@@ -47,6 +47,9 @@ pub struct Config {
     /// Enable RPC commands which affect the state of the node
     pub unsafe_rpc: bool,
 
+    /// Enable opt-in RPC diagnostics logging for request volume and slow calls.
+    pub rpc_diagnostics: bool,
+
     /// Allow the node to accept blocks from RPC while not synced
     /// (required when initiating a new network from genesis)
     pub enable_unsynced_mining: bool,
@@ -93,6 +96,7 @@ impl Config {
             utxoindex: false,
             atomic_unsafe_skip_snapshot_finality_check: false,
             unsafe_rpc: false,
+            rpc_diagnostics: false,
             enable_unsynced_mining: false,
             startup_repair_plan_path: None,
             enable_mainnet_mining: false,

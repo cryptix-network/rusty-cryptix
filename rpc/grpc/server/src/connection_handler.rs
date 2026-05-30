@@ -25,6 +25,7 @@ use cryptix_rpc_core::{
     notify::{channel::NotificationChannel, connection::ChannelConnection},
     Notification, RpcResult,
 };
+use cryptix_rpc_service::service::RpcCoreService;
 use cryptix_utils::networking::NetAddress;
 use cryptix_utils_tower::{
     counters::TowerConnectionCounters,
@@ -38,7 +39,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc::{channel as mpsc_channel, Sender as MpscSender};
 use tokio::{
@@ -59,6 +60,20 @@ pub struct ServerContext {
 impl ServerContext {
     pub fn new(core_service: DynRpcService, notifier: Arc<Notifier<Notification, Connection>>) -> Self {
         Self { core_service, notifier }
+    }
+
+    pub fn rpc_diagnostics_started(&self) -> Option<Instant> {
+        self.core_service
+            .as_ref()
+            .downcast_ref::<RpcCoreService>()
+            .ok()
+            .and_then(|service| service.rpc_diagnostics_enabled().then(Instant::now))
+    }
+
+    pub async fn record_rpc_diagnostics(&self, endpoint: &str, started: Option<Instant>, success: bool, detail: Option<&str>) {
+        if let Ok(service) = self.core_service.as_ref().downcast_ref::<RpcCoreService>() {
+            service.record_rpc_diagnostics(endpoint, started, success, detail).await;
+        }
     }
 }
 

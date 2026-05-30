@@ -22,6 +22,7 @@ Feedback and contributions are always welcome.
 | `--rpclisten-borsh[=IP[:PORT]]` | address | auto | wRPC Borsh listen address (defaults to network-specific port). |
 | `--rpclisten-json[=IP[:PORT]]` | address | auto | wRPC JSON listen address (defaults to network-specific port). |
 | `--unsaferpc` | switch | `false` | Enable RPC commands that mutate node state. |
+| `--rpc-diagnostics` | switch | `false` | Enable opt-in RPC diagnostics logs: endpoint request-volume summaries every 5 seconds and slow request snapshots at `>=500ms`. Useful for debugging WebWallet/wRPC lag; disabled by default. |
 | `--connect=<IP[:PORT]>` | address (repeatable) | empty | Connect only to specified peers. |
 | `--addpeer=<IP[:PORT]>` | address (repeatable) | empty | Add peers to connect to on startup. |
 | `--listen=<IP[:PORT]>` | address | auto | P2P listen address (defaults to network-specific port). |
@@ -69,6 +70,12 @@ Feedback and contributions are always welcome.
 | `--num-prealloc-utxos=<N>` | integer | none | Devnet preallocation count (`devnet-prealloc` feature only). |
 | `--prealloc-address=<ADDR>` | string | none | Devnet preallocation target address (`devnet-prealloc` feature only). |
 | `--prealloc-amount=<SOMPI>` | integer | `10000000000` | Devnet preallocation amount per UTXO (`devnet-prealloc` feature only). |
+
+RPC diagnostics example:
+
+```bash
+cryptixd --utxoindex --rpclisten-borsh=default --rpc-diagnostics
+```
 
 ## Installation
   <details>

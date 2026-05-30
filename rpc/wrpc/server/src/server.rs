@@ -26,6 +26,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
+    time::Instant,
 };
 use workflow_log::*;
 use workflow_rpc::server::prelude::*;
@@ -173,6 +174,16 @@ impl Server {
             rpc_core.service.clone()
         } else {
             connection.grpc_client()
+        }
+    }
+
+    pub fn rpc_diagnostics_started(&self) -> Option<Instant> {
+        self.inner.rpc_core.as_ref().and_then(|rpc_core| rpc_core.service.rpc_diagnostics_enabled().then(Instant::now))
+    }
+
+    pub async fn record_rpc_diagnostics(&self, endpoint: &'static str, started: Option<Instant>, success: bool, detail: Option<&str>) {
+        if let Some(rpc_core) = &self.inner.rpc_core {
+            rpc_core.service.record_rpc_diagnostics(endpoint, started, success, detail).await;
         }
     }
 

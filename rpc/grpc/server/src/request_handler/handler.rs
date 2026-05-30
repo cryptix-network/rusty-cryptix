@@ -35,7 +35,13 @@ impl RequestHandler {
 
     pub async fn handle_request(&self, request: CryptixdRequest) -> GrpcServerResult<CryptixdResponse> {
         let id = request.id;
-        let mut response = self.method.call(self.server_ctx.clone(), self.connection.clone(), request).await?;
+        let started = self.server_ctx.rpc_diagnostics_started();
+        let result = self.method.call(self.server_ctx.clone(), self.connection.clone(), request).await;
+        if started.is_some() {
+            let detail = result.as_ref().err().map(|err| err.to_string());
+            self.server_ctx.record_rpc_diagnostics(&format!("{:?}", self.rpc_op), started, result.is_ok(), detail.as_deref()).await;
+        }
+        let mut response = result?;
         response.id = id;
         Ok(response)
     }

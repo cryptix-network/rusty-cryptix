@@ -1282,6 +1282,14 @@ impl AtomicTokenService {
         self.processor.local_health().await
     }
 
+    pub async fn get_state_footprint(&self) -> AtomicTokenStateFootprint {
+        self.processor.state.read().await.footprint()
+    }
+
+    pub fn approximate_state_store_size_bytes(&self) -> Option<u64> {
+        self.processor.state_store.approximate_size_bytes()
+    }
+
     pub async fn get_state_hash_at_block(&self, at_block_hash: BlockHash) -> Option<[u8; 32]> {
         self.processor.state.read().await.get_state_hash_at_block(at_block_hash)
     }

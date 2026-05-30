@@ -150,6 +150,7 @@ pub struct RpcCoreService {
     fee_estimate_verbose_cache: ExpiringCache<cryptix_mining::errors::MiningManagerResult<GetFeeEstimateExperimentalResponse>>,
     hfa_engine: Arc<HfaEngine>,
     get_block_template_unsynced_last_log: Mutex<Option<Instant>>,
+    rpc_diagnostics: RpcDiagnostics,
 }
 
 const RPC_CORE: &str = "rpc-core";
@@ -164,6 +165,8 @@ const TOKEN_HOLDERS_LIMIT_MAX: usize = 4096;
 const TOKEN_LIQUIDITY_HOLDERS_LIMIT_MAX: usize = 4096;
 const LIQUIDITY_SUBMIT_READY_RECHECK_ATTEMPTS: usize = 6;
 const LIQUIDITY_SUBMIT_READY_RECHECK_DELAY: Duration = Duration::from_millis(150);
+const RPC_DIAGNOSTICS_SLOW_THRESHOLD: Duration = Duration::from_millis(500);
+const RPC_DIAGNOSTICS_SUMMARY_INTERVAL: Duration = Duration::from_secs(5);
 const TX_LOOKUP_MAX_IDS: usize = 512;
 const TX_LOOKUP_LOOKBACK_MARGIN_DAA: u64 = 64;
 const TX_LOOKUP_LOOKBACK_MIN_HEADERS: usize = 256;
@@ -182,6 +185,53 @@ const CAT_ERR_MIN_OUT_VIOLATION: &str = "CAT_ERR_MIN_OUT_VIOLATION";
 const CAT_ERR_ZERO_OUTPUT: &str = "CAT_ERR_ZERO_OUTPUT";
 const CAT_ERR_RECIPIENT_ENCODING_INVALID: &str = "CAT_ERR_RECIPIENT_ENCODING_INVALID";
 const CAT_ERR_PAYOUT_SCRIPT_CLASS_INVALID: &str = "CAT_ERR_PAYOUT_SCRIPT_CLASS_INVALID";
+
+#[derive(Clone, Default)]
+struct RpcEndpointDiagnostics {
+    requests: u64,
+    errors: u64,
+    slow: u64,
+    total_ms: u64,
+    max_ms: u64,
+}
+
+struct RpcDiagnosticsState {
+    window_started: Instant,
+    endpoints: HashMap<String, RpcEndpointDiagnostics>,
+    total_requests: u64,
+    total_errors: u64,
+    total_slow: u64,
+}
+
+impl RpcDiagnosticsState {
+    fn new_at(now: Instant) -> Self {
+        Self { window_started: now, endpoints: HashMap::new(), total_requests: 0, total_errors: 0, total_slow: 0 }
+    }
+}
+
+impl Default for RpcDiagnosticsState {
+    fn default() -> Self {
+        Self::new_at(Instant::now())
+    }
+}
+
+struct RpcDiagnosticsSummary {
+    elapsed: Duration,
+    total_requests: u64,
+    total_errors: u64,
+    total_slow: u64,
+    endpoints: Vec<(String, RpcEndpointDiagnostics)>,
+}
+
+struct RpcDiagnostics {
+    state: Mutex<RpcDiagnosticsState>,
+}
+
+impl Default for RpcDiagnostics {
+    fn default() -> Self {
+        Self { state: Mutex::new(RpcDiagnosticsState::default()) }
+    }
+}
 
 impl RpcCoreService {
     pub const IDENT: &'static str = "rpc-core-service";
@@ -208,6 +258,135 @@ impl RpcCoreService {
 
     fn annotate_mempool_entry_fast_path(&self, entry: &mut RpcMempoolEntry) {
         self.annotate_transaction_fast_path(&mut entry.transaction);
+    }
+
+    pub fn rpc_diagnostics_enabled(&self) -> bool {
+        self.config.rpc_diagnostics
+    }
+
+    pub async fn record_rpc_diagnostics(&self, endpoint: &str, started: Option<Instant>, success: bool, detail: Option<&str>) {
+        let Some(started) = started else {
+            return;
+        };
+        if !self.config.rpc_diagnostics {
+            return;
+        }
+
+        let now = Instant::now();
+        let elapsed = now.duration_since(started);
+        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        let is_slow = elapsed >= RPC_DIAGNOSTICS_SLOW_THRESHOLD;
+        let endpoint = endpoint.to_string();
+
+        let summary = {
+            let mut state = self.rpc_diagnostics.state.lock().expect("RPC diagnostics mutex poisoned");
+            let entry = state.endpoints.entry(endpoint.clone()).or_default();
+            entry.requests = entry.requests.saturating_add(1);
+            entry.total_ms = entry.total_ms.saturating_add(elapsed_ms);
+            entry.max_ms = entry.max_ms.max(elapsed_ms);
+            if !success {
+                entry.errors = entry.errors.saturating_add(1);
+            }
+            if is_slow {
+                entry.slow = entry.slow.saturating_add(1);
+            }
+
+            state.total_requests = state.total_requests.saturating_add(1);
+            if !success {
+                state.total_errors = state.total_errors.saturating_add(1);
+            }
+            if is_slow {
+                state.total_slow = state.total_slow.saturating_add(1);
+            }
+
+            if now.duration_since(state.window_started) >= RPC_DIAGNOSTICS_SUMMARY_INTERVAL {
+                let summary = RpcDiagnosticsSummary {
+                    elapsed: now.duration_since(state.window_started),
+                    total_requests: state.total_requests,
+                    total_errors: state.total_errors,
+                    total_slow: state.total_slow,
+                    endpoints: state.endpoints.iter().map(|(endpoint, stats)| (endpoint.clone(), stats.clone())).collect(),
+                };
+                *state = RpcDiagnosticsState::new_at(now);
+                Some(summary)
+            } else {
+                None
+            }
+        };
+
+        if is_slow {
+            self.log_slow_rpc_runtime_state(endpoint.as_str(), elapsed, if success { "ok" } else { "error" }, detail).await;
+        }
+        if let Some(summary) = summary {
+            self.log_rpc_diagnostics_summary(summary).await;
+        }
+    }
+
+    async fn log_slow_rpc_runtime_state(&self, endpoint: &str, elapsed: Duration, outcome: &str, detail: Option<&str>) {
+        let mempool = self.mining_manager.snapshot();
+        let atomic_health = self.atomic_token_service.get_local_health().await;
+        warn!(
+            "slow RPC diagnostics: endpoint={endpoint} elapsed_ms={} outcome={} detail={} borsh_live={} json_live={} mempool_ready={} mempool_txs={} mempool_orphans={} mempool_accepted_cache={} mempool_high_priority_total={} mempool_low_priority_total={} mempool_evicted_total={} atomic_runtime={} atomic_degraded={} atomic_bootstrap={} atomic_live_correct={} atomic_event_seq={}",
+            elapsed.as_millis(),
+            outcome,
+            detail.unwrap_or(""),
+            self.wrpc_borsh_counters.active_connections.load(Ordering::Relaxed),
+            self.wrpc_json_counters.active_connections.load(Ordering::Relaxed),
+            mempool.ready_txs_sample,
+            mempool.txs_sample,
+            mempool.orphans_sample,
+            mempool.accepted_sample,
+            mempool.high_priority_tx_counts,
+            mempool.low_priority_tx_counts,
+            mempool.tx_evicted_counts,
+            atomic_health.runtime_state.as_str(),
+            atomic_health.is_degraded,
+            atomic_health.bootstrap_in_progress,
+            atomic_health.live_correct,
+            atomic_health.last_sequence,
+        );
+    }
+
+    async fn log_rpc_diagnostics_summary(&self, mut summary: RpcDiagnosticsSummary) {
+        summary.endpoints.sort_by(|(left_name, left), (right_name, right)| {
+            right.requests.cmp(&left.requests).then_with(|| left_name.cmp(right_name))
+        });
+        let endpoint_summary = summary
+            .endpoints
+            .iter()
+            .map(|(endpoint, stats)| {
+                let avg_ms = if stats.requests == 0 { 0.0 } else { stats.total_ms as f64 / stats.requests as f64 };
+                format!(
+                    "{endpoint}:count={},err={},slow={},avg_ms={avg_ms:.1},max_ms={}",
+                    stats.requests, stats.errors, stats.slow, stats.max_ms
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        let mempool = self.mining_manager.snapshot();
+        let atomic_health = self.atomic_token_service.get_local_health().await;
+        let elapsed_secs = summary.elapsed.as_secs_f64().max(0.001);
+        info!(
+            "RPC diagnostics window: elapsed_ms={} total_requests={} rps={:.1} errors={} slow_ge_500ms={} borsh_live={} json_live={} mempool_ready={} mempool_txs={} mempool_orphans={} mempool_accepted_cache={} atomic_runtime={} atomic_degraded={} atomic_bootstrap={} atomic_live_correct={} atomic_event_seq={} endpoints=[{}]",
+            summary.elapsed.as_millis(),
+            summary.total_requests,
+            summary.total_requests as f64 / elapsed_secs,
+            summary.total_errors,
+            summary.total_slow,
+            self.wrpc_borsh_counters.active_connections.load(Ordering::Relaxed),
+            self.wrpc_json_counters.active_connections.load(Ordering::Relaxed),
+            mempool.ready_txs_sample,
+            mempool.txs_sample,
+            mempool.orphans_sample,
+            mempool.accepted_sample,
+            atomic_health.runtime_state.as_str(),
+            atomic_health.is_degraded,
+            atomic_health.bootstrap_in_progress,
+            atomic_health.live_correct,
+            atomic_health.last_sequence,
+            endpoint_summary,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -315,6 +494,7 @@ impl RpcCoreService {
             fee_estimate_verbose_cache: ExpiringCache::new(Duration::from_millis(500), Duration::from_millis(1000)),
             hfa_engine,
             get_block_template_unsynced_last_log: Mutex::new(None),
+            rpc_diagnostics: RpcDiagnostics::default(),
         }
     }
 
@@ -2670,6 +2850,12 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
 
         let minimum_relay_feerate =
             if req.custom_metrics { Some(self.mining_manager.clone().minimum_relay_feerate().await.max(0.0)) } else { None };
+        let diagnostics_metrics = req.custom_metrics && self.config.rpc_diagnostics;
+        let mempool_metrics = if diagnostics_metrics { Some(self.mining_manager.snapshot()) } else { None };
+        let atomic_health = if diagnostics_metrics { Some(self.atomic_token_service.get_local_health().await) } else { None };
+        let atomic_footprint = if diagnostics_metrics { Some(self.atomic_token_service.get_state_footprint().await) } else { None };
+        let atomic_state_store_bytes =
+            if diagnostics_metrics { self.atomic_token_service.approximate_state_store_size_bytes() } else { None };
 
         let custom_metrics: Option<HashMap<String, CustomMetricValue>> = req.custom_metrics.then(|| {
             let hfa = self.hfa_engine.metrics_snapshot();
@@ -2677,6 +2863,86 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             let configured_hfa_feerate_floor = self.hfa_engine.config().min_feerate_floor.max(0.0);
             let effective_hfa_feerate_floor = self.hfa_engine.effective_feerate_floor(minimum_relay_feerate);
             let mut out = HashMap::new();
+            if let (Some(mempool), Some(atomic_health), Some(atomic_footprint)) = (mempool_metrics, atomic_health, atomic_footprint) {
+                out.insert(
+                    "rpc_borsh_live_connections".to_string(),
+                    CustomMetricValue::U64(self.wrpc_borsh_counters.active_connections.load(Ordering::Relaxed) as u64),
+                );
+                out.insert(
+                    "rpc_json_live_connections".to_string(),
+                    CustomMetricValue::U64(self.wrpc_json_counters.active_connections.load(Ordering::Relaxed) as u64),
+                );
+                out.insert(
+                    "rpc_borsh_connection_attempts".to_string(),
+                    CustomMetricValue::U64(self.wrpc_borsh_counters.total_connections.load(Ordering::Relaxed) as u64),
+                );
+                out.insert(
+                    "rpc_json_connection_attempts".to_string(),
+                    CustomMetricValue::U64(self.wrpc_json_counters.total_connections.load(Ordering::Relaxed) as u64),
+                );
+                out.insert("mempool_ready_txs".to_string(), CustomMetricValue::U64(mempool.ready_txs_sample));
+                out.insert("mempool_txs".to_string(), CustomMetricValue::U64(mempool.txs_sample));
+                out.insert("mempool_orphans".to_string(), CustomMetricValue::U64(mempool.orphans_sample));
+                out.insert("mempool_accepted_cache".to_string(), CustomMetricValue::U64(mempool.accepted_sample));
+                out.insert(
+                    "mempool_high_priority_submitted_total".to_string(),
+                    CustomMetricValue::U64(mempool.high_priority_tx_counts),
+                );
+                out.insert("mempool_low_priority_submitted_total".to_string(), CustomMetricValue::U64(mempool.low_priority_tx_counts));
+                out.insert("mempool_accepted_total".to_string(), CustomMetricValue::U64(mempool.tx_accepted_counts));
+                out.insert("mempool_evicted_total".to_string(), CustomMetricValue::U64(mempool.tx_evicted_counts));
+                out.insert(
+                    "atomic_runtime_state".to_string(),
+                    CustomMetricValue::Text(atomic_health.runtime_state.as_str().to_string()),
+                );
+                out.insert("atomic_degraded".to_string(), CustomMetricValue::Bool(atomic_health.is_degraded));
+                out.insert("atomic_bootstrap_in_progress".to_string(), CustomMetricValue::Bool(atomic_health.bootstrap_in_progress));
+                out.insert("atomic_live_correct".to_string(), CustomMetricValue::Bool(atomic_health.live_correct));
+                out.insert("atomic_last_sequence".to_string(), CustomMetricValue::U64(atomic_health.last_sequence));
+                out.insert(
+                    "atomic_has_last_applied_block".to_string(),
+                    CustomMetricValue::Bool(atomic_health.last_applied_block.is_some()),
+                );
+                out.insert(
+                    "atomic_state_hash".to_string(),
+                    CustomMetricValue::Text(atomic_health.current_state_hash.as_slice().to_hex()),
+                );
+                out.insert("atomic_assets".to_string(), CustomMetricValue::U64(atomic_footprint.assets as u64));
+                out.insert("atomic_balances".to_string(), CustomMetricValue::U64(atomic_footprint.balances as u64));
+                out.insert("atomic_nonces".to_string(), CustomMetricValue::U64(atomic_footprint.nonces as u64));
+                out.insert("atomic_anchor_counts".to_string(), CustomMetricValue::U64(atomic_footprint.anchor_counts as u64));
+                out.insert("atomic_processed_ops".to_string(), CustomMetricValue::U64(atomic_footprint.processed_ops as u64));
+                out.insert("atomic_retained_blocks".to_string(), CustomMetricValue::U64(atomic_footprint.retained_blocks as u64));
+                out.insert("atomic_events".to_string(), CustomMetricValue::U64(atomic_footprint.events as u64));
+                out.insert("atomic_block_journals".to_string(), CustomMetricValue::U64(atomic_footprint.block_journals as u64));
+                out.insert(
+                    "atomic_state_hash_checkpoints".to_string(),
+                    CustomMetricValue::U64(atomic_footprint.state_hash_checkpoints as u64),
+                );
+                out.insert(
+                    "atomic_event_sequence_checkpoints".to_string(),
+                    CustomMetricValue::U64(atomic_footprint.event_sequence_checkpoints as u64),
+                );
+                out.insert(
+                    "atomic_liquidity_vault_outpoints".to_string(),
+                    CustomMetricValue::U64(atomic_footprint.liquidity_vault_outpoints as u64),
+                );
+                out.insert(
+                    "atomic_known_owner_addresses".to_string(),
+                    CustomMetricValue::U64(atomic_footprint.known_owner_addresses as u64),
+                );
+                out.insert(
+                    "atomic_owners_with_balances".to_string(),
+                    CustomMetricValue::U64(atomic_footprint.owners_with_balances as u64),
+                );
+                out.insert(
+                    "atomic_assets_with_holders".to_string(),
+                    CustomMetricValue::U64(atomic_footprint.assets_with_holders as u64),
+                );
+                if let Some(state_store_bytes) = atomic_state_store_bytes {
+                    out.insert("atomic_state_store_bytes".to_string(), CustomMetricValue::U64(state_store_bytes));
+                }
+            }
             out.insert("hfa_enabled".to_string(), CustomMetricValue::Bool(hfa.enabled));
             out.insert("hfa_node_epoch".to_string(), CustomMetricValue::U64(hfa.node_epoch));
             out.insert("hfa_mode".to_string(), CustomMetricValue::Text(hfa.mode.to_string()));

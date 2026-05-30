@@ -53,9 +53,14 @@ impl ToTokens for RpcTable {
                     interface.method(#rpc_api_ops::#handler, method!(|server_ctx: #server_ctx_type, connection_ctx: #connection_ctx_type, request: Serializable<#request_type>| async move {
                         let verbose = server_ctx.verbose();
                         if verbose { workflow_log::log_info!("request: {:?}",request); }
+                        let started = server_ctx.rpc_diagnostics_started();
                         // TODO: RPC-CONNECT
-                        let response: #response_type = server_ctx.rpc_service(&connection_ctx).#fn_call(None, request.into_inner()).await
-                            .map_err(|e|ServerError::Text(e.to_string()))?;
+                        let call_result = server_ctx.rpc_service(&connection_ctx).#fn_call(None, request.into_inner()).await;
+                        if started.is_some() {
+                            let detail = call_result.as_ref().err().map(|err| err.to_string());
+                            server_ctx.record_rpc_diagnostics(stringify!(#handler), started, call_result.is_ok(), detail.as_deref()).await;
+                        }
+                        let response: #response_type = call_result.map_err(|e|ServerError::Text(e.to_string()))?;
                         if verbose { workflow_log::log_info!("response: {:?}",response); }
                         Ok(Serializable(response))
                     }));

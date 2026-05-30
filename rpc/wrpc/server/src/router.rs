@@ -113,8 +113,22 @@ impl Router {
             RpcApiOps::Subscribe,
             workflow_rpc::server::Method::new(move |manager: Server, connection: Connection, scope: Serializable<Scope>| {
                 Box::pin(async move {
-                    manager.start_notify(&connection, scope.into_inner()).await.map_err(|err| err.to_string())?;
-                    Ok(Serializable(SubscribeResponse::new(connection.id())))
+                    let started = manager.rpc_diagnostics_started();
+                    let call_result = match manager.start_notify(&connection, scope.into_inner()).await {
+                        Ok(()) => Ok(Serializable(SubscribeResponse::new(connection.id()))),
+                        Err(err) => Err(err.to_string()),
+                    };
+                    if started.is_some() {
+                        manager
+                            .record_rpc_diagnostics(
+                                "Subscribe",
+                                started,
+                                call_result.is_ok(),
+                                call_result.as_ref().err().map(String::as_str),
+                            )
+                            .await;
+                    }
+                    call_result.map_err(ServerError::Text)
                 })
             }),
         );
@@ -123,9 +137,17 @@ impl Router {
             RpcApiOps::Unsubscribe,
             workflow_rpc::server::Method::new(move |manager: Server, connection: Connection, scope: Serializable<Scope>| {
                 Box::pin(async move {
-                    manager.stop_notify(&connection, scope.into_inner()).await.unwrap_or_else(|err| {
-                        workflow_log::log_trace!("wRPC server -> error calling stop_notify(): {err}");
-                    });
+                    let started = manager.rpc_diagnostics_started();
+                    let error = match manager.stop_notify(&connection, scope.into_inner()).await {
+                        Ok(()) => None,
+                        Err(err) => {
+                            workflow_log::log_trace!("wRPC server -> error calling stop_notify(): {err}");
+                            Some(err.to_string())
+                        }
+                    };
+                    if started.is_some() {
+                        manager.record_rpc_diagnostics("Unsubscribe", started, error.is_none(), error.as_deref()).await;
+                    }
                     Ok(Serializable(UnsubscribeResponse {}))
                 })
             }),

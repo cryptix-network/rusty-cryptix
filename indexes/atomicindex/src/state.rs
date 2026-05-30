@@ -5213,6 +5213,39 @@ mod tests {
     }
 
     #[test]
+    fn uncapped_mint_overflow_is_rejected_without_state_mutation() {
+        let receiver = [0x43; 32];
+        let create_op = CreateAssetWithMintOp {
+            token_version: CURRENT_TOKEN_VERSION,
+            decimals: 8,
+            supply_mode: SupplyMode::Uncapped,
+            max_supply: 0,
+            mint_authority_owner_id: creator,
+            name: b"Uncapped".to_vec(),
+            symbol: b"UNC".to_vec(),
+            metadata: vec![],
+            platform_tag: Vec::new(),
+            initial_mint_amount: u128::MAX,
+            initial_mint_to_owner_id: receiver,
+        };
+        let mut create_journal = JournalBuilder::default();
+        state
+            .execute_create_asset_with_mint(asset_id, creator, &create_op, BlockHash::from_u64_word(1), 1, 1, &mut create_journal)
+            .expect("uncapped asset may mint up to u128::MAX");
+        assert_eq!(state.asset_value(&asset_id).expect("asset should exist").total_supply, u128::MAX);
+        assert_eq!(state.get_balance(asset_id, receiver), u128::MAX);
+
+        let before_hash = state.compute_state_hash();
+        let mut mint_journal = JournalBuilder::default();
+        let mint_op = MintOp { asset_id, to_owner_id: receiver, amount: 1 };
+        assert_eq!(state.execute_mint(creator, &mint_op, &mut mint_journal), Err(NoopReason::SupplyOverflow));
+
+        assert_eq!(state.compute_state_hash(), before_hash, "rejected overflow mint must not mutate Atomic state");
+        assert_eq!(state.asset_value(&asset_id).expect("asset should still exist").total_supply, u128::MAX);
+        assert_eq!(state.get_balance(asset_id, receiver), u128::MAX);
+    }
+
+    #[test]
     fn liquidity_lock_blocks_outflows_until_buy_reaches_target_then_stays_unlocked() {
         let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
         let owner_script = test_script(33);

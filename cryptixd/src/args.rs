@@ -38,6 +38,7 @@ pub struct Args {
     pub rpclisten_json: Option<WrpcNetAddress>,
     #[serde(rename = "unsaferpc")]
     pub unsafe_rpc: bool,
+    pub rpc_diagnostics: bool,
     pub wrpc_verbose: bool,
     #[serde(rename = "loglevel")]
     pub log_level: String,
@@ -120,6 +121,7 @@ impl Default for Args {
             rpclisten_borsh: None,
             rpclisten_json: None,
             unsafe_rpc: false,
+            rpc_diagnostics: false,
             async_threads: num_cpus::get(),
             utxoindex: true,
             atomic_unsafe_skip_snapshot_finality_check: false,
@@ -187,6 +189,7 @@ impl Args {
         config.atomic_unsafe_skip_snapshot_finality_check = self.atomic_unsafe_skip_snapshot_finality_check;
         config.disable_upnp = self.disable_upnp;
         config.unsafe_rpc = self.unsafe_rpc;
+        config.rpc_diagnostics = self.rpc_diagnostics;
         config.enable_unsynced_mining = self.enable_unsynced_mining;
         config.startup_repair_plan_path = self.startup_repair_plan.as_ref().map(PathBuf::from);
         config.enable_mainnet_mining = self.enable_mainnet_mining;
@@ -297,6 +300,12 @@ pub fn cli() -> Command {
                 .help("Interface:port to listen for wRPC JSON connections (default port: 19401, testnet: 19402)."),
         )
         .arg(arg!(--unsaferpc "Enable RPC commands which affect the state of the node"))
+        .arg(
+            Arg::new("rpc-diagnostics")
+                .long("rpc-diagnostics")
+                .action(ArgAction::SetTrue)
+                .help("Enable opt-in RPC diagnostics logs: request volume summaries every 5s and slow request snapshots at >=500ms."),
+        )
         .arg(
             Arg::new("connect-peers")
                 .long("connect")
@@ -642,6 +651,7 @@ impl Args {
             rpclisten_borsh: m.get_one::<WrpcNetAddress>("rpclisten-borsh").cloned().or(defaults.rpclisten_borsh),
             rpclisten_json: m.get_one::<WrpcNetAddress>("rpclisten-json").cloned().or(defaults.rpclisten_json),
             unsafe_rpc: arg_match_unwrap_or::<bool>(&m, "unsaferpc", defaults.unsafe_rpc),
+            rpc_diagnostics: arg_match_unwrap_or::<bool>(&m, "rpc-diagnostics", defaults.rpc_diagnostics),
             wrpc_verbose: false,
             log_level: arg_match_unwrap_or::<String>(&m, "log_level", defaults.log_level),
             async_threads: arg_match_unwrap_or::<usize>(&m, "async_threads", defaults.async_threads),
@@ -823,5 +833,14 @@ mod tests {
     fn startup_repair_plan_parses() {
         let args = Args::parse(["cryptixd", "--startup-repair-plan=repair.json"]).expect("repair plan args should parse");
         assert_eq!(args.startup_repair_plan.as_deref(), Some("repair.json"));
+    }
+
+    #[test]
+    fn rpc_diagnostics_is_opt_in() {
+        let args = Args::parse(["cryptixd"]).expect("default args should parse");
+        assert!(!args.rpc_diagnostics);
+
+        let args = Args::parse(["cryptixd", "--rpc-diagnostics"]).expect("diagnostics args should parse");
+        assert!(args.rpc_diagnostics);
     }
 }
