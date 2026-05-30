@@ -5214,6 +5214,9 @@ mod tests {
 
     #[test]
     fn uncapped_mint_overflow_is_rejected_without_state_mutation() {
+        let mut state = AtomicTokenState::new(1, "cryptix-simnet".to_string());
+        let asset_id = [0x41; 32];
+        let creator = [0x42; 32];
         let receiver = [0x43; 32];
         let create_op = CreateAssetWithMintOp {
             token_version: CURRENT_TOKEN_VERSION,
