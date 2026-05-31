@@ -61,6 +61,8 @@ pub struct Args {
     #[serde_as(as = "Vec<DisplayFromStr>")]
     #[serde(rename = "atomic-bootstrap-peer")]
     pub atomic_bootstrap_peers: Vec<ContextualNetAddress>,
+    #[serde(rename = "no-atomic-seed", alias = "atomic-bootstrap-no-seed", alias = "disable-atomic-seed-sources")]
+    pub disable_atomic_seed_sources: bool,
     pub atomic_bootstrap_allow_peer_fallback: bool,
     pub atomic_bootstrap_peer_quorum_min_sources: Option<usize>,
     pub disable_atomic_health_audit: bool,
@@ -132,6 +134,7 @@ impl Default for Args {
             utxoindex: true,
             atomic_unsafe_skip_snapshot_finality_check: false,
             atomic_bootstrap_peers: vec![],
+            disable_atomic_seed_sources: false,
             atomic_bootstrap_allow_peer_fallback: false,
             atomic_bootstrap_peer_quorum_min_sources: None,
             disable_atomic_health_audit: false,
@@ -452,6 +455,13 @@ pub fn cli() -> Command {
                 .help("Add an optional Cryptix Atomic bootstrap gRPC endpoint for snapshot discovery/fetch. Normal P2P sync and local Atomic replay do not require this."),
         )
         .arg(
+            Arg::new("no-atomic-seed")
+                .long("no-atomic-seed")
+                .visible_alias("atomic-bootstrap-no-seed")
+                .action(ArgAction::SetTrue)
+                .help("Disable Atomic seed sources for Atomic sync/bootstrap/health quorum without disabling normal P2P DNS seeding."),
+        )
+        .arg(
             Arg::new("atomic-bootstrap-allow-peer-fallback")
                 .long("atomic-bootstrap-allow-peer-fallback")
                 .action(ArgAction::SetTrue)
@@ -725,6 +735,7 @@ impl Args {
                 "atomic-bootstrap-peer",
                 defaults.atomic_bootstrap_peers,
             ),
+            disable_atomic_seed_sources: arg_match_unwrap_or::<bool>(&m, "no-atomic-seed", defaults.disable_atomic_seed_sources),
             atomic_bootstrap_allow_peer_fallback: arg_match_unwrap_or::<bool>(
                 &m,
                 "atomic-bootstrap-allow-peer-fallback",
@@ -850,6 +861,20 @@ mod tests {
         let args =
             Args::parse(["cryptixd", "--atomic-bootstrap-peer-quorum-min-sources=1"]).expect("quorum override args should parse");
         assert_eq!(args.atomic_bootstrap_peer_quorum_min_sources, Some(1));
+    }
+
+    #[test]
+    fn no_atomic_seed_disables_only_atomic_seed_sources() {
+        let args = Args::parse(["cryptixd", "--no-atomic-seed"]).expect("atomic seed flag args should parse");
+        assert!(args.disable_atomic_seed_sources);
+        assert!(!args.disable_dns_seeding);
+    }
+
+    #[test]
+    fn atomic_bootstrap_no_seed_alias_parses() {
+        let args = Args::parse(["cryptixd", "--atomic-bootstrap-no-seed"]).expect("atomic seed alias args should parse");
+        assert!(args.disable_atomic_seed_sources);
+        assert!(!args.disable_dns_seeding);
     }
 
     #[test]

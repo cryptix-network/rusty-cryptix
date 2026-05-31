@@ -410,14 +410,21 @@ impl IbdFlow {
             .verify_consensus_atomic_state_hash_quorum_at_daa(proof_pruning_point, state_hash, proof_pruning_point_daa_score)
             .await
         {
-            let message = format!(
-                "P2P pruning-point atomic root quorum check unavailable for {} from peer {}; continuing with trusted-data root and validating it against the pruning-point commitment ({})",
-                proof_pruning_point, self.router, err
-            );
-            if Self::should_warn_pruning_point_atomic_quorum_check_error(&err) {
-                warn!("{message}");
+            if self.ctx.config.net.is_mainnet() {
+                return Err(ProtocolError::OtherOwned(format!(
+                    "post-HF pruning-point Atomic state hash quorum failed for {} from peer {}; refusing to import Atomic state from a single peer on mainnet ({})",
+                    proof_pruning_point, self.router, err
+                )));
             } else {
-                debug!("{message}");
+                let message = format!(
+                    "P2P pruning-point atomic root quorum check unavailable for {} from peer {}; continuing with trusted-data root and validating it against the pruning-point commitment on non-mainnet ({})",
+                    proof_pruning_point, self.router, err
+                );
+                if Self::should_warn_pruning_point_atomic_quorum_check_error(&err) {
+                    warn!("{message}");
+                } else {
+                    debug!("{message}");
+                }
             }
         }
 

@@ -335,12 +335,25 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
         if args.atomic_bootstrap_peer_quorum_min_sources.is_some() { " (operator override)" } else { "" }
     );
     info!("Cryptix Atomic bootstrap attestation policy: seed/peer quorum; manifests are not signer-attested");
+    let atomic_seed_sources_disabled_by_arg = args.disable_dns_seeding || args.disable_atomic_seed_sources;
+    let atomic_seed_disable_reason = if args.disable_dns_seeding && args.disable_atomic_seed_sources {
+        "--nodnsseed and --no-atomic-seed"
+    } else if args.disable_dns_seeding {
+        "--nodnsseed"
+    } else {
+        "--no-atomic-seed"
+    };
     let bootstrap_source_policy = if config.net.is_mainnet() {
-        if args.disable_dns_seeding && args.atomic_bootstrap_allow_peer_fallback {
-            "mainnet DNS seed bootstrap disabled by --nodnsseed; peer-only Atomic bootstrap fallback enabled by explicit operator flag"
-                .to_string()
-        } else if args.disable_dns_seeding {
-            "mainnet DNS seed bootstrap disabled by --nodnsseed; peer-only Atomic bootstrap fallback disabled".to_string()
+        if atomic_seed_sources_disabled_by_arg && args.atomic_bootstrap_allow_peer_fallback {
+            format!(
+                "mainnet Atomic seed sources disabled by {}; peer-only Atomic bootstrap fallback enabled by explicit operator flag",
+                atomic_seed_disable_reason
+            )
+        } else if atomic_seed_sources_disabled_by_arg {
+            format!(
+                "mainnet Atomic seed sources disabled by {}; peer-only Atomic bootstrap fallback disabled",
+                atomic_seed_disable_reason
+            )
         } else if args.atomic_bootstrap_allow_peer_fallback {
             "mainnet strict seed policy; peer-only fallback enabled by explicit operator flag".to_string()
         } else {
@@ -350,8 +363,10 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
         "non-mainnet policy; peer-majority fallback allowed".to_string()
     };
     info!("Cryptix Atomic bootstrap source policy: {}", bootstrap_source_policy);
-    if args.disable_dns_seeding {
-        info!("Cryptix Atomic bootstrap DNS seed sources: DISABLED");
+    if args.disable_atomic_seed_sources {
+        info!("Cryptix Atomic bootstrap seed sources: DISABLED by --no-atomic-seed; normal P2P DNS seeding is unchanged");
+    } else if args.disable_dns_seeding {
+        info!("Cryptix Atomic bootstrap seed sources: DISABLED by --nodnsseed");
     }
     info!("Strong-Node claimant overlay: ENABLED");
     info!("Auto-ban: {}; default strike threshold: 5, ban duration: 3h", if args.autoban { "ENABLED" } else { "DISABLED" });
@@ -485,6 +500,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
     // connect_peers means no DNS seeding and no outbound peers
     let outbound_target = if connect_peers.is_empty() { args.outbound_target } else { 0 };
     let dns_seeders = if connect_peers.is_empty() && !args.disable_dns_seeding { config.dns_seeders } else { &[] };
+    let atomic_seed_sources_disabled = dns_seeders.is_empty() || args.disable_atomic_seed_sources;
 
     let grpc_server_addr = args.rpclisten.unwrap_or(ContextualNetAddress::loopback()).normalize(config.default_rpc_port());
 
@@ -607,7 +623,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
             atomic_token_service.clone(),
             flow_context.clone(),
             configured_atomic_bootstrap_peers.clone(),
-            dns_seeders.is_empty(),
+            atomic_seed_sources_disabled,
             10,
             atomic_db_dir.clone(),
             args.atomic_bootstrap_allow_peer_fallback,

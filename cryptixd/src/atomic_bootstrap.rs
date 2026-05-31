@@ -207,10 +207,10 @@ impl AtomicBootstrapService {
         if flow_context.config.net.is_mainnet() {
             if disable_dns_seed_sources && allow_peer_majority_fallback_override {
                 info!(
-                    "[atomic-bootstrap] mainnet DNS seed bootstrap disabled by operator (--nodnsseed); peer-only fallback ENABLED by explicit override"
+                    "[atomic-bootstrap] mainnet Atomic seed sources disabled by operator; peer-only fallback ENABLED by explicit override"
                 );
             } else if disable_dns_seed_sources {
-                info!("[atomic-bootstrap] mainnet DNS seed bootstrap disabled by operator (--nodnsseed); peer-only fallback DISABLED");
+                info!("[atomic-bootstrap] mainnet Atomic seed sources disabled by operator; peer-only fallback DISABLED");
             } else if allow_peer_majority_fallback_override {
                 info!("[atomic-bootstrap] mainnet peer-only fallback override ENABLED; used only when no seed source is reachable");
             } else {
@@ -277,7 +277,7 @@ impl AtomicBootstrapService {
         } else if self.disable_dns_seed_sources {
             "no optional --atomic-bootstrap-peer RPC snapshot source configured; local replay and P2P pruning-point Atomic state sync remain authoritative".to_string()
         } else {
-            "no optional --atomic-bootstrap-peer RPC snapshot source configured; DNS seeds are only used for P2P discovery, not hidden RPC snapshot downloads".to_string()
+            "no compatible Atomic seed or --atomic-bootstrap-peer RPC source responded; local replay and P2P peer quorum remain available according to policy".to_string()
         }
     }
 
@@ -484,21 +484,71 @@ impl AtomicBootstrapService {
         expected_state_hash: [u8; 32],
         anchor_daa_score: Option<u64>,
     ) -> Result<(), String> {
-        let p2p_result = self.verify_consensus_atomic_state_hash_p2p_quorum(block_hash, expected_state_hash, anchor_daa_score).await;
-        match p2p_result {
-            Ok(()) => return Ok(()),
-            Err(err) if self.configured_rpc_peers.is_empty() => return Err(err),
-            Err(err) => trace!("[atomic-bootstrap] P2P Atomic state hash quorum unavailable; trying optional RPC sources: {err}"),
-        }
-
         let protocol_version = self.atomic_token_service.protocol_version() as u32;
         let network_id = self.atomic_token_service.network_id().to_string();
         let expected_state_hash_hex = hex_encode(expected_state_hash);
-        let sources = self.collect_compatible_sources(protocol_version, &network_id).await;
-        if sources.is_empty() {
-            return Err(self.no_sources_reason());
+        let anchor_daa_score = match anchor_daa_score {
+            Some(anchor_daa_score) => anchor_daa_score,
+            None => {
+                let consensus = self.flow_context.consensus();
+                let session = consensus.session().await;
+                session
+                    .async_get_header(block_hash)
+                    .await
+                    .map_err(|err| format!("local header unavailable for Atomic state hash quorum `{block_hash}`: {err}"))?
+                    .daa_score
+            }
+        };
+
+        let quorum_policy = self.snapshot_quorum_policy();
+        let p2p_min_sources = if quorum_policy.allow_peer_majority_fallback {
+            quorum_policy.peer_majority_min_sources.max(1)
+        } else {
+            quorum_policy.seed_confirmed_min_non_seed_sources.max(1)
+        };
+        let p2p_sample_limit = Self::p2p_audit_sample_limit(p2p_min_sources);
+        let mut evidence = self.collect_rpc_consensus_atomic_state_hash_evidence(block_hash, protocol_version, &network_id).await;
+        evidence.extend(self.collect_p2p_atomic_state_hash_evidence(block_hash, anchor_daa_score, p2p_sample_limit).await);
+
+        if evidence.is_empty() {
+            return Err(format!(
+                "no seed/RPC/P2P Atomic quorum source reported consensus atomic state for `{block_hash}` ({})",
+                self.no_sources_reason()
+            ));
         }
 
+        let decision = select_snapshot_quorum(
+            evidence,
+            quorum_policy.allow_peer_majority_fallback,
+            quorum_policy.require_seed_confirmed_if_any_seed,
+            quorum_policy.seed_confirmed_min_non_seed_sources,
+            quorum_policy.peer_majority_min_sources,
+        )
+        .map_err(|err| format!("atomic consensus state hash quorum unavailable for `{block_hash}`: {err}"))?;
+
+        if decision.snapshot_id != expected_state_hash_hex {
+            return Err(format!(
+                "atomic consensus state hash quorum selected `{}`, expected `{}` for `{}` using {}",
+                decision.snapshot_id, expected_state_hash_hex, block_hash, decision.policy_description
+            ));
+        }
+
+        trace!(
+            "[atomic-bootstrap] verified consensus atomic state hash {} for {} using {}",
+            expected_state_hash_hex,
+            block_hash,
+            decision.policy_description
+        );
+        Ok(())
+    }
+
+    async fn collect_rpc_consensus_atomic_state_hash_evidence(
+        &self,
+        block_hash: BlockHash,
+        protocol_version: u32,
+        network_id: &str,
+    ) -> Vec<SnapshotSupportEvidence> {
+        let sources = self.collect_compatible_sources(protocol_version, network_id).await;
         let mut evidence = Vec::new();
         for source in sources {
             let endpoint = source.endpoint.clone();
@@ -548,69 +598,7 @@ impl AtomicBootstrapService {
 
             let _ = source.client.disconnect().await;
         }
-
-        if evidence.is_empty() {
-            return Err(format!("no compatible bootstrap source reported consensus atomic state for `{block_hash}`"));
-        }
-
-        let quorum_policy = self.snapshot_quorum_policy();
-        let decision = select_snapshot_quorum(
-            evidence,
-            quorum_policy.allow_peer_majority_fallback,
-            quorum_policy.require_seed_confirmed_if_any_seed,
-            quorum_policy.seed_confirmed_min_non_seed_sources,
-            quorum_policy.peer_majority_min_sources,
-        )
-        .map_err(|err| format!("atomic consensus state hash quorum unavailable for `{block_hash}`: {err}"))?;
-
-        if decision.snapshot_id != expected_state_hash_hex {
-            return Err(format!(
-                "atomic consensus state hash quorum selected `{}`, expected `{}` for `{}` using {}",
-                decision.snapshot_id, expected_state_hash_hex, block_hash, decision.policy_description
-            ));
-        }
-
-        trace!(
-            "[atomic-bootstrap] verified consensus atomic state hash {} for {} using {}",
-            expected_state_hash_hex,
-            block_hash,
-            decision.policy_description
-        );
-        Ok(())
-    }
-
-    async fn verify_consensus_atomic_state_hash_p2p_quorum(
-        &self,
-        block_hash: BlockHash,
-        expected_state_hash: [u8; 32],
-        anchor_daa_score: Option<u64>,
-    ) -> Result<(), String> {
-        let anchor_daa_score = match anchor_daa_score {
-            Some(anchor_daa_score) => anchor_daa_score,
-            None => {
-                let consensus = self.flow_context.consensus();
-                let session = consensus.session().await;
-                session
-                    .async_get_header(block_hash)
-                    .await
-                    .map_err(|err| format!("local header unavailable for P2P Atomic state hash quorum `{block_hash}`: {err}"))?
-                    .daa_score
-            }
-        };
-        let decision = self.select_p2p_atomic_state_hash_quorum(block_hash, anchor_daa_score).await?;
-        let expected_state_hash_hex = hex_encode(expected_state_hash);
-        if decision.snapshot_id != expected_state_hash_hex {
-            return Err(format!(
-                "P2P atomic consensus state hash quorum selected `{}`, expected `{}` for `{}` using {}",
-                decision.snapshot_id, expected_state_hash_hex, block_hash, decision.policy_description
-            ));
-        }
-
-        info!(
-            "[atomic-bootstrap:p2p] verified Atomic state hash {} for {} using {}",
-            expected_state_hash_hex, block_hash, decision.policy_description
-        );
-        Ok(())
+        evidence
     }
 
     async fn select_p2p_atomic_state_hash_quorum(
@@ -632,7 +620,7 @@ impl AtomicBootstrapService {
 
     fn p2p_atomic_quorum_min_sources(&self) -> Result<usize, String> {
         if self.disable_dns_seed_sources && !self.allow_peer_majority_fallback_override {
-            return Err("P2P peer-only Atomic quorum disabled by policy: --nodnsseed requires --atomic-bootstrap-allow-peer-fallback"
+            return Err("P2P peer-only Atomic quorum disabled by policy: disabled Atomic seed sources require --atomic-bootstrap-allow-peer-fallback"
                 .to_string());
         }
 
@@ -1544,6 +1532,14 @@ impl AtomicBootstrapService {
     fn candidate_endpoints(&self) -> Vec<CandidateEndpoint> {
         let mut endpoints = Vec::new();
         let mut by_endpoint = HashMap::<String, usize>::new();
+
+        if !self.disable_dns_seed_sources {
+            let default_rpc_port = self.flow_context.config.default_rpc_port();
+            for seed_host in self.flow_context.config.dns_seeders.iter().copied() {
+                let endpoint = format!("grpc://{seed_host}:{default_rpc_port}");
+                push_candidate_endpoint(&mut endpoints, &mut by_endpoint, endpoint, None, SourceKind::Seed);
+            }
+        }
 
         for address in &self.configured_rpc_peers {
             let socket = SocketAddr::new(address.ip.into(), address.port);
