@@ -39,6 +39,9 @@ pub struct Args {
     #[serde(rename = "unsaferpc")]
     pub unsafe_rpc: bool,
     pub rpc_diagnostics: bool,
+    pub rpc_block_scan_cache: bool,
+    pub rpc_block_scan_cache_days: f64,
+    pub rpc_block_scan_cache_max_mb: u64,
     pub wrpc_verbose: bool,
     #[serde(rename = "loglevel")]
     pub log_level: String,
@@ -122,6 +125,9 @@ impl Default for Args {
             rpclisten_json: None,
             unsafe_rpc: false,
             rpc_diagnostics: false,
+            rpc_block_scan_cache: false,
+            rpc_block_scan_cache_days: 1.0,
+            rpc_block_scan_cache_max_mb: 1024,
             async_threads: num_cpus::get(),
             utxoindex: true,
             atomic_unsafe_skip_snapshot_finality_check: false,
@@ -190,6 +196,9 @@ impl Args {
         config.disable_upnp = self.disable_upnp;
         config.unsafe_rpc = self.unsafe_rpc;
         config.rpc_diagnostics = self.rpc_diagnostics;
+        config.rpc_block_scan_cache = self.rpc_block_scan_cache;
+        config.rpc_block_scan_cache_days = clamp_rpc_block_scan_cache_days(self.rpc_block_scan_cache_days);
+        config.rpc_block_scan_cache_max_bytes = self.rpc_block_scan_cache_max_mb.saturating_mul(1024 * 1024);
         config.enable_unsynced_mining = self.enable_unsynced_mining;
         config.startup_repair_plan_path = self.startup_repair_plan.as_ref().map(PathBuf::from);
         config.enable_mainnet_mining = self.enable_mainnet_mining;
@@ -305,6 +314,34 @@ pub fn cli() -> Command {
                 .long("rpc-diagnostics")
                 .action(ArgAction::SetTrue)
                 .help("Enable opt-in RPC diagnostics logs: request volume summaries every 5s and slow request snapshots at >=500ms."),
+        )
+        .arg(
+            Arg::new("rpc-block-scan-cache")
+                .long("rpc-block-scan-cache")
+                .action(ArgAction::SetTrue)
+                .help("Enable opt-in RAM cache for recent RPC block/header scan responses used by wallet sync/resync."),
+        )
+        .arg(
+            Arg::new("rpc-block-scan-cache-days")
+                .long("rpc-block-scan-cache-days")
+                .value_name("DAYS")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(f64))
+                .help(format!(
+                    "Recent data window for --rpc-block-scan-cache in days (default: {}, allowed: 0.1..7.0).",
+                    defaults.rpc_block_scan_cache_days
+                )),
+        )
+        .arg(
+            Arg::new("rpc-block-scan-cache-max-mb")
+                .long("rpc-block-scan-cache-max-mb")
+                .value_name("MB")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(u64))
+                .help(format!(
+                    "Approximate RAM cap for --rpc-block-scan-cache in MiB (default: {}).",
+                    defaults.rpc_block_scan_cache_max_mb
+                )),
         )
         .arg(
             Arg::new("connect-peers")
@@ -652,6 +689,17 @@ impl Args {
             rpclisten_json: m.get_one::<WrpcNetAddress>("rpclisten-json").cloned().or(defaults.rpclisten_json),
             unsafe_rpc: arg_match_unwrap_or::<bool>(&m, "unsaferpc", defaults.unsafe_rpc),
             rpc_diagnostics: arg_match_unwrap_or::<bool>(&m, "rpc-diagnostics", defaults.rpc_diagnostics),
+            rpc_block_scan_cache: arg_match_unwrap_or::<bool>(&m, "rpc-block-scan-cache", defaults.rpc_block_scan_cache),
+            rpc_block_scan_cache_days: clamp_rpc_block_scan_cache_days(arg_match_unwrap_or::<f64>(
+                &m,
+                "rpc-block-scan-cache-days",
+                defaults.rpc_block_scan_cache_days,
+            )),
+            rpc_block_scan_cache_max_mb: arg_match_unwrap_or::<u64>(
+                &m,
+                "rpc-block-scan-cache-max-mb",
+                defaults.rpc_block_scan_cache_max_mb,
+            ),
             wrpc_verbose: false,
             log_level: arg_match_unwrap_or::<String>(&m, "log_level", defaults.log_level),
             async_threads: arg_match_unwrap_or::<usize>(&m, "async_threads", defaults.async_threads),
@@ -767,6 +815,14 @@ fn arg_match_many_unwrap_or<T: Clone + Send + Sync + 'static>(m: &clap::ArgMatch
     }
 }
 
+fn clamp_rpc_block_scan_cache_days(days: f64) -> f64 {
+    if days.is_finite() {
+        days.clamp(0.1, 7.0)
+    } else {
+        1.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Args;
@@ -842,5 +898,32 @@ mod tests {
 
         let args = Args::parse(["cryptixd", "--rpc-diagnostics"]).expect("diagnostics args should parse");
         assert!(args.rpc_diagnostics);
+    }
+
+    #[test]
+    fn rpc_block_scan_cache_is_opt_in_with_defaults() {
+        let args = Args::parse(["cryptixd"]).expect("default args should parse");
+        assert!(!args.rpc_block_scan_cache);
+        assert_eq!(args.rpc_block_scan_cache_days, 1.0);
+        assert_eq!(args.rpc_block_scan_cache_max_mb, 1024);
+
+        let args = Args::parse(["cryptixd", "--rpc-block-scan-cache"]).expect("cache args should parse");
+        assert!(args.rpc_block_scan_cache);
+        assert_eq!(args.rpc_block_scan_cache_days, 1.0);
+        assert_eq!(args.rpc_block_scan_cache_max_mb, 1024);
+    }
+
+    #[test]
+    fn rpc_block_scan_cache_values_parse() {
+        let args = Args::parse([
+            "cryptixd",
+            "--rpc-block-scan-cache",
+            "--rpc-block-scan-cache-days=0.5",
+            "--rpc-block-scan-cache-max-mb=256",
+        ])
+        .expect("cache value args should parse");
+        assert!(args.rpc_block_scan_cache);
+        assert_eq!(args.rpc_block_scan_cache_days, 0.5);
+        assert_eq!(args.rpc_block_scan_cache_max_mb, 256);
     }
 }

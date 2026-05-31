@@ -50,6 +50,15 @@ pub struct Config {
     /// Enable opt-in RPC diagnostics logging for request volume and slow calls.
     pub rpc_diagnostics: bool,
 
+    /// Enable opt-in RPC-side block/header response cache for wallet sync scans.
+    pub rpc_block_scan_cache: bool,
+
+    /// Number of recent days to keep eligible in the RPC block/header scan cache.
+    pub rpc_block_scan_cache_days: f64,
+
+    /// Approximate maximum RAM bytes used by the RPC block/header scan cache.
+    pub rpc_block_scan_cache_max_bytes: u64,
+
     /// Allow the node to accept blocks from RPC while not synced
     /// (required when initiating a new network from genesis)
     pub enable_unsynced_mining: bool,
@@ -97,6 +106,9 @@ impl Config {
             atomic_unsafe_skip_snapshot_finality_check: false,
             unsafe_rpc: false,
             rpc_diagnostics: false,
+            rpc_block_scan_cache: false,
+            rpc_block_scan_cache_days: 1.0,
+            rpc_block_scan_cache_max_bytes: 1024 * 1024 * 1024,
             enable_unsynced_mining: false,
             startup_repair_plan_path: None,
             enable_mainnet_mining: false,

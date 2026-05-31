@@ -23,6 +23,9 @@ Feedback and contributions are always welcome.
 | `--rpclisten-json[=IP[:PORT]]` | address | auto | wRPC JSON listen address (defaults to network-specific port). |
 | `--unsaferpc` | switch | `false` | Enable RPC commands that mutate node state. |
 | `--rpc-diagnostics` | switch | `false` | Enable opt-in RPC diagnostics logs: endpoint request-volume summaries every 5 seconds and slow request snapshots at `>=500ms`. Useful for debugging WebWallet/wRPC lag; disabled by default. |
+| `--rpc-block-scan-cache` | switch | `false` | Enable an opt-in RAM cache for recent `GetHeaders`/`GetBlock`/`GetBlocks` RPC scan data used by wallet sync/resync, including selected-parent links for fast descending header scans. When enabled, the node waits until it is nearly synced and Atomic is ready after the token HF, warms the newest selected-chain data, serves the cache only after warmup completes, logs warmup/activity progress, and refreshes it while running. It is read-only and falls back to normal storage on cache misses. |
+| `--rpc-block-scan-cache-days=<DAYS>` | float | `1.0` | Recent-data window for `--rpc-block-scan-cache`; values are clamped to `0.1..7.0` days. |
+| `--rpc-block-scan-cache-max-mb=<MB>` | integer | `1024` | Approximate RAM cap for `--rpc-block-scan-cache`. When full, old entries are evicted and uncached data is read normally. |
 | `--connect=<IP[:PORT]>` | address (repeatable) | empty | Connect only to specified peers. |
 | `--addpeer=<IP[:PORT]>` | address (repeatable) | empty | Add peers to connect to on startup. |
 | `--listen=<IP[:PORT]>` | address | auto | P2P listen address (defaults to network-specific port). |
@@ -328,6 +331,9 @@ utxoindex = true
 disable-upnp = true
 perf-metrics = true
 tx-relay-broadcast-interval-ms = 250
+rpc-block-scan-cache = true
+rpc-block-scan-cache-days = 1.0
+rpc-block-scan-cache-max-mb = 1024
 appdir = "some-dir"
 hfa-microblock-interval-ms-normal = 50
 autoban = false

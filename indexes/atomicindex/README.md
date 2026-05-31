@@ -2,6 +2,8 @@
 
 Extended Developer Information:
 
+For frontend trade execution, pending mempool rendering, nonce prebuilding, and parent-built swap transactions, see [Atomic Trading Flow Notes](TRADING_FLOW.md).
+
 ## Core Model
 
 - Atomic payloads start with `CAT` (`0x43 0x41 0x54`) and version `1`.

@@ -1,6 +1,7 @@
 //! Core server implementation for ClientAPI
 
 use super::collector::{CollectorFromConsensus, CollectorFromIndex};
+use crate::block_scan_cache::{RpcBlockScanCache, RpcBlockScanCacheActivity, RpcBlockScanCacheConfig};
 use crate::converter::feerate_estimate::{FeeEstimateConverter, FeeEstimateVerboseConverter};
 use crate::converter::{consensus::ConsensusConverter, index::IndexConverter, protocol::ProtocolConverter};
 use crate::hfa::{FastIngressSource, HfaEngine, HfaRuntimeConfig};
@@ -104,7 +105,7 @@ use std::{
 };
 use tokio::{
     join, select,
-    time::{interval, MissedTickBehavior},
+    time::{interval, sleep, MissedTickBehavior},
 };
 use workflow_rpc::server::WebSocketCounters as WrpcServerCounters;
 
@@ -151,6 +152,7 @@ pub struct RpcCoreService {
     hfa_engine: Arc<HfaEngine>,
     get_block_template_unsynced_last_log: Mutex<Option<Instant>>,
     rpc_diagnostics: RpcDiagnostics,
+    block_scan_cache: RpcBlockScanCache,
 }
 
 const RPC_CORE: &str = "rpc-core";
@@ -167,6 +169,13 @@ const LIQUIDITY_SUBMIT_READY_RECHECK_ATTEMPTS: usize = 6;
 const LIQUIDITY_SUBMIT_READY_RECHECK_DELAY: Duration = Duration::from_millis(150);
 const RPC_DIAGNOSTICS_SLOW_THRESHOLD: Duration = Duration::from_millis(500);
 const RPC_DIAGNOSTICS_SUMMARY_INTERVAL: Duration = Duration::from_secs(5);
+const RPC_BLOCK_SCAN_CACHE_WARM_INTERVAL: Duration = Duration::from_secs(10);
+const RPC_BLOCK_SCAN_CACHE_ACTIVITY_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const RPC_BLOCK_SCAN_CACHE_WARM_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+const RPC_BLOCK_SCAN_CACHE_STARTUP_READY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const RPC_BLOCK_SCAN_CACHE_STARTUP_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const RPC_BLOCK_SCAN_CACHE_WARM_YIELD_EVERY: usize = 32;
+const RPC_BLOCK_SCAN_CACHE_WARM_CACHED_STOP: usize = 64;
 const TX_LOOKUP_MAX_IDS: usize = 512;
 const TX_LOOKUP_LOOKBACK_MARGIN_DAA: u64 = 64;
 const TX_LOOKUP_LOOKBACK_MIN_HEADERS: usize = 256;
@@ -201,6 +210,23 @@ struct RpcDiagnosticsState {
     total_requests: u64,
     total_errors: u64,
     total_slow: u64,
+}
+
+struct RpcBlockScanCacheStartupReadiness {
+    ready: bool,
+    wait_reason: &'static str,
+    peer_ready: bool,
+    node_nearly_synced: bool,
+    virtual_daa_score: u64,
+    activation_daa_score: u64,
+    atomic_required: bool,
+    atomic_ready: bool,
+    atomic_not_ready_reason: Option<&'static str>,
+    atomic_runtime: &'static str,
+    atomic_degraded: bool,
+    atomic_bootstrap: bool,
+    atomic_live_correct: bool,
+    atomic_last_applied: Option<BlockHash>,
 }
 
 impl RpcDiagnosticsState {
@@ -468,6 +494,20 @@ impl RpcCoreService {
 
         let hfa_engine = Arc::new(HfaEngine::new(hfa_config));
         flow_context.set_hfa_bridge(hfa_engine.clone());
+        let block_scan_cache = RpcBlockScanCache::new(RpcBlockScanCacheConfig::new(
+            config.rpc_block_scan_cache,
+            config.rpc_block_scan_cache_days,
+            config.rpc_block_scan_cache_max_bytes,
+        ));
+        if block_scan_cache.enabled() {
+            info!(
+                "RPC block scan cache enabled: days={:.2}, max_mb={}, startup_warm=after_node_and_atomic_ready, serve_after_startup_complete=true, refresh_interval_sec={}, activity_log_interval_sec={}, atomic_data_used=false, fallback=storage_on_miss",
+                block_scan_cache.days(),
+                block_scan_cache.max_bytes() / (1024 * 1024),
+                RPC_BLOCK_SCAN_CACHE_WARM_INTERVAL.as_secs(),
+                RPC_BLOCK_SCAN_CACHE_ACTIVITY_LOG_INTERVAL.as_secs()
+            );
+        }
 
         Self {
             consensus_manager,
@@ -495,6 +535,7 @@ impl RpcCoreService {
             hfa_engine,
             get_block_template_unsynced_last_log: Mutex::new(None),
             rpc_diagnostics: RpcDiagnostics::default(),
+            block_scan_cache,
         }
     }
 
@@ -512,7 +553,7 @@ impl RpcCoreService {
         false
     }
 
-    pub fn start_impl(&self) {
+    pub fn start_impl(self: &Arc<Self>) {
         self.notifier().start();
 
         let token_shutdown_listener = self.shutdown.listener.clone();
@@ -551,6 +592,8 @@ impl RpcCoreService {
             }
         });
 
+        self.clone().start_rpc_block_scan_cache_warmer();
+
         if !self.hfa_engine.is_enabled() {
             return;
         }
@@ -585,6 +628,339 @@ impl RpcCoreService {
                 }
             }
         });
+    }
+
+    fn start_rpc_block_scan_cache_warmer(self: Arc<Self>) {
+        if !self.block_scan_cache.enabled() {
+            return;
+        }
+
+        let shutdown_listener = self.shutdown.listener.clone();
+        tokio::spawn(async move {
+            let shutdown = shutdown_listener;
+            tokio::pin!(shutdown);
+
+            let mut readiness_tick = interval(RPC_BLOCK_SCAN_CACHE_STARTUP_READY_POLL_INTERVAL);
+            readiness_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            readiness_tick.tick().await;
+            let mut last_wait_log: Option<Instant> = None;
+
+            loop {
+                let readiness = self.rpc_block_scan_cache_startup_readiness().await;
+                if readiness.ready {
+                    info!(
+                        "RPC block scan cache startup warm gate passed: peer_ready={} node_nearly_synced={} virtual_daa={} activation_daa={} atomic_required={} atomic_ready={} atomic_runtime={} atomic_degraded={} atomic_bootstrap={} atomic_live_correct={} atomic_last_applied={:?}",
+                        readiness.peer_ready,
+                        readiness.node_nearly_synced,
+                        readiness.virtual_daa_score,
+                        readiness.activation_daa_score,
+                        readiness.atomic_required,
+                        readiness.atomic_ready,
+                        readiness.atomic_runtime,
+                        readiness.atomic_degraded,
+                        readiness.atomic_bootstrap,
+                        readiness.atomic_live_correct,
+                        readiness.atomic_last_applied
+                    );
+                    break;
+                }
+
+                if last_wait_log.map_or(true, |last| last.elapsed() >= RPC_BLOCK_SCAN_CACHE_STARTUP_WAIT_LOG_INTERVAL) {
+                    info!(
+                        "RPC block scan cache startup warm waiting: reason={} peer_ready={} node_nearly_synced={} virtual_daa={} activation_daa={} atomic_required={} atomic_ready={} atomic_reason={} atomic_runtime={} atomic_degraded={} atomic_bootstrap={} atomic_live_correct={} atomic_last_applied={:?}; cache_serving=false fallback=storage_on_miss",
+                        readiness.wait_reason,
+                        readiness.peer_ready,
+                        readiness.node_nearly_synced,
+                        readiness.virtual_daa_score,
+                        readiness.activation_daa_score,
+                        readiness.atomic_required,
+                        readiness.atomic_ready,
+                        readiness.atomic_not_ready_reason.unwrap_or("none"),
+                        readiness.atomic_runtime,
+                        readiness.atomic_degraded,
+                        readiness.atomic_bootstrap,
+                        readiness.atomic_live_correct,
+                        readiness.atomic_last_applied
+                    );
+                    last_wait_log = Some(Instant::now());
+                }
+
+                select! {
+                    _ = &mut shutdown => return,
+                    _ = readiness_tick.tick() => {}
+                }
+            }
+
+            loop {
+                if self.warm_rpc_block_scan_cache_once("startup", None).await {
+                    self.block_scan_cache.mark_ready_to_serve();
+                    let stats = self.block_scan_cache.stats();
+                    info!(
+                        "RPC block scan cache is now serving: cache_headers={} cache_blocks={} cache_parent_links={} cache_mb={}/{} fallback=storage_on_miss",
+                        stats.headers,
+                        stats.blocks,
+                        stats.selected_parent_links,
+                        stats.current_bytes / (1024 * 1024),
+                        stats.max_bytes / (1024 * 1024)
+                    );
+                    break;
+                }
+
+                warn!(
+                    "RPC block scan cache startup warm did not complete cleanly; cache_serving=false and startup warm will retry in {} seconds",
+                    RPC_BLOCK_SCAN_CACHE_WARM_INTERVAL.as_secs()
+                );
+                select! {
+                    _ = &mut shutdown => return,
+                    _ = sleep(RPC_BLOCK_SCAN_CACHE_WARM_INTERVAL) => {}
+                }
+            }
+
+            let mut tick = interval(RPC_BLOCK_SCAN_CACHE_WARM_INTERVAL);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut activity_tick = interval(RPC_BLOCK_SCAN_CACHE_ACTIVITY_LOG_INTERVAL);
+            activity_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut last_activity = self.block_scan_cache.activity_snapshot();
+            activity_tick.tick().await;
+            loop {
+                select! {
+                    _ = &mut shutdown => break,
+                    _ = tick.tick() => {
+                        self.warm_rpc_block_scan_cache_once("refresh", Some(RPC_BLOCK_SCAN_CACHE_WARM_CACHED_STOP)).await;
+                    },
+                    _ = activity_tick.tick() => {
+                        last_activity = self.log_rpc_block_scan_cache_activity(last_activity);
+                    }
+                }
+            }
+        });
+    }
+
+    async fn rpc_block_scan_cache_startup_readiness(&self) -> RpcBlockScanCacheStartupReadiness {
+        let peer_ready = self.has_sufficient_peer_connectivity();
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let virtual_daa_score = session.get_virtual_daa_score();
+        let activation_daa_score = self.config.params.payload_hf_activation_daa_score;
+        let node_nearly_synced = peer_ready && session.async_is_nearly_synced().await;
+        let atomic_required = virtual_daa_score >= activation_daa_score;
+        let atomic_health = if atomic_required { Some(self.atomic_token_service.get_health().await) } else { None };
+        let atomic_not_ready_reason = atomic_health.as_ref().and_then(Self::atomic_token_mining_not_ready_reason);
+        let atomic_ready = !atomic_required || atomic_not_ready_reason.is_none();
+        let ready = peer_ready && node_nearly_synced && atomic_ready;
+        let wait_reason = if !peer_ready {
+            "waiting_for_peer_connectivity"
+        } else if !node_nearly_synced {
+            "waiting_for_node_sync"
+        } else if !atomic_ready {
+            "waiting_for_atomic_sync"
+        } else {
+            "ready"
+        };
+        let atomic_runtime = atomic_health.as_ref().map(|health| health.runtime_state.as_str()).unwrap_or("not_required");
+        let atomic_degraded = atomic_health.as_ref().map_or(false, |health| health.is_degraded);
+        let atomic_bootstrap = atomic_health.as_ref().map_or(false, |health| health.bootstrap_in_progress);
+        let atomic_live_correct = atomic_health.as_ref().map_or(true, |health| health.live_correct);
+        let atomic_last_applied = atomic_health.as_ref().and_then(|health| health.last_applied_block);
+
+        RpcBlockScanCacheStartupReadiness {
+            ready,
+            wait_reason,
+            peer_ready,
+            node_nearly_synced,
+            virtual_daa_score,
+            activation_daa_score,
+            atomic_required,
+            atomic_ready,
+            atomic_not_ready_reason,
+            atomic_runtime,
+            atomic_degraded,
+            atomic_bootstrap,
+            atomic_live_correct,
+            atomic_last_applied,
+        }
+    }
+
+    fn log_rpc_block_scan_cache_activity(&self, previous: RpcBlockScanCacheActivity) -> RpcBlockScanCacheActivity {
+        let current = self.block_scan_cache.activity_snapshot();
+        let delta = current.saturating_sub(previous);
+        let stats = self.block_scan_cache.stats();
+        info!(
+            "RPC block scan cache activity last_60s: added_headers={} added_blocks={} added_parent_links={} removed_headers={} removed_blocks={} removed_parent_links={} added_mb={} removed_mb={} cache_headers={} cache_blocks={} cache_parent_links={} cache_mb={}/{} cache_serving={}",
+            delta.added_headers,
+            delta.added_blocks,
+            delta.added_selected_parent_links,
+            delta.removed_headers,
+            delta.removed_blocks,
+            delta.removed_selected_parent_links,
+            delta.added_bytes / (1024 * 1024),
+            delta.removed_bytes / (1024 * 1024),
+            stats.headers,
+            stats.blocks,
+            stats.selected_parent_links,
+            stats.current_bytes / (1024 * 1024),
+            stats.max_bytes / (1024 * 1024),
+            stats.serving,
+        );
+        current
+    }
+
+    async fn warm_rpc_block_scan_cache_once(&self, reason: &'static str, stop_after_cached_run: Option<usize>) -> bool {
+        if !self.block_scan_cache.enabled() {
+            return false;
+        }
+
+        let session = self.consensus_manager.consensus().session().await;
+        let mut current = session.async_get_sink().await;
+        let started = Instant::now();
+        let start_now_ms = unix_now();
+        let max_age_ms = self.block_scan_cache.max_age_ms();
+        let mut scanned = 0usize;
+        let mut warmed_headers = 0usize;
+        let mut warmed_blocks = 0usize;
+        let mut cached_run = 0usize;
+        let stop_reason;
+        let mut last_progress_log = Instant::now();
+
+        if reason == "startup" {
+            let stats = self.block_scan_cache.stats();
+            info!(
+                "RPC block scan cache startup warm started: target_days={:.2} max_mb={} start_hash={} cache_headers={} cache_blocks={} cache_parent_links={} cache_mb={} cache_serving={}",
+                self.block_scan_cache.days(),
+                stats.max_bytes / (1024 * 1024),
+                current,
+                stats.headers,
+                stats.blocks,
+                stats.selected_parent_links,
+                stats.current_bytes / (1024 * 1024),
+                stats.serving,
+            );
+        }
+
+        loop {
+            let now_ms = unix_now();
+            let rpc_header = if let Some(header) = self.block_scan_cache.get_header(current, now_ms) {
+                header
+            } else {
+                let header = match session.async_get_header(current).await {
+                    Ok(header) => header,
+                    Err(err) => {
+                        warn!("RPC block scan cache warm {reason}: failed reading header {current}: {err}");
+                        stop_reason = "header_read_failed";
+                        break;
+                    }
+                };
+                let rpc_header: RpcHeader = (&*header).into();
+                self.block_scan_cache.insert_header(rpc_header.clone(), now_ms);
+                warmed_headers = warmed_headers.saturating_add(1);
+                rpc_header
+            };
+
+            if start_now_ms.saturating_sub(rpc_header.timestamp) > max_age_ms {
+                stop_reason = "age_limit_reached";
+                break;
+            }
+
+            if self.block_scan_cache.contains_block(current, true, now_ms) {
+                cached_run = cached_run.saturating_add(1);
+                if stop_after_cached_run.is_some_and(|limit| cached_run >= limit) {
+                    stop_reason = "recent_cached_region_reached";
+                    break;
+                }
+            } else {
+                cached_run = 0;
+
+                let block = match session.async_get_block_even_if_header_only(current).await {
+                    Ok(block) => block,
+                    Err(err) => {
+                        warn!("RPC block scan cache warm {reason}: failed reading block {current}: {err}");
+                        stop_reason = "block_read_failed";
+                        break;
+                    }
+                };
+                match self.consensus_converter.get_block(&session, &block, true, true).await {
+                    Ok(rpc_block) => {
+                        let retained = self.block_scan_cache.insert_block(rpc_block, true, unix_now());
+                        if retained {
+                            warmed_blocks = warmed_blocks.saturating_add(1);
+                        } else if self.block_scan_cache.is_near_full() {
+                            stop_reason = "cache_capacity_reached";
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        warn!("RPC block scan cache warm {reason}: failed converting block {current}: {err}");
+                        stop_reason = "block_convert_failed";
+                        break;
+                    }
+                }
+            }
+
+            scanned = scanned.saturating_add(1);
+            if reason == "startup" && last_progress_log.elapsed() >= RPC_BLOCK_SCAN_CACHE_WARM_PROGRESS_INTERVAL {
+                let stats = self.block_scan_cache.stats();
+                info!(
+                    "RPC block scan cache startup warm progress: scanned={} warmed_headers={} warmed_blocks={} cache_headers={} cache_blocks={} cache_parent_links={} cache_mb={}/{} cache_serving={} current_hash={}",
+                    scanned,
+                    warmed_headers,
+                    warmed_blocks,
+                    stats.headers,
+                    stats.blocks,
+                    stats.selected_parent_links,
+                    stats.current_bytes / (1024 * 1024),
+                    stats.max_bytes / (1024 * 1024),
+                    stats.serving,
+                    current,
+                );
+                last_progress_log = Instant::now();
+            }
+
+            let ghostdag = match session.async_get_ghostdag_data(current).await {
+                Ok(ghostdag) => ghostdag,
+                Err(err) => {
+                    warn!("RPC block scan cache warm {reason}: failed reading ghostdag {current}: {err}");
+                    stop_reason = "ghostdag_read_failed";
+                    break;
+                }
+            };
+            self.block_scan_cache.insert_selected_parent(current, ghostdag.selected_parent, rpc_header.timestamp, unix_now());
+            if ghostdag.selected_parent.is_origin() {
+                stop_reason = "selected_parent_origin_reached";
+                break;
+            }
+            current = ghostdag.selected_parent;
+
+            if scanned % RPC_BLOCK_SCAN_CACHE_WARM_YIELD_EVERY == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        if reason == "startup" {
+            let stats = self.block_scan_cache.stats();
+            let ready_to_serve = matches!(
+                stop_reason,
+                "age_limit_reached" | "cache_capacity_reached" | "recent_cached_region_reached" | "selected_parent_origin_reached"
+            );
+            info!(
+                "RPC block scan cache startup warm complete: stop_reason={} ready_to_serve={} scanned={} warmed_headers={} warmed_blocks={} elapsed_ms={} cache_headers={} cache_blocks={} cache_parent_links={} cache_mb={}/{} cache_serving={} fallback=storage_on_miss",
+                stop_reason,
+                ready_to_serve,
+                scanned,
+                warmed_headers,
+                warmed_blocks,
+                started.elapsed().as_millis(),
+                stats.headers,
+                stats.blocks,
+                stats.selected_parent_links,
+                stats.current_bytes / (1024 * 1024),
+                stats.max_bytes / (1024 * 1024),
+                stats.serving
+            );
+        }
+
+        matches!(
+            stop_reason,
+            "age_limit_reached" | "cache_capacity_reached" | "recent_cached_region_reached" | "selected_parent_origin_reached"
+        )
     }
 
     pub async fn join(&self) -> RpcResult<()> {
@@ -1826,10 +2202,20 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
 
     async fn get_block_call(&self, _connection: Option<&DynRpcConnection>, request: GetBlockRequest) -> RpcResult<GetBlockResponse> {
         // TODO: test
+        let cache_now_ms = unix_now();
+        if let Some(mut rpc_block) = self.block_scan_cache.get_block(request.hash, request.include_transactions, cache_now_ms) {
+            self.annotate_block_fast_paths(&mut rpc_block);
+            return Ok(GetBlockResponse { block: rpc_block });
+        }
+
         let session = self.consensus_manager.consensus().session().await;
         let block = session.async_get_block_even_if_header_only(request.hash).await?;
-        let mut rpc_block =
+        let rpc_block =
             self.consensus_converter.get_block(&session, &block, request.include_transactions, request.include_transactions).await?;
+        if self.block_scan_cache.is_serving() {
+            self.block_scan_cache.insert_block(rpc_block.clone(), request.include_transactions, unix_now());
+        }
+        let mut rpc_block = rpc_block;
         self.annotate_block_fast_paths(&mut rpc_block);
         Ok(GetBlockResponse { block: rpc_block })
     }
@@ -2004,11 +2390,20 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let blocks = if request.include_blocks {
             let mut blocks = Vec::with_capacity(block_hashes.len());
             for hash in block_hashes.iter().copied() {
-                let block = session.async_get_block_even_if_header_only(hash).await?;
-                let mut rpc_block = self
-                    .consensus_converter
-                    .get_block(&session, &block, request.include_transactions, request.include_transactions)
-                    .await?;
+                let mut rpc_block =
+                    if let Some(rpc_block) = self.block_scan_cache.get_block(hash, request.include_transactions, unix_now()) {
+                        rpc_block
+                    } else {
+                        let block = session.async_get_block_even_if_header_only(hash).await?;
+                        let rpc_block = self
+                            .consensus_converter
+                            .get_block(&session, &block, request.include_transactions, request.include_transactions)
+                            .await?;
+                        if self.block_scan_cache.is_serving() {
+                            self.block_scan_cache.insert_block(rpc_block.clone(), request.include_transactions, unix_now());
+                        }
+                        rpc_block
+                    };
                 self.annotate_block_fast_paths(&mut rpc_block);
                 blocks.push(rpc_block)
             }
@@ -2586,7 +2981,18 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             for _ in 0..limit {
                 header_hashes.push(current);
 
+                if let Some(selected_parent) = self.block_scan_cache.get_selected_parent(current, unix_now()) {
+                    if selected_parent.is_origin() {
+                        break;
+                    }
+                    current = selected_parent;
+                    continue;
+                }
+
                 let ghostdag = session.async_get_ghostdag_data(current).await?;
+                if let Some(header) = self.block_scan_cache.get_header(current, unix_now()) {
+                    self.block_scan_cache.insert_selected_parent(current, ghostdag.selected_parent, header.timestamp, unix_now());
+                }
                 if ghostdag.selected_parent.is_origin() {
                     break;
                 }
@@ -2596,8 +3002,16 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
 
         let mut headers = Vec::with_capacity(header_hashes.len());
         for hash in header_hashes.into_iter() {
-            let header = session.async_get_header(hash).await?;
-            headers.push((&*header).into());
+            if let Some(header) = self.block_scan_cache.get_header(hash, unix_now()) {
+                headers.push(header);
+            } else {
+                let header = session.async_get_header(hash).await?;
+                let rpc_header: RpcHeader = (&*header).into();
+                if self.block_scan_cache.is_serving() {
+                    self.block_scan_cache.insert_header(rpc_header.clone(), unix_now());
+                }
+                headers.push(rpc_header);
+            }
         }
 
         Ok(GetHeadersResponse { headers })
