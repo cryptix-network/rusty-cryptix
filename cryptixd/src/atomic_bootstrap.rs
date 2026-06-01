@@ -1052,6 +1052,10 @@ impl AtomicBootstrapService {
     }
 
     async fn local_consensus_p2p_token_audit_hash(&self, block_hash: BlockHash) -> Result<Option<[u8; 32]>, String> {
+        if !self.flow_context.is_payload_hf_active() {
+            return Ok(None);
+        }
+
         let consensus = self.flow_context.consensus();
         let session = consensus.session().await;
         session
@@ -1313,12 +1317,13 @@ impl AtomicBootstrapService {
     }
 
     async fn try_bootstrap_once_inner(&self) -> Result<bool, String> {
-        let effective_health = self.atomic_token_service.get_health().await;
-        let health = self.atomic_token_service.get_local_health().await;
-        if health.runtime_state == AtomicTokenRuntimeState::NotReady && !self.flow_context.is_payload_hf_active() {
-            trace!("[atomic-bootstrap] bootstrap deferred until payload hardfork is active locally");
+        if !self.flow_context.is_payload_hf_active() {
+            trace!("[atomic-bootstrap] bootstrap and P2P health audit deferred until payload hardfork is active locally");
             return Ok(false);
         }
+
+        let effective_health = self.atomic_token_service.get_health().await;
+        let health = self.atomic_token_service.get_local_health().await;
         if health.bootstrap_in_progress {
             trace!("[atomic-bootstrap:p2p] local Atomic replay/import already in progress; skipping optional snapshot bootstrap");
             return Ok(false);
@@ -2135,6 +2140,10 @@ impl AtomicStateQuorumVerifier for AtomicBootstrapService {
     }
 
     async fn local_atomic_token_state_hash_for_peer(&self, block_hash: BlockHash) -> Result<Option<[u8; 32]>, String> {
+        if !self.flow_context.is_payload_hf_active() {
+            return Ok(None);
+        }
+
         self.local_consensus_p2p_token_audit_hash(block_hash).await
     }
 
