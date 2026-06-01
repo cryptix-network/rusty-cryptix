@@ -2652,7 +2652,7 @@ impl VirtualStateProcessor {
 
         let mut batch = WriteBatch::default();
         let mut virtual_write = RwLockUpgradableReadGuard::upgrade(virtual_read);
-        self.atomic_state_store.write_current_overlay_batch(&mut batch, &reconstructed).unwrap();
+        self.atomic_state_store.replace_current_overlay_batch(&mut batch, &reconstructed).unwrap();
         virtual_write.state.set_batch(&mut batch, Arc::new(updated_virtual_state)).unwrap();
         self.db.write(batch).unwrap();
     }
