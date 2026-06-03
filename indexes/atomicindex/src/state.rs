@@ -1156,10 +1156,18 @@ impl AtomicTokenState {
         let removed_total = notification.removed_chain_block_hashes.len();
         let added_total = notification.added_chain_block_hashes.len();
         let should_log_long_replay = removed_total.saturating_add(added_total) >= 1024;
+        let has_chain_rollback = removed_total > 0;
         let mut last_replay_log = Instant::now();
         if should_log_long_replay {
             info!("[{IDENT}] Cryptix Atomic applying virtual-chain update: +{} / -{} block(s)", added_total, removed_total);
         }
+        let before_reorg_last_applied = has_chain_rollback
+            .then(|| self.applied_chain_order.last().map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string()));
+        let before_reorg_state_hash = has_chain_rollback.then(|| self.compute_state_hash());
+        let before_reorg_event_seq = self.next_event_sequence;
+        let mut atomic_reorg_touched_state = false;
+        let mut reorg_rollback_log_lines = Vec::new();
+        let mut reorg_apply_log_lines = Vec::new();
 
         for (idx, removed_block_hash) in notification.removed_chain_block_hashes.iter().copied().enumerate() {
             let old_event_len = self.events.len();
@@ -1178,6 +1186,28 @@ impl AtomicTokenState {
                 return Err(AtomicTokenError::Processing(format!(
                     "Cryptix Atomic failed persisting rollback for block `{removed_block_hash}`: {err}"
                 )));
+            }
+            if has_chain_rollback && block_journal_touched_atomic_state(&rollback_journal, new_events.len()) {
+                atomic_reorg_touched_state = true;
+                let should_log_block_detail = removed_total <= 64 || idx < 3 || idx.saturating_add(3) >= removed_total;
+                if should_log_block_detail {
+                    reorg_rollback_log_lines.push(format!(
+                    "[{IDENT}] Cryptix Atomic reorg rollback block {}/{}: block={} tx_results={} processed_ops_removed={} events_added={} assets_changed={} balances_changed={} nonces_changed={} anchors_changed={} state_hash={} next_last_applied={} event_seq={}",
+                    idx.saturating_add(1),
+                    removed_total,
+                    removed_block_hash,
+                    rollback_journal.tx_results.len(),
+                    rollback_journal.added_processed_ops.len(),
+                    new_events.len(),
+                    rollback_journal.changed_assets.len(),
+                    rollback_journal.changed_balances.len(),
+                    rollback_journal.changed_nonces.len(),
+                    rollback_journal.changed_anchor_counts.len(),
+                    short_hex_for_log(&self.compute_state_hash()),
+                    self.applied_chain_order.last().map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string()),
+                    self.next_event_sequence
+                    ));
+                }
             }
             if should_log_long_replay && last_replay_log.elapsed() >= LONG_ATOMIC_REPLAY_LOG_INTERVAL {
                 info!(
@@ -1267,6 +1297,31 @@ impl AtomicTokenState {
             self.state_hash_by_block.insert(accepting_block_hash, state_hash);
             self.event_sequence_by_block.insert(accepting_block_hash, event_sequence);
             self.applied_chain_order.push(accepting_block_hash);
+            if has_chain_rollback {
+                let journal = self.block_journals.get(&accepting_block_hash).expect("just inserted Atomic block journal");
+                if block_journal_touched_atomic_state(journal, new_events.len()) {
+                    atomic_reorg_touched_state = true;
+                    let should_log_block_detail = added_total <= 64 || idx < 3 || idx.saturating_add(3) >= added_total;
+                    if should_log_block_detail {
+                        reorg_apply_log_lines.push(format!(
+                    "[{IDENT}] Cryptix Atomic reorg apply block {}/{}: block={} daa={} tx_results={} processed_ops_added={} events_added={} assets_changed={} balances_changed={} nonces_changed={} anchors_changed={} state_hash={} event_seq={}",
+                    idx.saturating_add(1),
+                    added_total,
+                    accepting_block_hash,
+                    accepting_header.daa_score,
+                    journal.tx_results.len(),
+                    journal.added_processed_ops.len(),
+                    new_events.len(),
+                    journal.changed_assets.len(),
+                    journal.changed_balances.len(),
+                    journal.changed_nonces.len(),
+                    journal.changed_anchor_counts.len(),
+                    short_hex_for_log(&state_hash),
+                    self.next_event_sequence
+                        ));
+                    }
+                }
+            }
             if should_log_long_replay && last_replay_log.elapsed() >= LONG_ATOMIC_REPLAY_LOG_INTERVAL {
                 info!("[{IDENT}] Cryptix Atomic virtual-chain apply progress: {}/{} block(s)", idx.saturating_add(1), added_total);
                 last_replay_log = Instant::now();
@@ -1274,6 +1329,42 @@ impl AtomicTokenState {
         }
 
         self.live_correct = !self.degraded;
+        let after_reorg_state_hash = has_chain_rollback.then(|| self.compute_state_hash());
+        let should_log_atomic_reorg = has_chain_rollback
+            && (atomic_reorg_touched_state
+                || before_reorg_event_seq != self.next_event_sequence
+                || before_reorg_state_hash != after_reorg_state_hash);
+        if should_log_atomic_reorg {
+            info!(
+                "[{IDENT}] Cryptix Atomic reorg detected: rollback={} apply={} before_last_applied={} before_state_hash={} before_event_seq={} remove_first={} remove_last={} add_first={} add_last={}",
+                removed_total,
+                added_total,
+                before_reorg_last_applied.unwrap_or_else(|| "<none>".to_string()),
+                before_reorg_state_hash.as_ref().map(|hash| short_hex_for_log(hash)).unwrap_or_else(|| "<none>".to_string()),
+                before_reorg_event_seq,
+                notification.removed_chain_block_hashes.first().map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string()),
+                notification.removed_chain_block_hashes.last().map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string()),
+                notification.added_chain_block_hashes.first().map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string()),
+                notification.added_chain_block_hashes.last().map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string())
+            );
+            for line in reorg_rollback_log_lines {
+                info!("{line}");
+            }
+            for line in reorg_apply_log_lines {
+                info!("{line}");
+            }
+            info!(
+                "[{IDENT}] Cryptix Atomic reorg applied: +{} / -{} block(s), before_state_hash={}, after_state_hash={}, after_last_applied={}, event_seq={}, live_correct={}, degraded={}",
+                added_total,
+                removed_total,
+                before_reorg_state_hash.as_ref().map(|hash| short_hex_for_log(hash)).unwrap_or_else(|| "<none>".to_string()),
+                after_reorg_state_hash.as_ref().map(|hash| short_hex_for_log(hash)).unwrap_or_else(|| "<none>".to_string()),
+                self.applied_chain_order.last().map(|hash| hash.to_string()).unwrap_or_else(|| "<none>".to_string()),
+                self.next_event_sequence,
+                self.live_correct,
+                self.degraded
+            );
+        }
         if should_log_long_replay {
             info!(
                 "[{IDENT}] Cryptix Atomic virtual-chain update applied: +{} / -{} block(s), live_correct={}",
@@ -4171,6 +4262,26 @@ fn is_replay_integrity_failure(reason: NoopReason) -> bool {
     // or the persisted V2 state is stale/corrupt, so fail closed instead of reporting
     // a healthy but submit-unsafe token state.
     !matches!(reason, NoopReason::None)
+}
+
+fn block_journal_touched_atomic_state(journal: &BlockJournal, events_added: usize) -> bool {
+    events_added > 0
+        || !journal.tx_results.is_empty()
+        || !journal.added_processed_ops.is_empty()
+        || !journal.changed_assets.is_empty()
+        || !journal.changed_balances.is_empty()
+        || !journal.changed_nonces.is_empty()
+        || !journal.changed_anchor_counts.is_empty()
+}
+
+fn short_hex_for_log(data: &[u8]) -> String {
+    if data.is_empty() {
+        return "<empty>".to_string();
+    }
+    if data.len() <= 8 {
+        return hex::encode(data);
+    }
+    format!("{}...{}", hex::encode(&data[..4]), hex::encode(&data[data.len() - 4..]))
 }
 
 #[cfg(test)]
