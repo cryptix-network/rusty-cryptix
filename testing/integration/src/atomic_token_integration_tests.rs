@@ -23,7 +23,7 @@ use cryptixd_lib::args::Args;
 use rand::thread_rng;
 use secp256k1::Keypair;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::PathBuf,
     time::{Duration, Instant},
@@ -43,6 +43,8 @@ const ATOMIC_LONG_STRESS_WALLET_COUNT: usize = 8;
 const ATOMIC_LONG_STRESS_WALLET_FUNDING_OUTPUTS: usize = 12;
 const ATOMIC_LONG_STRESS_WALLET_MIN_UTXOS: usize = 16;
 const ATOMIC_LONG_STRESS_WALLET_TOKEN_CREATES_PER_ROUND: u64 = 4;
+const ATOMIC_REORG_STRESS_DEFAULT_ROUNDS: u64 = 8;
+const ATOMIC_REORG_STRESS_WALLET_COUNT: usize = 4;
 const TOKEN_EVENTS_RPC_PAGE_LIMIT: u32 = 4_096;
 
 fn owner_id_from_address(address: &Address) -> [u8; 32] {
@@ -530,6 +532,14 @@ fn stress_index_wait_attempts_from_env() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(ATOMIC_LONG_STRESS_INDEX_WAIT_ATTEMPTS)
+        .max(1)
+}
+
+fn reorg_stress_rounds_from_env() -> u64 {
+    std::env::var("CRYPTIX_REORG_STRESS_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(ATOMIC_REORG_STRESS_DEFAULT_ROUNDS)
         .max(1)
 }
 
@@ -2896,6 +2906,829 @@ async fn atomic_token_reorg_across_payload_hardfork_reverts_state_and_accepts_fr
     let old_asset_after_fresh_op =
         client1.get_token_asset_call(None, GetTokenAssetRequest { asset_id, at_block_hash: None }).await.unwrap();
     assert!(old_asset_after_fresh_op.asset.is_none(), "fresh post-reorg op must not resurrect losing branch asset");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "long-running full-chain reorg stress test; run with --ignored and optionally CRYPTIX_REORG_STRESS_ROUNDS=16"]
+async fn atomic_token_ignored_reorg_stress_mempool_blocks_and_state() {
+    cryptix_core::log::try_init_logger("INFO");
+    let rounds = reorg_stress_rounds_from_env();
+    let mut daemon1 = Daemon::new_random_with_args(atomic_args(), 10);
+    let mut daemon2 = Daemon::new_random_with_args(atomic_args(), 10);
+    let client1 = daemon1.start().await;
+    let client2 = daemon2.start().await;
+    let consensus_manager = consensus_manager_from_daemon(&daemon1);
+
+    let (owner_sk, owner_pk) = secp256k1::generate_keypair(&mut thread_rng());
+    let owner_keypair = || Keypair::from_secret_key(secp256k1::SECP256K1, &owner_sk);
+    let owner_pubkey_bytes = owner_pk.x_only_public_key().0.serialize();
+    let owner_address = Address::new(daemon1.network.into(), Version::PubKey, &owner_pubkey_bytes);
+    let owner_id = owner_id_from_address(&owner_address);
+    let owner_id_hex = hex32(owner_id);
+
+    let (_receiver_sk, receiver_pk) = secp256k1::generate_keypair(&mut thread_rng());
+    let receiver_address = Address::new(daemon1.network.into(), Version::PubKey, &receiver_pk.x_only_public_key().0.serialize());
+    let receiver_id = owner_id_from_address(&receiver_address);
+    let receiver_id_hex = hex32(receiver_id);
+
+    let (winning_owner_sk, winning_owner_pk) = secp256k1::generate_keypair(&mut thread_rng());
+    let winning_owner_address =
+        Address::new(daemon1.network.into(), Version::PubKey, &winning_owner_pk.x_only_public_key().0.serialize());
+    let winning_owner_id = owner_id_from_address(&winning_owner_address);
+    let winning_owner_id_hex = hex32(winning_owner_id);
+
+    let mut stress_wallets = Vec::with_capacity(ATOMIC_REORG_STRESS_WALLET_COUNT);
+    for wallet_index in 0..ATOMIC_REORG_STRESS_WALLET_COUNT {
+        let (secret, public) = secp256k1::generate_keypair(&mut thread_rng());
+        let pubkey_bytes = public.x_only_public_key().0.serialize();
+        let address = Address::new(daemon1.network.into(), Version::PubKey, &pubkey_bytes);
+        let owner_id = owner_id_from_address(&address);
+        stress_wallets.push(StressWallet {
+            label: format!("reorg-wallet-{wallet_index}"),
+            secret,
+            address,
+            owner_id,
+            owner_id_hex: hex32(owner_id),
+            pubkey_bytes,
+            queue: VecDeque::new(),
+            consumed_outpoints: HashSet::new(),
+            owner_nonce: 1,
+            expected_base_balance: 0,
+        });
+    }
+
+    let coinbase_maturity = daemon1.args.read().coinbase_maturity_override.unwrap_or(SIMNET_PARAMS.coinbase_maturity);
+    let initial_utxos = mine_until_spendable_utxos(&client1, &owner_address, coinbase_maturity, 190).await;
+    let mut utxo_queue: VecDeque<_> = initial_utxos.into();
+    let mut consumed_outpoints = HashSet::new();
+    let mut accepted_producer_txids = HashSet::new();
+    for wallet in &mut stress_wallets {
+        wallet.queue = mine_until_spendable_utxos(&client1, &wallet.address, coinbase_maturity, 18).await.into();
+    }
+
+    let pre_stress_sink = client1.get_block_dag_info().await.unwrap().sink;
+    let pre_stress_health = wait_for_healthy_atomic_at_sink(&client1, pre_stress_sink, "reorg stress pre-token setup").await;
+    assert_eq!(pre_stress_health.token_state, "healthy");
+    let pre_stress_state = client1.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
+    assert_eq!(pre_stress_state.context.at_block_hash, pre_stress_sink);
+    assert_consensus_atomic_hash_exists(&client1, pre_stress_sink, "reorg stress pre-token state").await;
+
+    let mut token_txids = Vec::<(String, TransactionId)>::new();
+    let mut created_asset_ids = Vec::<String>::new();
+    let mut active_stress_wallets = HashSet::new();
+    let mut submitted_native = 0usize;
+    let mut submitted_messenger = 0usize;
+    let mut submitted_raw_payloads = 0usize;
+    let mut submitted_token_creates = 0usize;
+    let mut submitted_wallet_token_creates = 0usize;
+    let mut submitted_base_ops = 0usize;
+    let mut submitted_liquidity_buys = 0usize;
+    let mut submitted_liquidity_sells = 0usize;
+    let mut submitted_liquidity_claims = 0usize;
+    let mut max_mempool_entries = 0usize;
+    let mut max_block_template_txs = 0usize;
+    let mut mined_stress_blocks = 0u64;
+
+    let mut owner_nonce = 1u64;
+    let base_create_utxo = pop_stress_utxo(&mut utxo_queue, &mut consumed_outpoints, "reorg stress base create");
+    let base_create_tx = build_stress_payload_tx(
+        owner_keypair(),
+        &base_create_utxo,
+        &owner_address,
+        payload_create_asset_with_mint(
+            0,
+            owner_nonce,
+            0,
+            100_000_000,
+            owner_id,
+            owner_id,
+            200_000,
+            b"ReorgStressBase",
+            b"RSB",
+            b"reorg-stress-base",
+        ),
+    );
+    owner_nonce += 1;
+    let base_asset_id = base_create_tx.id().to_string();
+    let base_asset_bytes = base_create_tx.id().as_bytes();
+    token_txids.push(("reorg-setup-base-create".to_string(), base_create_tx.id()));
+    created_asset_ids.push(base_asset_id.clone());
+    submit_and_wait_indexed(&client1, &base_create_tx, &owner_address).await;
+    accepted_producer_txids.insert(base_create_tx.id());
+
+    let liquidity_utxo = pop_stress_utxo_with_min_amount(
+        &mut utxo_queue,
+        &mut consumed_outpoints,
+        "reorg stress liquidity create",
+        MIN_LIQUIDITY_SEED_RESERVE_SOMPI + required_fee(1, 2),
+    );
+    let liquidity_change = liquidity_utxo.1.amount - MIN_LIQUIDITY_SEED_RESERVE_SOMPI - required_fee(1, 2);
+    let liquidity_create_tx = build_payload_tx_with_outputs(
+        &owner_sk,
+        vec![(liquidity_utxo.0, liquidity_utxo.1.clone(), 1)],
+        vec![
+            TransactionOutput { value: MIN_LIQUIDITY_SEED_RESERVE_SOMPI, script_public_key: liquidity_vault_script() },
+            TransactionOutput { value: liquidity_change, script_public_key: pay_to_address_script(&owner_address) },
+        ],
+        payload_create_liquidity_with_fee_recipient(
+            0,
+            owner_nonce,
+            LIQUIDITY_TOKEN_SUPPLY_RAW,
+            100,
+            &owner_address,
+            0,
+            0,
+            b"ReorgStressPool",
+            b"RSP",
+        ),
+    );
+    owner_nonce += 1;
+    let liquidity_asset_id = liquidity_create_tx.id().to_string();
+    let liquidity_asset_bytes = liquidity_create_tx.id().as_bytes();
+    token_txids.push(("reorg-setup-liquidity-create".to_string(), liquidity_create_tx.id()));
+    created_asset_ids.push(liquidity_asset_id.clone());
+    submit_and_wait_indexed(&client1, &liquidity_create_tx, &owner_address).await;
+    accepted_producer_txids.insert(liquidity_create_tx.id());
+
+    let mut base_asset_nonce = 1u64;
+    let mut liquidity_asset_nonce = 1u64;
+    let mut expected_pool_nonce = 1u64;
+    let stress_addresses = stress_wallets.iter().map(|wallet| wallet.address.clone()).collect::<Vec<_>>();
+    let stress_owner_ids = stress_wallets.iter().map(|wallet| wallet.owner_id).collect::<Vec<_>>();
+
+    for round in 0..rounds {
+        refill_stress_utxos(
+            &client1,
+            consensus_manager.as_ref(),
+            &owner_address,
+            coinbase_maturity,
+            &mut utxo_queue,
+            &consumed_outpoints,
+            &accepted_producer_txids,
+            90,
+        )
+        .await;
+        for wallet in &mut stress_wallets {
+            refill_stress_utxos(
+                &client1,
+                consensus_manager.as_ref(),
+                &wallet.address,
+                coinbase_maturity,
+                &mut wallet.queue,
+                &wallet.consumed_outpoints,
+                &accepted_producer_txids,
+                12,
+            )
+            .await;
+        }
+
+        let mut parallel_queued = Vec::new();
+        let mut ordered_queued = Vec::new();
+        let mut phase_token_txids = Vec::new();
+        let mut phase_all_txids = Vec::new();
+
+        for i in 0..10u64 {
+            let utxo = pop_stress_utxo(&mut utxo_queue, &mut consumed_outpoints, "reorg stress native tx");
+            let tx = build_stress_native_tx(owner_keypair(), &utxo, &owner_address);
+            let label = format!("reorg-native-{round}-{i}");
+            phase_all_txids.push(stress_tx_trace(label.clone(), tx.id(), vec![utxo], &accepted_producer_txids));
+            parallel_queued.push((label, tx));
+            submitted_native += 1;
+        }
+
+        for i in 0..10u64 {
+            let utxo = pop_stress_utxo(&mut utxo_queue, &mut consumed_outpoints, "reorg stress messenger tx");
+            let tx = build_stress_payload_tx(
+                owner_keypair(),
+                &utxo,
+                &owner_address,
+                messenger_payload_v1(700_000 + round * 10_000 + i, owner_pubkey_bytes, 160 + ((i % 5) as usize * 96)),
+            );
+            let label = format!("reorg-messenger-{round}-{i}");
+            phase_all_txids.push(stress_tx_trace(label.clone(), tx.id(), vec![utxo], &accepted_producer_txids));
+            parallel_queued.push((label, tx));
+            submitted_messenger += 1;
+        }
+
+        for i in 0..6u64 {
+            let utxo = pop_stress_utxo(&mut utxo_queue, &mut consumed_outpoints, "reorg stress raw payload tx");
+            let mut payload = format!("RAW:reorg-stress:{round}:{i}:").into_bytes();
+            payload.resize(280 + ((i % 4) as usize * 96), (round.wrapping_add(i) & 0xff) as u8);
+            let tx = build_stress_payload_tx(owner_keypair(), &utxo, &owner_address, payload);
+            let label = format!("reorg-raw-{round}-{i}");
+            phase_all_txids.push(stress_tx_trace(label.clone(), tx.id(), vec![utxo], &accepted_producer_txids));
+            parallel_queued.push((label, tx));
+            submitted_raw_payloads += 1;
+        }
+
+        for wallet_index in 0..stress_wallets.len() {
+            let recipient_index = (wallet_index + round as usize + 1) % stress_addresses.len();
+            let wallet = &mut stress_wallets[wallet_index];
+            let utxo = pop_stress_utxo(&mut wallet.queue, &mut wallet.consumed_outpoints, "reorg wallet native tx");
+            let tx = build_stress_native_tx(wallet.keypair(), &utxo, &stress_addresses[recipient_index]);
+            let label = format!("reorg-wallet-native-{round}-{wallet_index}");
+            phase_all_txids.push(stress_tx_trace(label.clone(), tx.id(), vec![utxo], &accepted_producer_txids));
+            parallel_queued.push((label, tx));
+            active_stress_wallets.insert(wallet.owner_id_hex.clone());
+            submitted_native += 1;
+        }
+
+        for wallet_index in 0..stress_wallets.len() {
+            let recipient_index = (wallet_index + round as usize + 2) % stress_addresses.len();
+            let wallet = &mut stress_wallets[wallet_index];
+            let utxo = pop_stress_utxo(&mut wallet.queue, &mut wallet.consumed_outpoints, "reorg wallet messenger tx");
+            let tx = build_stress_payload_tx(
+                wallet.keypair(),
+                &utxo,
+                &stress_addresses[recipient_index],
+                messenger_payload_v1(900_000 + round * 10_000 + wallet_index as u64, wallet.pubkey_bytes, 192),
+            );
+            let label = format!("reorg-wallet-messenger-{round}-{wallet_index}");
+            phase_all_txids.push(stress_tx_trace(label.clone(), tx.id(), vec![utxo], &accepted_producer_txids));
+            parallel_queued.push((label, tx));
+            active_stress_wallets.insert(wallet.owner_id_hex.clone());
+            submitted_messenger += 1;
+        }
+
+        for wallet_index in 0..stress_wallets.len() {
+            let recipient_index = (wallet_index + round as usize + 3) % stress_addresses.len();
+            let wallet = &mut stress_wallets[wallet_index];
+            let utxo = pop_stress_utxo(&mut wallet.queue, &mut wallet.consumed_outpoints, "reorg wallet raw payload tx");
+            let mut payload = format!("RAW:reorg-wallet:{round}:{wallet_index}:").into_bytes();
+            payload.resize(200 + ((wallet_index % 4) * 80), wallet_index as u8);
+            let tx = build_stress_payload_tx(wallet.keypair(), &utxo, &stress_addresses[recipient_index], payload);
+            let label = format!("reorg-wallet-raw-{round}-{wallet_index}");
+            phase_all_txids.push(stress_tx_trace(label.clone(), tx.id(), vec![utxo], &accepted_producer_txids));
+            parallel_queued.push((label, tx));
+            active_stress_wallets.insert(wallet.owner_id_hex.clone());
+            submitted_raw_payloads += 1;
+        }
+
+        for i in 0..4u64 {
+            let utxo = pop_stress_utxo(&mut utxo_queue, &mut consumed_outpoints, "reorg stress token create");
+            let initial_mint = 1_000u128 + u128::from(round * 4 + i);
+            let name = format!("ReorgStress{round:03}{i:02}");
+            let symbol = format!("RS{round:03}{i:02}");
+            let tx = build_stress_payload_tx(
+                owner_keypair(),
+                &utxo,
+                &owner_address,
+                payload_create_asset_with_mint(
+                    0,
+                    owner_nonce,
+                    0,
+                    1_000_000_000,
+                    owner_id,
+                    owner_id,
+                    initial_mint,
+                    name.as_bytes(),
+                    symbol.as_bytes(),
+                    b"reorg-stress-created",
+                ),
+            );
+            owner_nonce += 1;
+            let label = format!("reorg-create-{round}-{i}");
+            let txid = tx.id();
+            token_txids.push((label.clone(), txid));
+            phase_token_txids.push((label.clone(), txid));
+            phase_all_txids.push(stress_tx_trace(label.clone(), txid, vec![utxo], &accepted_producer_txids));
+            created_asset_ids.push(txid.to_string());
+            ordered_queued.push((label, tx));
+            submitted_token_creates += 1;
+        }
+
+        for i in 0..2u64 {
+            let wallet_index = (round as usize + i as usize) % stress_wallets.len();
+            let wallet = &mut stress_wallets[wallet_index];
+            let utxo = pop_stress_utxo(&mut wallet.queue, &mut wallet.consumed_outpoints, "reorg wallet token create");
+            let name = format!("ReorgWallet{wallet_index:02}{round:03}{i:02}");
+            let symbol = format!("RW{wallet_index:02}{round:03}{i:02}");
+            let initial_mint = 700u128 + u128::from(round * 2 + i);
+            let tx = build_stress_payload_tx(
+                wallet.keypair(),
+                &utxo,
+                &wallet.address,
+                payload_create_asset_with_mint(
+                    0,
+                    wallet.owner_nonce,
+                    0,
+                    500_000_000,
+                    wallet.owner_id,
+                    wallet.owner_id,
+                    initial_mint,
+                    name.as_bytes(),
+                    symbol.as_bytes(),
+                    b"reorg-wallet-created",
+                ),
+            );
+            wallet.owner_nonce += 1;
+            let label = format!("reorg-wallet-create-{round}-{wallet_index}-{i}");
+            let txid = tx.id();
+            token_txids.push((label.clone(), txid));
+            phase_token_txids.push((label.clone(), txid));
+            phase_all_txids.push(stress_tx_trace(label.clone(), txid, vec![utxo], &accepted_producer_txids));
+            created_asset_ids.push(txid.to_string());
+            ordered_queued.push((label, tx));
+            active_stress_wallets.insert(wallet.owner_id_hex.clone());
+            submitted_token_creates += 1;
+            submitted_wallet_token_creates += 1;
+        }
+
+        for i in 0..4u64 {
+            let mint_amount = 90u128 + u128::from((round + i) % 23);
+            let transfer_amount = 15u128 + u128::from((round + i) % 7);
+            let burn_amount = 5u128 + u128::from((round + i) % 5);
+
+            let mint_utxo = pop_stress_utxo(&mut utxo_queue, &mut consumed_outpoints, "reorg stress mint");
+            let mint_tx = build_stress_payload_tx(
+                owner_keypair(),
+                &mint_utxo,
+                &owner_address,
+                payload_mint(0, base_asset_nonce, base_asset_bytes, owner_id, mint_amount),
+            );
+            base_asset_nonce += 1;
+            let mint_label = format!("reorg-mint-{round}-{i}");
+            let mint_txid = mint_tx.id();
+            token_txids.push((mint_label.clone(), mint_txid));
+            phase_token_txids.push((mint_label.clone(), mint_txid));
+            phase_all_txids.push(stress_tx_trace(mint_label.clone(), mint_txid, vec![mint_utxo], &accepted_producer_txids));
+            ordered_queued.push((mint_label, mint_tx));
+            submitted_base_ops += 1;
+
+            let transfer_utxo = pop_stress_utxo(&mut utxo_queue, &mut consumed_outpoints, "reorg stress transfer");
+            let recipient_slot = ((round + i) as usize) % (stress_owner_ids.len() + 1);
+            let transfer_recipient = if recipient_slot == 0 { receiver_id } else { stress_owner_ids[recipient_slot - 1] };
+            let transfer_tx = build_stress_payload_tx(
+                owner_keypair(),
+                &transfer_utxo,
+                &owner_address,
+                payload_transfer(0, base_asset_nonce, base_asset_bytes, transfer_recipient, transfer_amount),
+            );
+            base_asset_nonce += 1;
+            let transfer_label = format!("reorg-transfer-{round}-{i}");
+            let transfer_txid = transfer_tx.id();
+            token_txids.push((transfer_label.clone(), transfer_txid));
+            phase_token_txids.push((transfer_label.clone(), transfer_txid));
+            phase_all_txids.push(stress_tx_trace(
+                transfer_label.clone(),
+                transfer_txid,
+                vec![transfer_utxo],
+                &accepted_producer_txids,
+            ));
+            ordered_queued.push((transfer_label, transfer_tx));
+            submitted_base_ops += 1;
+
+            let burn_utxo = pop_stress_utxo(&mut utxo_queue, &mut consumed_outpoints, "reorg stress burn");
+            let burn_tx = build_stress_payload_tx(
+                owner_keypair(),
+                &burn_utxo,
+                &owner_address,
+                payload_burn(0, base_asset_nonce, base_asset_bytes, burn_amount),
+            );
+            base_asset_nonce += 1;
+            let burn_label = format!("reorg-burn-{round}-{i}");
+            let burn_txid = burn_tx.id();
+            token_txids.push((burn_label.clone(), burn_txid));
+            phase_token_txids.push((burn_label.clone(), burn_txid));
+            phase_all_txids.push(stress_tx_trace(burn_label.clone(), burn_txid, vec![burn_utxo], &accepted_producer_txids));
+            ordered_queued.push((burn_label, burn_tx));
+            submitted_base_ops += 1;
+        }
+
+        let pool_before_buy = client1
+            .get_liquidity_pool_state_call(
+                None,
+                GetLiquidityPoolStateRequest { asset_id: liquidity_asset_id.clone(), at_block_hash: None },
+            )
+            .await
+            .unwrap()
+            .pool
+            .expect("liquidity pool must exist before reorg stress buy");
+        assert_eq!(pool_before_buy.pool_nonce, expected_pool_nonce);
+        let pool_vault_value = pool_before_buy.vault_value_sompi.parse::<u64>().unwrap();
+        let buy_quote = client1
+            .get_liquidity_quote_call(
+                None,
+                GetLiquidityQuoteRequest {
+                    asset_id: liquidity_asset_id.clone(),
+                    side: 0,
+                    exact_in_amount: "2000000000".to_string(),
+                    at_block_hash: None,
+                },
+            )
+            .await
+            .unwrap();
+        let buy_in_sompi = buy_quote.exact_in_amount.parse::<u64>().unwrap();
+        let buy_min_token_out = buy_quote.amount_out.parse::<u128>().unwrap();
+        let buy_fee = required_fee(2, 2);
+        let buy_utxo =
+            pop_stress_utxo_with_min_amount(&mut utxo_queue, &mut consumed_outpoints, "reorg stress buy", buy_in_sompi + buy_fee);
+        let buy_change = buy_utxo.1.amount - buy_in_sompi - buy_fee;
+        let buy_vault_input = (
+            TransactionOutpoint::new(pool_before_buy.vault_txid, pool_before_buy.vault_output_index),
+            UtxoEntry::new(pool_vault_value, liquidity_vault_script(), 0, false),
+        );
+        let buy_tx = build_payload_tx_with_outputs(
+            &owner_sk,
+            vec![(buy_vault_input.0, buy_vault_input.1.clone(), 0), (buy_utxo.0, buy_utxo.1.clone(), 1)],
+            vec![
+                TransactionOutput { value: pool_vault_value + buy_in_sompi, script_public_key: liquidity_vault_script() },
+                TransactionOutput { value: buy_change, script_public_key: pay_to_address_script(&owner_address) },
+            ],
+            payload_buy_liquidity(
+                1,
+                liquidity_asset_nonce,
+                liquidity_asset_bytes,
+                pool_before_buy.pool_nonce,
+                buy_in_sompi,
+                buy_min_token_out,
+            ),
+        );
+        liquidity_asset_nonce += 1;
+        expected_pool_nonce += 1;
+        let buy_label = format!("reorg-liquidity-buy-{round}");
+        let buy_txid = buy_tx.id();
+        token_txids.push((buy_label.clone(), buy_txid));
+        phase_token_txids.push((buy_label.clone(), buy_txid));
+        phase_all_txids.push(stress_tx_trace(buy_label.clone(), buy_txid, vec![buy_vault_input, buy_utxo], &accepted_producer_txids));
+        ordered_queued.push((buy_label, buy_tx));
+        submitted_liquidity_buys += 1;
+
+        let phase_queued = parallel_queued.len() + ordered_queued.len();
+        let parallel_submit = tokio::spawn(submit_transactions_parallel_owned(client1.clone(), parallel_queued, 32));
+        for (label, tx) in &ordered_queued {
+            submit_transaction_and_assert_mempool(&client1, label, tx).await;
+        }
+        parallel_submit.await.expect("reorg stress parallel submit task panicked");
+        let phase_mempool = client1.get_mempool_entries(false, false).await.unwrap();
+        max_mempool_entries = max_mempool_entries.max(phase_mempool.len());
+        assert!(phase_mempool.len() >= phase_queued, "reorg stress phase did not queue enough txs");
+
+        let phase_chain_start = client1.get_block_dag_info().await.unwrap().sink;
+        let (phase_max_block_txs, phase_mined_blocks) = drain_stress_mempool(&client1, &owner_address, "reorg stress phase").await;
+        max_block_template_txs = max_block_template_txs.max(phase_max_block_txs);
+        mined_stress_blocks += phase_mined_blocks;
+        let phase_accepted =
+            assert_txids_accepted_since(&client1, phase_chain_start, &phase_all_txids, &format!("reorg stress phase {round}")).await;
+        accepted_producer_txids.extend(phase_accepted);
+        assert_token_statuses_applied(&client1, &phase_token_txids, &format!("reorg stress phase {round}")).await;
+
+        let pool_after_buy = client1
+            .get_liquidity_pool_state_call(
+                None,
+                GetLiquidityPoolStateRequest { asset_id: liquidity_asset_id.clone(), at_block_hash: None },
+            )
+            .await
+            .unwrap()
+            .pool
+            .expect("liquidity pool must exist after reorg stress buy");
+        assert_eq!(pool_after_buy.pool_nonce, expected_pool_nonce);
+        let sell_token_in = 2u128;
+        let sell_quote = client1
+            .get_liquidity_quote_call(
+                None,
+                GetLiquidityQuoteRequest {
+                    asset_id: liquidity_asset_id.clone(),
+                    side: 1,
+                    exact_in_amount: sell_token_in.to_string(),
+                    at_block_hash: None,
+                },
+            )
+            .await
+            .unwrap();
+        let sell_cpay_out = sell_quote.amount_out.parse::<u64>().unwrap();
+        let sell_fee = required_fee(2, 3);
+        let sell_change = buy_change - sell_fee;
+        let sell_vault_value = pool_after_buy.vault_value_sompi.parse::<u64>().unwrap() - sell_cpay_out;
+        let sell_vault_input = (
+            TransactionOutpoint::new(pool_after_buy.vault_txid, pool_after_buy.vault_output_index),
+            UtxoEntry::new(pool_after_buy.vault_value_sompi.parse::<u64>().unwrap(), liquidity_vault_script(), 0, false),
+        );
+        let sell_change_input =
+            (TransactionOutpoint::new(buy_txid, 1), UtxoEntry::new(buy_change, pay_to_address_script(&owner_address), 0, false));
+        let sell_tx = build_payload_tx_with_outputs(
+            &owner_sk,
+            vec![(sell_vault_input.0, sell_vault_input.1.clone(), 0), (sell_change_input.0, sell_change_input.1.clone(), 1)],
+            vec![
+                TransactionOutput { value: sell_vault_value, script_public_key: liquidity_vault_script() },
+                TransactionOutput { value: sell_cpay_out, script_public_key: pay_to_address_script(&owner_address) },
+                TransactionOutput { value: sell_change, script_public_key: pay_to_address_script(&owner_address) },
+            ],
+            payload_sell_liquidity(
+                1,
+                liquidity_asset_nonce,
+                liquidity_asset_bytes,
+                pool_after_buy.pool_nonce,
+                sell_token_in,
+                sell_cpay_out,
+                1,
+            ),
+        );
+        liquidity_asset_nonce += 1;
+        expected_pool_nonce += 1;
+        let sell_label = format!("reorg-liquidity-sell-{round}");
+        let sell_txid = sell_tx.id();
+        token_txids.push((sell_label.clone(), sell_txid));
+        let sell_phase_txids =
+            vec![stress_tx_trace(sell_label.clone(), sell_txid, vec![sell_vault_input, sell_change_input], &accepted_producer_txids)];
+        let sell_phase_token_txids = vec![(sell_label.clone(), sell_txid)];
+        submit_transaction_and_assert_mempool(&client1, &sell_label, &sell_tx).await;
+        submitted_liquidity_sells += 1;
+        let sell_chain_start = client1.get_block_dag_info().await.unwrap().sink;
+        let (sell_max_block_txs, sell_mined_blocks) = drain_stress_mempool(&client1, &owner_address, "reorg stress sell").await;
+        max_block_template_txs = max_block_template_txs.max(sell_max_block_txs);
+        mined_stress_blocks += sell_mined_blocks;
+        let sell_accepted =
+            assert_txids_accepted_since(&client1, sell_chain_start, &sell_phase_txids, &format!("reorg stress sell {round}")).await;
+        accepted_producer_txids.extend(sell_accepted);
+        assert_token_statuses_applied(&client1, &sell_phase_token_txids, &format!("reorg stress sell {round}")).await;
+
+        let pool_after_sell = client1
+            .get_liquidity_pool_state_call(
+                None,
+                GetLiquidityPoolStateRequest { asset_id: liquidity_asset_id.clone(), at_block_hash: None },
+            )
+            .await
+            .unwrap()
+            .pool
+            .expect("liquidity pool must exist after reorg stress sell");
+        assert_eq!(pool_after_sell.pool_nonce, expected_pool_nonce);
+        let unclaimed_after_sell = pool_after_sell.unclaimed_fee_total_sompi.parse::<u64>().unwrap();
+        if round % 2 == 0 && unclaimed_after_sell >= 12_000_000 {
+            let claim_amount = 12_000_000u64;
+            let claim_fee = required_fee(2, 3);
+            let claim_change = sell_change - claim_fee;
+            let claim_vault_value = pool_after_sell.vault_value_sompi.parse::<u64>().unwrap() - claim_amount;
+            let claim_vault_input = (
+                TransactionOutpoint::new(pool_after_sell.vault_txid, pool_after_sell.vault_output_index),
+                UtxoEntry::new(pool_after_sell.vault_value_sompi.parse::<u64>().unwrap(), liquidity_vault_script(), 0, false),
+            );
+            let claim_change_input =
+                (TransactionOutpoint::new(sell_txid, 2), UtxoEntry::new(sell_change, pay_to_address_script(&owner_address), 0, false));
+            let claim_tx = build_payload_tx_with_outputs(
+                &owner_sk,
+                vec![(claim_vault_input.0, claim_vault_input.1.clone(), 0), (claim_change_input.0, claim_change_input.1.clone(), 1)],
+                vec![
+                    TransactionOutput { value: claim_vault_value, script_public_key: liquidity_vault_script() },
+                    TransactionOutput { value: claim_amount, script_public_key: pay_to_address_script(&owner_address) },
+                    TransactionOutput { value: claim_change, script_public_key: pay_to_address_script(&owner_address) },
+                ],
+                payload_claim_liquidity(
+                    1,
+                    liquidity_asset_nonce,
+                    liquidity_asset_bytes,
+                    pool_after_sell.pool_nonce,
+                    0,
+                    claim_amount,
+                    1,
+                ),
+            );
+            liquidity_asset_nonce += 1;
+            expected_pool_nonce += 1;
+            let claim_label = format!("reorg-liquidity-claim-{round}");
+            let claim_txid = claim_tx.id();
+            token_txids.push((claim_label.clone(), claim_txid));
+            let claim_phase_txids = vec![stress_tx_trace(
+                claim_label.clone(),
+                claim_txid,
+                vec![claim_vault_input, claim_change_input],
+                &accepted_producer_txids,
+            )];
+            let claim_phase_token_txids = vec![(claim_label.clone(), claim_txid)];
+            submit_transaction_and_assert_mempool(&client1, &claim_label, &claim_tx).await;
+            submitted_liquidity_claims += 1;
+            let claim_chain_start = client1.get_block_dag_info().await.unwrap().sink;
+            let (claim_max_block_txs, claim_mined_blocks) = drain_stress_mempool(&client1, &owner_address, "reorg stress claim").await;
+            max_block_template_txs = max_block_template_txs.max(claim_max_block_txs);
+            mined_stress_blocks += claim_mined_blocks;
+            let claim_accepted =
+                assert_txids_accepted_since(&client1, claim_chain_start, &claim_phase_txids, &format!("reorg stress claim {round}"))
+                    .await;
+            accepted_producer_txids.extend(claim_accepted);
+            assert_token_statuses_applied(&client1, &claim_phase_token_txids, &format!("reorg stress claim {round}")).await;
+
+            let pool_after_claim = client1
+                .get_liquidity_pool_state_call(
+                    None,
+                    GetLiquidityPoolStateRequest { asset_id: liquidity_asset_id.clone(), at_block_hash: None },
+                )
+                .await
+                .unwrap()
+                .pool
+                .expect("liquidity pool must exist after reorg stress claim");
+            assert_eq!(pool_after_claim.pool_nonce, expected_pool_nonce);
+        }
+    }
+
+    let remaining = client1.get_mempool_entries(false, false).await.unwrap();
+    assert!(remaining.is_empty(), "reorg stress ended losing branch with non-empty mempool: remaining={}", remaining.len());
+    assert!(active_stress_wallets.len() == stress_wallets.len(), "not all stress wallets became active");
+    assert!(max_mempool_entries >= 50, "reorg stress did not build enough mempool pressure: {max_mempool_entries}");
+    assert!(max_block_template_txs >= 45, "reorg stress did not mine a large stress block: {max_block_template_txs}");
+    assert!(submitted_native > 0 && submitted_messenger > 0 && submitted_raw_payloads > 0);
+    assert!(submitted_token_creates > 0 && submitted_wallet_token_creates > 0 && submitted_base_ops > 0);
+    assert!(submitted_liquidity_buys > 0 && submitted_liquidity_sells > 0 && submitted_liquidity_claims > 0);
+    assert_token_statuses_applied(&client1, &token_txids, "reorg stress losing branch").await;
+
+    let losing_chain = client1.get_virtual_chain_from_block(pre_stress_sink, true).await.unwrap();
+    let losing_blocks = losing_chain.added_chain_block_hashes.len();
+    let losing_accepted_txs =
+        losing_chain.accepted_transaction_ids.iter().map(|entry| entry.accepted_transaction_ids.len()).sum::<usize>();
+    let state_before_reorg = client1.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
+    assert_ne!(state_before_reorg.context.state_hash, pre_stress_state.context.state_hash);
+    assert_consensus_atomic_hash_exists(&client1, state_before_reorg.context.at_block_hash, "reorg stress losing branch state").await;
+
+    let base_asset_before = client1
+        .get_token_asset_call(None, GetTokenAssetRequest { asset_id: base_asset_id.clone(), at_block_hash: None })
+        .await
+        .unwrap()
+        .asset
+        .expect("reorg stress base asset must exist before reorg");
+    assert!(base_asset_before.total_supply.parse::<u128>().unwrap() > 0);
+    let pool_before_reorg = client1
+        .get_liquidity_pool_state_call(
+            None,
+            GetLiquidityPoolStateRequest { asset_id: liquidity_asset_id.clone(), at_block_hash: None },
+        )
+        .await
+        .unwrap()
+        .pool
+        .expect("reorg stress liquidity pool must exist before reorg");
+    assert!(pool_before_reorg.pool_nonce > 1);
+
+    let events_before = client1
+        .get_token_events_call(
+            None,
+            GetTokenEventsRequest { after_sequence: 0, limit: TOKEN_EVENTS_RPC_PAGE_LIMIT, at_block_hash: None },
+        )
+        .await
+        .unwrap();
+    let mut applied_event_ids = HashMap::new();
+    for (label, txid) in &token_txids {
+        let status =
+            client1.get_token_op_status_call(None, GetTokenOpStatusRequest { txid: *txid, at_block_hash: None }).await.unwrap();
+        assert_eq!(status.apply_status, Some(0), "losing branch token tx {label}/{txid} must be applied before reorg");
+        let event = events_before
+            .events
+            .iter()
+            .find(|event| event.txid == *txid && event.apply_status == 0 && event.reorg_of_event_id.is_none())
+            .unwrap_or_else(|| panic!("missing applied event before reorg for {label}/{txid}"));
+        applied_event_ids.insert(*txid, event.event_id.clone());
+    }
+
+    let tip1_count = client1.get_block_dag_info().await.unwrap().block_count;
+    while client2.get_block_dag_info().await.unwrap().block_count < tip1_count + 40 {
+        mine_blocks(&client2, &winning_owner_address, 1).await;
+    }
+    let chain2 = client2.get_virtual_chain_from_block(cryptix_consensus::params::SIMNET_GENESIS.hash, true).await.unwrap();
+    assert!(chain2.removed_chain_block_hashes.is_empty());
+    let winning_blocks = chain2.added_chain_block_hashes;
+    let winning_sink = *winning_blocks.last().expect("winning reorg branch must have blocks");
+    let winning_block_count = winning_blocks.len();
+    for hash in winning_blocks {
+        let block = client2.get_block_call(None, GetBlockRequest { hash, include_transactions: true }).await.unwrap().block;
+        let raw_block = RpcRawBlock { header: Header::from(&block.header).into(), transactions: block.transactions };
+        let _ = client1.submit_block(raw_block, false).await;
+    }
+
+    let sink_client = client1.clone();
+    wait_for(
+        100,
+        400,
+        move || {
+            async fn adopted(client: GrpcClient, expected_sink: cryptix_hashes::Hash) -> bool {
+                client.get_block_dag_info().await.map(|info| info.sink == expected_sink).unwrap_or(false)
+            }
+            Box::pin(adopted(sink_client.clone(), winning_sink))
+        },
+        "node did not adopt reorg stress winning branch",
+    )
+    .await;
+
+    let health_after_reorg = wait_for_healthy_atomic_at_sink(&client1, winning_sink, "reorg stress winning branch").await;
+    assert_eq!(health_after_reorg.last_applied_block, Some(winning_sink));
+    let state_after_reorg = client1.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
+    assert_eq!(state_after_reorg.context.at_block_hash, winning_sink);
+    assert_eq!(health_after_reorg.state_hash, state_after_reorg.context.state_hash);
+    assert_eq!(
+        state_after_reorg.context.state_hash, pre_stress_state.context.state_hash,
+        "reorg stress winning token-empty branch must restore the exact pre-stress Atomic state"
+    );
+    assert_ne!(state_after_reorg.context.state_hash, state_before_reorg.context.state_hash);
+    assert_consensus_atomic_hash_exists(&client1, winning_sink, "reorg stress winning branch state").await;
+
+    let events_after = client1
+        .get_token_events_call(
+            None,
+            GetTokenEventsRequest { after_sequence: 0, limit: TOKEN_EVENTS_RPC_PAGE_LIMIT, at_block_hash: None },
+        )
+        .await
+        .unwrap();
+    for (label, txid) in &token_txids {
+        let status =
+            client1.get_token_op_status_call(None, GetTokenOpStatusRequest { txid: *txid, at_block_hash: None }).await.unwrap();
+        assert!(status.apply_status.is_none(), "reorged token tx {label}/{txid} must not keep an op status");
+        let applied_event_id = applied_event_ids.get(txid).expect("applied event id must be captured before reorg");
+        assert!(
+            events_after.events.iter().any(|event| {
+                event.txid == *txid && event.event_type == 2 && event.reorg_of_event_id.as_deref() == Some(applied_event_id.as_str())
+            }),
+            "missing reorged event for stress tx {label}/{txid}"
+        );
+    }
+
+    for asset_id in &created_asset_ids {
+        let asset = client1
+            .get_token_asset_call(None, GetTokenAssetRequest { asset_id: asset_id.clone(), at_block_hash: None })
+            .await
+            .unwrap();
+        assert!(asset.asset.is_none(), "reorged stress asset {asset_id} must disappear after reorg");
+    }
+    for owner in std::iter::once(owner_id_hex.clone())
+        .chain(std::iter::once(receiver_id_hex.clone()))
+        .chain(stress_wallets.iter().map(|wallet| wallet.owner_id_hex.clone()))
+    {
+        let balance = client1
+            .get_token_balance_call(
+                None,
+                GetTokenBalanceRequest { asset_id: base_asset_id.clone(), owner_id: owner, at_block_hash: None },
+            )
+            .await
+            .unwrap();
+        assert_eq!(balance.balance, "0", "reorged base asset balance must be zero");
+    }
+    let owner_nonce_after = client1
+        .get_token_nonce_call(None, GetTokenNonceRequest { owner_id: owner_id_hex.clone(), asset_id: None, at_block_hash: None })
+        .await
+        .unwrap();
+    assert_eq!(owner_nonce_after.expected_next_nonce, 1);
+    for wallet in &stress_wallets {
+        let nonce_after = client1
+            .get_token_nonce_call(
+                None,
+                GetTokenNonceRequest { owner_id: wallet.owner_id_hex.clone(), asset_id: None, at_block_hash: None },
+            )
+            .await
+            .unwrap();
+        assert_eq!(nonce_after.expected_next_nonce, 1, "{} owner nonce must reset after reorg", wallet.label);
+    }
+
+    for _ in 0..80 {
+        if client1.get_mempool_entries(false, false).await.unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let remaining_after_reorg = client1.get_mempool_entries(false, false).await.unwrap();
+    assert!(remaining_after_reorg.is_empty(), "reorg stress left stale transactions in mempool: {}", remaining_after_reorg.len());
+
+    let winner_utxos = fetch_spendable_utxos(&client1, winning_owner_address.clone(), coinbase_maturity).await;
+    assert!(!winner_utxos.is_empty(), "winning branch must fund the post-reorg owner");
+    let fresh_create_tx = build_payload_tx(
+        Keypair::from_secret_key(secp256k1::SECP256K1, &winning_owner_sk),
+        &winner_utxos[0],
+        &winning_owner_address,
+        payload_create_asset(0, 1, 0, winning_owner_id, b"ReorgStressAfter", b"RSA", b"winning-branch"),
+    );
+    let fresh_asset_id = fresh_create_tx.id().to_string();
+    submit_and_wait_indexed(&client1, &fresh_create_tx, &winning_owner_address).await;
+    let fresh_asset = client1
+        .get_token_asset_call(None, GetTokenAssetRequest { asset_id: fresh_asset_id, at_block_hash: None })
+        .await
+        .unwrap()
+        .asset
+        .expect("fresh post-reorg stress asset must exist");
+    assert_eq!(fresh_asset.symbol, "RSA");
+    let winner_nonce_after_fresh = client1
+        .get_token_nonce_call(None, GetTokenNonceRequest { owner_id: winning_owner_id_hex, asset_id: None, at_block_hash: None })
+        .await
+        .unwrap();
+    assert_eq!(winner_nonce_after_fresh.expected_next_nonce, 2);
+
+    println!(
+        "reorg stress summary: rounds={} wallets={} active_wallets={} native={} messenger={} raw_payloads={} token_creates={} wallet_token_creates={} base_ops={} buys={} sells={} claims={} token_txs={} losing_blocks={} losing_accepted_txs={} winning_blocks={} max_mempool_entries={} max_block_template_txs={} mined_stress_blocks={} before_hash={} after_hash={}",
+        rounds,
+        stress_wallets.len(),
+        active_stress_wallets.len(),
+        submitted_native,
+        submitted_messenger,
+        submitted_raw_payloads,
+        submitted_token_creates,
+        submitted_wallet_token_creates,
+        submitted_base_ops,
+        submitted_liquidity_buys,
+        submitted_liquidity_sells,
+        submitted_liquidity_claims,
+        token_txids.len(),
+        losing_blocks,
+        losing_accepted_txs,
+        winning_block_count,
+        max_mempool_entries,
+        max_block_template_txs,
+        mined_stress_blocks,
+        state_before_reorg.context.state_hash,
+        state_after_reorg.context.state_hash
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
