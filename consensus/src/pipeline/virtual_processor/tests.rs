@@ -34,6 +34,9 @@ use cryptix_hashes::Hash;
 use cryptix_muhash::MuHash;
 use std::{collections::VecDeque, sync::Arc, thread::JoinHandle, time::Duration};
 
+#[path = "atomic_stress_crosscheck.rs"]
+mod atomic_stress_crosscheck;
+
 struct OnetimeTxSelector {
     txs: Option<Vec<Transaction>>,
     rejected: bool,
