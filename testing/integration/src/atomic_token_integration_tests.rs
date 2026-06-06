@@ -39,6 +39,10 @@ const OWNER_AUTH_SCHEME_PUBKEY_ECDSA: u8 = 1;
 const ATOMIC_TEST_PAYLOAD_HF_DAA: u64 = 2;
 const ATOMIC_LONG_STRESS_DEFAULT_SECONDS: u64 = 300;
 const ATOMIC_LONG_STRESS_INDEX_WAIT_ATTEMPTS: usize = 1_800;
+const ATOMIC_LONG_STRESS_WALLET_COUNT: usize = 8;
+const ATOMIC_LONG_STRESS_WALLET_FUNDING_OUTPUTS: usize = 12;
+const ATOMIC_LONG_STRESS_WALLET_MIN_UTXOS: usize = 16;
+const ATOMIC_LONG_STRESS_WALLET_TOKEN_CREATES_PER_ROUND: u64 = 4;
 const TOKEN_EVENTS_RPC_PAGE_LIMIT: u32 = 4_096;
 
 fn owner_id_from_address(address: &Address) -> [u8; 32] {
@@ -313,6 +317,34 @@ fn build_stress_native_tx(signer: Keypair, utxo: &(TransactionOutpoint, UtxoEntr
     sign(MutableTransaction::with_entries(unsigned, vec![utxo.1.clone()]), signer).tx
 }
 
+fn build_stress_wallet_funding_tx(
+    signer: Keypair,
+    utxo: &(TransactionOutpoint, UtxoEntry),
+    fund_address: &Address,
+    change_address: &Address,
+    funding_outputs: usize,
+) -> Transaction {
+    let output_count = funding_outputs + 1;
+    let minimum_fee = required_fee(1, output_count as u64);
+    assert!(utxo.1.amount > minimum_fee, "stress wallet funding UTXO is too small");
+    let spendable = utxo.1.amount - minimum_fee;
+    let funding_value = spendable / (funding_outputs as u64 + 1);
+    assert!(funding_value > required_fee(1, 1), "stress wallet funding output is too small: funding_value={funding_value}");
+
+    let mut outputs = Vec::with_capacity(output_count);
+    for _ in 0..funding_outputs {
+        outputs.push(TransactionOutput { value: funding_value, script_public_key: pay_to_address_script(fund_address) });
+    }
+    outputs.push(TransactionOutput {
+        value: spendable - funding_value * funding_outputs as u64,
+        script_public_key: pay_to_address_script(change_address),
+    });
+
+    let input = TransactionInput { previous_outpoint: utxo.0, signature_script: vec![], sequence: 0, sig_op_count: 1 };
+    let unsigned = Transaction::new(TX_VERSION, vec![input], outputs, 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+    sign(MutableTransaction::with_entries(unsigned, vec![utxo.1.clone()]), signer).tx
+}
+
 fn build_payload_tx_with_outputs(
     signer_secret: &secp256k1::SecretKey,
     inputs: Vec<(TransactionOutpoint, UtxoEntry, u8)>,
@@ -515,6 +547,25 @@ struct StressTxTrace {
     label: String,
     txid: TransactionId,
     inputs: Vec<StressInputTrace>,
+}
+
+struct StressWallet {
+    label: String,
+    secret: secp256k1::SecretKey,
+    address: Address,
+    owner_id: [u8; 32],
+    owner_id_hex: String,
+    pubkey_bytes: [u8; 32],
+    queue: VecDeque<(TransactionOutpoint, UtxoEntry)>,
+    consumed_outpoints: HashSet<TransactionOutpoint>,
+    owner_nonce: u64,
+    expected_base_balance: u128,
+}
+
+impl StressWallet {
+    fn keypair(&self) -> Keypair {
+        Keypair::from_secret_key(secp256k1::SECP256K1, &self.secret)
+    }
 }
 
 fn stress_tx_trace(
@@ -1486,6 +1537,25 @@ async fn atomic_token_ignored_long_full_chain_stress_mempool_blocks_and_state() 
     let owner_address = Address::new(daemon.network.into(), Version::PubKey, &owner_pk.x_only_public_key().0.serialize());
     let (_receiver_sk, receiver_pk) = secp256k1::generate_keypair(&mut thread_rng());
     let receiver_address = Address::new(daemon.network.into(), Version::PubKey, &receiver_pk.x_only_public_key().0.serialize());
+    let mut stress_wallets = Vec::with_capacity(ATOMIC_LONG_STRESS_WALLET_COUNT);
+    for wallet_index in 0..ATOMIC_LONG_STRESS_WALLET_COUNT {
+        let (secret, public) = secp256k1::generate_keypair(&mut thread_rng());
+        let pubkey_bytes = public.x_only_public_key().0.serialize();
+        let address = Address::new(daemon.network.into(), Version::PubKey, &pubkey_bytes);
+        let owner_id = owner_id_from_address(&address);
+        stress_wallets.push(StressWallet {
+            label: format!("wallet-{wallet_index}"),
+            secret,
+            address,
+            owner_id,
+            owner_id_hex: hex32(owner_id),
+            pubkey_bytes,
+            queue: VecDeque::new(),
+            consumed_outpoints: HashSet::new(),
+            owner_nonce: 1,
+            expected_base_balance: 0,
+        });
+    }
     let owner_pubkey_bytes = owner_pk.x_only_public_key().0.serialize();
     let owner_id = owner_id_from_address(&owner_address);
     let receiver_id = owner_id_from_address(&receiver_address);
@@ -1499,6 +1569,46 @@ async fn atomic_token_ignored_long_full_chain_stress_mempool_blocks_and_state() 
     let mut consumed_outpoints = HashSet::new();
     let mut accepted_producer_txids = HashSet::new();
     let mut token_txids = Vec::new();
+
+    let wallet_funding_chain_start = client.get_block_dag_info().await.unwrap().sink;
+    let mut wallet_funding_txs = Vec::with_capacity(stress_wallets.len());
+    let mut wallet_funding_traces = Vec::with_capacity(stress_wallets.len());
+    for wallet in &stress_wallets {
+        let funding_utxo = pop_stress_utxo(&mut utxo_queue, &mut consumed_outpoints, "stress wallet funding");
+        let funding_tx = build_stress_wallet_funding_tx(
+            owner_keypair(),
+            &funding_utxo,
+            &wallet.address,
+            &owner_address,
+            ATOMIC_LONG_STRESS_WALLET_FUNDING_OUTPUTS,
+        );
+        let label = format!("long-fund-{}", wallet.label);
+        wallet_funding_traces.push(stress_tx_trace(
+            label.clone(),
+            funding_tx.id(),
+            vec![funding_utxo.clone()],
+            &accepted_producer_txids,
+        ));
+        wallet_funding_txs.push((label, funding_tx));
+    }
+    submit_transactions_parallel_owned(client.clone(), wallet_funding_txs, ATOMIC_LONG_STRESS_WALLET_COUNT).await;
+    let _ = drain_stress_mempool(&client, &owner_address, "long stress wallet funding").await;
+    let wallet_funding_accepted =
+        assert_txids_accepted_since(&client, wallet_funding_chain_start, &wallet_funding_traces, "long stress wallet funding").await;
+    accepted_producer_txids.extend(wallet_funding_accepted);
+    for wallet in &mut stress_wallets {
+        refill_stress_utxos(
+            &client,
+            consensus_manager.as_ref(),
+            &wallet.address,
+            coinbase_maturity,
+            &mut wallet.queue,
+            &wallet.consumed_outpoints,
+            &accepted_producer_txids,
+            ATOMIC_LONG_STRESS_WALLET_FUNDING_OUTPUTS,
+        )
+        .await;
+    }
 
     let base_create_utxo = pop_stress_utxo(&mut utxo_queue, &mut consumed_outpoints, "base asset create");
     let base_create_tx = build_stress_payload_tx(
@@ -1572,20 +1682,27 @@ async fn atomic_token_ignored_long_full_chain_stress_mempool_blocks_and_state() 
     let mut expected_owner_base_balance = 250_000u128;
     let mut expected_receiver_base_balance = 0u128;
     let mut expected_base_supply = 250_000u128;
-    let mut created_assets = Vec::<(String, String, String, u128)>::new();
+    let mut created_assets = Vec::<(String, String, String, String, u128)>::new();
     let mut submitted_native = 0usize;
     let mut submitted_messenger = 0usize;
     let mut submitted_raw_payloads = 0usize;
     let mut submitted_token_creates = 0usize;
+    let mut submitted_wallet_native = 0usize;
+    let mut submitted_wallet_messenger = 0usize;
+    let mut submitted_wallet_raw_payloads = 0usize;
+    let mut submitted_wallet_token_creates = 0usize;
     let mut submitted_base_ops = 0usize;
     let mut submitted_liquidity_buys = 0usize;
     let mut submitted_liquidity_sells = 0usize;
     let mut submitted_liquidity_claims = 0usize;
+    let mut active_stress_wallets = HashSet::new();
     let mut max_mempool_entries = 0usize;
     let mut max_block_template_txs = 0usize;
     let mut mined_stress_blocks = 0u64;
     let stress_started = Instant::now();
     let mut round = 0u64;
+    let stress_addresses = stress_wallets.iter().map(|wallet| wallet.address.clone()).collect::<Vec<_>>();
+    let stress_owner_ids = stress_wallets.iter().map(|wallet| wallet.owner_id).collect::<Vec<_>>();
 
     while stress_started.elapsed() < stress_duration || round == 0 {
         refill_stress_utxos(
@@ -1599,6 +1716,19 @@ async fn atomic_token_ignored_long_full_chain_stress_mempool_blocks_and_state() 
             100,
         )
         .await;
+        for wallet in &mut stress_wallets {
+            refill_stress_utxos(
+                &client,
+                consensus_manager.as_ref(),
+                &wallet.address,
+                coinbase_maturity,
+                &mut wallet.queue,
+                &wallet.consumed_outpoints,
+                &accepted_producer_txids,
+                ATOMIC_LONG_STRESS_WALLET_MIN_UTXOS,
+            )
+            .await;
+        }
 
         let mut parallel_queued = Vec::new();
         let mut ordered_queued = Vec::new();
@@ -1640,6 +1770,53 @@ async fn atomic_token_ignored_long_full_chain_stress_mempool_blocks_and_state() 
             submitted_raw_payloads += 1;
         }
 
+        for wallet_index in 0..stress_wallets.len() {
+            let recipient_index = (wallet_index + round as usize + 1) % stress_addresses.len();
+            let wallet = &mut stress_wallets[wallet_index];
+            let utxo = pop_stress_utxo(&mut wallet.queue, &mut wallet.consumed_outpoints, "multi-wallet native stress tx");
+            let tx = build_stress_native_tx(wallet.keypair(), &utxo, &stress_addresses[recipient_index]);
+            let label = format!("long-wallet-native-{round}-{wallet_index}");
+            phase_all_txids.push(stress_tx_trace(label.clone(), tx.id(), vec![utxo.clone()], &accepted_producer_txids));
+            parallel_queued.push((label, tx));
+            active_stress_wallets.insert(wallet.owner_id_hex.clone());
+            submitted_native += 1;
+            submitted_wallet_native += 1;
+        }
+
+        for wallet_index in 0..stress_wallets.len() {
+            let recipient_index = (wallet_index + round as usize + 2) % stress_addresses.len();
+            let wallet = &mut stress_wallets[wallet_index];
+            let utxo = pop_stress_utxo(&mut wallet.queue, &mut wallet.consumed_outpoints, "multi-wallet messenger stress tx");
+            let body_len = 128 + (((round + wallet_index as u64) % 7) as usize * 48);
+            let tx = build_stress_payload_tx(
+                wallet.keypair(),
+                &utxo,
+                &stress_addresses[recipient_index],
+                messenger_payload_v1(round * 100_000 + wallet_index as u64, wallet.pubkey_bytes, body_len),
+            );
+            let label = format!("long-wallet-messenger-{round}-{wallet_index}");
+            phase_all_txids.push(stress_tx_trace(label.clone(), tx.id(), vec![utxo.clone()], &accepted_producer_txids));
+            parallel_queued.push((label, tx));
+            active_stress_wallets.insert(wallet.owner_id_hex.clone());
+            submitted_messenger += 1;
+            submitted_wallet_messenger += 1;
+        }
+
+        for wallet_index in 0..stress_wallets.len() {
+            let recipient_index = (wallet_index + round as usize + 3) % stress_addresses.len();
+            let wallet = &mut stress_wallets[wallet_index];
+            let utxo = pop_stress_utxo(&mut wallet.queue, &mut wallet.consumed_outpoints, "multi-wallet raw payload stress tx");
+            let mut payload = format!("RAW:multi-wallet:{round}:{wallet_index}:").into_bytes();
+            payload.resize(160 + (((round + wallet_index as u64) % 6) as usize * 80), (wallet_index as u8).wrapping_add(round as u8));
+            let tx = build_stress_payload_tx(wallet.keypair(), &utxo, &stress_addresses[recipient_index], payload);
+            let label = format!("long-wallet-raw-payload-{round}-{wallet_index}");
+            phase_all_txids.push(stress_tx_trace(label.clone(), tx.id(), vec![utxo.clone()], &accepted_producer_txids));
+            parallel_queued.push((label, tx));
+            active_stress_wallets.insert(wallet.owner_id_hex.clone());
+            submitted_raw_payloads += 1;
+            submitted_wallet_raw_payloads += 1;
+        }
+
         for i in 0..6u64 {
             let utxo = pop_stress_utxo(&mut utxo_queue, &mut consumed_outpoints, "stress token create");
             let initial_mint = 1_000u128 + u128::from(round * 6 + i);
@@ -1668,9 +1845,46 @@ async fn atomic_token_ignored_long_full_chain_stress_mempool_blocks_and_state() 
             token_txids.push((label.clone(), txid));
             phase_token_txids.push((label.clone(), txid));
             phase_all_txids.push(stress_tx_trace(label.clone(), txid, vec![utxo.clone()], &accepted_producer_txids));
-            created_assets.push((txid.to_string(), name, symbol, initial_mint));
+            created_assets.push((txid.to_string(), name, symbol, owner_id_hex.clone(), initial_mint));
             ordered_queued.push((label, tx));
             submitted_token_creates += 1;
+        }
+
+        for i in 0..ATOMIC_LONG_STRESS_WALLET_TOKEN_CREATES_PER_ROUND {
+            let wallet_index = (round as usize + i as usize) % stress_wallets.len();
+            let wallet = &mut stress_wallets[wallet_index];
+            let utxo = pop_stress_utxo(&mut wallet.queue, &mut wallet.consumed_outpoints, "multi-wallet token create");
+            let initial_mint = 700u128 + u128::from(round * ATOMIC_LONG_STRESS_WALLET_TOKEN_CREATES_PER_ROUND + i);
+            let name = format!("WalletStress{wallet_index:02}{round:04}{i:02}");
+            let symbol = format!("W{wallet_index:02}{round:04}{i:02}");
+            let tx = build_stress_payload_tx(
+                wallet.keypair(),
+                &utxo,
+                &wallet.address,
+                payload_create_asset_with_mint(
+                    0,
+                    wallet.owner_nonce,
+                    0,
+                    500_000_000,
+                    wallet.owner_id,
+                    wallet.owner_id,
+                    initial_mint,
+                    name.as_bytes(),
+                    symbol.as_bytes(),
+                    b"long-stress-wallet-created",
+                ),
+            );
+            wallet.owner_nonce += 1;
+            let label = format!("long-wallet-create-{round}-{wallet_index}-{i}");
+            let txid = tx.id();
+            token_txids.push((label.clone(), txid));
+            phase_token_txids.push((label.clone(), txid));
+            phase_all_txids.push(stress_tx_trace(label.clone(), txid, vec![utxo.clone()], &accepted_producer_txids));
+            created_assets.push((txid.to_string(), name, symbol, wallet.owner_id_hex.clone(), initial_mint));
+            ordered_queued.push((label, tx));
+            active_stress_wallets.insert(wallet.owner_id_hex.clone());
+            submitted_token_creates += 1;
+            submitted_wallet_token_creates += 1;
         }
 
         for i in 0..8u64 {
@@ -1697,15 +1911,21 @@ async fn atomic_token_ignored_long_full_chain_stress_mempool_blocks_and_state() 
             submitted_base_ops += 1;
 
             let transfer_utxo = pop_stress_utxo(&mut utxo_queue, &mut consumed_outpoints, "stress token transfer");
+            let recipient_slot = ((round + i) as usize) % (stress_owner_ids.len() + 1);
+            let transfer_recipient = if recipient_slot == 0 { receiver_id } else { stress_owner_ids[recipient_slot - 1] };
             let transfer_tx = build_stress_payload_tx(
                 owner_keypair(),
                 &transfer_utxo,
                 &owner_address,
-                payload_transfer(0, base_asset_nonce, base_asset_bytes, receiver_id, transfer_amount),
+                payload_transfer(0, base_asset_nonce, base_asset_bytes, transfer_recipient, transfer_amount),
             );
             base_asset_nonce += 1;
             expected_owner_base_balance -= transfer_amount;
-            expected_receiver_base_balance += transfer_amount;
+            if recipient_slot == 0 {
+                expected_receiver_base_balance += transfer_amount;
+            } else {
+                stress_wallets[recipient_slot - 1].expected_base_balance += transfer_amount;
+            }
             let transfer_label = format!("long-transfer-{round}-{i}");
             let transfer_txid = transfer_tx.id();
             token_txids.push((transfer_label.clone(), transfer_txid));
@@ -1996,19 +2216,36 @@ async fn atomic_token_ignored_long_full_chain_stress_mempool_blocks_and_state() 
     assert!(submitted_messenger > 0);
     assert!(submitted_raw_payloads > 0);
     assert!(submitted_token_creates > 0);
+    assert_eq!(
+        active_stress_wallets.len(),
+        stress_wallets.len(),
+        "expected every stress wallet to submit transactions: active={} total={}",
+        active_stress_wallets.len(),
+        stress_wallets.len()
+    );
+    assert!(submitted_wallet_native > 0);
+    assert!(submitted_wallet_messenger > 0);
+    assert!(submitted_wallet_raw_payloads > 0);
+    assert!(submitted_wallet_token_creates > 0);
     assert!(submitted_base_ops > 0);
     assert!(submitted_liquidity_buys > 0);
     assert!(submitted_liquidity_sells > 0);
     assert!(submitted_liquidity_claims > 0);
 
     println!(
-        "long stress summary: duration_secs={} rounds={} native={} messenger={} raw_payloads={} token_creates={} base_ops={} buys={} sells={} claims={} max_mempool_entries={} max_block_template_txs={} mined_stress_blocks={}",
+        "long stress summary: duration_secs={} rounds={} wallets={} active_wallets={} native={} wallet_native={} messenger={} wallet_messenger={} raw_payloads={} wallet_raw_payloads={} token_creates={} wallet_token_creates={} base_ops={} buys={} sells={} claims={} max_mempool_entries={} max_block_template_txs={} mined_stress_blocks={}",
         stress_duration.as_secs(),
         round,
+        stress_wallets.len(),
+        active_stress_wallets.len(),
         submitted_native,
+        submitted_wallet_native,
         submitted_messenger,
+        submitted_wallet_messenger,
         submitted_raw_payloads,
+        submitted_wallet_raw_payloads,
         submitted_token_creates,
+        submitted_wallet_token_creates,
         submitted_base_ops,
         submitted_liquidity_buys,
         submitted_liquidity_sells,
@@ -2065,7 +2302,22 @@ async fn atomic_token_ignored_long_full_chain_stress_mempool_blocks_and_state() 
         .unwrap();
     assert_eq!(liquidity_asset_nonce_after.expected_next_nonce, liquidity_asset_nonce);
 
-    for (asset_id, name, symbol, initial_mint) in &created_assets {
+    for wallet in &stress_wallets {
+        let wallet_nonce_after = client
+            .get_token_nonce_call(
+                None,
+                GetTokenNonceRequest { owner_id: wallet.owner_id_hex.clone(), asset_id: None, at_block_hash: None },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wallet_nonce_after.expected_next_nonce, wallet.owner_nonce,
+            "wrong owner nonce for multi-wallet stress owner {}",
+            wallet.label
+        );
+    }
+
+    for (asset_id, name, symbol, asset_owner_id_hex, initial_mint) in &created_assets {
         let asset = client
             .get_token_asset_call(None, GetTokenAssetRequest { asset_id: asset_id.clone(), at_block_hash: None })
             .await
@@ -2078,7 +2330,7 @@ async fn atomic_token_ignored_long_full_chain_stress_mempool_blocks_and_state() 
         let balance = client
             .get_token_balance_call(
                 None,
-                GetTokenBalanceRequest { asset_id: asset_id.clone(), owner_id: owner_id_hex.clone(), at_block_hash: None },
+                GetTokenBalanceRequest { asset_id: asset_id.clone(), owner_id: asset_owner_id_hex.clone(), at_block_hash: None },
             )
             .await
             .unwrap();
@@ -2111,6 +2363,25 @@ async fn atomic_token_ignored_long_full_chain_stress_mempool_blocks_and_state() 
         .holders
         .iter()
         .any(|entry| entry.owner_id == receiver_id_hex && entry.balance == expected_receiver_base_balance.to_string()));
+    for wallet in &stress_wallets {
+        let wallet_balance = client
+            .get_token_balance_call(
+                None,
+                GetTokenBalanceRequest { asset_id: base_asset_id.clone(), owner_id: wallet.owner_id_hex.clone(), at_block_hash: None },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wallet_balance.balance,
+            wallet.expected_base_balance.to_string(),
+            "wrong base asset balance for multi-wallet stress owner {}",
+            wallet.label
+        );
+        assert!(holders
+            .holders
+            .iter()
+            .any(|entry| { entry.owner_id == wallet.owner_id_hex && entry.balance == wallet.expected_base_balance.to_string() }));
+    }
 
     let owner_balances = client
         .get_token_balances_by_owner_call(
@@ -2129,12 +2400,33 @@ async fn atomic_token_ignored_long_full_chain_stress_mempool_blocks_and_state() 
         .balances
         .iter()
         .any(|entry| entry.asset_id == base_asset_id && entry.balance == expected_owner_base_balance.to_string()));
-    assert!(created_assets.iter().all(|(asset_id, _, _, initial_mint)| {
-        owner_balances
+    assert!(created_assets.iter().filter(|(_, _, _, asset_owner_id_hex, _)| asset_owner_id_hex == &owner_id_hex).all(
+        |(asset_id, _, _, _, initial_mint)| {
+            owner_balances
+                .balances
+                .iter()
+                .any(|entry| entry.asset_id.as_str() == asset_id.as_str() && entry.balance == initial_mint.to_string())
+        }
+    ));
+    for wallet in &stress_wallets {
+        let wallet_balances = client
+            .get_token_balances_by_owner_call(
+                None,
+                GetTokenBalancesByOwnerRequest {
+                    owner_id: wallet.owner_id_hex.clone(),
+                    offset: 0,
+                    limit: (wallet.owner_nonce as usize + 16).min(u32::MAX as usize) as u32,
+                    include_assets: true,
+                    at_block_hash: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(wallet_balances
             .balances
             .iter()
-            .any(|entry| entry.asset_id.as_str() == asset_id.as_str() && entry.balance == initial_mint.to_string())
-    }));
+            .any(|entry| { entry.asset_id == base_asset_id && entry.balance == wallet.expected_base_balance.to_string() }));
+    }
 
     let pool_after = client
         .get_liquidity_pool_state_call(
