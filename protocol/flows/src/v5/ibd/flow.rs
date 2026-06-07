@@ -243,12 +243,29 @@ impl IbdFlow {
 
     async fn sync_and_validate_pruning_proof(&mut self, staging: &ConsensusProxy) -> Result<Hash, ProtocolError> {
         self.router.enqueue(make_message!(Payload::RequestPruningPointProof, RequestPruningPointProofMessage {})).await?;
-        let proof_timeout = Duration::from_secs(600);
+        let proof_wait_log_interval = Duration::from_secs(15 * 60);
         let proof_wait_started = Instant::now();
-        info!("IBD requested pruning point proof from {}; waiting up to {} seconds", self.router, proof_timeout.as_secs());
+        info!(
+            "IBD requested pruning point proof from {}; waiting with {} second progress interval",
+            self.router,
+            proof_wait_log_interval.as_secs()
+        );
 
-        // Pruning proof generation and communication might take several minutes, so we allow a long 10 minute timeout
-        let msg = dequeue_with_timeout!(self.incoming_route, Payload::PruningPointProof, proof_timeout)?;
+        // Pruning proof generation and communication can take many minutes on slow peers after a cold start.
+        // Keep the session alive across progress intervals so a late proof is still accepted.
+        let msg = loop {
+            match dequeue_with_timeout!(self.incoming_route, Payload::PruningPointProof, proof_wait_log_interval) {
+                Ok(msg) => break msg,
+                Err(ProtocolError::Timeout(_)) => {
+                    warn!(
+                        "IBD is still waiting for pruning point proof from {} after {}; keeping the session open",
+                        self.router,
+                        format!("{}s", proof_wait_started.elapsed().as_secs())
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+        };
         let proof: PruningPointProof = msg.try_into()?;
         let proof_header_count = proof.iter().map(|l| l.len()).sum::<usize>();
         info!(
