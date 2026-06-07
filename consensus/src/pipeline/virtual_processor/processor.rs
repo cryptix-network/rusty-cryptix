@@ -1177,23 +1177,43 @@ impl VirtualStateProcessor {
             }
             None => "unknown".to_string(),
         };
-        info!(
-            "[atomic] Atomic consensus state: local_state=consistent consensus_correct=true reason={} daa={} hf_active={} root={} root_only={} assets={} balances={} nonces={} anchors={} vaults={} selected_parent={} parents={} utxo_add={} utxo_remove={}",
-            reason,
-            virtual_state.daa_score,
-            self.transaction_validator.is_payload_hf_active(virtual_state.daa_score),
-            faster_hex::hex_string(&summary.root),
-            summary.root_only,
-            summary.assets,
-            summary.balances,
-            summary.nonces,
-            summary.anchors,
-            vaults,
-            virtual_state.ghostdag_data.selected_parent,
-            virtual_state.parents.len(),
-            virtual_state.utxo_diff.added().len(),
-            virtual_state.utxo_diff.removed().len(),
-        );
+        if virtual_state.daa_score == 0 && reason == "periodic" {
+            debug!(
+                "[atomic] Atomic consensus state: local_state=consistent consensus_correct=true reason={} daa={} hf_active={} root={} root_only={} assets={} balances={} nonces={} anchors={} vaults={} selected_parent={} parents={} utxo_add={} utxo_remove={}",
+                reason,
+                virtual_state.daa_score,
+                self.transaction_validator.is_payload_hf_active(virtual_state.daa_score),
+                faster_hex::hex_string(&summary.root),
+                summary.root_only,
+                summary.assets,
+                summary.balances,
+                summary.nonces,
+                summary.anchors,
+                vaults,
+                virtual_state.ghostdag_data.selected_parent,
+                virtual_state.parents.len(),
+                virtual_state.utxo_diff.added().len(),
+                virtual_state.utxo_diff.removed().len(),
+            );
+        } else {
+            info!(
+                "[atomic] Atomic consensus state: local_state=consistent consensus_correct=true reason={} daa={} hf_active={} root={} root_only={} assets={} balances={} nonces={} anchors={} vaults={} selected_parent={} parents={} utxo_add={} utxo_remove={}",
+                reason,
+                virtual_state.daa_score,
+                self.transaction_validator.is_payload_hf_active(virtual_state.daa_score),
+                faster_hex::hex_string(&summary.root),
+                summary.root_only,
+                summary.assets,
+                summary.balances,
+                summary.nonces,
+                summary.anchors,
+                vaults,
+                virtual_state.ghostdag_data.selected_parent,
+                virtual_state.parents.len(),
+                virtual_state.utxo_diff.added().len(),
+                virtual_state.utxo_diff.removed().len(),
+            );
+        }
     }
 
     fn log_current_atomic_consensus_state(&self, reason: &str) {

@@ -1,5 +1,6 @@
 use crate::common::ProtocolError;
 use crate::core::hub::HubEvent;
+use crate::pb::cryptixd_message::Payload as CryptixdMessagePayload;
 use crate::pb::{
     p2p_client::P2pClient as ProtoP2pClient, p2p_server::P2p as ProtoP2p, p2p_server::P2pServer as ProtoP2pServer, CryptixdMessage,
 };
@@ -11,7 +12,7 @@ use cryptix_utils_tower::{
     middleware::{measure_request_body_size_layer, CountBytesBody, MapResponseBodyLayer, ServiceBuilder},
 };
 use futures::FutureExt;
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,6 +45,20 @@ pub enum ConnectionError {
 
 /// Maximum P2P decoded gRPC message size to send and receive
 const P2P_MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // 1GB
+
+fn log_outgoing_network_message(msg: &CryptixdMessage, peer: SocketAddr) {
+    if let Some(CryptixdMessagePayload::PruningPointProof(proof)) = msg.payload.as_ref() {
+        let headers = proof.headers.iter().map(|level| level.headers.len()).sum::<usize>();
+        info!(
+            "P2P outgoing stream dequeued pruning point proof to {}: levels={} headers={} response_id={} request_id={}",
+            peer,
+            proof.headers.len(),
+            headers,
+            msg.response_id,
+            msg.request_id
+        );
+    }
+}
 
 /// Handles Router creation for both server and client-side new connections
 #[derive(Clone)]
@@ -121,7 +136,11 @@ impl ConnectionHandler {
             .max_decoding_message_size(P2P_MAX_MESSAGE_SIZE);
 
         let (outgoing_route, outgoing_receiver) = mpsc_channel(Self::outgoing_network_channel_size());
-        let incoming_stream = client.message_stream(ReceiverStream::new(outgoing_receiver)).await?.into_inner();
+        let outgoing_stream = ReceiverStream::new(outgoing_receiver).map(move |msg| {
+            log_outgoing_network_message(&msg, socket_address);
+            msg
+        });
+        let incoming_stream = client.message_stream(outgoing_stream).await?.into_inner();
 
         let router = Router::new(socket_address, true, self.hub_sender.clone(), incoming_stream, outgoing_route).await;
 
@@ -221,6 +240,9 @@ impl ProtoP2p for ConnectionHandler {
         self.hub_sender.send(HubEvent::NewPeer(router)).await.expect("hub receiver should never drop before senders");
 
         // Give tonic a receiver stream (messages sent to it will be forwarded to the network peer)
-        Ok(Response::new(Box::pin(ReceiverStream::new(outgoing_receiver).map(Ok)) as Self::MessageStreamStream))
+        Ok(Response::new(Box::pin(ReceiverStream::new(outgoing_receiver).map(move |msg| {
+            log_outgoing_network_message(&msg, remote_address);
+            Ok(msg)
+        })) as Self::MessageStreamStream))
     }
 }

@@ -47,6 +47,7 @@ impl ReceivePingsFlow {
 }
 
 pub const PING_INTERVAL: Duration = Duration::from_secs(120); // 2 minutes
+const PONG_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Flow for managing a loop sending pings and waiting for pongs
 pub struct SendPingsFlow {
@@ -90,7 +91,7 @@ impl SendPingsFlow {
                 return Err(ProtocolError::ConnectionClosed);
             };
             router.enqueue(ping).await?;
-            let pong = dequeue_with_timeout!(self.incoming_route, Payload::Pong)?;
+            let pong = dequeue_with_timeout!(self.incoming_route, Payload::Pong, PONG_TIMEOUT)?;
             if pong.nonce != nonce {
                 return Err(ProtocolError::Other("nonce mismatch between ping and pong"));
             } else {

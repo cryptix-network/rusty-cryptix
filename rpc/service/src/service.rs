@@ -666,22 +666,41 @@ impl RpcCoreService {
                 }
 
                 if last_wait_log.map_or(true, |last| last.elapsed() >= RPC_BLOCK_SCAN_CACHE_STARTUP_WAIT_LOG_INTERVAL) {
-                    info!(
-                        "RPC block scan cache startup warm waiting: reason={} peer_ready={} node_nearly_synced={} virtual_daa={} activation_daa={} atomic_required={} atomic_ready={} atomic_reason={} atomic_runtime={} atomic_degraded={} atomic_bootstrap={} atomic_live_correct={} atomic_last_applied={:?}; cache_serving=false fallback=storage_on_miss",
-                        readiness.wait_reason,
-                        readiness.peer_ready,
-                        readiness.node_nearly_synced,
-                        readiness.virtual_daa_score,
-                        readiness.activation_daa_score,
-                        readiness.atomic_required,
-                        readiness.atomic_ready,
-                        readiness.atomic_not_ready_reason.unwrap_or("none"),
-                        readiness.atomic_runtime,
-                        readiness.atomic_degraded,
-                        readiness.atomic_bootstrap,
-                        readiness.atomic_live_correct,
-                        readiness.atomic_last_applied
-                    );
+                    if readiness.wait_reason == "waiting_for_node_sync" && readiness.virtual_daa_score == 0 {
+                        debug!(
+                            "RPC block scan cache startup warm waiting: reason={} peer_ready={} node_nearly_synced={} virtual_daa={} activation_daa={} atomic_required={} atomic_ready={} atomic_reason={} atomic_runtime={} atomic_degraded={} atomic_bootstrap={} atomic_live_correct={} atomic_last_applied={:?}; cache_serving=false fallback=storage_on_miss",
+                            readiness.wait_reason,
+                            readiness.peer_ready,
+                            readiness.node_nearly_synced,
+                            readiness.virtual_daa_score,
+                            readiness.activation_daa_score,
+                            readiness.atomic_required,
+                            readiness.atomic_ready,
+                            readiness.atomic_not_ready_reason.unwrap_or("none"),
+                            readiness.atomic_runtime,
+                            readiness.atomic_degraded,
+                            readiness.atomic_bootstrap,
+                            readiness.atomic_live_correct,
+                            readiness.atomic_last_applied
+                        );
+                    } else {
+                        info!(
+                            "RPC block scan cache startup warm waiting: reason={} peer_ready={} node_nearly_synced={} virtual_daa={} activation_daa={} atomic_required={} atomic_ready={} atomic_reason={} atomic_runtime={} atomic_degraded={} atomic_bootstrap={} atomic_live_correct={} atomic_last_applied={:?}; cache_serving=false fallback=storage_on_miss",
+                            readiness.wait_reason,
+                            readiness.peer_ready,
+                            readiness.node_nearly_synced,
+                            readiness.virtual_daa_score,
+                            readiness.activation_daa_score,
+                            readiness.atomic_required,
+                            readiness.atomic_ready,
+                            readiness.atomic_not_ready_reason.unwrap_or("none"),
+                            readiness.atomic_runtime,
+                            readiness.atomic_degraded,
+                            readiness.atomic_bootstrap,
+                            readiness.atomic_live_correct,
+                            readiness.atomic_last_applied
+                        );
+                    }
                     last_wait_log = Some(Instant::now());
                 }
 

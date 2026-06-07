@@ -266,10 +266,19 @@ impl IbdFlow {
                 Err(err) => return Err(err),
             }
         };
+        let proof_msg_levels = msg.headers.len();
+        let proof_msg_header_count = msg.headers.iter().map(|level| level.headers.len()).sum::<usize>();
+        info!(
+            "IBD dequeued pruning point proof message from {} with {} levels and {} headers after {} ms; converting",
+            self.router,
+            proof_msg_levels,
+            proof_msg_header_count,
+            proof_wait_started.elapsed().as_millis()
+        );
         let proof: PruningPointProof = msg.try_into()?;
         let proof_header_count = proof.iter().map(|l| l.len()).sum::<usize>();
         info!(
-            "IBD received pruning point proof from {} with {} headers after {} ms; validating",
+            "IBD converted pruning point proof from {} with {} headers after {} ms; validating",
             self.router,
             proof_header_count,
             proof_wait_started.elapsed().as_millis()

@@ -174,6 +174,15 @@ fn message_summary(msg: &CryptixdMessage) -> impl Debug {
     msg.payload.as_ref().map(std::convert::Into::<CryptixdMessagePayloadType>::into)
 }
 
+fn pruning_point_proof_message_summary(msg: &CryptixdMessage) -> Option<(usize, usize, u32, u32)> {
+    match msg.payload.as_ref()? {
+        CryptixdMessagePayload::PruningPointProof(proof) => {
+            Some((proof.headers.len(), proof.headers.iter().map(|level| level.headers.len()).sum(), msg.response_id, msg.request_id))
+        }
+        _ => None,
+    }
+}
+
 impl Router {
     pub(crate) async fn new(
         net_address: SocketAddr,
@@ -214,8 +223,22 @@ impl Router {
                     res = incoming_stream.message() => match res {
                         Ok(Some(msg)) => {
                             trace!("P2P msg: {:?}, router-id: {}, peer: {}", message_summary(&msg), router.identity(), router);
+                            let pruning_point_proof_summary = pruning_point_proof_message_summary(&msg);
+                            if let Some((levels, headers, response_id, request_id)) = pruning_point_proof_summary {
+                                info!(
+                                    "P2P decoded pruning point proof from peer {}: levels={} headers={} response_id={} request_id={}; routing",
+                                    router, levels, headers, response_id, request_id
+                                );
+                            }
                             match router.route_to_flow(msg) {
-                                Ok(()) => {},
+                                Ok(()) => {
+                                    if let Some((levels, headers, response_id, request_id)) = pruning_point_proof_summary {
+                                        info!(
+                                            "P2P routed pruning point proof from peer {}: levels={} headers={} response_id={} request_id={}",
+                                            router, levels, headers, response_id, request_id
+                                        );
+                                    }
+                                },
                                 Err(e) => {
                                     match e {
                                         ProtocolError::IgnorableReject(reason) => debug!("P2P, got reject message: {} from peer: {}", reason, router),

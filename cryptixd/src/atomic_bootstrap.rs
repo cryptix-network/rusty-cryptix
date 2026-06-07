@@ -7,7 +7,7 @@ use cryptix_atomicindex::{
 };
 use cryptix_consensus_core::Hash as BlockHash;
 use cryptix_core::{
-    info,
+    debug, info,
     task::service::{AsyncService, AsyncServiceFuture},
     trace, warn,
 };
@@ -279,6 +279,10 @@ impl AtomicBootstrapService {
         } else {
             "no compatible Atomic seed or --atomic-bootstrap-peer RPC source responded; local replay and P2P peer quorum remain available according to policy".to_string()
         }
+    }
+
+    fn is_transient_p2p_audit_error(err: &str) -> bool {
+        err.starts_with("timed out after ") || err == "response route closed" || err.contains("peer connection is closed")
     }
 
     fn log_candidate_unavailable(candidate: &CandidateEndpoint, reason: &str) {
@@ -697,7 +701,11 @@ impl AtomicBootstrapService {
                     trace!("[atomic-bootstrap:p2p] peer {} has no consensus Atomic state for {}", router_label, block_hash);
                 }
                 Err(err) => {
-                    info!("[atomic-bootstrap:p2p] peer {} consensus Atomic state hash request failed: {}", router_label, err);
+                    if Self::is_transient_p2p_audit_error(&err) {
+                        debug!("[atomic-bootstrap:p2p] peer {} consensus Atomic state hash request failed: {}", router_label, err);
+                    } else {
+                        info!("[atomic-bootstrap:p2p] peer {} consensus Atomic state hash request failed: {}", router_label, err);
+                    }
                 }
             }
         }
@@ -755,7 +763,11 @@ impl AtomicBootstrapService {
                     trace!("[atomic-bootstrap:p2p] peer {} has no healthy Atomic token state for {}", router_label, block_hash);
                 }
                 Err(err) => {
-                    info!("[atomic-bootstrap:p2p] peer {} Atomic token state hash request failed: {}", router_label, err);
+                    if Self::is_transient_p2p_audit_error(&err) {
+                        debug!("[atomic-bootstrap:p2p] peer {} Atomic token state hash request failed: {}", router_label, err);
+                    } else {
+                        info!("[atomic-bootstrap:p2p] peer {} Atomic token state hash request failed: {}", router_label, err);
+                    }
                 }
             }
         }
@@ -1321,6 +1333,21 @@ impl AtomicBootstrapService {
             trace!("[atomic-bootstrap] bootstrap and P2P health audit deferred until payload hardfork is active locally");
             return Ok(false);
         }
+        let consensus = self.flow_context.consensus();
+        let session = consensus.session().await;
+        if !session.async_is_nearly_synced().await {
+            let virtual_daa_score = consensus.unguarded_session().get_virtual_daa_score();
+            self.log_pending_audit(
+                "node_not_nearly_synced",
+                format!(
+                    "[atomic-bootstrap:p2p] audit result: status=pending scope=token reason=node_not_nearly_synced action=wait_for_node_sync virtual_daa={}",
+                    virtual_daa_score
+                ),
+            )
+            .await;
+            return Ok(false);
+        }
+        drop(session);
 
         let effective_health = self.atomic_token_service.get_health().await;
         let health = self.atomic_token_service.get_local_health().await;

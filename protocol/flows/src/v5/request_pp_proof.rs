@@ -48,7 +48,7 @@ impl RequestPruningPointProofFlow {
                 ))
                 .await?;
             info!(
-                "Sent pruning point proof to {} with {} headers in {} ms",
+                "Queued pruning point proof to {} with {} headers in {} ms",
                 self.router,
                 header_count,
                 request_started.elapsed().as_millis()
