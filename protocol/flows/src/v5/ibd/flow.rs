@@ -243,11 +243,20 @@ impl IbdFlow {
 
     async fn sync_and_validate_pruning_proof(&mut self, staging: &ConsensusProxy) -> Result<Hash, ProtocolError> {
         self.router.enqueue(make_message!(Payload::RequestPruningPointProof, RequestPruningPointProofMessage {})).await?;
+        let proof_timeout = Duration::from_secs(600);
+        let proof_wait_started = Instant::now();
+        info!("IBD requested pruning point proof from {}; waiting up to {} seconds", self.router, proof_timeout.as_secs());
 
         // Pruning proof generation and communication might take several minutes, so we allow a long 10 minute timeout
-        let msg = dequeue_with_timeout!(self.incoming_route, Payload::PruningPointProof, Duration::from_secs(600))?;
+        let msg = dequeue_with_timeout!(self.incoming_route, Payload::PruningPointProof, proof_timeout)?;
         let proof: PruningPointProof = msg.try_into()?;
-        debug!("received proof with overall {} headers", proof.iter().map(|l| l.len()).sum::<usize>());
+        let proof_header_count = proof.iter().map(|l| l.len()).sum::<usize>();
+        info!(
+            "IBD received pruning point proof from {} with {} headers after {} ms; validating",
+            self.router,
+            proof_header_count,
+            proof_wait_started.elapsed().as_millis()
+        );
 
         // Get a new session for current consensus (non staging)
         let consensus = self.ctx.consensus().session().await;
@@ -258,6 +267,10 @@ impl IbdFlow {
         let proof_pruning_point_header = proof[0].last().expect("was just ensured by validation");
         let proof_pruning_point = proof_pruning_point_header.hash;
         let proof_pruning_point_daa_score = proof_pruning_point_header.daa_score;
+        info!(
+            "IBD validated pruning point proof from {}; pruning_point={} daa={}",
+            self.router, proof_pruning_point, proof_pruning_point_daa_score
+        );
 
         if proof_pruning_point == self.ctx.config.genesis.hash {
             return Err(ProtocolError::Other("the proof pruning point is the genesis block"));
@@ -272,9 +285,17 @@ impl IbdFlow {
         self.router
             .enqueue(make_message!(Payload::RequestPruningPointAndItsAnticone, RequestPruningPointAndItsAnticoneMessage {}))
             .await?;
+        let trusted_data_wait_started = Instant::now();
+        info!("IBD requested pruning point anticone and trusted data from {}", self.router);
 
         let msg = dequeue_with_timeout!(self.incoming_route, Payload::PruningPoints)?;
         let pruning_points: PruningPointsList = msg.try_into()?;
+        info!(
+            "IBD received {} pruning point headers from {} after {} ms",
+            pruning_points.len(),
+            self.router,
+            trusted_data_wait_started.elapsed().as_millis()
+        );
 
         if pruning_points.is_empty() || pruning_points.last().unwrap().hash != proof_pruning_point {
             return Err(ProtocolError::Other("the proof pruning point is not equal to the last pruning point in the list"));
@@ -292,7 +313,15 @@ impl IbdFlow {
 
         let msg = dequeue_with_timeout!(self.incoming_route, Payload::TrustedData)?;
         let mut pkg: TrustedDataPackage = msg.try_into()?;
-        debug!("received trusted data with {} daa entries and {} ghostdag entries", pkg.daa_window.len(), pkg.ghostdag_window.len());
+        info!(
+            "IBD received trusted data from {} with {} daa entries, {} ghostdag entries, {} Atomic state chunks ({} bytes) after {} ms",
+            self.router,
+            pkg.daa_window.len(),
+            pkg.ghostdag_window.len(),
+            pkg.atomic_state_chunk_count,
+            pkg.atomic_state_byte_length,
+            trusted_data_wait_started.elapsed().as_millis()
+        );
         let pruning_point_atomic_state =
             self.receive_pruning_point_atomic_state(&mut pkg, proof_pruning_point, proof_pruning_point_daa_score).await?;
 

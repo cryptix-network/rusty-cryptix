@@ -1316,16 +1316,19 @@ impl AtomicTokenService {
             );
             return Ok(());
         };
-        let p2p_audit_hash = compute_p2p_audit_state_root_from_parts(&view.assets, &view.balances, &view.nonces, &view.anchor_counts);
-        let report = debug_state_root_report_from_parts(&view.assets, &view.balances, &view.nonces, &view.anchor_counts, 4);
-        info!(
-            "[{IDENT}] local Atomic token index debug at DAA-rendezvous block {}: checkpoint_hash={}, recomputed_view_hash={}, p2p_audit_hash={}\n{}",
-            at_block_hash,
-            checkpoint_hash.map(|hash| short_hex_for_log(&hash)).unwrap_or_else(|| "<missing>".to_string()),
-            short_hex_for_log(&view.state_hash),
-            short_hex_for_log(&p2p_audit_hash),
-            report
-        );
+        if log::log_enabled!(log::Level::Debug) {
+            let p2p_audit_hash =
+                compute_p2p_audit_state_root_from_parts(&view.assets, &view.balances, &view.nonces, &view.anchor_counts);
+            let report = debug_state_root_report_from_parts(&view.assets, &view.balances, &view.nonces, &view.anchor_counts, 4);
+            debug!(
+                "[{IDENT}] local Atomic token index debug at DAA-rendezvous block {}: checkpoint_hash={}, recomputed_view_hash={}, p2p_audit_hash={}\n{}",
+                at_block_hash,
+                checkpoint_hash.map(|hash| short_hex_for_log(&hash)).unwrap_or_else(|| "<missing>".to_string()),
+                short_hex_for_log(&view.state_hash),
+                short_hex_for_log(&p2p_audit_hash),
+                report
+            );
+        }
         Ok(())
     }
 

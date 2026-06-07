@@ -14,8 +14,8 @@ use cryptix_p2p_lib::{
     IncomingRoute, Router,
 };
 use itertools::Itertools;
-use log::debug;
-use std::sync::Arc;
+use log::{debug, info};
+use std::{sync::Arc, time::Instant};
 
 use crate::{
     flow_context::FlowContext,
@@ -48,7 +48,8 @@ impl PruningPointAndItsAnticoneRequestsFlow {
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
         loop {
             let (_, request_id) = dequeue_with_request_id!(self.incoming_route, Payload::RequestPruningPointAndItsAnticone)?;
-            debug!("Got request for pruning point and its anticone");
+            let request_started = Instant::now();
+            info!("Got request for pruning point and its anticone from {}", self.router);
 
             let consensus = self.ctx.consensus();
             let mut session = consensus.session().await;
@@ -58,6 +59,13 @@ impl PruningPointAndItsAnticoneRequestsFlow {
                 return Err(ProtocolError::Other("cannot serve pruning point data without pruning point headers"));
             };
             let payload_hf_active = proof_pruning_point_header.daa_score >= self.ctx.config.params.payload_hf_activation_daa_score;
+            info!(
+                "Serving {} pruning point headers to {} (pruning_point={} daa={})",
+                pp_headers.len(),
+                self.router,
+                proof_pruning_point_header.hash,
+                proof_pruning_point_header.daa_score
+            );
             self.router
                 .enqueue(make_response!(
                     Payload::PruningPoints,
@@ -66,6 +74,8 @@ impl PruningPointAndItsAnticoneRequestsFlow {
                 ))
                 .await?;
 
+            let trusted_data_started = Instant::now();
+            info!("Preparing pruning point anticone and trusted data for {}", self.router);
             let trusted_data = session.async_get_pruning_point_anticone_and_trusted_data().await?;
             let pp_anticone = &trusted_data.anticone;
             let daa_window = &trusted_data.daa_window_blocks;
@@ -94,6 +104,16 @@ impl PruningPointAndItsAnticoneRequestsFlow {
                 }
                 None => (Vec::new(), Vec::new(), 0, 0),
             };
+            info!(
+                "Prepared pruning point anticone and trusted data for {}: anticone_blocks={}, daa_window={}, ghostdag={}, atomic_state_chunks={}, atomic_state_bytes={} in {} ms",
+                self.router,
+                pp_anticone.len(),
+                daa_window.len(),
+                ghostdag_data.len(),
+                atomic_consensus_state_chunk_count,
+                atomic_consensus_state_byte_length,
+                trusted_data_started.elapsed().as_millis()
+            );
             self.router
                 .enqueue(make_response!(
                     Payload::TrustedData,
@@ -155,7 +175,12 @@ impl PruningPointAndItsAnticoneRequestsFlow {
             self.router
                 .enqueue(make_response!(Payload::DoneBlocksWithTrustedData, DoneBlocksWithTrustedDataMessage {}, request_id))
                 .await?;
-            debug!("Finished sending pruning point anticone")
+            info!(
+                "Finished sending pruning point anticone to {}: {} blocks in {} ms",
+                self.router,
+                pp_anticone.len(),
+                request_started.elapsed().as_millis()
+            );
         }
     }
 
@@ -187,7 +212,7 @@ impl PruningPointAndItsAnticoneRequestsFlow {
                 dequeue!(self.incoming_route, Payload::RequestNextPruningPointAtomicStateChunk)?;
             }
         }
-        debug!("Finished sending pruning point Atomic state in {} chunk(s)", total_chunks);
+        info!("Finished sending pruning point Atomic state to {} in {} chunk(s)", self.router, total_chunks);
         Ok(())
     }
 }

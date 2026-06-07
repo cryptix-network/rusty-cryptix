@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use cryptix_p2p_lib::{
     common::ProtocolError,
@@ -6,7 +6,7 @@ use cryptix_p2p_lib::{
     pb::{cryptixd_message::Payload, PruningPointProofMessage},
     IncomingRoute, Router,
 };
-use log::debug;
+use log::{debug, info};
 
 use crate::{flow_context::FlowContext, flow_trait::Flow};
 
@@ -35,8 +35,11 @@ impl RequestPruningPointProofFlow {
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
         loop {
             let (_, request_id) = dequeue_with_request_id!(self.incoming_route, Payload::RequestPruningPointProof)?;
-            debug!("Got pruning point proof request");
+            let request_started = Instant::now();
+            info!("Got pruning point proof request from {}", self.router);
             let proof = self.ctx.consensus().unguarded_session().async_get_pruning_point_proof().await;
+            let header_count = proof.iter().map(|headers| headers.len()).sum::<usize>();
+            debug!("Built pruning point proof with {} headers", header_count);
             self.router
                 .enqueue(make_response!(
                     Payload::PruningPointProof,
@@ -44,7 +47,12 @@ impl RequestPruningPointProofFlow {
                     request_id
                 ))
                 .await?;
-            debug!("Sent pruning point proof");
+            info!(
+                "Sent pruning point proof to {} with {} headers in {} ms",
+                self.router,
+                header_count,
+                request_started.elapsed().as_millis()
+            );
         }
     }
 }

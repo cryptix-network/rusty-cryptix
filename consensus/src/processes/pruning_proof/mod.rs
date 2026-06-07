@@ -724,6 +724,11 @@ impl PruningProofManager {
             return vec![];
         }
 
+        let build_started = Instant::now();
+        let mut last_progress_log = build_started;
+        let mut built_headers = 0usize;
+        info!("Building pruning point proof for {pp} (max_level={}, pruning_proof_m={})", self.max_block_level, self.pruning_proof_m);
+
         let pp_header = self.headers_store.get_header_with_block_level(pp).unwrap();
         let selected_tip_by_level = (0..=self.max_block_level)
             .map(|level| {
@@ -772,50 +777,111 @@ impl PruningProofManager {
                     block_at_depth_2m
                 };
 
+                let level_started = Instant::now();
+                let mut last_level_progress_log = level_started;
+                let selected_tip_blue_work = self.ghostdag_stores[level].get_blue_work(selected_tip).unwrap();
+                let relations_store = self.relations_stores.read()[level].clone();
+                let mut scanned_children = 0usize;
+                let mut skipped_non_ancestor_children = 0usize;
+                let mut skipped_above_tip_children = 0usize;
+                let mut max_queue_len = 1usize;
                 let mut headers = Vec::with_capacity(2 * self.pruning_proof_m as usize);
                 let mut queue = BinaryHeap::<Reverse<SortableBlock>>::new();
                 let mut visited = BlockHashSet::new();
+                visited.insert(root);
                 queue.push(Reverse(SortableBlock::new(root, self.ghostdag_stores[level].get_blue_work(root).unwrap())));
                 while let Some(current) = queue.pop() {
                     let current = current.0.hash;
-                    if !visited.insert(current) {
-                        continue;
-                    }
-
-                    if !self.reachability_service.is_dag_ancestor_of(current, selected_tip) {
-                        continue;
-                    }
 
                     headers.push(self.headers_store.get_header(current).unwrap());
-                    for child in self.relations_stores.read()[level].get_children(current).unwrap().read().iter().copied() {
-                        queue.push(Reverse(SortableBlock::new(child, self.ghostdag_stores[level].get_blue_work(child).unwrap())));
+                    for child in relations_store.get_children(current).unwrap().read().iter().copied() {
+                        scanned_children += 1;
+                        if !visited.insert(child) {
+                            continue;
+                        }
+
+                        let child_blue_work = self.ghostdag_stores[level].get_blue_work(child).unwrap();
+                        if child_blue_work > selected_tip_blue_work {
+                            skipped_above_tip_children += 1;
+                            continue;
+                        }
+
+                        if self.reachability_service.is_dag_ancestor_of(child, selected_tip) {
+                            queue.push(Reverse(SortableBlock::new(child, child_blue_work)));
+                            max_queue_len = max_queue_len.max(queue.len());
+                        } else {
+                            skipped_non_ancestor_children += 1;
+                        }
+                    }
+
+                    if last_level_progress_log.elapsed() >= PRUNING_PROOF_PROGRESS_LOG_INTERVAL {
+                        info!(
+                            "Pruning point proof build level {}/{} in progress: headers={} visited={} queue={} scanned_children={} skipped_non_ancestor={} skipped_above_tip={} elapsed={}",
+                            level,
+                            self.max_block_level,
+                            headers.len(),
+                            visited.len(),
+                            queue.len(),
+                            scanned_children,
+                            skipped_non_ancestor_children,
+                            skipped_above_tip_children,
+                            format_pruning_proof_duration(level_started.elapsed())
+                        );
+                        last_level_progress_log = Instant::now();
                     }
                 }
 
-                // Temp assertion for verifying a bug fix: assert that the full 2M chain is actually contained in the composed level proof
-                let set = BlockHashSet::from_iter(headers.iter().map(|h| h.hash));
-                let chain_2m = self
-                    .chain_up_to_depth(&*self.ghostdag_stores[level], selected_tip, 2 * self.pruning_proof_m)
-                    .map_err(|err| {
-                        dbg!(level, selected_tip, block_at_depth_2m, root);
-                        format!("Assert 2M chain -- level: {}, err: {}", level, err)
-                    })
-                    .unwrap();
-                let chain_2m_len = chain_2m.len();
-                for (i, chain_hash) in chain_2m.into_iter().enumerate() {
-                    if !set.contains(&chain_hash) {
-                        let next_level_tip = selected_tip_by_level[level + 1];
-                        let next_level_chain_m =
-                            self.chain_up_to_depth(&*self.ghostdag_stores[level + 1], next_level_tip, self.pruning_proof_m).unwrap();
-                        let next_level_block_m = next_level_chain_m.last().copied().unwrap();
-                        dbg!(next_level_chain_m.len());
-                        dbg!(self.ghostdag_stores[level + 1].get_compact_data(next_level_tip).unwrap().blue_score);
-                        dbg!(self.ghostdag_stores[level + 1].get_compact_data(next_level_block_m).unwrap().blue_score);
-                        dbg!(self.ghostdag_stores[level].get_compact_data(selected_tip).unwrap().blue_score);
-                        dbg!(self.ghostdag_stores[level].get_compact_data(block_at_depth_2m).unwrap().blue_score);
-                        dbg!(level, selected_tip, block_at_depth_2m, root);
-                        panic!("Assert 2M chain -- missing block {} at index {} out of {} chain blocks", chain_hash, i, chain_2m_len);
+                #[cfg(debug_assertions)]
+                {
+                    // Expensive invariant check for local debugging. Keeping this out of release builds is important
+                    // because pruning proof generation is on the IBD serving path.
+                    let set = BlockHashSet::from_iter(headers.iter().map(|h| h.hash));
+                    let chain_2m = self
+                        .chain_up_to_depth(&*self.ghostdag_stores[level], selected_tip, 2 * self.pruning_proof_m)
+                        .map_err(|err| {
+                            dbg!(level, selected_tip, block_at_depth_2m, root);
+                            format!("Assert 2M chain -- level: {}, err: {}", level, err)
+                        })
+                        .unwrap();
+                    let chain_2m_len = chain_2m.len();
+                    for (i, chain_hash) in chain_2m.into_iter().enumerate() {
+                        if !set.contains(&chain_hash) {
+                            let next_level_tip = selected_tip_by_level[level + 1];
+                            let next_level_chain_m = self
+                                .chain_up_to_depth(&*self.ghostdag_stores[level + 1], next_level_tip, self.pruning_proof_m)
+                                .unwrap();
+                            let next_level_block_m = next_level_chain_m.last().copied().unwrap();
+                            dbg!(next_level_chain_m.len());
+                            dbg!(self.ghostdag_stores[level + 1].get_compact_data(next_level_tip).unwrap().blue_score);
+                            dbg!(self.ghostdag_stores[level + 1].get_compact_data(next_level_block_m).unwrap().blue_score);
+                            dbg!(self.ghostdag_stores[level].get_compact_data(selected_tip).unwrap().blue_score);
+                            dbg!(self.ghostdag_stores[level].get_compact_data(block_at_depth_2m).unwrap().blue_score);
+                            dbg!(level, selected_tip, block_at_depth_2m, root);
+                            panic!(
+                                "Assert 2M chain -- missing block {} at index {} out of {} chain blocks",
+                                chain_hash, i, chain_2m_len
+                            );
+                        }
                     }
+                }
+
+                built_headers += headers.len();
+                if last_progress_log.elapsed() >= PRUNING_PROOF_PROGRESS_LOG_INTERVAL || level == self.max_block_level as usize {
+                    info!(
+                        "Pruning point proof build: level={}/{} level_headers={} total_headers={} visited={} scanned_children={} skipped_non_ancestor={} skipped_above_tip={} max_queue={} level_elapsed={} total_elapsed={}",
+                        level,
+                        self.max_block_level,
+                        headers.len(),
+                        built_headers,
+                        visited.len(),
+                        scanned_children,
+                        skipped_non_ancestor_children,
+                        skipped_above_tip_children,
+                        max_queue_len,
+                        format_pruning_proof_duration(level_started.elapsed()),
+                        format_pruning_proof_duration(build_started.elapsed())
+                    );
+                    last_progress_log = Instant::now();
                 }
 
                 headers
@@ -1095,10 +1161,25 @@ impl PruningProofManager {
         let mut cache_lock = self.cached_proof.lock();
         if let Some(cache) = cache_lock.clone() {
             if cache.pruning_point == pp {
+                info!(
+                    "Returning cached pruning point proof for {} with {} levels and {} headers",
+                    pp,
+                    cache.data.len(),
+                    cache.data.iter().map(|level| level.len()).sum::<usize>()
+                );
                 return cache.data;
             }
         }
+        let started = Instant::now();
+        info!("Pruning point proof cache miss for {}; building proof", pp);
         let proof = Arc::new(self.build_pruning_point_proof(pp));
+        info!(
+            "Built pruning point proof for {} with {} levels and {} headers in {}",
+            pp,
+            proof.len(),
+            proof.iter().map(|level| level.len()).sum::<usize>(),
+            format_pruning_proof_duration(started.elapsed())
+        );
         cache_lock.replace(CachedPruningPointData { pruning_point: pp, data: proof.clone() });
         proof
     }
