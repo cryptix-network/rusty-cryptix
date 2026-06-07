@@ -84,10 +84,12 @@ impl IbdFlow {
             if let Some(_guard) = self.ctx.try_set_ibd_running(self.router.key(), relay_block.header.daa_score) {
                 info!("IBD started with peer {}", self.router);
 
-                match self.ibd(relay_block).await {
-                    Ok(_) => info!("IBD with peer {} completed successfully", self.router),
+                let result = self.ibd(relay_block).await;
+                cryptix_alloc::collect_allocator(true);
+                match result {
+                    Ok(_) => info!("IBD with peer {} completed successfully; allocator collection requested", self.router),
                     Err(e) => {
-                        info!("IBD with peer {} completed with error: {}", self.router, e);
+                        info!("IBD with peer {} completed with error: {}; allocator collection requested", self.router, e);
                         return Err(e);
                     }
                 }

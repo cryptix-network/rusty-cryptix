@@ -11,6 +11,7 @@ repository.workspace = true
 
 [dependencies]
 cryptix-atomicindex.workspace = true
+cryptix-alloc.workspace = true
 cryptix-addresses.workspace = true
 cryptix-consensus-core.workspace = true
 cryptix-consensus-notify.workspace = true

@@ -955,6 +955,8 @@ impl RpcCoreService {
                 stats.max_bytes / (1024 * 1024),
                 stats.serving
             );
+            cryptix_alloc::collect_allocator(true);
+            info!("RPC block scan cache startup warm requested allocator collection after temporary warmup allocations");
         }
 
         matches!(
@@ -3265,6 +3267,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let minimum_relay_feerate =
             if req.custom_metrics { Some(self.mining_manager.clone().minimum_relay_feerate().await.max(0.0)) } else { None };
         let diagnostics_metrics = req.custom_metrics && self.config.rpc_diagnostics;
+        let block_scan_cache_stats = req.custom_metrics.then(|| self.block_scan_cache.stats());
         let mempool_metrics = if diagnostics_metrics { Some(self.mining_manager.snapshot()) } else { None };
         let atomic_health = if diagnostics_metrics { Some(self.atomic_token_service.get_local_health().await) } else { None };
         let atomic_footprint = if diagnostics_metrics { Some(self.atomic_token_service.get_state_footprint().await) } else { None };
@@ -3277,6 +3280,19 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             let configured_hfa_feerate_floor = self.hfa_engine.config().min_feerate_floor.max(0.0);
             let effective_hfa_feerate_floor = self.hfa_engine.effective_feerate_floor(minimum_relay_feerate);
             let mut out = HashMap::new();
+            if let Some(stats) = block_scan_cache_stats {
+                out.insert("rpc_block_scan_cache_enabled".to_string(), CustomMetricValue::Bool(self.block_scan_cache.enabled()));
+                out.insert("rpc_block_scan_cache_serving".to_string(), CustomMetricValue::Bool(stats.serving));
+                out.insert("rpc_block_scan_cache_headers".to_string(), CustomMetricValue::U64(stats.headers as u64));
+                out.insert("rpc_block_scan_cache_blocks".to_string(), CustomMetricValue::U64(stats.blocks as u64));
+                out.insert(
+                    "rpc_block_scan_cache_parent_links".to_string(),
+                    CustomMetricValue::U64(stats.selected_parent_links as u64),
+                );
+                out.insert("rpc_block_scan_cache_bytes".to_string(), CustomMetricValue::U64(stats.current_bytes));
+                out.insert("rpc_block_scan_cache_max_bytes".to_string(), CustomMetricValue::U64(stats.max_bytes));
+                out.insert("rpc_block_scan_cache_days".to_string(), CustomMetricValue::F64(self.block_scan_cache.days()));
+            }
             if let (Some(mempool), Some(atomic_health), Some(atomic_footprint)) = (mempool_metrics, atomic_health, atomic_footprint) {
                 out.insert(
                     "rpc_borsh_live_connections".to_string(),
