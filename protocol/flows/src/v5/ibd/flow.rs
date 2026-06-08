@@ -67,6 +67,8 @@ pub enum IbdType {
     DownloadHeadersProof,
 }
 
+const ERR_PROOF_PRUNING_POINT_ALREADY_CURRENT: &str = "the proof pruning point is the same as the current pruning point";
+
 struct QueueChunkOutput {
     jobs: Vec<BlockValidationFuture>,
     daa_score: u64,
@@ -133,9 +135,25 @@ impl IbdFlow {
                         session = self.ctx.consensus().session().await;
                     }
                     Err(e) => {
-                        info!("IBD with headers proof from {} was unsuccessful ({})", self.router, e);
                         staging.cancel();
-                        return Err(e);
+                        if matches!(&e, ProtocolError::Other(ERR_PROOF_PRUNING_POINT_ALREADY_CURRENT)) {
+                            session = self.ctx.consensus().session().await;
+                            let current_pruning_point = session.async_pruning_point().await;
+                            info!(
+                                "IBD headers proof from {} points at the current pruning point {}; continuing header/body sync on the active consensus",
+                                self.router, current_pruning_point
+                            );
+                            self.sync_headers(
+                                &session,
+                                negotiation_output.syncer_virtual_selected_parent,
+                                current_pruning_point,
+                                &relay_block,
+                            )
+                            .await?;
+                        } else {
+                            info!("IBD with headers proof from {} was unsuccessful ({})", self.router, e);
+                            return Err(e);
+                        }
                     }
                 }
             }
@@ -303,7 +321,7 @@ impl IbdFlow {
         }
 
         if proof_pruning_point == consensus.async_pruning_point().await {
-            return Err(ProtocolError::Other("the proof pruning point is the same as the current pruning point"));
+            return Err(ProtocolError::Other(ERR_PROOF_PRUNING_POINT_ALREADY_CURRENT));
         }
 
         drop(consensus);
