@@ -1762,6 +1762,143 @@ async fn atomic_pruning_sync_after_pre_and_post_hf_prunings_accepts_live_token_b
 }
 
 #[tokio::test]
+async fn atomic_pruned_sync_after_pre_hf_pruning_reorgs_live_atomic_branch() {
+    cryptix_core::log::try_init_logger("info");
+    let activation_daa = 36;
+    let source_config = atomic_pruning_config(activation_daa, true);
+    let mut source = TestContext::new(TestConsensus::new(&source_config));
+    let owner_script = cryptix_txscript::pay_to_script_hash_script(&p2sh_redeem_script());
+    let receiver_script = cryptix_txscript::pay_to_script_hash_script(&second_p2sh_redeem_script());
+    let owner_id = atomic_owner_id_from_script(&owner_script).expect("owner id should derive from P2SH");
+    let receiver_id = atomic_owner_id_from_script(&receiver_script).expect("receiver id should derive from P2SH");
+    source.miner_data = MinerData::new(owner_script.clone(), vec![]);
+
+    mine_empty_blocks(&mut source, 18, 2_400).await;
+    let first_pre_hf_pruning_point = wait_for_pruning_point_at_or_after_blue_score(&source, ATOMIC_PRUNING_FINALITY_DEPTH).await;
+    assert!(source.consensus.get_header(first_pre_hf_pruning_point).unwrap().daa_score < activation_daa);
+    mine_empty_blocks(&mut source, 12, 2_500).await;
+    let second_pre_hf_pruning_point = wait_for_pruning_point_at_or_after_blue_score(&source, ATOMIC_PRUNING_FINALITY_DEPTH + 8).await;
+    assert_ne!(first_pre_hf_pruning_point, second_pre_hf_pruning_point);
+    assert!(source.consensus.get_header(second_pre_hf_pruning_point).unwrap().daa_score < activation_daa);
+
+    while source.consensus.get_virtual_daa_score() < activation_daa {
+        let nonce = 2_600 + source.consensus.get_virtual_daa_score();
+        mine_empty_blocks(&mut source, 1, nonce).await;
+    }
+
+    let initial_supply = 20_000u128;
+    let (asset_id, create_block_hash) =
+        mine_asset_create_block(&mut source, &owner_script, owner_id, 2_700, b"PrunedReorg", b"PRG", initial_supply).await;
+    let mut owner_expected = initial_supply;
+    let mut receiver_expected = 0u128;
+    let mut last_token_blue_score = source.consensus.get_header(create_block_hash).unwrap().blue_score;
+
+    for (idx, amount) in [250u128, 350, 450, 550].into_iter().enumerate() {
+        let block_hash =
+            mine_token_transfer_block(&mut source, &owner_script, asset_id, receiver_id, idx as u64 + 1, amount, 2_800 + idx as u64)
+                .await;
+        owner_expected -= amount;
+        receiver_expected += amount;
+        last_token_blue_score = source.consensus.get_header(block_hash).unwrap().blue_score;
+    }
+
+    mine_empty_blocks(&mut source, 24, 2_900).await;
+    wait_for_pruning_point_at_or_after_blue_score(&source, last_token_blue_score).await;
+    let source_pruning_point = wait_for_pruning_point_to_stabilize(&source).await;
+    assert!(source.consensus.get_header(source_pruning_point).unwrap().blue_score >= last_token_blue_score);
+    let source_pruning_atomic = materialized_pruning_atomic_state(&source);
+    assert_eq!(balance_of(&source_pruning_atomic, asset_id, owner_id), owner_expected);
+    assert_eq!(balance_of(&source_pruning_atomic, asset_id, receiver_id), receiver_expected);
+
+    let target_config = atomic_pruning_config(activation_daa, false);
+    let mut target = import_pruned_consensus_from_source(&source, &target_config).await;
+    assert_eq!(target.consensus.pruning_point(), source_pruning_point);
+    assert_eq!(target.consensus.virtual_atomic_state().canonical_hash(), source_pruning_atomic.canonical_hash());
+
+    let fork_parent = sync_selected_chain_from_source(&source, &mut target, source_pruning_point).await;
+    assert_eq!(fork_parent, source.consensus.get_sink());
+    assert_eq!(target.consensus.virtual_atomic_state().canonical_hash(), source.consensus.virtual_atomic_state().canonical_hash());
+
+    target.miner_data = MinerData::new(owner_script.clone(), vec![]);
+    let tx_fee = 10_000u64;
+    let losing_amount = 111u128;
+    let winning_amount = 777u128;
+    let next_asset_nonce = 5u64;
+
+    let losing_utxo = find_virtual_utxo_by_script(&target, &owner_script);
+    let winning_utxo = find_virtual_utxo_by_script(&source, &owner_script);
+    assert_eq!(losing_utxo.0, winning_utxo.0, "branches should compete over the same CPAY UTXO at the fork point");
+    assert_eq!(losing_utxo.1.amount, winning_utxo.1.amount);
+
+    let losing_transfer = payload_tx(
+        vec![TransactionInput::new(losing_utxo.0, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(losing_utxo.1.amount - tx_fee, owner_script.clone())],
+        payload_transfer(0, next_asset_nonce, asset_id, receiver_id, losing_amount),
+    );
+    target.simulated_time += target.consensus.params().target_time_per_block;
+    let losing_block = target.build_utxo_valid_block_with_parents_and_transactions(
+        vec![fork_parent],
+        vec![losing_transfer],
+        3_000,
+        target.simulated_time,
+    );
+    target.validate_and_insert_utxo_valid_block(losing_block.to_immutable()).await;
+
+    let target_losing_atomic = target.consensus.virtual_atomic_state();
+    assert_eq!(balance_of(&target_losing_atomic, asset_id, owner_id), owner_expected - losing_amount);
+    assert_eq!(balance_of(&target_losing_atomic, asset_id, receiver_id), receiver_expected + losing_amount);
+
+    let winning_transfer = payload_tx(
+        vec![TransactionInput::new(winning_utxo.0, p2sh_signature_script(), 0, 0)],
+        vec![TransactionOutput::new(winning_utxo.1.amount - tx_fee, owner_script.clone())],
+        payload_transfer(0, next_asset_nonce, asset_id, receiver_id, winning_amount),
+    );
+    source.simulated_time += source.consensus.params().target_time_per_block;
+    let winning_block = source.build_utxo_valid_block_with_parents_and_transactions(
+        vec![fork_parent],
+        vec![winning_transfer],
+        3_100,
+        source.simulated_time,
+    );
+    let mut winning_tip = winning_block.header.hash;
+    source.validate_and_insert_utxo_valid_block(winning_block.to_immutable()).await;
+
+    for nonce in 3_101..3_104 {
+        source.simulated_time += source.consensus.params().target_time_per_block;
+        let extension =
+            source.build_utxo_valid_block_with_parents_and_transactions(vec![winning_tip], vec![], nonce, source.simulated_time);
+        winning_tip = extension.header.hash;
+        source.validate_and_insert_utxo_valid_block(extension.to_immutable()).await;
+    }
+    assert!(source.consensus.reachability_service().is_chain_ancestor_of(winning_tip, source.consensus.get_sink()));
+
+    let reorged_sink = sync_selected_chain_from_source(&source, &mut target, fork_parent).await;
+    assert_eq!(reorged_sink, source.consensus.get_sink());
+    let target_atomic = target.consensus.virtual_atomic_state();
+    assert_eq!(target_atomic.canonical_hash(), source.consensus.virtual_atomic_state().canonical_hash());
+    assert_eq!(balance_of(&target_atomic, asset_id, owner_id), owner_expected - winning_amount);
+    assert_eq!(balance_of(&target_atomic, asset_id, receiver_id), receiver_expected + winning_amount);
+    assert_ne!(balance_of(&target_atomic, asset_id, receiver_id), receiver_expected + losing_amount);
+    assert_eq!(target_atomic.next_nonces.get(&AtomicNonceKey::asset(owner_id, asset_id)), Some(&(next_asset_nonce + 1)));
+    target.consensus.validate_pruning_points().expect("mixed pre/post-HF pruning point chain must remain valid after reorg");
+
+    let reorged_sink_blue_score = target.consensus.get_header(reorged_sink).unwrap().blue_score;
+    mine_empty_blocks(&mut target, 24, 3_200).await;
+    wait_for_pruning_point_at_or_after_blue_score(&target, reorged_sink_blue_score).await;
+    let post_reorg_pruning_point = wait_for_pruning_point_to_stabilize(&target).await;
+    let post_reorg_pruning_atomic = materialized_pruning_atomic_state(&target);
+    assert!(target.consensus.get_header(post_reorg_pruning_point).unwrap().blue_score >= reorged_sink_blue_score);
+    assert_eq!(
+        post_reorg_pruning_atomic.canonical_hash(),
+        target.consensus.get_atomic_state_hash(post_reorg_pruning_point).unwrap().unwrap()
+    );
+    assert_eq!(balance_of(&post_reorg_pruning_atomic, asset_id, owner_id), owner_expected - winning_amount);
+    assert_eq!(balance_of(&post_reorg_pruning_atomic, asset_id, receiver_id), receiver_expected + winning_amount);
+    assert_eq!(post_reorg_pruning_atomic.next_nonces.get(&AtomicNonceKey::asset(owner_id, asset_id)), Some(&(next_asset_nonce + 1)));
+    target.consensus.validate_pruning_points().expect("post-reorg Atomic pruning point chain must remain valid");
+}
+
+#[tokio::test]
 async fn atomic_archival_peer_provides_full_atomic_pruning_state_for_pruned_sync() {
     cryptix_core::log::try_init_logger("info");
     let source_config = atomic_pruning_archival_config(0, true);
