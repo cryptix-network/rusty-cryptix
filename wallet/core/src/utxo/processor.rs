@@ -45,7 +45,6 @@ struct ConfirmedTransactionCacheEntry {
 #[derive(Clone, Default)]
 struct DecodedRpcBlockCacheEntry {
     transactions: Vec<Transaction>,
-    merge_set_hashes: Vec<RpcHash>,
 }
 
 pub struct Inner {
@@ -502,13 +501,7 @@ impl UtxoProcessor {
             }
         }
 
-        let mut merge_set_hashes = Vec::new();
-        if let Some(verbose_data) = block.verbose_data {
-            merge_set_hashes.extend(verbose_data.merge_set_blues_hashes.iter().copied());
-            merge_set_hashes.extend(verbose_data.merge_set_reds_hashes.iter().copied());
-        }
-
-        let entry = DecodedRpcBlockCacheEntry { transactions, merge_set_hashes };
+        let entry = DecodedRpcBlockCacheEntry { transactions };
         cache.insert(block_hash, entry.clone());
         Ok(entry)
     }
