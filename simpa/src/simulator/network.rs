@@ -85,6 +85,7 @@ impl CryptixNetworkSimulator {
                 Default::default(),
                 Default::default(),
                 unix_now(),
+                false,
             ));
             let handles = consensus.run_processors();
             let (sk, pk) = secp.generate_keypair(&mut rng);

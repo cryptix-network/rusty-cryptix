@@ -228,6 +228,7 @@ fn main_impl(args: Args) {
             Default::default(),
             Default::default(),
             unix_now(),
+            false,
         ));
         (consensus, lifetime)
     } else {
@@ -264,6 +265,7 @@ fn main_impl(args: Args) {
         Default::default(),
         Default::default(),
         unix_now(),
+        false,
     ));
     let handles2 = consensus2.run_processors();
     if args.headers_first {
