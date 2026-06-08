@@ -813,6 +813,221 @@ async fn assert_consensus_atomic_hash_exists(client: &GrpcClient, block_hash: cr
     state_hash
 }
 
+async fn spendable_cpay_snapshot(client: &GrpcClient, address: &Address, coinbase_maturity: u64) -> Vec<(String, u64)> {
+    let mut snapshot = fetch_spendable_utxos(client, address.clone(), coinbase_maturity)
+        .await
+        .into_iter()
+        .map(|(outpoint, entry)| (outpoint.to_string(), entry.amount))
+        .collect::<Vec<_>>();
+    snapshot.sort();
+    snapshot
+}
+
+async fn import_selected_chain_blocks(
+    source: &GrpcClient,
+    target: &GrpcClient,
+    from_hash: cryptix_hashes::Hash,
+    label: &str,
+) -> (Vec<cryptix_hashes::Hash>, HashSet<TransactionId>) {
+    let chain = source.get_virtual_chain_from_block(from_hash, true).await.unwrap();
+    assert!(
+        chain.removed_chain_block_hashes.is_empty(),
+        "{label} source chain from {from_hash} unexpectedly removed {} blocks",
+        chain.removed_chain_block_hashes.len()
+    );
+    let accepted = chain.accepted_transaction_ids.iter().flat_map(|entry| entry.accepted_transaction_ids.iter().copied()).collect();
+    let added_blocks = chain.added_chain_block_hashes;
+    assert!(!added_blocks.is_empty(), "{label} selected chain import had no added blocks from {from_hash}");
+
+    for hash in &added_blocks {
+        let block = source.get_block_call(None, GetBlockRequest { hash: *hash, include_transactions: true }).await.unwrap().block;
+        let raw_block = RpcRawBlock { header: Header::from(&block.header).into(), transactions: block.transactions };
+        target.submit_block(raw_block, false).await.unwrap_or_else(|err| panic!("failed importing {label} block {hash}: {err}"));
+    }
+
+    (added_blocks, accepted)
+}
+
+async fn wait_for_sink(client: &GrpcClient, expected_sink: cryptix_hashes::Hash, label: &'static str) {
+    let sink_client = client.clone();
+    wait_for(
+        100,
+        400,
+        move || {
+            async fn adopted(client: GrpcClient, expected_sink: cryptix_hashes::Hash) -> bool {
+                client.get_block_dag_info().await.map(|info| info.sink == expected_sink).unwrap_or(false)
+            }
+            Box::pin(adopted(sink_client.clone(), expected_sink))
+        },
+        label,
+    )
+    .await;
+}
+
+struct LiquidityBranchResult {
+    txids: Vec<(String, TransactionId)>,
+    claim_txid: TransactionId,
+    claim_amount_sompi: u64,
+}
+
+async fn apply_liquidity_buy_sell_claim_branch(
+    client: &GrpcClient,
+    owner_secret: &secp256k1::SecretKey,
+    owner_address: &Address,
+    asset_id: &str,
+    asset_id_bytes: [u8; 32],
+    start_pool: &RpcLiquidityPoolState,
+    buy_utxo: &(TransactionOutpoint, UtxoEntry),
+    buy_in_sompi: u64,
+    sell_token_in: u128,
+    claim_amount_sompi: u64,
+    label: &str,
+) -> LiquidityBranchResult {
+    let buy_quote = client
+        .get_liquidity_quote_call(
+            None,
+            GetLiquidityQuoteRequest {
+                asset_id: asset_id.to_string(),
+                side: 0,
+                exact_in_amount: buy_in_sompi.to_string(),
+                at_block_hash: None,
+            },
+        )
+        .await
+        .unwrap();
+    let canonical_buy_in_sompi = buy_quote.exact_in_amount.parse::<u64>().unwrap();
+    let buy_min_token_out = buy_quote.amount_out.parse::<u128>().unwrap();
+    let buy_fee = required_fee(2, 2);
+    assert!(
+        buy_utxo.1.amount > canonical_buy_in_sompi + buy_fee,
+        "{label} buy UTXO is too small: amount={} requested_buy_in={} canonical_buy_in={} fee={}",
+        buy_utxo.1.amount,
+        buy_in_sompi,
+        canonical_buy_in_sompi,
+        buy_fee
+    );
+    let buy_change = buy_utxo.1.amount - canonical_buy_in_sompi - buy_fee;
+    let start_vault_value = start_pool.vault_value_sompi.parse::<u64>().unwrap();
+    let buy_tx = build_payload_tx_with_outputs(
+        owner_secret,
+        vec![
+            (
+                TransactionOutpoint::new(start_pool.vault_txid, start_pool.vault_output_index),
+                UtxoEntry::new(start_vault_value, liquidity_vault_script(), 0, false),
+                0,
+            ),
+            (buy_utxo.0, buy_utxo.1.clone(), 1),
+        ],
+        vec![
+            TransactionOutput { value: start_vault_value + canonical_buy_in_sompi, script_public_key: liquidity_vault_script() },
+            TransactionOutput { value: buy_change, script_public_key: pay_to_address_script(owner_address) },
+        ],
+        payload_buy_liquidity(1, 1, asset_id_bytes, start_pool.pool_nonce, canonical_buy_in_sompi, buy_min_token_out),
+    );
+    let buy_txid = buy_tx.id();
+    submit_and_wait_indexed(client, &buy_tx, owner_address).await;
+
+    let pool_after_buy = client
+        .get_liquidity_pool_state_call(None, GetLiquidityPoolStateRequest { asset_id: asset_id.to_string(), at_block_hash: None })
+        .await
+        .unwrap()
+        .pool
+        .unwrap_or_else(|| panic!("{label} pool missing after buy"));
+    assert_eq!(pool_after_buy.pool_nonce, start_pool.pool_nonce + 1, "{label} buy must advance pool nonce");
+    let unclaimed_after_buy = pool_after_buy.unclaimed_fee_total_sompi.parse::<u64>().unwrap();
+    assert!(unclaimed_after_buy > 0, "{label} buy must accrue claimable CPAY fees");
+
+    let sell_quote = client
+        .get_liquidity_quote_call(
+            None,
+            GetLiquidityQuoteRequest {
+                asset_id: asset_id.to_string(),
+                side: 1,
+                exact_in_amount: sell_token_in.to_string(),
+                at_block_hash: None,
+            },
+        )
+        .await
+        .unwrap();
+    let sell_cpay_out = sell_quote.amount_out.parse::<u64>().unwrap();
+    let sell_fee = required_fee(2, 3);
+    let sell_change = buy_change.checked_sub(sell_fee).unwrap_or_else(|| panic!("{label} sell change underflow"));
+    let pool_after_buy_vault = pool_after_buy.vault_value_sompi.parse::<u64>().unwrap();
+    let sell_vault_value =
+        pool_after_buy_vault.checked_sub(sell_cpay_out).unwrap_or_else(|| panic!("{label} sell cpay out exceeds pool vault"));
+    let sell_tx = build_payload_tx_with_outputs(
+        owner_secret,
+        vec![
+            (
+                TransactionOutpoint::new(pool_after_buy.vault_txid, pool_after_buy.vault_output_index),
+                UtxoEntry::new(pool_after_buy_vault, liquidity_vault_script(), 0, false),
+                0,
+            ),
+            (TransactionOutpoint::new(buy_txid, 1), UtxoEntry::new(buy_change, pay_to_address_script(owner_address), 0, false), 1),
+        ],
+        vec![
+            TransactionOutput { value: sell_vault_value, script_public_key: liquidity_vault_script() },
+            TransactionOutput { value: sell_cpay_out, script_public_key: pay_to_address_script(owner_address) },
+            TransactionOutput { value: sell_change, script_public_key: pay_to_address_script(owner_address) },
+        ],
+        payload_sell_liquidity(1, 2, asset_id_bytes, pool_after_buy.pool_nonce, sell_token_in, sell_cpay_out, 1),
+    );
+    let sell_txid = sell_tx.id();
+    submit_and_wait_indexed(client, &sell_tx, owner_address).await;
+
+    let pool_after_sell = client
+        .get_liquidity_pool_state_call(None, GetLiquidityPoolStateRequest { asset_id: asset_id.to_string(), at_block_hash: None })
+        .await
+        .unwrap()
+        .pool
+        .unwrap_or_else(|| panic!("{label} pool missing after sell"));
+    assert_eq!(pool_after_sell.pool_nonce, start_pool.pool_nonce + 2, "{label} sell must advance pool nonce");
+    let unclaimed_after_sell = pool_after_sell.unclaimed_fee_total_sompi.parse::<u64>().unwrap();
+    assert!(
+        unclaimed_after_sell >= claim_amount_sompi,
+        "{label} does not have enough claimable fees: unclaimed={} claim={}",
+        unclaimed_after_sell,
+        claim_amount_sompi
+    );
+
+    let claim_fee = required_fee(2, 3);
+    let claim_change = sell_change.checked_sub(claim_fee).unwrap_or_else(|| panic!("{label} claim change underflow"));
+    let pool_after_sell_vault = pool_after_sell.vault_value_sompi.parse::<u64>().unwrap();
+    let claim_vault_value =
+        pool_after_sell_vault.checked_sub(claim_amount_sompi).unwrap_or_else(|| panic!("{label} claim amount exceeds pool vault"));
+    let claim_tx = build_payload_tx_with_outputs(
+        owner_secret,
+        vec![
+            (
+                TransactionOutpoint::new(pool_after_sell.vault_txid, pool_after_sell.vault_output_index),
+                UtxoEntry::new(pool_after_sell_vault, liquidity_vault_script(), 0, false),
+                0,
+            ),
+            (TransactionOutpoint::new(sell_txid, 2), UtxoEntry::new(sell_change, pay_to_address_script(owner_address), 0, false), 1),
+        ],
+        vec![
+            TransactionOutput { value: claim_vault_value, script_public_key: liquidity_vault_script() },
+            TransactionOutput { value: claim_amount_sompi, script_public_key: pay_to_address_script(owner_address) },
+            TransactionOutput { value: claim_change, script_public_key: pay_to_address_script(owner_address) },
+        ],
+        payload_claim_liquidity(1, 3, asset_id_bytes, pool_after_sell.pool_nonce, 0, claim_amount_sompi, 1),
+    );
+    let claim_txid = claim_tx.id();
+    submit_and_wait_indexed(client, &claim_tx, owner_address).await;
+
+    let txids = vec![(format!("{label}-buy"), buy_txid), (format!("{label}-sell"), sell_txid), (format!("{label}-claim"), claim_txid)];
+    assert_token_statuses_applied(client, &txids, label).await;
+    let pool_after_claim = client
+        .get_liquidity_pool_state_call(None, GetLiquidityPoolStateRequest { asset_id: asset_id.to_string(), at_block_hash: None })
+        .await
+        .unwrap()
+        .pool
+        .unwrap_or_else(|| panic!("{label} pool missing after claim"));
+    assert_eq!(pool_after_claim.pool_nonce, start_pool.pool_nonce + 3, "{label} claim must advance pool nonce");
+
+    LiquidityBranchResult { txids, claim_txid, claim_amount_sompi }
+}
+
 fn atomic_args() -> Args {
     Args {
         simnet: true,
@@ -2906,6 +3121,574 @@ async fn atomic_token_reorg_across_payload_hardfork_reverts_state_and_accepts_fr
     let old_asset_after_fresh_op =
         client1.get_token_asset_call(None, GetTokenAssetRequest { asset_id, at_block_hash: None }).await.unwrap();
     assert!(old_asset_after_fresh_op.asset.is_none(), "fresh post-reorg op must not resurrect losing branch asset");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn atomic_token_reorg_applies_winning_branch_token_ops() {
+    cryptix_core::log::try_init_logger("INFO");
+    let mut daemon1 = Daemon::new_random_with_args(atomic_args(), 10);
+    let mut daemon2 = Daemon::new_random_with_args(atomic_args(), 10);
+    let client1 = daemon1.start().await;
+    let client2 = daemon2.start().await;
+
+    let (losing_owner_sk, losing_owner_pk) = secp256k1::generate_keypair(&mut thread_rng());
+    let losing_owner_address =
+        Address::new(daemon1.network.into(), Version::PubKey, &losing_owner_pk.x_only_public_key().0.serialize());
+    let losing_owner_id = owner_id_from_address(&losing_owner_address);
+
+    let (winning_owner_sk, winning_owner_pk) = secp256k1::generate_keypair(&mut thread_rng());
+    let winning_owner_address =
+        Address::new(daemon1.network.into(), Version::PubKey, &winning_owner_pk.x_only_public_key().0.serialize());
+    let winning_owner_id = owner_id_from_address(&winning_owner_address);
+
+    let coinbase_maturity = daemon1.args.read().coinbase_maturity_override.unwrap_or(SIMNET_PARAMS.coinbase_maturity);
+    let losing_utxos = mine_until_spendable_utxos(&client1, &losing_owner_address, coinbase_maturity, 1).await;
+    let pre_reorg_state = client1.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
+
+    let losing_create_tx = build_payload_tx(
+        Keypair::from_secret_key(secp256k1::SECP256K1, &losing_owner_sk),
+        &losing_utxos[0],
+        &losing_owner_address,
+        payload_create_asset(0, 1, 0, losing_owner_id, b"LosingReorg", b"LRG", b"losing-branch"),
+    );
+    let losing_asset_id = losing_create_tx.id().to_string();
+    submit_and_wait_indexed(&client1, &losing_create_tx, &losing_owner_address).await;
+    let losing_status_before = client1
+        .get_token_op_status_call(None, GetTokenOpStatusRequest { txid: losing_create_tx.id(), at_block_hash: None })
+        .await
+        .unwrap();
+    assert_eq!(losing_status_before.apply_status, Some(0), "losing branch CAT tx must apply before reorg");
+
+    let winning_utxos = mine_until_spendable_utxos(&client2, &winning_owner_address, coinbase_maturity, 1).await;
+    let winning_create_tx = build_payload_tx(
+        Keypair::from_secret_key(secp256k1::SECP256K1, &winning_owner_sk),
+        &winning_utxos[0],
+        &winning_owner_address,
+        payload_create_asset(0, 1, 0, winning_owner_id, b"WinningReorg", b"WRG", b"winning-branch"),
+    );
+    let winning_asset_id = winning_create_tx.id().to_string();
+    submit_and_wait_indexed(&client2, &winning_create_tx, &winning_owner_address).await;
+    let winning_status_before = client2
+        .get_token_op_status_call(None, GetTokenOpStatusRequest { txid: winning_create_tx.id(), at_block_hash: None })
+        .await
+        .unwrap();
+    assert_eq!(winning_status_before.apply_status, Some(0), "winning branch CAT tx must apply before import");
+
+    let client1_tip_count = client1.get_block_dag_info().await.unwrap().block_count;
+    while client2.get_block_dag_info().await.unwrap().block_count < client1_tip_count + 40 {
+        mine_blocks(&client2, &winning_owner_address, 1).await;
+    }
+
+    let chain2 = client2.get_virtual_chain_from_block(cryptix_consensus::params::SIMNET_GENESIS.hash, true).await.unwrap();
+    assert!(chain2.removed_chain_block_hashes.is_empty());
+    assert!(
+        chain2
+            .accepted_transaction_ids
+            .iter()
+            .any(|entry| entry.accepted_transaction_ids.iter().any(|txid| *txid == winning_create_tx.id())),
+        "winning branch CAT tx must be in accepted_transaction_ids before import"
+    );
+    let winning_blocks = chain2.added_chain_block_hashes;
+    let winning_sink = *winning_blocks.last().expect("winning branch must contain selected blocks");
+    let client2_winning_state =
+        client2.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
+    assert_eq!(client2_winning_state.context.at_block_hash, winning_sink);
+
+    for hash in winning_blocks {
+        let block = client2.get_block_call(None, GetBlockRequest { hash, include_transactions: true }).await.unwrap().block;
+        let raw_block = RpcRawBlock { header: Header::from(&block.header).into(), transactions: block.transactions };
+        let _ = client1.submit_block(raw_block, false).await;
+    }
+
+    let sink_client = client1.clone();
+    wait_for(
+        100,
+        300,
+        move || {
+            async fn adopted(client: GrpcClient, expected_sink: cryptix_hashes::Hash) -> bool {
+                client.get_block_dag_info().await.map(|info| info.sink == expected_sink).unwrap_or(false)
+            }
+            Box::pin(adopted(sink_client.clone(), winning_sink))
+        },
+        "node did not adopt imported winning branch with token ops",
+    )
+    .await;
+
+    let health_after_reorg = wait_for_healthy_atomic_at_sink(&client1, winning_sink, "winning branch token-op reorg").await;
+    assert_eq!(health_after_reorg.last_applied_block, Some(winning_sink));
+
+    let state_after_reorg = client1.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
+    assert_eq!(state_after_reorg.context.at_block_hash, winning_sink);
+    assert_eq!(state_after_reorg.context.state_hash, health_after_reorg.state_hash);
+    assert_eq!(
+        state_after_reorg.context.state_hash, client2_winning_state.context.state_hash,
+        "reorged node must match the winner node token state hash"
+    );
+    assert_ne!(
+        state_after_reorg.context.state_hash, pre_reorg_state.context.state_hash,
+        "winning branch CAT op must change token state relative to the pre-op base"
+    );
+
+    let losing_status_after = client1
+        .get_token_op_status_call(None, GetTokenOpStatusRequest { txid: losing_create_tx.id(), at_block_hash: None })
+        .await
+        .unwrap();
+    assert!(losing_status_after.apply_status.is_none(), "losing CAT tx must be removed by reorg");
+    let winning_status_after = client1
+        .get_token_op_status_call(None, GetTokenOpStatusRequest { txid: winning_create_tx.id(), at_block_hash: None })
+        .await
+        .unwrap();
+    assert_eq!(winning_status_after.apply_status, Some(0), "winning CAT tx must apply during reorg import");
+
+    let losing_asset_after =
+        client1.get_token_asset_call(None, GetTokenAssetRequest { asset_id: losing_asset_id, at_block_hash: None }).await.unwrap();
+    assert!(losing_asset_after.asset.is_none(), "losing branch asset must disappear after reorg");
+    let winning_asset_after =
+        client1.get_token_asset_call(None, GetTokenAssetRequest { asset_id: winning_asset_id, at_block_hash: None }).await.unwrap();
+    assert_eq!(winning_asset_after.asset.expect("winning branch asset must exist after reorg").symbol, "WRG");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn atomic_token_reorg_applies_same_asset_competing_winning_ops() {
+    cryptix_core::log::try_init_logger("INFO");
+    let mut daemon1 = Daemon::new_random_with_args(atomic_args(), 10);
+    let mut daemon2 = Daemon::new_random_with_args(atomic_args(), 10);
+    let client1 = daemon1.start().await;
+    let client2 = daemon2.start().await;
+
+    let (owner_sk, owner_pk) = secp256k1::generate_keypair(&mut thread_rng());
+    let owner_address = Address::new(daemon1.network.into(), Version::PubKey, &owner_pk.x_only_public_key().0.serialize());
+    let owner_id = owner_id_from_address(&owner_address);
+    let owner_id_hex = hex32(owner_id);
+    let owner_keypair = || Keypair::from_secret_key(secp256k1::SECP256K1, &owner_sk);
+
+    let (_receiver_sk, receiver_pk) = secp256k1::generate_keypair(&mut thread_rng());
+    let receiver_address = Address::new(daemon1.network.into(), Version::PubKey, &receiver_pk.x_only_public_key().0.serialize());
+    let receiver_id = owner_id_from_address(&receiver_address);
+    let receiver_id_hex = hex32(receiver_id);
+
+    let coinbase_maturity = daemon1.args.read().coinbase_maturity_override.unwrap_or(SIMNET_PARAMS.coinbase_maturity);
+    let mut utxos = mine_until_spendable_utxos(&client1, &owner_address, coinbase_maturity, 7).await;
+    utxos.truncate(7);
+
+    let create_tx = build_payload_tx(
+        owner_keypair(),
+        &utxos[0],
+        &owner_address,
+        payload_create_asset_with_mint(0, 1, 0, 1_000_000, owner_id, owner_id, 10_000, b"SameAssetReorg", b"SAR", b"common-base"),
+    );
+    let asset_id = create_tx.id().to_string();
+    let asset_id_bytes = create_tx.id().as_bytes();
+    submit_and_wait_indexed(&client1, &create_tx, &owner_address).await;
+    let common_sink = client1.get_block_dag_info().await.unwrap().sink;
+    let common_state = client1.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
+
+    let (common_blocks, _) =
+        import_selected_chain_blocks(&client1, &client2, cryptix_consensus::params::SIMNET_GENESIS.hash, "same-asset common prefix")
+            .await;
+    assert!(common_blocks.contains(&common_sink), "common prefix import must include the common sink");
+    wait_for_sink(&client2, common_sink, "node2 did not adopt same-asset common prefix").await;
+    let client2_common_health = wait_for_healthy_atomic_at_sink(&client2, common_sink, "same-asset common prefix").await;
+    assert_eq!(client2_common_health.state_hash, common_state.context.state_hash);
+
+    let losing_mint_tx =
+        build_payload_tx(owner_keypair(), &utxos[1], &owner_address, payload_mint(0, 1, asset_id_bytes, owner_id, 500));
+    submit_and_wait_indexed(&client1, &losing_mint_tx, &owner_address).await;
+    let losing_transfer_tx =
+        build_payload_tx(owner_keypair(), &utxos[2], &owner_address, payload_transfer(0, 2, asset_id_bytes, receiver_id, 300));
+    submit_and_wait_indexed(&client1, &losing_transfer_tx, &owner_address).await;
+    let losing_burn_tx = build_payload_tx(owner_keypair(), &utxos[3], &owner_address, payload_burn(0, 3, asset_id_bytes, 100));
+    submit_and_wait_indexed(&client1, &losing_burn_tx, &owner_address).await;
+    let losing_txids = vec![
+        ("losing-mint".to_string(), losing_mint_tx.id()),
+        ("losing-transfer".to_string(), losing_transfer_tx.id()),
+        ("losing-burn".to_string(), losing_burn_tx.id()),
+    ];
+    assert_token_statuses_applied(&client1, &losing_txids, "same-asset losing branch").await;
+    let losing_state_before_reorg =
+        client1.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
+    assert_ne!(losing_state_before_reorg.context.state_hash, common_state.context.state_hash);
+
+    let winning_mint_tx =
+        build_payload_tx(owner_keypair(), &utxos[4], &owner_address, payload_mint(0, 1, asset_id_bytes, owner_id, 700));
+    submit_and_wait_indexed(&client2, &winning_mint_tx, &owner_address).await;
+    let winning_transfer_tx =
+        build_payload_tx(owner_keypair(), &utxos[5], &owner_address, payload_transfer(0, 2, asset_id_bytes, receiver_id, 250));
+    submit_and_wait_indexed(&client2, &winning_transfer_tx, &owner_address).await;
+    let winning_burn_tx = build_payload_tx(owner_keypair(), &utxos[6], &owner_address, payload_burn(0, 3, asset_id_bytes, 50));
+    submit_and_wait_indexed(&client2, &winning_burn_tx, &owner_address).await;
+    let winning_txids = vec![
+        ("winning-mint".to_string(), winning_mint_tx.id()),
+        ("winning-transfer".to_string(), winning_transfer_tx.id()),
+        ("winning-burn".to_string(), winning_burn_tx.id()),
+    ];
+    assert_token_statuses_applied(&client2, &winning_txids, "same-asset winning branch before import").await;
+
+    let client1_tip_count = client1.get_block_dag_info().await.unwrap().block_count;
+    while client2.get_block_dag_info().await.unwrap().block_count < client1_tip_count + 40 {
+        mine_blocks(&client2, &owner_address, 1).await;
+    }
+    let client2_winning_sink = client2.get_block_dag_info().await.unwrap().sink;
+    let client2_winning_health = wait_for_healthy_atomic_at_sink(&client2, client2_winning_sink, "same-asset winning branch").await;
+    let client2_winning_state =
+        client2.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
+    assert_eq!(client2_winning_health.state_hash, client2_winning_state.context.state_hash);
+    let client2_winning_cpay_snapshot = spendable_cpay_snapshot(&client2, &owner_address, coinbase_maturity).await;
+
+    let (winning_blocks, winning_accepted) =
+        import_selected_chain_blocks(&client2, &client1, common_sink, "same-asset winning branch").await;
+    assert_eq!(*winning_blocks.last().expect("winning branch must have a sink"), client2_winning_sink);
+    for (label, txid) in &winning_txids {
+        assert!(winning_accepted.contains(txid), "same-asset winning branch did not accept {label}/{txid}");
+    }
+
+    wait_for_sink(&client1, client2_winning_sink, "node1 did not adopt same-asset winning branch").await;
+    let health_after_reorg = wait_for_healthy_atomic_at_sink(&client1, client2_winning_sink, "same-asset post-reorg").await;
+    let state_after_reorg = client1.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
+    assert_eq!(state_after_reorg.context.at_block_hash, client2_winning_sink);
+    assert_eq!(state_after_reorg.context.state_hash, health_after_reorg.state_hash);
+    assert_eq!(
+        state_after_reorg.context.state_hash, client2_winning_state.context.state_hash,
+        "same-asset reorged node must match the winner node Atomic state hash"
+    );
+    assert_ne!(state_after_reorg.context.state_hash, losing_state_before_reorg.context.state_hash);
+    assert_ne!(state_after_reorg.context.state_hash, common_state.context.state_hash);
+
+    for (label, txid) in &losing_txids {
+        let status =
+            client1.get_token_op_status_call(None, GetTokenOpStatusRequest { txid: *txid, at_block_hash: None }).await.unwrap();
+        assert!(status.apply_status.is_none(), "same-asset losing tx {label}/{txid} must be removed by reorg");
+    }
+    assert_token_statuses_applied(&client1, &winning_txids, "same-asset winning branch after reorg").await;
+
+    let asset_after = client1
+        .get_token_asset_call(None, GetTokenAssetRequest { asset_id: asset_id.clone(), at_block_hash: None })
+        .await
+        .unwrap()
+        .asset
+        .expect("same-asset token must survive on winning branch");
+    assert_eq!(asset_after.total_supply, "10650");
+    let owner_balance = client1
+        .get_token_balance_call(
+            None,
+            GetTokenBalanceRequest { asset_id: asset_id.clone(), owner_id: owner_id_hex.clone(), at_block_hash: None },
+        )
+        .await
+        .unwrap();
+    let receiver_balance = client1
+        .get_token_balance_call(
+            None,
+            GetTokenBalanceRequest { asset_id: asset_id.clone(), owner_id: receiver_id_hex.clone(), at_block_hash: None },
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner_balance.balance, "10400");
+    assert_eq!(receiver_balance.balance, "250");
+    let cpay_snapshot_after_reorg = spendable_cpay_snapshot(&client1, &owner_address, coinbase_maturity).await;
+    assert_eq!(
+        cpay_snapshot_after_reorg, client2_winning_cpay_snapshot,
+        "same-asset reorged node CPAY wallet UTXO set must match the winner node"
+    );
+
+    let owner_nonce = client1
+        .get_token_nonce_call(None, GetTokenNonceRequest { owner_id: owner_id_hex.clone(), asset_id: None, at_block_hash: None })
+        .await
+        .unwrap();
+    let asset_nonce = client1
+        .get_token_nonce_call(None, GetTokenNonceRequest { owner_id: owner_id_hex, asset_id: Some(asset_id), at_block_hash: None })
+        .await
+        .unwrap();
+    assert_eq!(owner_nonce.expected_next_nonce, 2);
+    assert_eq!(asset_nonce.expected_next_nonce, 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn atomic_token_reorg_applies_same_pool_competing_liquidity_ops() {
+    cryptix_core::log::try_init_logger("INFO");
+    let mut daemon1 = Daemon::new_random_with_args(atomic_args(), 10);
+    let mut daemon2 = Daemon::new_random_with_args(atomic_args(), 10);
+    let client1 = daemon1.start().await;
+    let client2 = daemon2.start().await;
+    let consensus_manager = consensus_manager_from_daemon(&daemon1);
+
+    let (owner_sk, owner_pk) = secp256k1::generate_keypair(&mut thread_rng());
+    let owner_address = Address::new(daemon1.network.into(), Version::PubKey, &owner_pk.x_only_public_key().0.serialize());
+    let owner_id = owner_id_from_address(&owner_address);
+    let owner_id_hex = hex32(owner_id);
+
+    let coinbase_maturity = daemon1.args.read().coinbase_maturity_override.unwrap_or(SIMNET_PARAMS.coinbase_maturity);
+    let mut utxos = mine_until_spendable_utxos(&client1, &owner_address, coinbase_maturity, 3).await;
+    utxos.truncate(3);
+
+    let liquidity_fee = required_fee(1, 2);
+    assert!(utxos[0].1.amount > MIN_LIQUIDITY_SEED_RESERVE_SOMPI + liquidity_fee);
+    let liquidity_change = utxos[0].1.amount - MIN_LIQUIDITY_SEED_RESERVE_SOMPI - liquidity_fee;
+    let create_liquidity_tx = build_payload_tx_with_outputs(
+        &owner_sk,
+        vec![(utxos[0].0, utxos[0].1.clone(), 1)],
+        vec![
+            TransactionOutput { value: MIN_LIQUIDITY_SEED_RESERVE_SOMPI, script_public_key: liquidity_vault_script() },
+            TransactionOutput { value: liquidity_change, script_public_key: pay_to_address_script(&owner_address) },
+        ],
+        payload_create_liquidity_with_fee_recipient(
+            0,
+            1,
+            LIQUIDITY_TOKEN_SUPPLY_RAW,
+            100,
+            &owner_address,
+            0,
+            0,
+            b"SamePoolReorg",
+            b"SPR",
+        ),
+    );
+    let liquidity_asset_id = create_liquidity_tx.id().to_string();
+    let liquidity_asset_bytes = create_liquidity_tx.id().as_bytes();
+    submit_and_wait_indexed(&client1, &create_liquidity_tx, &owner_address).await;
+
+    let common_pool = client1
+        .get_liquidity_pool_state_call(
+            None,
+            GetLiquidityPoolStateRequest { asset_id: liquidity_asset_id.clone(), at_block_hash: None },
+        )
+        .await
+        .unwrap()
+        .pool
+        .expect("common liquidity pool must exist before split");
+    assert_eq!(common_pool.pool_nonce, 1);
+    let common_sink = client1.get_block_dag_info().await.unwrap().sink;
+    let common_state = client1.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
+
+    let (common_blocks, _) =
+        import_selected_chain_blocks(&client1, &client2, cryptix_consensus::params::SIMNET_GENESIS.hash, "same-pool common prefix")
+            .await;
+    assert!(common_blocks.contains(&common_sink), "common pool import must include the common sink");
+    wait_for_sink(&client2, common_sink, "node2 did not adopt same-pool common prefix").await;
+    let client2_common_health = wait_for_healthy_atomic_at_sink(&client2, common_sink, "same-pool common prefix").await;
+    assert_eq!(client2_common_health.state_hash, common_state.context.state_hash);
+    let client2_common_pool = client2
+        .get_liquidity_pool_state_call(
+            None,
+            GetLiquidityPoolStateRequest { asset_id: liquidity_asset_id.clone(), at_block_hash: None },
+        )
+        .await
+        .unwrap()
+        .pool
+        .expect("client2 common liquidity pool must exist before split");
+    assert_eq!(client2_common_pool.vault_txid, common_pool.vault_txid);
+    assert_eq!(client2_common_pool.vault_value_sompi, common_pool.vault_value_sompi);
+
+    let losing_branch = apply_liquidity_buy_sell_claim_branch(
+        &client1,
+        &owner_sk,
+        &owner_address,
+        &liquidity_asset_id,
+        liquidity_asset_bytes,
+        &common_pool,
+        &utxos[1],
+        2_000_000_000,
+        2,
+        12_000_000,
+        "same-pool-losing",
+    )
+    .await;
+    let losing_pool_before_reorg = client1
+        .get_liquidity_pool_state_call(
+            None,
+            GetLiquidityPoolStateRequest { asset_id: liquidity_asset_id.clone(), at_block_hash: None },
+        )
+        .await
+        .unwrap()
+        .pool
+        .expect("losing pool must exist before reorg");
+    let losing_state_before_reorg =
+        client1.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
+    assert_ne!(losing_state_before_reorg.context.state_hash, common_state.context.state_hash);
+
+    let winning_branch = apply_liquidity_buy_sell_claim_branch(
+        &client2,
+        &owner_sk,
+        &owner_address,
+        &liquidity_asset_id,
+        liquidity_asset_bytes,
+        &client2_common_pool,
+        &utxos[2],
+        3_000_000_000,
+        3,
+        12_000_000,
+        "same-pool-winning",
+    )
+    .await;
+
+    let client1_tip_count = client1.get_block_dag_info().await.unwrap().block_count;
+    while client2.get_block_dag_info().await.unwrap().block_count < client1_tip_count + 40 {
+        mine_blocks(&client2, &owner_address, 1).await;
+    }
+    let client2_winning_sink = client2.get_block_dag_info().await.unwrap().sink;
+    let client2_winning_health = wait_for_healthy_atomic_at_sink(&client2, client2_winning_sink, "same-pool winning branch").await;
+    let client2_winning_state =
+        client2.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
+    assert_eq!(client2_winning_health.state_hash, client2_winning_state.context.state_hash);
+    let client2_winning_pool = client2
+        .get_liquidity_pool_state_call(
+            None,
+            GetLiquidityPoolStateRequest { asset_id: liquidity_asset_id.clone(), at_block_hash: None },
+        )
+        .await
+        .unwrap()
+        .pool
+        .expect("winning pool must exist before import");
+    let client2_winning_fee_state = client2
+        .get_liquidity_fee_state_call(None, GetLiquidityFeeStateRequest { asset_id: liquidity_asset_id.clone(), at_block_hash: None })
+        .await
+        .unwrap();
+    let client2_winning_holders = client2
+        .get_liquidity_holders_call(
+            None,
+            GetLiquidityHoldersRequest { asset_id: liquidity_asset_id.clone(), offset: 0, limit: 100, at_block_hash: None },
+        )
+        .await
+        .unwrap();
+    let client2_winning_balance = client2
+        .get_token_balance_call(
+            None,
+            GetTokenBalanceRequest { asset_id: liquidity_asset_id.clone(), owner_id: owner_id_hex.clone(), at_block_hash: None },
+        )
+        .await
+        .unwrap();
+    let client2_winning_quote = client2
+        .get_liquidity_quote_call(
+            None,
+            GetLiquidityQuoteRequest {
+                asset_id: liquidity_asset_id.clone(),
+                side: 0,
+                exact_in_amount: "1000000000".to_string(),
+                at_block_hash: None,
+            },
+        )
+        .await
+        .unwrap();
+    let client2_winning_cpay_snapshot = spendable_cpay_snapshot(&client2, &owner_address, coinbase_maturity).await;
+
+    let (winning_blocks, winning_accepted) =
+        import_selected_chain_blocks(&client2, &client1, common_sink, "same-pool winning branch").await;
+    assert_eq!(*winning_blocks.last().expect("winning pool branch must have a sink"), client2_winning_sink);
+    for (label, txid) in &winning_branch.txids {
+        assert!(winning_accepted.contains(txid), "same-pool winning branch did not accept {label}/{txid}");
+    }
+
+    wait_for_sink(&client1, client2_winning_sink, "node1 did not adopt same-pool winning branch").await;
+    let health_after_reorg = wait_for_healthy_atomic_at_sink(&client1, client2_winning_sink, "same-pool post-reorg").await;
+    let state_after_reorg = client1.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await.unwrap();
+    assert_eq!(state_after_reorg.context.at_block_hash, client2_winning_sink);
+    assert_eq!(state_after_reorg.context.state_hash, health_after_reorg.state_hash);
+    assert_eq!(
+        state_after_reorg.context.state_hash, client2_winning_state.context.state_hash,
+        "same-pool reorged node must match the winner node Atomic state hash"
+    );
+    assert_ne!(state_after_reorg.context.state_hash, losing_state_before_reorg.context.state_hash);
+
+    for (label, txid) in &losing_branch.txids {
+        let status =
+            client1.get_token_op_status_call(None, GetTokenOpStatusRequest { txid: *txid, at_block_hash: None }).await.unwrap();
+        assert!(status.apply_status.is_none(), "same-pool losing tx {label}/{txid} must be removed by reorg");
+    }
+    assert_token_statuses_applied(&client1, &winning_branch.txids, "same-pool winning branch after reorg").await;
+
+    let pool_after_reorg = client1
+        .get_liquidity_pool_state_call(
+            None,
+            GetLiquidityPoolStateRequest { asset_id: liquidity_asset_id.clone(), at_block_hash: None },
+        )
+        .await
+        .unwrap()
+        .pool
+        .expect("same-pool liquidity state must exist after reorg");
+    assert_eq!(pool_after_reorg.pool_nonce, client2_winning_pool.pool_nonce);
+    assert_eq!(pool_after_reorg.vault_txid, client2_winning_pool.vault_txid);
+    assert_eq!(pool_after_reorg.vault_output_index, client2_winning_pool.vault_output_index);
+    assert_eq!(pool_after_reorg.vault_value_sompi, client2_winning_pool.vault_value_sompi);
+    assert_eq!(pool_after_reorg.real_cpay_reserves_sompi, client2_winning_pool.real_cpay_reserves_sompi);
+    assert_eq!(pool_after_reorg.liquidity_cpay_sompi, client2_winning_pool.liquidity_cpay_sompi);
+    assert_eq!(pool_after_reorg.unclaimed_fee_total_sompi, client2_winning_pool.unclaimed_fee_total_sompi);
+    assert_eq!(pool_after_reorg.real_token_reserves, client2_winning_pool.real_token_reserves);
+    assert_eq!(pool_after_reorg.circulating_token_supply, client2_winning_pool.circulating_token_supply);
+    assert_eq!(pool_after_reorg.current_spot_price_sompi, client2_winning_pool.current_spot_price_sompi);
+    assert_ne!(
+        pool_after_reorg.vault_value_sompi, losing_pool_before_reorg.vault_value_sompi,
+        "same-pool reorg must replace losing CPAY vault state"
+    );
+
+    let fee_state_after = client1
+        .get_liquidity_fee_state_call(None, GetLiquidityFeeStateRequest { asset_id: liquidity_asset_id.clone(), at_block_hash: None })
+        .await
+        .unwrap();
+    assert_eq!(fee_state_after.total_unclaimed_sompi, client2_winning_fee_state.total_unclaimed_sompi);
+    assert_eq!(fee_state_after.recipients.len(), 1);
+    assert_eq!(client2_winning_fee_state.recipients.len(), 1);
+    assert_eq!(fee_state_after.recipients[0].owner_id, client2_winning_fee_state.recipients[0].owner_id);
+    assert_eq!(fee_state_after.recipients[0].address, client2_winning_fee_state.recipients[0].address);
+    assert_eq!(fee_state_after.recipients[0].unclaimed_sompi, client2_winning_fee_state.recipients[0].unclaimed_sompi);
+
+    let holders_after = client1
+        .get_liquidity_holders_call(
+            None,
+            GetLiquidityHoldersRequest { asset_id: liquidity_asset_id.clone(), offset: 0, limit: 100, at_block_hash: None },
+        )
+        .await
+        .unwrap();
+    let holder_after = holders_after
+        .holders
+        .iter()
+        .find(|holder| holder.owner_id == owner_id_hex)
+        .expect("owner must hold winning liquidity tokens after reorg");
+    let holder_winning = client2_winning_holders
+        .holders
+        .iter()
+        .find(|holder| holder.owner_id == owner_id_hex)
+        .expect("winner node must report owner liquidity holder");
+    assert_eq!(holder_after.balance, holder_winning.balance);
+
+    let balance_after = client1
+        .get_token_balance_call(
+            None,
+            GetTokenBalanceRequest { asset_id: liquidity_asset_id.clone(), owner_id: owner_id_hex.clone(), at_block_hash: None },
+        )
+        .await
+        .unwrap();
+    assert_eq!(balance_after.balance, client2_winning_balance.balance);
+
+    let quote_after = client1
+        .get_liquidity_quote_call(
+            None,
+            GetLiquidityQuoteRequest {
+                asset_id: liquidity_asset_id,
+                side: 0,
+                exact_in_amount: "1000000000".to_string(),
+                at_block_hash: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(quote_after.amount_out, client2_winning_quote.amount_out);
+    assert_eq!(quote_after.fee_amount_sompi, client2_winning_quote.fee_amount_sompi);
+    assert_eq!(quote_after.net_in_amount, client2_winning_quote.net_in_amount);
+    let cpay_snapshot_after_reorg = spendable_cpay_snapshot(&client1, &owner_address, coinbase_maturity).await;
+    assert_eq!(
+        cpay_snapshot_after_reorg, client2_winning_cpay_snapshot,
+        "same-pool reorged node CPAY wallet UTXO set must match the winner node"
+    );
+
+    let winning_claim_outpoint = TransactionOutpoint::new(winning_branch.claim_txid, 1);
+    let winning_claim_utxo = virtual_utxo_entry_exact(consensus_manager.as_ref(), winning_claim_outpoint)
+        .await
+        .expect("winning fee-claim CPAY payout must exist after reorg");
+    assert_eq!(winning_claim_utxo.amount, winning_branch.claim_amount_sompi);
+    let losing_claim_outpoint = TransactionOutpoint::new(losing_branch.claim_txid, 1);
+    assert!(
+        virtual_utxo_entry_exact(consensus_manager.as_ref(), losing_claim_outpoint).await.is_none(),
+        "losing fee-claim CPAY payout must disappear after reorg"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
