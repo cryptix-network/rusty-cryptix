@@ -5,7 +5,7 @@
 //! No data submitted by the client to the server can be trusted
 
 use crate::api::connection::DynRpcConnection;
-use crate::{model::*, notify::connection::ChannelConnection, RpcResult};
+use crate::{model::*, notify::connection::ChannelConnection, RpcError, RpcResult};
 use async_trait::async_trait;
 use cryptix_notify::{listener::ListenerId, scope::Scope, subscription::Command};
 use downcast::{downcast_sync, AnySync};
@@ -823,6 +823,57 @@ pub trait RpcApi: Sync + Send + AnySync {
         connection: Option<&DynRpcConnection>,
         request: GetDaaScoreTimestampEstimateRequest,
     ) -> RpcResult<GetDaaScoreTimestampEstimateResponse>;
+
+    // Defaulted to NotImplemented so only the core service has to implement them.
+    async fn get_spendable_balances_by_addresses(
+        &self,
+        addresses: Vec<RpcAddress>,
+    ) -> RpcResult<Vec<RpcSpendableBalanceEntry>> {
+        Ok(self
+            .get_spendable_balances_by_addresses_call(None, GetSpendableBalancesByAddressesRequest { addresses })
+            .await?
+            .entries)
+    }
+    async fn get_spendable_balances_by_addresses_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetSpendableBalancesByAddressesRequest,
+    ) -> RpcResult<GetSpendableBalancesByAddressesResponse> {
+        Err(RpcError::NotImplemented)
+    }
+
+    async fn get_transaction_mass_estimate(&self, transaction: RpcTransaction) -> RpcResult<GetTransactionMassEstimateResponse> {
+        self.get_transaction_mass_estimate_call(None, GetTransactionMassEstimateRequest { transaction }).await
+    }
+    async fn get_transaction_mass_estimate_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetTransactionMassEstimateRequest,
+    ) -> RpcResult<GetTransactionMassEstimateResponse> {
+        Err(RpcError::NotImplemented)
+    }
+
+    async fn validate_transaction(&self, transaction: RpcTransaction) -> RpcResult<ValidateTransactionResponse> {
+        self.validate_transaction_call(None, ValidateTransactionRequest { transaction }).await
+    }
+    async fn validate_transaction_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: ValidateTransactionRequest,
+    ) -> RpcResult<ValidateTransactionResponse> {
+        Err(RpcError::NotImplemented)
+    }
+
+    async fn get_transaction_status(&self, entries: Vec<RpcTransactionLookupRequest>) -> RpcResult<GetTransactionStatusResponse> {
+        self.get_transaction_status_call(None, GetTransactionStatusRequest { entries }).await
+    }
+    async fn get_transaction_status_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetTransactionStatusRequest,
+    ) -> RpcResult<GetTransactionStatusResponse> {
+        Err(RpcError::NotImplemented)
+    }
 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Fee estimation API

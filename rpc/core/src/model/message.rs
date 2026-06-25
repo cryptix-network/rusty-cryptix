@@ -6033,3 +6033,220 @@ impl Deserializer for UnsubscribeResponse {
         Ok(Self {})
     }
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcSpendableBalanceEntry {
+    pub address: RpcAddress,
+    pub mature: u64,
+    pub immature_coinbase: u64,
+    pub pending: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetSpendableBalancesByAddressesRequest {
+    pub addresses: Vec<RpcAddress>,
+}
+
+impl Serializer for GetSpendableBalancesByAddressesRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Vec<RpcAddress>, &self.addresses, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetSpendableBalancesByAddressesRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let addresses = load!(Vec<RpcAddress>, reader)?;
+        Ok(Self { addresses })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetSpendableBalancesByAddressesResponse {
+    pub entries: Vec<RpcSpendableBalanceEntry>,
+}
+
+impl Serializer for GetSpendableBalancesByAddressesResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Vec<RpcSpendableBalanceEntry>, &self.entries, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetSpendableBalancesByAddressesResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let entries = load!(Vec<RpcSpendableBalanceEntry>, reader)?;
+        Ok(Self { entries })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTransactionMassEstimateRequest {
+    pub transaction: RpcTransaction,
+}
+
+impl Serializer for GetTransactionMassEstimateRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        serialize!(RpcTransaction, &self.transaction, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTransactionMassEstimateRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let transaction = deserialize!(RpcTransaction, reader)?;
+        Ok(Self { transaction })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTransactionMassEstimateResponse {
+    pub compute_mass: u64,
+    pub storage_mass: u64,
+    pub overall_mass: u64,
+}
+
+impl Serializer for GetTransactionMassEstimateResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(u64, &self.compute_mass, writer)?;
+        store!(u64, &self.storage_mass, writer)?;
+        store!(u64, &self.overall_mass, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTransactionMassEstimateResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let compute_mass = load!(u64, reader)?;
+        let storage_mass = load!(u64, reader)?;
+        let overall_mass = load!(u64, reader)?;
+        Ok(Self { compute_mass, storage_mass, overall_mass })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateTransactionRequest {
+    pub transaction: RpcTransaction,
+}
+
+impl Serializer for ValidateTransactionRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        serialize!(RpcTransaction, &self.transaction, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for ValidateTransactionRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let transaction = deserialize!(RpcTransaction, reader)?;
+        Ok(Self { transaction })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateTransactionResponse {
+    pub is_valid: bool,
+    pub error: Option<String>,
+    pub compute_mass: u64,
+    pub storage_mass: u64,
+    pub overall_mass: u64,
+    pub fee: u64,
+}
+
+impl Serializer for ValidateTransactionResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(bool, &self.is_valid, writer)?;
+        store!(Option<String>, &self.error, writer)?;
+        store!(u64, &self.compute_mass, writer)?;
+        store!(u64, &self.storage_mass, writer)?;
+        store!(u64, &self.overall_mass, writer)?;
+        store!(u64, &self.fee, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for ValidateTransactionResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let is_valid = load!(bool, reader)?;
+        let error = load!(Option<String>, reader)?;
+        let compute_mass = load!(u64, reader)?;
+        let storage_mass = load!(u64, reader)?;
+        let overall_mass = load!(u64, reader)?;
+        let fee = load!(u64, reader)?;
+        Ok(Self { is_valid, error, compute_mass, storage_mass, overall_mass, fee })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTransactionStatusEntry {
+    pub transaction_id: RpcTransactionId,
+    pub status: String,
+    pub is_accepted: bool,
+    pub accepting_block_hash: Option<RpcHash>,
+    pub block_daa_score: Option<u64>,
+    pub confirmations: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTransactionStatusRequest {
+    pub entries: Vec<RpcTransactionLookupRequest>,
+}
+
+impl Serializer for GetTransactionStatusRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        serialize!(Vec<RpcTransactionLookupRequest>, &self.entries, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTransactionStatusRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let entries = deserialize!(Vec<RpcTransactionLookupRequest>, reader)?;
+        Ok(Self { entries })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTransactionStatusResponse {
+    pub entries: Vec<RpcTransactionStatusEntry>,
+}
+
+impl Serializer for GetTransactionStatusResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Vec<RpcTransactionStatusEntry>, &self.entries, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTransactionStatusResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let entries = load!(Vec<RpcTransactionStatusEntry>, reader)?;
+        Ok(Self { entries })
+    }
+}

@@ -307,6 +307,10 @@ impl RpcApi for GrpcClient {
     route!(get_sc_replay_window_chunk_call, GetScReplayWindowChunk);
     route!(get_sc_snapshot_head_call, GetScSnapshotHead);
     route!(get_consensus_atomic_state_hash_call, GetConsensusAtomicStateHash);
+    route!(get_spendable_balances_by_addresses_call, GetSpendableBalancesByAddresses);
+    route!(get_transaction_mass_estimate_call, GetTransactionMassEstimate);
+    route!(validate_transaction_call, ValidateTransaction);
+    route!(get_transaction_status_call, GetTransactionStatus);
 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Notification API

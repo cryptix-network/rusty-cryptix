@@ -105,6 +105,10 @@ impl Router {
                 SubmitFastIntent,
                 GetFastIntentStatus,
                 CancelFastIntent,
+                GetSpendableBalancesByAddresses,
+                GetTransactionMassEstimate,
+                ValidateTransaction,
+                GetTransactionStatus,
                 Unban,
             ]
         );

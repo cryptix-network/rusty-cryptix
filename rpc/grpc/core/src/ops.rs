@@ -117,6 +117,10 @@ pub enum CryptixdPayloadOps {
     GetScReplayWindowChunk,
     GetScSnapshotHead,
     GetConsensusAtomicStateHash,
+    GetSpendableBalancesByAddresses,
+    GetTransactionMassEstimate,
+    ValidateTransaction,
+    GetTransactionStatus,
 
     // Subscription commands for starting/stopping notifications
     NotifyBlockAdded,

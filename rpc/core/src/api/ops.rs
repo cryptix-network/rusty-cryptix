@@ -8,7 +8,7 @@ use workflow_core::enums::Describe;
 pub const RPC_API_VERSION: u16 = 1;
 /// API revision. Change in this value denotes
 /// backwards-compatible changes.
-pub const RPC_API_REVISION: u16 = 2;
+pub const RPC_API_REVISION: u16 = 3;
 
 #[derive(Describe, Clone, Copy, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -198,6 +198,11 @@ pub enum RpcApiOps {
     GetTransactionsByIds = 180,
     /// Get Cryptix Atomic next nonce for owner-scope create operations.
     GetOwnerNonce = 181,
+
+    GetSpendableBalancesByAddresses = 190,
+    GetTransactionMassEstimate = 191,
+    ValidateTransaction = 192,
+    GetTransactionStatus = 193,
 }
 
 impl RpcApiOps {

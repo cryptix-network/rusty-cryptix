@@ -29,7 +29,9 @@ use cryptix_atomicindex::{
     },
 };
 use cryptix_consensus_core::api::counters::ProcessingCounters;
+use cryptix_consensus_core::api::args::TransactionValidationArgs;
 use cryptix_consensus_core::errors::block::RuleError;
+use cryptix_consensus_core::mass::{calc_storage_mass, Kip9Version, MassCalculator};
 use cryptix_consensus_core::{
     block::Block,
     blockhash::BlockHashExtensions,
@@ -37,7 +39,7 @@ use cryptix_consensus_core::{
     config::Config,
     constants::MAX_SOMPI,
     network::NetworkType,
-    tx::{ScriptPublicKey, Transaction, TransactionId, TransactionOutpoint, UtxoEntry, COINBASE_TRANSACTION_INDEX},
+    tx::{MutableTransaction, ScriptPublicKey, Transaction, TransactionId, TransactionOutpoint, UtxoEntry, COINBASE_TRANSACTION_INDEX},
 };
 use cryptix_consensus_notify::{
     notifier::ConsensusNotifier,
@@ -2868,6 +2870,181 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let circulating_sompi =
             self.utxoindex.clone().unwrap().get_circulating_supply().await.map_err(|e| RpcError::General(e.to_string()))?;
         Ok(GetCoinSupplyResponse::new(MAX_SOMPI, circulating_sompi))
+    }
+
+    async fn get_spendable_balances_by_addresses_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetSpendableBalancesByAddressesRequest,
+    ) -> RpcResult<GetSpendableBalancesByAddressesResponse> {
+        if !self.config.utxoindex {
+            return Err(RpcError::NoUtxoIndex);
+        }
+        let entry_map = self.get_utxo_set_by_script_public_key(request.addresses.iter()).await;
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let virtual_daa_score = session.async_get_stats().await.virtual_stats.daa_score;
+        let coinbase_maturity = self.config.params.coinbase_maturity;
+
+        let entries = request
+            .addresses
+            .iter()
+            .map(|address| {
+                let spk = pay_to_address_script(address);
+                let mut mature = 0u64;
+                let mut immature_coinbase = 0u64;
+                if let Some(utxos) = entry_map.get(&spk) {
+                    for utxo in utxos.values() {
+                        // coinbase outputs are only spendable once `coinbase_maturity` DAA scores deep
+                        if utxo.is_coinbase && virtual_daa_score < utxo.block_daa_score.saturating_add(coinbase_maturity) {
+                            immature_coinbase = immature_coinbase.saturating_add(utxo.amount);
+                        } else {
+                            mature = mature.saturating_add(utxo.amount);
+                        }
+                    }
+                }
+                RpcSpendableBalanceEntry { address: address.to_owned(), mature, immature_coinbase, pending: 0 }
+            })
+            .collect();
+        Ok(GetSpendableBalancesByAddressesResponse { entries })
+    }
+
+    async fn get_transaction_mass_estimate_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTransactionMassEstimateRequest,
+    ) -> RpcResult<GetTransactionMassEstimateResponse> {
+        let transaction: Transaction = request.transaction.try_into()?;
+        let mass_calc = MassCalculator::new_with_consensus_params(&self.config.params);
+        let storage_param = self.config.params.storage_mass_parameter;
+        let session = self.consensus_manager.consensus().unguarded_session();
+
+        let res: Result<(u64, u64), String> = session
+            .spawn_blocking(move |c| {
+                let mut mtx = MutableTransaction::from_tx(transaction);
+                c.populate_mempool_transaction(&mut mtx).map_err(|e| e.to_string())?;
+                let compute_mass = mass_calc.calc_tx_compute_mass(mtx.tx.as_ref());
+                let input_values = mtx.entries.iter().map(|e| e.as_ref().map(|u| u.amount).unwrap_or_default()).collect::<Vec<_>>();
+                let output_values = mtx.tx.as_ref().outputs.iter().map(|o| o.value).collect::<Vec<_>>();
+                let storage_mass =
+                    calc_storage_mass(false, input_values.into_iter(), output_values.into_iter(), Kip9Version::Alpha, storage_param)
+                        .unwrap_or(u64::MAX);
+                Ok((compute_mass, storage_mass))
+            })
+            .await;
+
+        let (compute_mass, storage_mass) = res.map_err(RpcError::General)?;
+        Ok(GetTransactionMassEstimateResponse {
+            compute_mass,
+            storage_mass,
+            overall_mass: compute_mass.saturating_add(storage_mass),
+        })
+    }
+
+    async fn validate_transaction_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: ValidateTransactionRequest,
+    ) -> RpcResult<ValidateTransactionResponse> {
+        let transaction: Transaction = request.transaction.try_into()?;
+        let storage_param = self.config.params.storage_mass_parameter;
+        let session = self.consensus_manager.consensus().unguarded_session();
+
+        // validate against the UTXO set without inserting into the mempool
+        let (is_valid, error, compute_mass, storage_mass, fee) = session
+            .spawn_blocking(move |c| {
+                let mut mtx = MutableTransaction::from_tx(transaction);
+                if let Err(e) = c.populate_mempool_transaction(&mut mtx) {
+                    return (false, Some(e.to_string()), 0u64, 0u64, 0u64);
+                }
+                match c.validate_mempool_transaction(&mut mtx, &TransactionValidationArgs::default()) {
+                    Ok(()) => {
+                        let compute_mass = mtx.calculated_compute_mass.unwrap_or_default();
+                        let fee = mtx.calculated_fee.unwrap_or_default();
+                        let input_values =
+                            mtx.entries.iter().map(|e| e.as_ref().map(|u| u.amount).unwrap_or_default()).collect::<Vec<_>>();
+                        let output_values = mtx.tx.as_ref().outputs.iter().map(|o| o.value).collect::<Vec<_>>();
+                        let storage_mass = calc_storage_mass(
+                            false,
+                            input_values.into_iter(),
+                            output_values.into_iter(),
+                            Kip9Version::Alpha,
+                            storage_param,
+                        )
+                        .unwrap_or(u64::MAX);
+                        (true, None, compute_mass, storage_mass, fee)
+                    }
+                    Err(e) => (false, Some(e.to_string()), 0, 0, 0),
+                }
+            })
+            .await;
+
+        Ok(ValidateTransactionResponse {
+            is_valid,
+            error,
+            compute_mass,
+            storage_mass,
+            overall_mass: compute_mass.saturating_add(storage_mass),
+            fee,
+        })
+    }
+
+    async fn get_transaction_status_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTransactionStatusRequest,
+    ) -> RpcResult<GetTransactionStatusResponse> {
+        // reuse the existing tx lookup: mempool, plus a chain lookback when a DAA hint is given
+        let lookup = self
+            .get_transactions_by_ids_call(
+                None,
+                GetTransactionsByIdsRequest {
+                    entries: request.entries.clone(),
+                    include_orphan_pool: true,
+                    filter_transaction_pool: false,
+                },
+            )
+            .await?;
+
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let virtual_daa_score = session.async_get_stats().await.virtual_stats.daa_score;
+
+        let entries = request
+            .entries
+            .iter()
+            .map(|req| {
+                let id = req.transaction_id;
+                match lookup.entries.iter().find(|e| e.transaction_id == id) {
+                    Some(found) if found.source == "mempool" => RpcTransactionStatusEntry {
+                        transaction_id: id,
+                        status: "mempool".to_string(),
+                        is_accepted: false,
+                        accepting_block_hash: None,
+                        block_daa_score: None,
+                        confirmations: None,
+                    },
+                    Some(found) if found.block_hash.is_some() => {
+                        let confirmations = found.block_daa_score.map(|daa| virtual_daa_score.saturating_sub(daa));
+                        RpcTransactionStatusEntry {
+                            transaction_id: id,
+                            status: "mined".to_string(),
+                            is_accepted: true,
+                            accepting_block_hash: found.block_hash,
+                            block_daa_score: found.block_daa_score,
+                            confirmations,
+                        }
+                    }
+                    _ => RpcTransactionStatusEntry {
+                        transaction_id: id,
+                        status: "unknown".to_string(),
+                        is_accepted: false,
+                        accepting_block_hash: None,
+                        block_daa_score: None,
+                        confirmations: None,
+                    },
+                }
+            })
+            .collect();
+        Ok(GetTransactionStatusResponse { entries })
     }
 
     async fn get_daa_score_timestamp_estimate_call(

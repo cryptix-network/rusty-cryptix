@@ -96,6 +96,10 @@ message CryptixdRequest {
     GetLiquidityClaimPreviewRequestMessage getLiquidityClaimPreviewRequest = 1170;
     GetLiquidityHoldersRequestMessage getLiquidityHoldersRequest = 1172;
     GetConsensusAtomicStateHashRequestMessage getConsensusAtomicStateHashRequest = 1174;
+    GetSpendableBalancesByAddressesRequestMessage getSpendableBalancesByAddressesRequest = 1176;
+    GetTransactionMassEstimateRequestMessage getTransactionMassEstimateRequest = 1178;
+    ValidateTransactionRequestMessage validateTransactionRequest = 1180;
+    GetTransactionStatusRequestMessage getTransactionStatusRequest = 1182;
   }
 }
 
@@ -193,6 +197,10 @@ message CryptixdResponse {
     GetLiquidityClaimPreviewResponseMessage getLiquidityClaimPreviewResponse = 1171;
     GetLiquidityHoldersResponseMessage getLiquidityHoldersResponse = 1173;
     GetConsensusAtomicStateHashResponseMessage getConsensusAtomicStateHashResponse = 1175;
+    GetSpendableBalancesByAddressesResponseMessage getSpendableBalancesByAddressesResponse = 1177;
+    GetTransactionMassEstimateResponseMessage getTransactionMassEstimateResponse = 1179;
+    ValidateTransactionResponseMessage validateTransactionResponse = 1181;
+    GetTransactionStatusResponseMessage getTransactionStatusResponse = 1183;
   }
 }
 

@@ -2357,3 +2357,142 @@ mod tests {
         }
     }
 }
+
+from!(item: &cryptix_rpc_core::RpcSpendableBalanceEntry, protowire::RpcSpendableBalanceEntry, {
+    Self {
+        address: (&item.address).into(),
+        mature: item.mature,
+        immature_coinbase: item.immature_coinbase,
+        pending: item.pending,
+        error: None,
+    }
+});
+try_from!(item: &protowire::RpcSpendableBalanceEntry, cryptix_rpc_core::RpcSpendableBalanceEntry, {
+    Self {
+        address: item.address.as_str().try_into()?,
+        mature: item.mature,
+        immature_coinbase: item.immature_coinbase,
+        pending: item.pending,
+    }
+});
+
+from!(item: &cryptix_rpc_core::GetSpendableBalancesByAddressesRequest, protowire::GetSpendableBalancesByAddressesRequestMessage, {
+    Self { addresses: item.addresses.iter().map(|x| x.into()).collect() }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetSpendableBalancesByAddressesResponse>, protowire::GetSpendableBalancesByAddressesResponseMessage, {
+    Self { entries: item.entries.iter().map(|x| x.into()).collect(), error: None }
+});
+try_from!(item: &protowire::GetSpendableBalancesByAddressesRequestMessage, cryptix_rpc_core::GetSpendableBalancesByAddressesRequest, {
+    Self { addresses: item.addresses.iter().map(|x| x.as_str().try_into()).collect::<Result<Vec<_>, _>>()? }
+});
+try_from!(item: &protowire::GetSpendableBalancesByAddressesResponseMessage, RpcResult<cryptix_rpc_core::GetSpendableBalancesByAddressesResponse>, {
+    Self { entries: item.entries.iter().map(|x| x.try_into()).collect::<Result<Vec<_>, _>>()? }
+});
+
+from!(item: &cryptix_rpc_core::GetTransactionMassEstimateRequest, protowire::GetTransactionMassEstimateRequestMessage, {
+    Self { transaction: Some((&item.transaction).into()) }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetTransactionMassEstimateResponse>, protowire::GetTransactionMassEstimateResponseMessage, {
+    Self { compute_mass: item.compute_mass, storage_mass: item.storage_mass, overall_mass: item.overall_mass, error: None }
+});
+try_from!(item: &protowire::GetTransactionMassEstimateRequestMessage, cryptix_rpc_core::GetTransactionMassEstimateRequest, {
+    Self {
+        transaction: item
+            .transaction
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetTransactionMassEstimateRequestMessage".to_string(), "transaction".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetTransactionMassEstimateResponseMessage, RpcResult<cryptix_rpc_core::GetTransactionMassEstimateResponse>, {
+    Self { compute_mass: item.compute_mass, storage_mass: item.storage_mass, overall_mass: item.overall_mass }
+});
+
+from!(item: &cryptix_rpc_core::ValidateTransactionRequest, protowire::ValidateTransactionRequestMessage, {
+    Self { transaction: Some((&item.transaction).into()) }
+});
+from!(item: RpcResult<&cryptix_rpc_core::ValidateTransactionResponse>, protowire::ValidateTransactionResponseMessage, {
+    Self {
+        is_valid: item.is_valid,
+        validation_error: item.error.clone().unwrap_or_default(),
+        compute_mass: item.compute_mass,
+        storage_mass: item.storage_mass,
+        overall_mass: item.overall_mass,
+        fee: item.fee,
+        error: None,
+    }
+});
+try_from!(item: &protowire::ValidateTransactionRequestMessage, cryptix_rpc_core::ValidateTransactionRequest, {
+    Self {
+        transaction: item
+            .transaction
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("ValidateTransactionRequestMessage".to_string(), "transaction".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::ValidateTransactionResponseMessage, RpcResult<cryptix_rpc_core::ValidateTransactionResponse>, {
+    Self {
+        is_valid: item.is_valid,
+        error: if item.validation_error.is_empty() { None } else { Some(item.validation_error.clone()) },
+        compute_mass: item.compute_mass,
+        storage_mass: item.storage_mass,
+        overall_mass: item.overall_mass,
+        fee: item.fee,
+    }
+});
+
+from!(item: &cryptix_rpc_core::RpcTransactionStatusEntry, protowire::RpcTransactionStatusEntry, {
+    Self {
+        transaction_id: item.transaction_id.to_string(),
+        status: item.status.clone(),
+        is_accepted: item.is_accepted,
+        accepting_block_hash: item.accepting_block_hash.map_or(String::new(), |h| h.to_string()),
+        block_daa_score: item.block_daa_score.unwrap_or_default(),
+        confirmations: item.confirmations.unwrap_or_default(),
+        error: None,
+    }
+});
+try_from!(item: &protowire::RpcTransactionStatusEntry, cryptix_rpc_core::RpcTransactionStatusEntry, {
+    Self {
+        transaction_id: RpcHash::from_str(&item.transaction_id)?,
+        status: item.status.clone(),
+        is_accepted: item.is_accepted,
+        accepting_block_hash: if item.accepting_block_hash.is_empty() { None } else { Some(RpcHash::from_str(&item.accepting_block_hash)?) },
+        block_daa_score: if item.block_daa_score == 0 { None } else { Some(item.block_daa_score) },
+        confirmations: if item.status == "mined" { Some(item.confirmations) } else { None },
+    }
+});
+
+from!(item: &cryptix_rpc_core::GetTransactionStatusRequest, protowire::GetTransactionStatusRequestMessage, {
+    Self {
+        entries: item
+            .entries
+            .iter()
+            .map(|e| protowire::RpcTransactionStatusRequestEntry {
+                transaction_id: e.transaction_id.to_string(),
+                block_daa_score: e.block_daa_score.unwrap_or_default(),
+            })
+            .collect(),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetTransactionStatusResponse>, protowire::GetTransactionStatusResponseMessage, {
+    Self { entries: item.entries.iter().map(|x| x.into()).collect(), error: None }
+});
+try_from!(item: &protowire::GetTransactionStatusRequestMessage, cryptix_rpc_core::GetTransactionStatusRequest, {
+    Self {
+        entries: item
+            .entries
+            .iter()
+            .map(|e| {
+                Ok::<_, RpcError>(cryptix_rpc_core::RpcTransactionLookupRequest {
+                    transaction_id: RpcHash::from_str(&e.transaction_id)?,
+                    block_daa_score: if e.block_daa_score == 0 { None } else { Some(e.block_daa_score) },
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    }
+});
+try_from!(item: &protowire::GetTransactionStatusResponseMessage, RpcResult<cryptix_rpc_core::GetTransactionStatusResponse>, {
+    Self { entries: item.entries.iter().map(|x| x.try_into()).collect::<Result<Vec<_>, _>>()? }
+});

@@ -93,6 +93,10 @@ pub mod cryptixd_request_convert {
     impl_into_cryptixd_request!(GetScReplayWindowChunk);
     impl_into_cryptixd_request!(GetScSnapshotHead);
     impl_into_cryptixd_request!(GetConsensusAtomicStateHash);
+    impl_into_cryptixd_request!(GetSpendableBalancesByAddresses);
+    impl_into_cryptixd_request!(GetTransactionMassEstimate);
+    impl_into_cryptixd_request!(ValidateTransaction);
+    impl_into_cryptixd_request!(GetTransactionStatus);
 
     impl_into_cryptixd_request!(NotifyBlockAdded);
     impl_into_cryptixd_request!(NotifyNewBlockTemplate);
@@ -261,6 +265,10 @@ pub mod cryptixd_response_convert {
     impl_into_cryptixd_response!(GetScReplayWindowChunk);
     impl_into_cryptixd_response!(GetScSnapshotHead);
     impl_into_cryptixd_response!(GetConsensusAtomicStateHash);
+    impl_into_cryptixd_response!(GetSpendableBalancesByAddresses);
+    impl_into_cryptixd_response!(GetTransactionMassEstimate);
+    impl_into_cryptixd_response!(ValidateTransaction);
+    impl_into_cryptixd_response!(GetTransactionStatus);
 
     impl_into_cryptixd_notify_response!(NotifyBlockAdded);
     impl_into_cryptixd_notify_response!(NotifyNewBlockTemplate);

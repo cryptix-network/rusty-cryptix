@@ -1544,3 +1544,69 @@ message CancelFastIntentResponseMessage {
   bool epoch_changed = 6;
   RPCError error = 1000;
 }
+
+message GetSpendableBalancesByAddressesRequestMessage {
+  repeated string addresses = 1;
+}
+
+message RpcSpendableBalanceEntry {
+  string address = 1;
+  uint64 mature = 2;
+  uint64 immatureCoinbase = 3;
+  uint64 pending = 4;
+  RPCError error = 1000;
+}
+
+message GetSpendableBalancesByAddressesResponseMessage {
+  repeated RpcSpendableBalanceEntry entries = 1;
+  RPCError error = 1000;
+}
+
+message GetTransactionMassEstimateRequestMessage {
+  RpcTransaction transaction = 1;
+}
+
+message GetTransactionMassEstimateResponseMessage {
+  uint64 computeMass = 1;
+  uint64 storageMass = 2;
+  uint64 overallMass = 3;
+  RPCError error = 1000;
+}
+
+message ValidateTransactionRequestMessage {
+  RpcTransaction transaction = 1;
+}
+
+message ValidateTransactionResponseMessage {
+  bool isValid = 1;
+  string validationError = 2;
+  uint64 computeMass = 3;
+  uint64 storageMass = 4;
+  uint64 overallMass = 5;
+  uint64 fee = 6;
+  RPCError error = 1000;
+}
+
+message RpcTransactionStatusRequestEntry {
+  string transactionId = 1;
+  uint64 blockDaaScore = 2;
+}
+
+message GetTransactionStatusRequestMessage {
+  repeated RpcTransactionStatusRequestEntry entries = 1;
+}
+
+message RpcTransactionStatusEntry {
+  string transactionId = 1;
+  string status = 2;
+  bool isAccepted = 3;
+  string acceptingBlockHash = 4;
+  uint64 blockDaaScore = 5;
+  uint64 confirmations = 6;
+  RPCError error = 1000;
+}
+
+message GetTransactionStatusResponseMessage {
+  repeated RpcTransactionStatusEntry entries = 1;
+  RPCError error = 1000;
+}
